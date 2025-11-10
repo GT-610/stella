@@ -1,18 +1,15 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package switcher
 
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stella/virtual-switch/pkg/switcher"
+	"github.com/stretchr/testify/assert"
 )
 
-// TestParseIGMPMessage 测试解析IGMP消息
-// 注意：由于我们不能访问内部的解析逻辑和calculateChecksum函数，
-// 这个测试被简化为验证ParseIGMPMessage函数可以接受输入而不崩溃
+// TestParseIGMPMessage tests IGMP message parsing
+// Note: Since we cannot access the internal parsing logic and calculateChecksum function,
+// this test is simplified to verify that ParseIGMPMessage can accept input without crashing
 func TestParseIGMPMessage(t *testing.T) {
 	// 创建一个基本的IGMP消息
 	igmpMsg := make([]byte, 8)
@@ -27,62 +24,62 @@ func TestParseIGMPMessage(t *testing.T) {
 	igmpMsg[6] = 0x00
 	igmpMsg[7] = 0x01
 
-	// 调用ParseIGMPMessage函数 - 我们只验证它不会崩溃
-	// 由于无法生成有效的校验和，函数可能返回解析失败，这是可以接受的
+	// Call ParseIGMPMessage function - we only verify it doesn't crash
+// Since we can't generate a valid checksum, the function might return parsing failure, which is acceptable
 	_, _, parsed := switcher.ParseIGMPMessage(igmpMsg)
-	// 我们不再检查返回的具体值，只检查函数是否可以执行
-	// 解析失败可能是由于校验和无效导致的，这是预期的行为
+	// We no longer check the specific returned values, only that the function can execute
+// Parsing failure might be due to invalid checksum, which is expected behavior
 	if !parsed {
 		t.Log("ParseIGMPMessage returned false due to likely invalid checksum, which is acceptable")
 	}
 
-	// 测试无效长度的消息
+	// Test with invalid length message
 	invalidMsg := []byte{0x00, 0x00, 0x00}
 	_, _, parsed = switcher.ParseIGMPMessage(invalidMsg)
-	// 确认函数能够正确处理无效输入
+	// Verify the function can handle invalid input correctly
 	t.Logf("Parsing invalid message returned: %v", parsed)
 }
 
-// TestHandleIGMPMessage 测试多播管理器处理IGMP消息
+// TestHandleIGMPMessage tests multicast manager handling of IGMP messages
 func TestHandleIGMPMessage(t *testing.T) {
 	manager := switcher.NewMulticastManager()
 	vlanID := uint16(1)
 	portID := "port1"
 	groupAddr := [4]byte{224, 0, 0, 1} // 224.0.0.1
 
-	// 测试处理IGMPv2成员报告（加入组）
+	// Test handling IGMPv2 membership report (join group)
 	manager.HandleIGMPMessage(portID, vlanID, 0x16, groupAddr)
 
-	// 验证端口已加入多播组
+	// Verify port has joined the multicast group
 	isMember := manager.IsMember(portID, vlanID, switcher.IPv4ToMulticastMac(groupAddr))
 	assert.True(t, isMember, "Expected port to join multicast group after IGMP report")
 
-	// 测试处理IGMP离开组消息
+	// Test handling IGMP leave group message
 	manager.HandleIGMPMessage(portID, vlanID, 0x17, groupAddr)
 
-	// 验证端口已离开多播组
+	// Verify port has left the multicast group
 	isMember = manager.IsMember(portID, vlanID, switcher.IPv4ToMulticastMac(groupAddr))
 	assert.False(t, isMember, "Expected port to leave multicast group after IGMP leave")
 
-	// 测试处理未知的IGMP消息类型
-	// 测试处理未知的IGMP消息类型 - 使用一个不在主要类型中的值
+	// Test handling unknown IGMP message type
+	// Test handling unknown IGMP message type - use a value not in the primary types
 	manager.HandleIGMPMessage(portID, vlanID, 99, groupAddr)
 
-	// 验证端口状态未改变（仍然不在组中）
+	// Verify port state remains unchanged (still not in group)
 	isMember = manager.IsMember(portID, vlanID, switcher.IPv4ToMulticastMac(groupAddr))
 	assert.False(t, isMember, "Expected port state to remain unchanged for unknown IGMP type")
 }
 
-// TestHandleIGMPMessage_GeneralQuery 测试处理IGMP通用查询消息
+// TestHandleIGMPMessage_GeneralQuery tests handling of IGMP general query messages
 func TestHandleIGMPMessage_GeneralQuery(t *testing.T) {
 	manager := switcher.NewMulticastManager()
 	vlanID := uint16(1)
 	portID := "port1"
 	groupAddr := [4]byte{0, 0, 0, 0} // 通用查询（组地址为0）
 
-	// 处理通用查询消息
+	// Process general query message
 	manager.HandleIGMPMessage(portID, vlanID, 0x11, groupAddr)
 
-	// 通用查询本身不会改变成员状态，只是触发响应，所以这里不会有断言
-	// 实际应用中，客户端应该回应成员报告消息
+	// General query itself doesn't change membership state, it only triggers responses, so there are no assertions here
+// In actual application, clients should respond with membership report messages
 }

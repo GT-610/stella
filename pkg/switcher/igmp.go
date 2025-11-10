@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package switcher
 
 import (
@@ -10,41 +7,41 @@ import (
 	"github.com/stella/virtual-switch/pkg/address"
 )
 
-// IGMP消息类型常量
+// IGMP message type constants
 const (
-	IGMPTypeMembershipQuery       = 0x11
-	IGMPTypeMembershipReportV1    = 0x12
-	IGMPTypeMembershipReportV2    = 0x16
-	IGMPTypeMembershipReportV3    = 0x22
-	IGMPTypeLeaveGroup            = 0x17
+	IGMPTypeMembershipQuery    = 0x11
+	IGMPTypeMembershipReportV1 = 0x12
+	IGMPTypeMembershipReportV2 = 0x16
+	IGMPTypeMembershipReportV3 = 0x22
+	IGMPTypeLeaveGroup         = 0x17
 )
 
-// IGMP头部结构
+// IGMP header structure
 type IGMPHeader struct {
 	Type        uint8
 	MaxRespTime uint8
 	Checksum    uint16
 }
 
-// IGMP成员关系查询消息结构
+// IGMP membership query message structure
 type IGMPMembershipQuery struct {
-	Header      IGMPHeader
+	Header       IGMPHeader
 	GroupAddress [4]byte
 }
 
-// IGMP成员关系报告消息结构
+// IGMP membership report message structure
 type IGMPMembershipReport struct {
-	Header      IGMPHeader
+	Header       IGMPHeader
 	GroupAddress [4]byte
 }
 
-// IGMP离开组消息结构
+// IGMP leave group message structure
 type IGMPLeaveGroup struct {
-	Header      IGMPHeader
+	Header       IGMPHeader
 	GroupAddress [4]byte
 }
 
-// 计算IGMP校验和
+// Calculate IGMP checksum
 func calculateChecksum(data []byte) uint16 {
 	var sum uint32
 	for i := 0; i < len(data)-1; i += 2 {
@@ -53,26 +50,26 @@ func calculateChecksum(data []byte) uint16 {
 	if len(data)%2 == 1 {
 		sum += uint32(data[len(data)-1]) << 8
 	}
-	// 将溢出部分相加
+	// Add overflow part
 	sum = (sum >> 16) + (sum & 0xffff)
 	sum += (sum >> 16)
 	return uint16(^sum)
 }
 
-// 验证IGMP校验和
+// Validate IGMP checksum
 func validateChecksum(data []byte) bool {
 	return calculateChecksum(data) == 0
 }
 
-// 解析IPv4数据包中的IGMP消息
+// Parse IGMP message from IPv4 packet
 func ParseIGMPMessage(ipv4Data []byte) (uint8, [4]byte, bool) {
-	// IPv4头部长度
+	// IPv4 header length
 	ipHeaderLen := int((ipv4Data[0] & 0x0F) << 2)
 	if ipHeaderLen < 20 || len(ipv4Data) < ipHeaderLen {
 		return 0, [4]byte{}, false
 	}
 
-	// 提取IGMP消息
+	// Extract IGMP message
 	igmpData := ipv4Data[ipHeaderLen:]
 	if len(igmpData) < 8 {
 		return 0, [4]byte{}, false
@@ -83,49 +80,49 @@ func ParseIGMPMessage(ipv4Data []byte) (uint8, [4]byte, bool) {
 		return 0, [4]byte{}, false
 	}
 
-	// 解析IGMP头部
+	// Parse IGMP header
 	var header IGMPHeader
 	header.Type = igmpData[0]
 	header.MaxRespTime = igmpData[1]
 	header.Checksum = binary.BigEndian.Uint16(igmpData[2:4])
 
-	// 提取组地址
+	// Extract group address
 	var groupAddr [4]byte
 	copy(groupAddr[:], igmpData[4:8])
 
 	return header.Type, groupAddr, true
 }
 
-// 处理IGMP消息
+// Handle IGMP message
 func (m *MulticastManager) HandleIGMPMessage(portID string, vlanID uint16, igmpType uint8, groupAddr [4]byte) {
-	// 将IPv4多播地址转换为MAC地址
+	// Convert IPv4 multicast address to MAC address
 	multicastMac := IPv4ToMulticastMac(groupAddr)
-	
-	// 根据IGMP消息类型处理
+
+	// Handle based on IGMP message type
 	switch igmpType {
 	case IGMPTypeMembershipReportV1, IGMPTypeMembershipReportV2, IGMPTypeMembershipReportV3:
-		// 成员报告，添加端口到多播组
+		// Membership report, add port to multicast group
 		m.AddMember(vlanID, multicastMac, 0, portID)
 	case IGMPTypeLeaveGroup:
-		// 离开组，从多播组中移除端口
+		// Leave group, remove port from multicast group
 		m.RemoveMember(vlanID, multicastMac, 0, portID)
 
 	case IGMPTypeMembershipQuery:
-		// 处理查询消息
-		// 我们不需要特殊处理查询消息，因为主机应该自动发送报告
-		// 我们只需要确保查询消息被正确转发到所有端口
+		// Handle query message
+		// We don't need special handling for query messages as hosts should automatically send reports
+		// We just need to ensure query messages are properly forwarded to all ports
 	}
 }
 
-// 将IPv4多播地址转换为以太网多播MAC地址
+// IPv4ToMulticastMac converts an IPv4 multicast address to an Ethernet multicast MAC address
 func IPv4ToMulticastMac(ipv4Addr [4]byte) address.MAC {
-	// IPv4多播地址到以太网多播MAC地址的转换规则：
-	// MAC地址的前3个字节固定为01:00:5E，第4个字节的最高位为0，
-	// 最后3个字节使用IPv4地址的最后23位
+	// Conversion rule from IPv4 multicast address to Ethernet multicast MAC address:
+	// The first 3 bytes of MAC address are fixed as 01:00:5E, the highest bit of the 4th byte is 0,
+	// and the last 3 bytes use the last 23 bits of the IPv4 address
 	var mac address.MAC
-	// 使用正确的方式设置MAC地址字节，避免切片操作
+	// Set MAC address bytes correctly, avoiding slice operations
 	macBytes := []byte{0x01, 0x00, 0x5E, ipv4Addr[1] & 0x7F, ipv4Addr[2], ipv4Addr[3]}
-	// 使用NewMACFromBytes创建MAC地址
+	// Create MAC address using NewMACFromBytes
 	macPtr, _ := address.NewMACFromBytes(macBytes)
 	if macPtr != nil {
 		mac = *macPtr
@@ -133,15 +130,15 @@ func IPv4ToMulticastMac(ipv4Addr [4]byte) address.MAC {
 	return mac
 }
 
-// 将以太网多播MAC地址转换为IPv4多播地址（如果可能）
+// MulticastMacToIPv4 converts an Ethernet multicast MAC address to an IPv4 multicast address (if possible)
 func MulticastMacToIPv4(mac address.MAC) (net.IP, bool) {
-	// 检查是否是IPv4多播MAC地址（01:00:5E开头）
+	// Check if it's an IPv4 multicast MAC address (starting with 01:00:5E)
 	macBytes := mac.Bytes()
 	if macBytes[0] != 0x01 || macBytes[1] != 0x00 || macBytes[2] != 0x5E {
 		return nil, false
 	}
 
-	// 创建IPv4地址
+	// Create IPv4 address
 	ipv4Addr := make(net.IP, 4)
 	ipv4Addr[0] = 224 // IPv4多播地址范围：224.0.0.0 - 239.255.255.255
 	ipv4Addr[1] = macBytes[3]
@@ -151,26 +148,26 @@ func MulticastMacToIPv4(mac address.MAC) (net.IP, bool) {
 	return ipv4Addr, true
 }
 
-// 检查数据包是否包含IGMP消息
+// IsIGMPPacket checks if a packet contains an IGMP message
 func IsIGMPPacket(ethFrame []byte) bool {
-	// 验证以太网帧长度
+	// Validate Ethernet frame length
 	if len(ethFrame) < 14+20 { // 以太网头部(14) + 最小IPv4头部(20)
 		return false
 	}
 
-	// 解析以太网帧的以太网类型
+	// Parse the Ethernet type of the Ethernet frame
 	etherType := binary.BigEndian.Uint16(ethFrame[12:14])
 
-	// 检查是否是IPv4数据包
+	// Check if it's an IPv4 packet
 	if etherType != 0x0800 { // IPv4
 		return false
 	}
 
-	// 解析IPv4头部
+	// Parse IPv4 header
 	ipHeader := ethFrame[14 : 14+20]
 	protocol := ipHeader[9] // 第10个字节是协议字段
 
-	// 检查是否是IGMP协议
+	// Check if it's IGMP protocol
 	if protocol != 2 { // IGMP
 		return false
 	}

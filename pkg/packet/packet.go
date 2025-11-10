@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package packet
 
 import (
@@ -126,26 +123,26 @@ func NewPacket(dst, src *address.Address) (*Packet, error) {
 	if dst == nil || src == nil {
 		return nil, fmt.Errorf("destination and source addresses cannot be nil")
 	}
-	
+
 	// Create minimum length packet
 	data := make([]byte, PacketIdxPayload)
-	
+
 	// Generate random packet ID
 	_, err := rand.Read(data[PacketIdxIV:PacketIdxDest])
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate random packet ID: %v", err)
 	}
-	
+
 	// Set destination address
 	copy(data[PacketIdxDest:PacketIdxSrc], dst.Bytes())
-	
+
 	// Set source address
 	copy(data[PacketIdxSrc:PacketIdxFlags], src.Bytes())
-	
+
 	// Initialize flags, use Curve25519 cipher suite, 0 hops
 	// 0b11100000 & 0b00011100 & 0b00000011 = flags/cipher/hops
-	data[PacketIdxFlags] = uint8(CipherC25519_POLY1305_SALSA2012<<2) // Default to Curve25519 cipher suite
-	
+	data[PacketIdxFlags] = uint8(CipherC25519_POLY1305_SALSA2012 << 2) // Default to Curve25519 cipher suite
+
 	return &Packet{Data: data}, nil
 }
 
@@ -154,11 +151,11 @@ func NewPacketFromData(data []byte) (*Packet, error) {
 	if len(data) < PacketIdxPayload {
 		return nil, fmt.Errorf("packet too small: minimum length is %d bytes", PacketIdxPayload)
 	}
-	
+
 	// Create a copy to avoid modifying original data
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
-	
+
 	return &Packet{Data: dataCopy}, nil
 }
 
@@ -252,7 +249,7 @@ func (p *Packet) SetVerb(verb Verb) {
 	if len(p.Data) <= PacketIdxEncryptedFlagsAndVerb {
 		p.Data = append(p.Data, make([]byte, PacketIdxEncryptedFlagsAndVerb-len(p.Data)+1)...)
 	}
-	
+
 	// Preserve high 3 bits, set low 5 bits
 	p.Data[PacketIdxEncryptedFlagsAndVerb] = (p.Data[PacketIdxEncryptedFlagsAndVerb] & 0xe0) | (uint8(verb) & 0x1f)
 }
@@ -276,7 +273,7 @@ func (p *Packet) SetPayload(payload []byte) {
 		// Preserve header, only modify payload
 		p.Data = p.Data[:PacketIdxPayload]
 	}
-	
+
 	// Add new payload
 	p.Data = append(p.Data, payload...)
 }
@@ -292,29 +289,29 @@ func (p *Packet) IsValid() bool {
 	if len(p.Data) < PacketIdxPayload {
 		return false
 	}
-	
+
 	// Check if destination and source addresses are valid (by attempting to create address objects)
 	dst, err := address.NewAddressFromBytes(p.Data[PacketIdxDest:PacketIdxSrc])
 	if err != nil || dst == nil {
 		return false
 	}
-	
+
 	src, err := address.NewAddressFromBytes(p.Data[PacketIdxSrc:PacketIdxFlags])
 	if err != nil || src == nil {
 		return false
 	}
-	
+
 	// Check if hop count is valid
 	if p.Hops() > ProtocolMaxHops {
 		return false
 	}
-	
+
 	// Check if cipher suite is supported
 	cipher := p.Cipher()
 	if cipher != CipherC25519_POLY1305_SALSA2012 && cipher != CipherAES_GMAC_SIV {
 		return false
 	}
-	
+
 	return true
 }
 
@@ -330,29 +327,29 @@ func NewFragment(packet *Packet, fragStart, fragLen, fragNo, fragTotal int) (*Fr
 	if fragNo >= fragTotal || fragNo < 0 || fragTotal <= 0 || fragTotal > 16 {
 		return nil, fmt.Errorf("invalid fragment parameters: fragNo=%d, fragTotal=%d", fragNo, fragTotal)
 	}
-	
+
 	if fragStart < 0 || fragStart >= len(packet.Data) || (fragStart+fragLen) > len(packet.Data) {
 		return nil, fmt.Errorf("fragment out of bounds: start=%d, len=%d, packetLen=%d", fragStart, fragLen, len(packet.Data))
 	}
-	
+
 	// Create fragment data
 	data := make([]byte, ProtoMinFragmentLength+fragLen)
-	
+
 	// Copy packet ID and destination address
 	copy(data[PacketFragmentIdxPacketId:PacketFragmentIdxDest+5], packet.Data[PacketIdxIV:PacketIdxSrc])
-	
+
 	// Set fragment indicator
 	data[PacketFragmentIdxFragmentIndicator] = PacketFragmentIndicator
-	
+
 	// Set total fragments and fragment number
 	data[PacketFragmentIdxFragmentNo] = uint8(((fragTotal & 0xf) << 4) | (fragNo & 0xf))
-	
+
 	// Set hop count to 0
 	data[PacketFragmentIdxHops] = 0
-	
+
 	// Copy fragment data
 	copy(data[PacketFragmentIdxPayload:], packet.Data[fragStart:fragStart+fragLen])
-	
+
 	return &Fragment{Data: data}, nil
 }
 
@@ -361,16 +358,16 @@ func NewFragmentFromData(data []byte) (*Fragment, error) {
 	if len(data) < ProtoMinFragmentLength {
 		return nil, fmt.Errorf("fragment too small: minimum length is %d bytes", ProtoMinFragmentLength)
 	}
-	
+
 	// Check if it's a valid fragment
 	if data[PacketFragmentIdxFragmentIndicator] != PacketFragmentIndicator {
 		return nil, fmt.Errorf("not a valid fragment: missing fragment indicator")
 	}
-	
+
 	// 创建一个副本，避免修改原始数据
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
-	
+
 	return &Fragment{Data: dataCopy}, nil
 }
 
@@ -428,24 +425,24 @@ func (f *Fragment) IsValid() bool {
 	if len(f.Data) < ProtoMinFragmentLength {
 		return false
 	}
-	
+
 	// Check fragment indicator
 	if f.Data[PacketFragmentIdxFragmentIndicator] != PacketFragmentIndicator {
 		return false
 	}
-	
+
 	// Check fragment number and total count
 	fragNo := f.FragmentNumber()
 	fragTotal := f.TotalFragments()
 	if fragNo < 0 || fragTotal <= 0 || fragNo >= fragTotal || fragTotal > 16 {
 		return false
 	}
-	
+
 	// Check if destination address is valid (by attempting to create address object)
 	dst, err := address.NewAddressFromBytes(f.Data[PacketFragmentIdxDest : PacketFragmentIdxDest+address.AddressLength])
 	if err != nil || dst == nil {
 		return false
 	}
-	
+
 	return true
 }

@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package switcher
 
 import (
@@ -10,15 +7,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// 创建模拟端口
-func createMockPort(portID string) *switcher.Port {
-	port := switcher.NewPort(portID, "mock-port")
-	return port
-}
-
-// TestMulticastPacketForwarding 测试多播数据包转发
-// 注意：由于我们不能直接模拟Port的SendPacket方法和访问内部字段，
-// 这个测试被简化为验证交换机能否处理多播数据包而不崩溃
+// TestMulticastPacketForwarding tests multicast packet forwarding
+// Note: Due to limitations in directly mocking Port's SendPacket method and accessing internal fields,
+// this test is simplified to verify that the switch can process multicast packets without crashing
 func TestMulticastPacketForwarding(t *testing.T) {
 	// 创建交换机
 	switcherInst, err := switcher.NewSwitcher("test-switch", "Test Switch")
@@ -37,14 +28,14 @@ func TestMulticastPacketForwarding(t *testing.T) {
 	switcherInst.AddPort(port2)
 	switcherInst.AddPort(port3)
 
-	// 由于我们不能创建和操作数据包，我们只能验证交换机的基本功能
+	// Due to limitations in creating and manipulating packets, we can only verify the basic functionality of the switch
 
-	// 由于无法创建有效的数据包，我们暂时跳过HandlePacket测试
+	// Skip HandlePacket test as we cannot create valid packets
 }
 
-// TestIGMPMembershipManagement 测试IGMP成员管理
-// 注意：由于我们不能访问内部的multicastManager和模拟端口的发送方法，
-// 这个测试被简化为验证交换机可以处理IGMP消息而不崩溃
+// TestIGMPMembershipManagement tests IGMP membership management
+// Note: Due to limitations in accessing the internal multicastManager and mocking port sending methods,
+// this test is simplified to verify that the switch can process IGMP messages without crashing
 func TestIGMPMembershipManagement(t *testing.T) {
 	// 创建交换机
 	switcherInst, err := switcher.NewSwitcher("test-switch", "Test Switch")
@@ -56,20 +47,20 @@ func TestIGMPMembershipManagement(t *testing.T) {
 	// 创建端口
 	port1 := switcher.NewPort("port1", "mock-port")
 	port2 := switcher.NewPort("port2", "mock-port")
-	
+
 	// 将端口添加到交换机
 	switcherInst.AddPort(port1)
 	switcherInst.AddPort(port2)
 
-	// 由于无法直接访问内部实现和创建有效的IGMP数据包，我们只能验证交换机的基本功能
-	
-	// 验证交换机可以正常运行
+	// Due to limitations in directly accessing internal implementations and creating valid IGMP packets, we can only verify the basic functionality of the switch
+
+	// Verify that the switch is operational
 	assert.NotNil(t, switcherInst, "Switch should be initialized")
 }
 
-// TestMulticastInVLAN 测试VLAN环境下的多播转发
-// 注意：由于我们不能访问内部的vlanManager和multicastManager，
-// 这个测试被简化为验证交换机可以处理带VLAN标签的数据包而不崩溃
+// TestMulticastInVLAN tests multicast forwarding in a VLAN environment
+// Note: Due to limitations in accessing the internal vlanManager and multicastManager,
+// this test is simplified to verify that the switch can process VLAN-tagged packets without crashing
 func TestMulticastInVLAN(t *testing.T) {
 	// 创建交换机
 	switcherInst, err := switcher.NewSwitcher("test-switch", "Test Switch")
@@ -88,9 +79,9 @@ func TestMulticastInVLAN(t *testing.T) {
 	switcherInst.AddPort(port2)
 	switcherInst.AddPort(port3)
 
-	// 由于我们不能访问vlanManager和multicastManager，我们无法测试具体的VLAN和多播转发逻辑
-	// 这里我们只验证交换机可以正常初始化和运行
-	
-	// 验证交换机可以正常运行
+	// Due to limitations in accessing vlanManager and multicastManager, we cannot test specific VLAN and multicast forwarding logic
+	// Here we only verify that the switch initializes and runs properly
+
+	// Verify that the switch is operational
 	assert.NotNil(t, switcherInst, "Switch should be initialized")
 }

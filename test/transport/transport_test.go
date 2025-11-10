@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package transport_test
 
 import (
@@ -100,7 +97,7 @@ func TestConnectionManagerAddRemove(t *testing.T) {
 	// Test removing connection
 	err = manager.CloseConnection(remoteAddr)
 	require.NoError(t, err)
-	
+
 	// Test getting non-existent connection
 	retrievedConn = manager.GetConnection(remoteAddr)
 	assert.Nil(t, retrievedConn)

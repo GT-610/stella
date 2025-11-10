@@ -8,7 +8,7 @@ import (
 	"github.com/stella/virtual-switch/pkg/switcher"
 )
 
-// TestSwitcherCreation 测试交换机创建功能
+// TestSwitcherCreation tests switch creation functionality
 func TestSwitcherCreation(t *testing.T) {
 	switcherObj, err := switcher.NewSwitcher("switch1", "Test Switch")
 	if err != nil {
@@ -28,14 +28,14 @@ func TestSwitcherCreation(t *testing.T) {
 	}
 }
 
-// TestSwitcherStartStop 测试交换机启动和停止功能
+// TestSwitcherStartStop tests switch start and stop functionality
 func TestSwitcherStartStop(t *testing.T) {
 	switcherObj, err := switcher.NewSwitcher("switch2", "Test Switch")
 	if err != nil {
 		t.Fatalf("Expected no error creating switcher, got %v", err)
 	}
 
-	// 测试启动
+	// Test starting
 	err = switcherObj.Start()
 	if err != nil {
 		t.Fatalf("Expected no error starting switcher, got %v", err)
@@ -49,7 +49,7 @@ func TestSwitcherStartStop(t *testing.T) {
 		t.Error("Expected IsRunning() to return true after start")
 	}
 
-	// 测试停止
+	// Test stopping
 	err = switcherObj.Stop()
 	if err != nil {
 		t.Fatalf("Expected no error stopping switcher, got %v", err)
@@ -60,36 +60,36 @@ func TestSwitcherStartStop(t *testing.T) {
 	}
 }
 
-// TestPortManagement 测试端口管理功能
+// TestPortManagement tests port management functionality
 func TestPortManagement(t *testing.T) {
 	switcherObj, err := switcher.NewSwitcher("switch3", "Test Switch")
 	if err != nil {
 		t.Fatalf("Expected no error creating switcher, got %v", err)
 	}
 
-	// 创建端口
+	// Create ports
 	port1 := switcher.NewPort("port1", "Test Port 1")
 	port2 := switcher.NewPort("port2", "Test Port 2")
 
-	// 添加端口
+	// Add port
 	err = switcherObj.AddPort(port1)
 	if err != nil {
 		t.Fatalf("Expected no error adding port1, got %v", err)
 	}
 
-	// 测试添加重复端口
+	// Test adding duplicate port
 	err = switcherObj.AddPort(port1)
 	if err == nil {
 		t.Fatal("Expected error adding duplicate port, got nil")
 	}
 
-	// 添加第二个端口
+	// Add second port
 	err = switcherObj.AddPort(port2)
 	if err != nil {
 		t.Fatalf("Expected no error adding port2, got %v", err)
 	}
 
-	// 获取端口
+	// Get port
 	retrievedPort, err := switcherObj.GetPort("port1")
 	if err != nil {
 		t.Fatalf("Expected no error retrieving port1, got %v", err)
@@ -99,54 +99,54 @@ func TestPortManagement(t *testing.T) {
 		t.Errorf("Expected retrieved port ID 'port1', got '%s'", retrievedPort.ID)
 	}
 
-	// 测试获取不存在的端口
+	// Test getting nonexistent port
 	_, err = switcherObj.GetPort("nonexistent")
 	if err == nil {
 		t.Fatal("Expected error retrieving nonexistent port, got nil")
 	}
 
-	// 移除端口
+	// Remove port
 	err = switcherObj.RemovePort("port1")
 	if err != nil {
 		t.Fatalf("Expected no error removing port1, got %v", err)
 	}
 
-	// 测试移除不存在的端口
+	// Test removing nonexistent port
 	err = switcherObj.RemovePort("nonexistent")
 	if err == nil {
 		t.Fatal("Expected error removing nonexistent port, got nil")
 	}
 }
 
-// TestPacketHandling 测试数据包处理功能 - 简化版本
+// TestPacketHandling tests packet processing functionality - simplified version
 func TestPacketHandlingBasic(t *testing.T) {
 	switcherObj, err := switcher.NewSwitcher("switch4", "Test Switch")
 	if err != nil {
 		t.Fatalf("Expected no error creating switcher, got %v", err)
 	}
 
-	// 启动交换机
+	// Start switch
 	err = switcherObj.Start()
 	if err != nil {
 		t.Fatalf("Expected no error starting switcher, got %v", err)
 	}
-	defer switcherObj.Stop() // 确保测试结束时停止交换机
+	defer switcherObj.Stop() // Ensure switch is stopped at test completion
 
-	// 创建端口并添加
+	// Create and add port
 	port := switcher.NewPort("port1", "Test Port 1")
 	err = switcherObj.AddPort(port)
 	if err != nil {
 		t.Fatalf("Expected no error adding port, got %v", err)
 	}
 
-	// 测试处理不存在的端口
+	// Test processing packet for nonexistent port
 	mockPacket := &packet.Packet{}
 	err = switcherObj.HandlePacket("nonexistent", mockPacket)
 	if err == nil {
 		t.Fatal("Expected error handling packet for nonexistent port, got nil")
 	}
 
-	// 停止交换机后测试
+	// Test after stopping switch
 	switcherObj.Stop()
 	err = switcherObj.HandlePacket("port1", mockPacket)
 	if err == nil {
@@ -154,30 +154,30 @@ func TestPacketHandlingBasic(t *testing.T) {
 	}
 }
 
-// TestMACTableLearning 测试MAC地址表学习功能
+// TestMACTableLearning tests MAC address table learning functionality
 func TestMACTableLearning(t *testing.T) {
-	// 创建MAC表
+	// Create MAC table
 	macTable := switcher.NewMACTable(100, 300*time.Second)
 
-	// 测试学习MAC地址
+	// Test learning MAC address
 	result := macTable.LearnMAC("00:11:22:33:44:55", "port1")
 	if !result {
 		t.Error("Expected MAC learning to succeed")
 	}
 
-	// 测试再次学习同一个MAC地址
+	// Test learning the same MAC address again
 	result = macTable.LearnMAC("00:11:22:33:44:55", "port1")
 	if !result {
 		t.Error("Expected updating existing MAC entry to succeed")
 	}
 }
 
-// TestMACTableCapacityHandling 测试MAC地址表容量限制处理
+// TestMACTableCapacityHandling tests MAC address table capacity handling
 func TestMACTableCapacityHandling(t *testing.T) {
-	// 创建一个容量为3的MAC表
+	// Create a MAC table with capacity of 3
 	macTable := switcher.NewMACTable(3, 300*time.Second)
 
-	// 添加3个MAC地址，填满表
+	// Add 3 MAC addresses to fill the table
 	result1 := macTable.LearnMAC("00:00:00:00:00:01", "port1")
 	result2 := macTable.LearnMAC("00:00:00:00:00:02", "port2")
 	result3 := macTable.LearnMAC("00:00:00:00:00:03", "port3")
@@ -186,13 +186,13 @@ func TestMACTableCapacityHandling(t *testing.T) {
 		t.Error("Expected all initial MAC learning to succeed")
 	}
 
-	// 添加第4个MAC地址，应该替换最旧的条目
+	// Add 4th MAC address, should replace the oldest entry
 	result4 := macTable.LearnMAC("00:00:00:00:00:04", "port4")
 	if !result4 {
 		t.Error("Expected MAC learning to succeed when replacing oldest entry")
 	}
 
-	// 添加第5个MAC地址，应该继续替换最旧的条目
+	// Add 5th MAC address, should continue to replace oldest entry
 	result5 := macTable.LearnMAC("00:00:00:00:00:05", "port5")
 	if !result5 {
 		t.Error("Expected MAC learning to succeed for second replacement")

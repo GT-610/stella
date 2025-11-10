@@ -8,86 +8,86 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestUDPTransportWithEncryption 测试启用加密的UDP传输
+// TestUDPTransportWithEncryption tests UDP transport with encryption enabled
 func TestUDPTransportWithEncryption(t *testing.T) {
-	// 创建两个传输实例，模拟两个节点（使用测试模式）
+	// Create two transport instances to simulate two nodes (using test mode)
 	
-	// 创建传输1，使用测试模式
+	// Create transport 1, using test mode
 	t1 := NewUDPTransport()
 	err := t1.Init(map[string]interface{}{"test_mode": true})
 	assert.NoError(t, err)
 
-	// 创建传输2，使用测试模式
+	// Create transport 2, using test mode
 	t2 := NewUDPTransport()
 	err = t2.Init(map[string]interface{}{"test_mode": true})
 	assert.NoError(t, err)
 
-	// 获取并交换公钥
+	// Get and exchange public keys
 	addr1 := t1.listenAddr.String()
 	addr2 := t2.listenAddr.String()
 	t1.SetPeerPublicKey(addr2, t2.GetPublicKey())
 	t2.SetPeerPublicKey(addr1, t1.GetPublicKey())
 
-	// 确保加密已启用
+	// Ensure encryption is enabled
 	t1.SetEncryptionEnabled(true)
 	t2.SetEncryptionEnabled(true)
 
-	// 测试消息
+	// Test message
 	message := []byte("This is a secure test message")
 
 
 
-	// 启动传输2并设置处理器
+	// Start transport 2 and set handler
 	err = t2.Start(func(srcAddr net.Addr, data []byte) error {
-		// 在测试模式下，处理器不需要实际处理消息
+		// In test mode, handler doesn't need to process messages
 		return nil
 	})
 	assert.NoError(t, err)
 	defer t2.Stop()
 
-	// 启动传输1
-	err = t1.Start(nil) // 传输1不需要处理器
+	// Start transport 1
+	err = t1.Start(nil) // Transport 1 doesn't need a handler
 	assert.NoError(t, err)
 	defer t1.Stop()
 
-	// 发送加密消息
+	// Send encrypted message
 	dstAddr := t2.listenAddr
 	err = t1.Send(dstAddr, message)
 	assert.NoError(t, err)
 
-	// 在测试模式下，我们直接验证加密功能和消息发送，不进行实际的网络通信
-	// 直接进行断言验证
+	// In test mode, we directly verify encryption functionality and message sending without actual network communication
+	// Direct assertion verification
 	t.Log("In test mode, skipping actual network communication")
 	assert.True(t, true, "Test completed in test mode")
 
-	// 测试禁用加密后的消息传输
+	// Test message transmission with encryption disabled
 	t1.SetEncryptionEnabled(false)
 	t2.SetEncryptionEnabled(false)
 
-	// 发送非加密消息
+	// Send non-encrypted message
 	nonEncryptedMessage := []byte("This is a non-encrypted test message")
 	err = t1.Send(dstAddr, nonEncryptedMessage)
 	assert.NoError(t, err)
 
-	// 在测试模式下，我们直接验证非加密功能
+	// In test mode, we directly verify non-encryption functionality
 	t.Log("In test mode, skipping actual network communication for non-encrypted test")
 	assert.True(t, true, "Non-encrypted test completed in test mode")
 }
 
-// TestUDPTransportKeyExchange 测试密钥交换功能
+// TestUDPTransportKeyExchange tests key exchange functionality
 func TestUDPTransportKeyExchange(t *testing.T) {
-	// 创建传输实例（使用测试模式）
+	// Create transport instance (using test mode)
 	transport := NewUDPTransport()
 	err := transport.Init(map[string]interface{}{"test_mode": true})
 	assert.NoError(t, err)
 	defer transport.Stop()
 
-	// 获取公钥
+	// Get public key
 	publicKey := transport.GetPublicKey()
 	assert.NotNil(t, publicKey)
-	assert.Len(t, publicKey, 32) // Curve25519公钥大小
+	assert.Len(t, publicKey, 32) // Curve25519 public key size
 
-	// 设置对等节点公钥
+	// Set peer public key
 	peerAddr := "remote-host:8888"
 	peerPublicKey := make([]byte, 32)
 	for i := range peerPublicKey {
@@ -96,7 +96,7 @@ func TestUDPTransportKeyExchange(t *testing.T) {
 
 	transport.SetPeerPublicKey(peerAddr, peerPublicKey)
 
-	// 验证公钥是否正确存储
+	// Verify if the public key is correctly stored
 	transport.cryptoMux.RLock()
 	storedKey, exists := transport.peerKeys[peerAddr]
 	transport.cryptoMux.RUnlock()
@@ -105,73 +105,73 @@ func TestUDPTransportKeyExchange(t *testing.T) {
 	assert.Equal(t, peerPublicKey, storedKey)
 }
 
-// TestUDPTransportEncryptionToggle 测试加密开关功能
+// TestUDPTransportEncryptionToggle tests encryption toggle functionality
 func TestUDPTransportEncryptionToggle(t *testing.T) {
-	// 创建传输实例（使用测试模式）
+	// Create transport instance (using test mode)
 	transport := NewUDPTransport()
 	err := transport.Init(map[string]interface{}{"test_mode": true})
 	assert.NoError(t, err)
 	defer transport.Stop()
 
-	// 默认应该启用加密
+	// Encryption should be enabled by default
 	assert.True(t, transport.enableEncryption)
 
-	// 禁用加密
+	// Disable encryption
 	transport.SetEncryptionEnabled(false)
 	assert.False(t, transport.enableEncryption)
 
-	// 重新启用加密
+	// Re-enable encryption
 	transport.SetEncryptionEnabled(true)
 	assert.True(t, transport.enableEncryption)
 }
 
-// TestUDPTransportWithRetryAndEncryption 测试带重试的加密传输
+// TestUDPTransportWithRetryAndEncryption tests encrypted transport with retry support
 func TestUDPTransportWithRetryAndEncryption(t *testing.T) {
-	// 创建接收传输，使用测试模式
+	// Create receiving transport, using test mode
 	receiver := NewUDPTransport()
 	err := receiver.Init(map[string]interface{}{"test_mode": true})
 	assert.NoError(t, err)
 
-	// 设置高重试次数
+	// Set high retry count
 	receiver.maxRetries = 3
 	receiver.retryInterval = 100 * time.Millisecond
 
-	// 创建发送传输，使用测试模式
+	// Create sending transport, using test mode
 	sender := NewUDPTransport()
 	err = sender.Init(map[string]interface{}{"test_mode": true})
 	assert.NoError(t, err)
 
-	// 交换公钥
+	// Exchange public keys
 	receiverAddr := receiver.listenAddr.String()
 	senderAddr := sender.listenAddr.String()
 	sender.SetPeerPublicKey(receiverAddr, receiver.GetPublicKey())
 	receiver.SetPeerPublicKey(senderAddr, sender.GetPublicKey())
 
-	// 确保加密已启用
+	// Ensure encryption is enabled
 	sender.SetEncryptionEnabled(true)
 	receiver.SetEncryptionEnabled(true)
 
-	// 测试消息
+	// Test message
 	message := []byte("Secure message with retry support")
-	// 不需要等待组，因为在测试模式下不进行实际的网络传输
+	// No need for wait groups as we don't perform actual network transmission in test mode
 
-	// 在测试模式下，我们测试重试和加密配置而不是实际的网络传输
+	// In test mode, we test retry and encryption configuration rather than actual network transmission
 	
-	// 在测试模式下验证配置
-	// 验证重试参数已正确设置
+	// Verify configuration in test mode
+	// Verify retry parameters are correctly set
 	assert.Equal(t, 3, receiver.maxRetries)
 	assert.Equal(t, 100*time.Millisecond, receiver.retryInterval)
 	
-	// 测试发送消息（在测试模式下不需要启动）
+	// Test sending message (no need to start in test mode)
 	dstAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
 	err = sender.Send(dstAddr, message)
 	assert.NoError(t, err)
 	
-	// 验证加密已启用
+	// Verify encryption is enabled
 	assert.True(t, sender.enableEncryption)
 	assert.True(t, receiver.enableEncryption)
 	
-	// 清理资源
+	// Clean up resources
 	defer sender.Stop()
 	defer receiver.Stop()
 }

@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package transport
 
 import (
@@ -9,6 +6,7 @@ import (
 	"sync"
 	"time"
 )
+
 // simpleConnection is a minimal Connection implementation
 
 type simpleConnection struct {
@@ -121,8 +119,8 @@ func (m *DefaultConnectionManager) AddConnection(conn Connection) error {
 			m.connections[addrStr] = conn
 			m.mu.Unlock()
 			// Notify listeners
-		m.notifyListeners(conn, EventConnected, []byte{}, nil)
-		return nil
+			m.notifyListeners(conn, EventConnected, []byte{}, nil)
+			return nil
 		}
 		m.mu.Unlock()
 		return NewTransportError("connection already exists", 4003, nil)
@@ -188,17 +186,17 @@ func (m *DefaultConnectionManager) RemoveConnectionByAddr(addr net.Addr) error {
 func (m *DefaultConnectionManager) CreateConnection(remoteAddr net.Addr) (Connection, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	key := m.getConnectionKey(remoteAddr)
-	
+
 	// Check if connection already exists
 	if conn, exists := m.connections[key]; exists {
 		return conn, nil
 	}
-	
+
 	// Create connection based on transport type
 	var newConn Connection
-	
+
 	if t, ok := m.transport.(*UDPTransport); ok {
 		// Create a simple connection implementation
 		newConn = &simpleConnection{
@@ -209,13 +207,13 @@ func (m *DefaultConnectionManager) CreateConnection(remoteAddr net.Addr) (Connec
 	} else {
 		return nil, errors.New("unsupported transport type")
 	}
-	
+
 	// Store the connection
 	m.connections[key] = newConn
-	
+
 	// Notify listeners about the new connection with proper event
 	m.notifyListeners(newConn, EventConnected, []byte{}, nil)
-	
+
 	return newConn, nil
 }
 
@@ -227,7 +225,7 @@ func (m *DefaultConnectionManager) CloseConnection(remoteAddr net.Addr) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	key := m.getConnectionKey(remoteAddr)
 	conn, exists := m.connections[key]
 	if !exists {
@@ -265,12 +263,12 @@ func (m *DefaultConnectionManager) GetConnection(addr net.Addr) Connection {
 func (m *DefaultConnectionManager) GetConnections() []Connection {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	connections := make([]Connection, 0, len(m.connections))
 	for _, conn := range m.connections {
 		connections = append(connections, conn)
 	}
-	
+
 	return connections
 }
 

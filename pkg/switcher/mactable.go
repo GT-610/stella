@@ -5,29 +5,29 @@ import (
 	"time"
 )
 
-// MAC表项结构
+// MACEntry represents a MAC table entry
 type MACEntry struct {
-	MAC      interface{} // 简化处理，实际应该是*address.MAC
+	MAC      interface{} // Simplified handling, should be *address.MAC in reality
 	PortID   string
 	LastSeen time.Time
-	Static   bool // 是否为静态条目（不会老化）
+	Static   bool // Whether it's a static entry (won't age)
 }
 
-// MAC表结构
+// MACTable represents a MAC address table
 type MACTable struct {
-	entries      map[string]*MACEntry // 以MAC地址字符串为键
-	maxSize      int                  // 最大表项数量
-	agingTimeout time.Duration        // 老化超时时间
+	entries      map[string]*MACEntry // Keyed by MAC address string
+	maxSize      int                  // Maximum number of entries
+	agingTimeout time.Duration        // Aging timeout duration
 	mutex        sync.RWMutex
 }
 
-// 创建新的MAC表
+// NewMACTable creates a new MAC address table
 func NewMACTable(maxSize int, agingTimeout time.Duration) *MACTable {
 	if maxSize <= 0 {
-		maxSize = 1024 // 默认最大表项数
+		maxSize = 1024 // Default maximum number of entries
 	}
 	if agingTimeout <= 0 {
-		agingTimeout = 300 * time.Second // 默认老化时间5分钟
+		agingTimeout = 300 * time.Second // Default aging time 5 minutes
 	}
 
 	return &MACTable{
@@ -37,19 +37,19 @@ func NewMACTable(maxSize int, agingTimeout time.Duration) *MACTable {
 	}
 }
 
-// 查找最旧的非静态MAC表项
+// findOldestDynamicEntry finds the oldest non-static MAC table entry
 func (m *MACTable) findOldestDynamicEntry() string {
 	var oldestMAC string
 	var oldestTime time.Time
 	first := true
 
 	for mac, entry := range m.entries {
-		// 跳过静态条目
+		// Skip static entries
 		if entry.Static {
 			continue
 		}
 
-		// 初始化或更新最旧条目
+		// Initialize or update the oldest entry
 		if first || entry.LastSeen.Before(oldestTime) {
 			oldestMAC = mac
 			oldestTime = entry.LastSeen
@@ -60,35 +60,35 @@ func (m *MACTable) findOldestDynamicEntry() string {
 	return oldestMAC
 }
 
-// 学习MAC地址（实现容量限制处理）
+// LearnMAC learns a MAC address (with capacity limit handling)
 func (m *MACTable) LearnMAC(mac interface{}, portID string) bool {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	// 简化处理，假设可以将MAC转为字符串
+	// Simplified handling, assuming MAC can be converted to string
 	macStr := "mac-placeholder"
 
-	// 检查是否已存在该MAC地址
+	// Check if the MAC address already exists
 	entry, exists := m.entries[macStr]
 	if exists {
-		// 更新最后看到的时间
+		// Update last seen time
 		entry.LastSeen = time.Now()
 		return true
 	}
 
-	// 检查MAC表是否已满
+	// Check if MAC table is full
 	if len(m.entries) >= m.maxSize {
-		// 尝试找到最旧的非静态条目进行替换
+		// Try to find the oldest non-static entry for replacement
 		oldestMAC := m.findOldestDynamicEntry()
 		if oldestMAC == "" {
-			// 如果所有条目都是静态的，则无法添加新条目
+			// If all entries are static, cannot add new entry
 			return false
 		}
-		// 删除最旧的非静态条目
+		// Delete the oldest non-static entry
 		delete(m.entries, oldestMAC)
 	}
 
-	// 添加新的MAC表项
+	// Add new MAC table entry
 	m.entries[macStr] = &MACEntry{
 		MAC:      mac,
 		PortID:   portID,
@@ -99,7 +99,7 @@ func (m *MACTable) LearnMAC(mac interface{}, portID string) bool {
 	return true
 }
 
-// 启动MAC地址老化管理器
+// StartAgingManager starts the MAC address aging manager
 func (m *MACTable) StartAgingManager(stopChan <-chan struct{}) {
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -108,7 +108,7 @@ func (m *MACTable) StartAgingManager(stopChan <-chan struct{}) {
 		for {
 			select {
 			case <-ticker.C:
-				// 简化处理，不实现实际的老化逻辑
+				// Simplified handling, actual aging logic not implemented
 			case <-stopChan:
 				return
 			}

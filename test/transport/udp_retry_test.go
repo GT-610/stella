@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package transport_test
 
 import (
@@ -117,7 +114,7 @@ func TestUDPTransportPacketLoss(t *testing.T) {
 		receiveCount++
 		receivedData = data
 		mu.Unlock()
-		
+
 		// Only signal done on first successful receive
 		if receiveCount == 1 {
 			receiveDone.Done()
@@ -137,7 +134,7 @@ func TestUDPTransportPacketLoss(t *testing.T) {
 	// We'll simulate packet loss by temporarily blocking the connection
 	// In a real test, you might use a network simulator or packet capture
 	// For this test, we'll just verify the retry mechanism works in general
-	
+
 	// Send message from client to server
 	serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4446}
 	err = clientTransport.Send(serverAddr, message)

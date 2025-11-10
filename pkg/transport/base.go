@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package transport
 
 import (
@@ -14,13 +11,13 @@ import (
 // and manages state, timeouts, and basic concurrency control
 
 type BaseTransport struct {
-	state       ConnectionState
-	localAddr   net.Addr
-	readTimeout time.Duration
+	state        ConnectionState
+	localAddr    net.Addr
+	readTimeout  time.Duration
 	writeTimeout time.Duration
-	mu          sync.RWMutex
-	handler     PacketHandler
-	closed      bool
+	mu           sync.RWMutex
+	handler      PacketHandler
+	closed       bool
 }
 
 // NewBaseTransport creates a new base transport instance

@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package transport
 
 import (
@@ -15,10 +12,10 @@ import (
 	"github.com/stella/virtual-switch/pkg/identity"
 )
 
-// DiscoveryProtocolVersion 定义了节点发现协议的版本
+// DiscoveryProtocolVersion defines the version of the node discovery protocol
 const DiscoveryProtocolVersion uint8 = 1
 
-// 节点发现消息类型
+// Node discovery message types
 const (
 	DiscoveryTypeHello uint8 = iota
 	DiscoveryTypeResponse
@@ -26,58 +23,58 @@ const (
 	DiscoveryTypePong
 )
 
-// DiscoveryManager 负责节点发现和对等节点管理
-// 实现与ZeroTier兼容的节点发现机制
+// DiscoveryManager is responsible for node discovery and peer management
+// Implements ZeroTier-compatible node discovery mechanism
 
 type DiscoveryManager struct {
-	// 本地节点身份
+	// Local node identity
 	localIdentity *identity.Identity
 
-	// 传输层引用，用于发送发现消息
+	// Transport layer reference for sending discovery messages
 	transport Transport
 
-	// 已知对等节点列表，键为节点地址字符串
+	// List of known peers, keyed by node address string
 	peers map[string]*DiscoveredPeer
 
-	// 锁保护peers映射的并发访问
+	// Lock to protect concurrent access to peers map
 	mu sync.RWMutex
 
-	// 上下文，用于取消发现管理器
-	ctx context.Context
+	// Context for canceling the discovery manager
+	ctx    context.Context
 	cancel context.CancelFunc
 
-	// 随机数生成器，用于生成随机延迟
+	// Random number generator for generating random delays
 	rand *rand.Rand
 
-	// 启动时间
+	// Start time
 	startTime time.Time
 
-	// 发现超时时间
+	// Discovery timeout duration
 	discoveryTimeout time.Duration
 
-	// 心跳间隔
+	// Heartbeat interval
 	heartbeatInterval time.Duration
 
-	// 重试次数
+	// Maximum retry attempts
 	maxRetries int
 }
 
-// DiscoveredPeer 表示通过发现协议找到的对等节点
+// DiscoveredPeer represents a peer found through the discovery protocol
 
 type DiscoveredPeer struct {
-	// 节点身份信息
+	// Node identity information
 	Identity *identity.Identity
 
-	// 网络地址信息
+	// Network address information
 	Address net.Addr
 
-	// 最后一次看到该节点的时间
+	// Last time the node was seen
 	LastSeen time.Time
 
-	// 连接状态
+	// Connection status
 	Connected bool
 
-	// 延迟估计（毫秒）
+	// Latency estimate (milliseconds)
 	Latency int64
 }
 
@@ -85,7 +82,7 @@ type DiscoveredPeer struct {
 func NewDiscoveryManager(localIdentity *identity.Identity, transport Transport) *DiscoveryManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// 为随机数生成器设置种子
+	// Set seed for random number generator
 	source := rand.NewSource(time.Now().UnixNano())
 	random := rand.New(source)
 
@@ -105,10 +102,10 @@ func NewDiscoveryManager(localIdentity *identity.Identity, transport Transport) 
 
 // Start 启动节点发现服务
 func (dm *DiscoveryManager) Start() error {
-	// 启动定期清理过期节点的goroutine
+	// Start goroutine for cleaning up expired peers periodically
 	go dm.cleanupExpiredPeers()
 
-	// 启动心跳检测
+	// Start heartbeat checking
 	go dm.heartbeatChecker()
 
 	return nil
@@ -122,16 +119,16 @@ func (dm *DiscoveryManager) Stop() error {
 
 // SendDiscoveryHello 向指定地址发送发现Hello消息
 func (dm *DiscoveryManager) SendDiscoveryHello(addr net.Addr) error {
-	// 构造Hello消息
+	// Construct Hello message
 	message := dm.buildDiscoveryMessage(DiscoveryTypeHello)
 
-	// 通过传输层发送消息
+	// Send message through transport layer
 	return dm.transport.Send(addr, message)
 }
 
 // SendDiscoveryPing 向指定地址发送Ping消息
 func (dm *DiscoveryManager) SendDiscoveryPing(addr net.Addr) error {
-	// 构造Ping消息
+	// Construct Ping message
 	message := dm.buildDiscoveryMessage(DiscoveryTypePing)
 
 	// 通过传输层发送消息
@@ -140,21 +137,21 @@ func (dm *DiscoveryManager) SendDiscoveryPing(addr net.Addr) error {
 
 // HandleDiscoveryMessage 处理接收到的发现消息
 func (dm *DiscoveryManager) HandleDiscoveryMessage(addr net.Addr, data []byte) error {
-	// 验证消息长度至少包含头部
+	// Verify message length includes at least the header
 	if len(data) < 3 { // 版本(1) + 类型(1) + 时间戳(8)
 		return fmt.Errorf("discovery message too short")
 	}
 
-	// 解析消息头
+	// Parse message header
 	version := data[0]
 	msgType := data[1]
 
-	// 验证版本
+	// Verify version
 	if version != DiscoveryProtocolVersion {
 		return fmt.Errorf("unsupported discovery protocol version: %d", version)
 	}
 
-	// 处理不同类型的消息
+	// Handle different message types
 	switch msgType {
 	case DiscoveryTypeHello:
 		return dm.handleHelloMessage(addr, data)
@@ -202,38 +199,38 @@ func (dm *DiscoveryManager) buildDiscoveryMessage(msgType uint8) []byte {
 	header[1] = msgType
 	binary.BigEndian.PutUint64(header[2:], timestamp)
 
-	// 添加身份信息
-	// 这里简化处理，在实际实现中需要添加公钥等信息
+	// Add identity information
+// Simplified handling here, in actual implementation need to add public key, etc.
 	message := append(header, dm.localIdentity.PublicKey...)
 
 	return message
 }
 
-// handleHelloMessage 处理Hello消息
+// handleHelloMessage processes Hello messages
 func (dm *DiscoveryManager) handleHelloMessage(addr net.Addr, data []byte) error {
-	// 提取对方公钥
-	if len(data) < 10 { // 至少包含头部
+	// Extract peer's public key
+	if len(data) < 10 { // At least include the header
 		return fmt.Errorf("invalid hello message format")
 	}
 
-	// 提取公钥 (假设从索引10开始，实际实现需要根据格式调整)
+	// Extract public key (assuming starts at index 10, actual implementation needs adjustment based on format)
 	publicKey := data[10:]
 
-	// 创建对方身份
+	// Create peer identity
 	peerIdentity, err := identity.NewIdentityFromPublic(publicKey)
 	if err != nil {
 		return fmt.Errorf("failed to create peer identity: %v", err)
 	}
 
-	// 保存对等节点信息
+	// Save peer information
 	dm.addOrUpdatePeer(peerIdentity, addr, false)
 
-	// 发送响应消息
+	// Send response message
 	response := dm.buildDiscoveryMessage(DiscoveryTypeResponse)
 	return dm.transport.Send(addr, response)
 }
 
-// handleResponseMessage 处理Response消息
+// handleResponseMessage processes Response messages
 func (dm *DiscoveryManager) handleResponseMessage(addr net.Addr, data []byte) error {
 	// 提取对方公钥
 	if len(data) < 10 {
@@ -254,16 +251,16 @@ func (dm *DiscoveryManager) handleResponseMessage(addr net.Addr, data []byte) er
 	return nil
 }
 
-// handlePingMessage 处理Ping消息
-func (dm *DiscoveryManager) handlePingMessage(addr net.Addr, data []byte) error {
-	// 发送Pong响应
+// handlePingMessage processes Ping messages
+func (dm *DiscoveryManager) handlePingMessage(addr net.Addr, _ []byte) error {
+	// Send Pong response
 	pong := dm.buildDiscoveryMessage(DiscoveryTypePong)
 	return dm.transport.Send(addr, pong)
 }
 
-// handlePongMessage 处理Pong消息
+// handlePongMessage processes Pong messages
 func (dm *DiscoveryManager) handlePongMessage(addr net.Addr, data []byte) error {
-	// 解析时间戳
+	// Parse timestamp
 	if len(data) < 10 {
 		return fmt.Errorf("invalid pong message format")
 	}
@@ -271,10 +268,10 @@ func (dm *DiscoveryManager) handlePongMessage(addr net.Addr, data []byte) error 
 	timestamp := binary.BigEndian.Uint64(data[2:10])
 	now := uint64(time.Now().UnixNano() / int64(time.Millisecond))
 
-	// 计算延迟
+	// Calculate latency
 	latency := now - timestamp
 
-	// 更新对等节点信息
+	// Update peer information
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
@@ -288,7 +285,7 @@ func (dm *DiscoveryManager) handlePongMessage(addr net.Addr, data []byte) error 
 	return nil
 }
 
-// addOrUpdatePeer 添加或更新对等节点信息
+// addOrUpdatePeer adds or updates peer information
 func (dm *DiscoveryManager) addOrUpdatePeer(peerIdentity *identity.Identity, addr net.Addr, connected bool) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
@@ -297,17 +294,17 @@ func (dm *DiscoveryManager) addOrUpdatePeer(peerIdentity *identity.Identity, add
 	peer, exists := dm.peers[peerAddr]
 
 	if !exists {
-		// 创建新的对等节点记录
+		// Create new peer record
 		peer = &DiscoveredPeer{
 			Identity:  peerIdentity,
 			Address:   addr,
 			LastSeen:  time.Now(),
 			Connected: connected,
-			Latency:   -1, // 未测量
+			Latency:   -1, // Not measured
 		}
 		dm.peers[peerAddr] = peer
 	} else {
-		// 更新现有记录
+		// Update existing record
 		peer.Identity = peerIdentity
 		peer.Address = addr
 		peer.LastSeen = time.Now()
@@ -317,7 +314,7 @@ func (dm *DiscoveryManager) addOrUpdatePeer(peerIdentity *identity.Identity, add
 	}
 }
 
-// cleanupExpiredPeers 定期清理过期的对等节点
+// cleanupExpiredPeers periodically cleans up expired peers
 func (dm *DiscoveryManager) cleanupExpiredPeers() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -328,7 +325,7 @@ func (dm *DiscoveryManager) cleanupExpiredPeers() {
 			dm.mu.Lock()
 			now := time.Now()
 			for addr, peer := range dm.peers {
-				// 如果超过发现超时时间没有收到消息，则删除该节点
+				// If no message is received within discovery timeout, remove the node
 				if now.Sub(peer.LastSeen) > dm.discoveryTimeout {
 					delete(dm.peers, addr)
 				}
@@ -340,7 +337,7 @@ func (dm *DiscoveryManager) cleanupExpiredPeers() {
 	}
 }
 
-// heartbeatChecker 定期向已知节点发送心跳
+// heartbeatChecker periodically sends heartbeats to known nodes
 func (dm *DiscoveryManager) heartbeatChecker() {
 	ticker := time.NewTicker(dm.heartbeatInterval)
 	defer ticker.Stop()
@@ -355,9 +352,9 @@ func (dm *DiscoveryManager) heartbeatChecker() {
 			}
 			dm.mu.RUnlock()
 
-			// 向每个对等节点发送Ping消息
+			// Send Ping message to each peer
 			for _, peer := range peers {
-				// 添加随机延迟，避免网络风暴
+				// Add random delay to avoid network storms
 				delay := time.Duration(dm.rand.Intn(1000)) * time.Millisecond
 				go func(p *DiscoveredPeer) {
 					time.Sleep(delay)
@@ -370,25 +367,25 @@ func (dm *DiscoveryManager) heartbeatChecker() {
 	}
 }
 
-// DiscoverNode 主动发现指定地址的节点
+// DiscoverNode actively discovers a node at the specified address
 func (dm *DiscoveryManager) DiscoverNode(addr net.Addr) error {
-	// 发送Hello消息
+	// Send Hello message
 	err := dm.SendDiscoveryHello(addr)
 	if err != nil {
 		return err
 	}
 
-	// 等待响应
+	// Wait for response
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
 
 	peerAddr := addr.String()
 
-	// 检查节点是否被发现
+	// Check if node has been discovered
 	for i := 0; i < dm.maxRetries; i++ {
 		select {
 		case <-timer.C:
-			// 检查是否已找到节点
+			// Check if node has been found
 			dm.mu.RLock()
 			_, found := dm.peers[peerAddr]
 			dm.mu.RUnlock()
@@ -397,7 +394,7 @@ func (dm *DiscoveryManager) DiscoverNode(addr net.Addr) error {
 				return nil
 			}
 
-			// 重试发送Hello消息
+			// Retry sending Hello message
 			if i < dm.maxRetries-1 {
 				err = dm.SendDiscoveryHello(addr)
 				if err != nil {

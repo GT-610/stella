@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package node
 
 import (
@@ -162,7 +159,7 @@ func GetNodeStatus(n *Node) map[string]interface{} {
 
 	if n.Identity != nil {
 		status["identity"] = map[string]interface{}{
-			"address": n.Identity.Address.String(),
+			"address":   n.Identity.Address.String(),
 			"publicKey": string(n.Identity.PublicKey),
 		}
 	}

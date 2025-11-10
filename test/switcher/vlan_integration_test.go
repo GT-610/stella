@@ -7,22 +7,22 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestVlanIsolation 测试VLAN隔离功能
+// TestVlanIsolation tests VLAN isolation functionality
 func TestVlanIsolation(t *testing.T) {
-	// 创建交换机
+	// Create switcher
 	switcherObj, err := switcher.NewSwitcher("test-switch", "VLAN Test Switch")
 	assert.NoError(t, err, "Expected no error creating switcher")
 
-	// 启动交换机
+	// Start switcher
 	err = switcherObj.Start()
 	assert.NoError(t, err, "Expected no error starting switcher")
 	defer switcherObj.Stop()
 
-	// 获取VLAN管理器
+	// Get VLAN manager
 	vlanManager := switcherObj.GetVlanManager()
 	assert.NotNil(t, vlanManager, "Expected non-nil VLAN manager")
 
-	// 创建并添加VLAN 10和VLAN 20
+	// Create and add VLAN 10 and VLAN 20
 	vlan10, _ := switcher.NewVlanConfig(10, "VLAN 10")
 	vlan20, _ := switcher.NewVlanConfig(20, "VLAN 20")
 
@@ -32,17 +32,17 @@ func TestVlanIsolation(t *testing.T) {
 	err = vlanManager.AddVlan(vlan20)
 	assert.NoError(t, err, "Expected no error adding VLAN 20")
 
-	// 验证VLAN已添加
+	// Verify VLANs are added
 	assert.True(t, vlanManager.IsVlanActive(10), "Expected VLAN 10 to be active")
 	assert.True(t, vlanManager.IsVlanActive(20), "Expected VLAN 20 to be active")
 
-	// 创建4个端口
+	// Create 4 ports
 	port1 := switcher.NewPort("port1", "Access Port VLAN 10")
 	port2 := switcher.NewPort("port2", "Access Port VLAN 10")
 	port3 := switcher.NewPort("port3", "Access Port VLAN 20")
 	port4 := switcher.NewPort("port4", "Trunk Port")
 
-	// 配置端口VLAN模式
+	// Configure port VLAN modes
 	port1.VlanMode = switcher.VlanModeAccess
 	port1.AccessVlanID = 10
 
@@ -56,13 +56,13 @@ func TestVlanIsolation(t *testing.T) {
 	port4.AllowedVlans[10] = true
 	port4.AllowedVlans[20] = true
 
-	// 设置端口状态为Up
+	// Set port states to Up
 	port1.State = switcher.PortStateUp
 	port2.State = switcher.PortStateUp
 	port3.State = switcher.PortStateUp
 	port4.State = switcher.PortStateUp
 
-	// 添加端口到交换机
+	// Add ports to switcher
 	err = switcherObj.AddPort(port1)
 	assert.NoError(t, err, "Expected no error adding port1")
 
@@ -75,60 +75,60 @@ func TestVlanIsolation(t *testing.T) {
 	err = switcherObj.AddPort(port4)
 	assert.NoError(t, err, "Expected no error adding port4")
 
-	// 测试准备完成
+	// Test setup complete
 	assert.True(t, true, "VLAN isolation test setup complete")
 }
 
-// TestSwitchVlanManagement 测试交换机的VLAN管理功能
+// TestSwitchVlanManagement tests VLAN management functionality of the switcher
 func TestSwitchVlanManagement(t *testing.T) {
-	// 创建交换机
+	// Create switcher
 	switcherObj, err := switcher.NewSwitcher("test-switch", "VLAN Management Switch")
 	assert.NoError(t, err, "Expected no error creating switcher")
 
-	// 获取VLAN管理器
+	// Get VLAN manager
 	vlanManager := switcherObj.GetVlanManager()
 	assert.NotNil(t, vlanManager, "Expected non-nil VLAN manager")
 
-	// 验证默认VLAN 1已创建
+	// Verify default VLAN 1 is created
 	defaultVlan, err := vlanManager.GetVlan(1)
 	assert.NoError(t, err, "Expected to find default VLAN 1")
 	assert.Equal(t, "Default VLAN", defaultVlan.Name, "Expected default VLAN name")
 	assert.True(t, defaultVlan.Enabled, "Expected default VLAN to be enabled")
 
-	// 添加新的VLAN
+	// Add new VLAN
 	newVlan, _ := switcher.NewVlanConfig(100, "Test VLAN")
 	err = vlanManager.AddVlan(newVlan)
 	assert.NoError(t, err, "Expected no error adding new VLAN")
 
-	// 验证新VLAN已添加
+	// Verify new VLAN is added
 	addedVlan, err := vlanManager.GetVlan(100)
 	assert.NoError(t, err, "Expected to find newly added VLAN")
 	assert.Equal(t, "Test VLAN", addedVlan.Name, "Expected VLAN name to match")
 
-	// 删除VLAN
+	// Remove VLAN
 	err = vlanManager.RemoveVlan(100)
 	assert.NoError(t, err, "Expected no error removing VLAN")
 
-	// 验证VLAN已删除
+	// Verify VLAN is removed
 	_, err = vlanManager.GetVlan(100)
 	assert.Error(t, err, "Expected error finding removed VLAN")
 }
 
-// TestPortVlanModes 测试不同端口VLAN模式的行为
+// TestPortVlanModes tests behavior of different port VLAN modes
 func TestPortVlanModes(t *testing.T) {
-	// 创建Access端口
+	// Create Access port
 	accessPort := switcher.NewPort("access-port", "Access Port")
 	accessPort.VlanMode = switcher.VlanModeAccess
 	accessPort.AccessVlanID = 100
 
-	// 创建Trunk端口
+	// Create Trunk port
 	trunkPort := switcher.NewPort("trunk-port", "Trunk Port")
 	trunkPort.VlanMode = switcher.VlanModeTrunk
 	trunkPort.NativeVlanID = 1
 	trunkPort.AllowedVlans[100] = true
 	trunkPort.AllowedVlans[200] = true
 
-	// 验证配置
+	// Verify configuration
 	assert.Equal(t, switcher.VlanModeAccess, accessPort.VlanMode, "Expected Access mode")
 	assert.Equal(t, uint16(100), accessPort.AccessVlanID, "Expected Access VLAN 100")
 

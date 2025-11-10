@@ -9,7 +9,7 @@ import (
 	"github.com/stella/virtual-switch/pkg/packet"
 )
 
-// 交换机状态枚举
+// SwitchState represents switch states
 type SwitchState int
 
 const (
@@ -20,26 +20,26 @@ const (
 	StateError
 )
 
-// 交换机结构
+// Switcher represents a network switch
 type Switcher struct {
-	// 基本信息
+	// Basic information
 	ID          string
 	Name        string
 	Description string
 	State       SwitchState
 
-	// 组件
+	// Components
 	ports      map[string]*Port
 	macTable   *MACTable
 	vlanManager *VlanManager
 	multicastManager *MulticastManager
 
-	// 同步控制
+	// Synchronization control
 	mutex    sync.RWMutex
 	stopChan chan struct{}
 }
 
-// 创建新的交换机实例
+// NewSwitcher creates a new switch instance
 func NewSwitcher(id string, name string) (*Switcher, error) {
 	if id == "" {
 		return nil, errors.New("switch ID cannot be empty")
@@ -48,11 +48,11 @@ func NewSwitcher(id string, name string) (*Switcher, error) {
 	// 创建VLAN管理器
 	vlanManager := NewVlanManager()
 	
-	// 创建默认VLAN 1
+	// Create default VLAN 1
 	defaultVlan, _ := NewVlanConfig(1, "Default VLAN")
 	vlanManager.AddVlan(defaultVlan)
 
-	// 初始化多播管理器
+	// Initialize multicast manager
 	multicastManager := NewMulticastManager()
 
 	return &Switcher{
@@ -68,7 +68,7 @@ func NewSwitcher(id string, name string) (*Switcher, error) {
 	}, nil
 }
 
-// 启动交换机
+// Start starts the switch
 func (s *Switcher) Start() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -79,14 +79,14 @@ func (s *Switcher) Start() error {
 
 	s.State = StateStarting
 
-	// 启动MAC地址表老化管理器
+	// Start MAC address table aging manager
 	s.macTable.StartAgingManager(s.stopChan)
 
 	s.State = StateRunning
 	return nil
 }
 
-// 停止交换机
+// Stop stops the switch
 func (s *Switcher) Stop() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -97,10 +97,10 @@ func (s *Switcher) Stop() error {
 
 	s.State = StateStopping
 
-	// 关闭老化管理器
+	// Close aging manager
 	close(s.stopChan)
 
-	// 关闭所有端口
+	// Close all ports
 	for _, port := range s.ports {
 		port.Close()
 	}
@@ -109,19 +109,19 @@ func (s *Switcher) Stop() error {
 	return nil
 }
 
-// 获取交换机状态
+// GetState returns the switch state
 func (s *Switcher) GetState() SwitchState {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 	return s.State
 }
 
-// 是否运行中
+// IsRunning checks if the switch is running
 func (s *Switcher) IsRunning() bool {
 	return s.GetState() == StateRunning
 }
 
-// 添加端口
+// AddPort adds a port to the switch
 func (s *Switcher) AddPort(port *Port) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -130,7 +130,7 @@ func (s *Switcher) AddPort(port *Port) error {
 		return errors.New("port with ID already exists")
 	}
 
-	// 设置端口的数据包处理回调
+	// Set port packet processing callback
 	port.SetPacketHandler(func(pkt *packet.Packet) error {
 		return s.HandlePacket(port.ID, pkt)
 	})
@@ -139,7 +139,7 @@ func (s *Switcher) AddPort(port *Port) error {
 	return nil
 }
 
-// 移除端口
+// RemovePort removes a port from the switch
 func (s *Switcher) RemovePort(portID string) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -149,15 +149,15 @@ func (s *Switcher) RemovePort(portID string) error {
 		return errors.New("port not found")
 	}
 
-	// 关闭端口
+	// Close port
 	port.Close()
 
-	// 从映射中删除
+	// Remove from map
 	delete(s.ports, portID)
 	return nil
 }
 
-// 获取端口
+// GetPort retrieves a port by ID
 func (s *Switcher) GetPort(portID string) (*Port, error) {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
@@ -170,7 +170,7 @@ func (s *Switcher) GetPort(portID string) (*Port, error) {
 	return port, nil
 }
 
-// 获取VLAN管理器
+// GetVlanManager returns the VLAN manager
 func (s *Switcher) GetVlanManager() *VlanManager {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
@@ -178,53 +178,53 @@ func (s *Switcher) GetVlanManager() *VlanManager {
 	return s.vlanManager
 }
 
-// 处理接收到的数据包
+// HandlePacket processes a received packet
 func (s *Switcher) HandlePacket(portID string, pkt *packet.Packet) error {
 	if !s.IsRunning() {
 		return errors.New("switch is not running")
 	}
 
-	// 检查端口是否存在
+	// Check if port exists
 	inPort, exists := s.ports[portID]
 	if !exists {
 		return errors.New("port not found")
 	}
 
-	// 检查端口状态
+	// Check port state
 	if inPort.State != PortStateUp {
 		return errors.New("port is down")
 	}
 
-	// 处理VLAN相关逻辑
-	// 获取端口的VLAN信息
+	// Process VLAN related logic
+	// Get port VLAN information
 	portVlanMode := inPort.VlanMode
 	portVlanID := uint16(0)
 
 	switch portVlanMode {
 	case VlanModeAccess:
 		portVlanID = inPort.AccessVlanID
-		// Access端口：数据包属于该端口的Access VLAN
-		// 在实际实现中，这里可能需要检查数据包是否带有VLAN标签
-		// 如果有，可能需要过滤或移除标签
+		// Access port: packet belongs to the port's Access VLAN
+		// In actual implementation, may need to check if packet has VLAN tag
+		// If yes, may need to filter or remove the tag
 	case VlanModeTrunk:
-		// Trunk端口：需要检查数据包的VLAN标签
-		// 简化实现：暂时使用Native VLAN
+		// Trunk port: need to check packet's VLAN tag
+		// Simplified implementation: using Native VLAN for now
 		portVlanID = inPort.NativeVlanID
 	}
 
-	// 验证VLAN是否存在且启用
+	// Verify VLAN exists and is active
 	if !s.vlanManager.IsVlanActive(portVlanID) {
 		return errors.New("VLAN not active")
 	}
 
-	// 获取数据包负载（以太网帧）
+	// Get packet payload (Ethernet frame)
 	payload := pkt.Payload()
-	if len(payload) < 14 { // 最小以太网帧长度
+	if len(payload) < 14 { // Minimum Ethernet frame length
 		return nil
 	}
 
-	// 学习源MAC地址到端口的映射
-	// 注意：暂时注释掉这部分代码，避免在测试中出现数组越界错误
+	// Learn source MAC address to port mapping
+	// Note: Temporarily commented out to avoid array index out of bounds error in tests
 	/*
 	// 使用NewMACFromBytes创建MAC地址
 	srcMac, err := address.NewMACFromBytes(payload[6:12])
@@ -233,40 +233,40 @@ func (s *Switcher) HandlePacket(portID string, pkt *packet.Packet) error {
 	}
 	*/
 
-	// 解析目标MAC地址
+	// Parse destination MAC address
 	destMac, err := address.NewMACFromBytes(payload[:6])
 	if err != nil {
 		return nil
 	}
 
-	// 检查是否是多播数据包
+	// Check if it's a multicast packet
 	if destMac.IsMulticast() {
-		// 检查是否是IGMP消息
+		// Check if it's an IGMP message
 		if IsIGMPPacket(payload) {
-			// 解析IPv4数据包中的IGMP消息
-			// 跳过以太网头部
+			// Parse IGMP message from IPv4 packet
+			// Skip Ethernet header
 			ipv4Data := payload[14:]
 			igmpType, groupAddr, parsed := ParseIGMPMessage(ipv4Data)
 			if parsed {
-				// 处理IGMP消息
+				// Process IGMP message
 				s.multicastManager.HandleIGMPMessage(portID, portVlanID, igmpType, groupAddr)
 			}
 		}
 
-		// 处理多播数据包转发
+		// Process multicast packet forwarding
 		s.multicastManager.HandleMulticastPacket(s, portID, pkt, portVlanID, payload)
 
-		// 同时也进行泛洪转发作为后备
+		// Also flood as a backup
 		s.floodPacket(portID, pkt)
 	} else {
-		// 单播数据包，使用泛洪转发
+		// Unicast packet, use flooding
 		s.floodPacket(portID, pkt)
 	}
 
 	return nil
 }
 
-// 泛洪转发数据包
+// floodPacket floods a packet
 func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
@@ -274,13 +274,13 @@ func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 	var lastErr error
 	sentCount := 0
 
-	// 获取入站端口的VLAN信息
+	// Get inbound port VLAN information
 	inPort, exists := s.ports[inPortID]
 	if !exists {
 		return errors.New("inbound port not found")
 	}
 
-	// 获取入站端口的VLAN ID
+	// Get inbound port VLAN ID
 	inPortVlanID := uint16(0)
 	switch inPort.VlanMode {
 	case VlanModeAccess:
@@ -291,7 +291,7 @@ func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 	}
 
 	for portID, port := range s.ports {
-		// 跳过输入端口
+		// Skip input port
 		if portID == inPortID {
 			continue
 		}
@@ -301,16 +301,16 @@ func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 			continue
 		}
 
-		// 根据目标端口的VLAN模式进行过滤
+		// Filter based on destination port's VLAN mode
 		shouldSend := false
 
 		switch port.VlanMode {
 		case VlanModeAccess:
-			// Access端口：只有当VLAN ID匹配时才发送
+			// Access port: only send if VLAN ID matches
 			shouldSend = (port.AccessVlanID == inPortVlanID)
 		case VlanModeTrunk:
-			// Trunk端口：检查是否允许该VLAN
-			// 简化实现：如果没有配置AllowedVlans，则允许所有VLAN
+			// Trunk port: check if VLAN is allowed
+			// Simplified implementation: allow all VLANs if AllowedVlans is not configured
 			if len(port.AllowedVlans) == 0 {
 				shouldSend = true
 			} else {
@@ -318,7 +318,7 @@ func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 			}
 		}
 
-		// 如果应该发送，则发送数据包
+		// If should send, send the packet
 		if shouldSend {
 			if err := port.SendPacket(pkt); err != nil {
 				lastErr = err
@@ -328,7 +328,7 @@ func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 		}
 	}
 
-	// 如果没有成功发送到任何端口，返回最后一个错误
+	// If no ports received the packet successfully, return the last error
 	if sentCount == 0 && lastErr != nil {
 		return lastErr
 	}

@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package node_test
 
 import (
@@ -9,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stella/virtual-switch/pkg/identity"
 	"github.com/stella/virtual-switch/pkg/node"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestNodeCreation(t *testing.T) {

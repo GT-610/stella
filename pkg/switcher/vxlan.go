@@ -8,44 +8,44 @@ import (
 	"github.com/stella/virtual-switch/pkg/packet"
 )
 
-// VXLAN相关常量
+// VXLAN related constants
 const (
-	// VXLAN UDP端口
+	// VxlanUdpPort is the standard VXLAN UDP port
 	VxlanUdpPort = 4789
 
-	// VXLAN头部长度
+	// VxlanHeaderLength is the length of VXLAN header
 	VxlanHeaderLength = 8
 
-	// VXLAN flags中VNI有效的标志位
+	// VxlanFlagIbit is the flag bit indicating valid VNI in VXLAN header
 	VxlanFlagIbit = 0x08
 
-	// 最大VXLAN标识符(VNI)值
+	// MaxVxlanVni is the maximum value for VXLAN Network Identifier
 	MaxVxlanVni = 0xffffff
 )
 
-// VXLAN封装器结构
+// VxlanEncapsulator handles VXLAN encapsulation and decapsulation
 type VxlanEncapsulator struct {
-	// 可以添加额外的配置参数，如UDP端口等
+	// Additional configuration parameters can be added, like UDP port
 	UdpPort uint16
 }
 
-// 创建新的VXLAN封装器
+// NewVxlanEncapsulator creates a new VXLAN encapsulator
 func NewVxlanEncapsulator() *VxlanEncapsulator {
 	return &VxlanEncapsulator{
 		UdpPort: VxlanUdpPort,
 	}
 }
 
-// 将VLAN ID转换为VNI (Virtual Network Identifier)
-// VLAN ID范围: 1-4094
-// VNI范围: 0-16777215
+// VlanIdToVni converts a VLAN ID to a VNI (Virtual Network Identifier)
+// VLAN ID range: 1-4094
+// VNI range: 0-16777215
 func VlanIdToVni(vlanId uint16) uint32 {
-	// 简单映射：将VLAN ID扩展为24位VNI
-	// 实际应用中可能有更复杂的映射规则
+		// Simple mapping: extend VLAN ID to 24-bit VNI
+	// More complex mapping rules might be used in real applications
 	return uint32(vlanId)
 }
 
-// 将VNI转换为VLAN ID
+// VniToVlanId converts a VNI to a VLAN ID
 func VniToVlanId(vni uint32) (uint16, error) {
 	if vni > MaxVlanID {
 		return 0, errors.New("VNI exceeds maximum VLAN ID")
@@ -53,67 +53,67 @@ func VniToVlanId(vni uint32) (uint16, error) {
 	return uint16(vni), nil
 }
 
-// 封装数据包为VXLAN格式
-// 注意：这是一个简化的实现，实际的VXLAN封装需要UDP/IP头
+// EncapsulatePacket encapsulates a packet in VXLAN format
+// Note: This is a simplified implementation, actual VXLAN encapsulation requires UDP/IP headers
 func (v *VxlanEncapsulator) EncapsulatePacket(pkt *packet.Packet, vlanId uint16) ([]byte, error) {
-	// 验证VLAN ID
+	// Validate VLAN ID
 	if vlanId < 1 || vlanId > MaxVlanID {
 		return nil, fmt.Errorf("invalid VLAN ID: %d", vlanId)
 	}
 
-	// 获取原始数据包内容
+	// Get original packet content
 	payload := pkt.Payload()
 	if len(payload) == 0 {
 		return nil, errors.New("empty packet payload")
 	}
 
-	// 计算VNI
+	// Calculate VNI
 	vni := VlanIdToVni(vlanId)
 
-	// 创建VXLAN头部
+	// Create VXLAN header
 	vxlanHeader := make([]byte, VxlanHeaderLength)
 
-	// 设置标志位（只设置I位，表示VNI有效）
+	// Set flag bits (only set I bit, indicating VNI is valid)
 	vxlanHeader[0] = VxlanFlagIbit
 
-	// 设置VNI（占用后24位，前8位保留）
+	// Set VNI (occupies last 24 bits, first 8 bits reserved)
 	binary.BigEndian.PutUint32(vxlanHeader[4:], vni<<8)
 
-	// 组合VXLAN头部和原始以太网帧
+	// Combine VXLAN header and original Ethernet frame
 	vxlanPacket := append(vxlanHeader, payload...)
 
 	return vxlanPacket, nil
 }
 
-// 解封装VXLAN数据包
+// DecapsulatePacket decapsulates a VXLAN packet
 func (v *VxlanEncapsulator) DecapsulatePacket(data []byte) ([]byte, uint16, error) {
-	// 检查数据包长度
+	// Check packet length
 	if len(data) < VxlanHeaderLength {
 		return nil, 0, errors.New("VXLAN packet too short")
 	}
 
-	// 检查I标志位
+	// Check I flag bit
 	if (data[0] & VxlanFlagIbit) == 0 {
 		return nil, 0, errors.New("VXLAN packet missing I flag")
 	}
 
-	// 提取VNI（后24位）
+	// Extract VNI (last 24 bits)
 	vni := binary.BigEndian.Uint32(data[4:]) >> 8
 
-	// 转换VNI为VLAN ID
+	// Convert VNI to VLAN ID
 	vlanId, err := VniToVlanId(vni)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	// 提取原始以太网帧
+	// Extract original Ethernet frame
 	ethFrame := data[VxlanHeaderLength:]
 
 	return ethFrame, vlanId, nil
 }
 
-// 检查是否是VXLAN数据包
+// IsVxlanPacket checks if the data represents a VXLAN packet
 func (v *VxlanEncapsulator) IsVxlanPacket(data []byte) bool {
-	// 基本长度检查和标志位检查
+	// Basic length check and flag bit check
 	return len(data) >= VxlanHeaderLength && (data[0]&VxlanFlagIbit) != 0
 }

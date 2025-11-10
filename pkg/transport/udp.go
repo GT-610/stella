@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package transport
 
 import (
@@ -35,14 +32,14 @@ type UDPTransport struct {
 	retryInterval     time.Duration
 	retryExponential  bool
 	ackHandlerEnabled bool
-	
+
 	// 加密相关字段
-	cryptoMux         sync.RWMutex
-	keyPair           *crypto.KeyPair
-	peerKeys          map[string][]byte // 地址到公钥的映射
-	cipherSuite       uint8             // 使用的加密套件
-	enableEncryption  bool              // 是否启用加密
-	
+	cryptoMux        sync.RWMutex
+	keyPair          *crypto.KeyPair
+	peerKeys         map[string][]byte // 地址到公钥的映射
+	cipherSuite      uint8             // 使用的加密套件
+	enableEncryption bool              // 是否启用加密
+
 	// 用于测试的标志
 	isTestMode bool
 }
@@ -66,7 +63,7 @@ func NewUDPTransport() *UDPTransport {
 		// 如果密钥生成失败，使用默认空密钥
 		keyPair = &crypto.KeyPair{}
 	}
-		t := &UDPTransport{
+	t := &UDPTransport{
 		BaseTransport:     *NewBaseTransport(),
 		bufferSize:        4096,
 		pendingPackets:    make(map[string]*pendingPacket),
@@ -110,10 +107,10 @@ func (t *UDPTransport) Init(config map[string]interface{}) error {
 	// 设置默认值
 	t.retryInterval = 500 // 默认重试间隔500毫秒
 	t.maxRetries = 3      // 默认最大重试次数3次
-	
+
 	// 创建上下文
 	t.ctx, t.cancel = context.WithCancel(context.Background())
-	
+
 	// 检查是否为测试模式
 	if testMode, ok := config["test_mode"].(bool); ok && testMode {
 		t.isTestMode = true
@@ -122,18 +119,18 @@ func (t *UDPTransport) Init(config map[string]interface{}) error {
 		t.listenAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
 		return nil
 	}
-	
+
 	// 使用本地回环地址和随机端口，避免权限和端口冲突问题
 	t.listenAddr = &net.UDPAddr{
 		Port: 0, // 使用0表示随机分配可用端口
 		IP:   net.ParseIP("127.0.0.1"),
 	}
-	
+
 	// Apply config if provided
 	if port, ok := config["port"].(int); ok && port > 0 {
 		t.listenAddr.Port = port
 	}
-	
+
 	// 处理addr配置参数
 	if addr, ok := config["addr"].(string); ok && addr != "" {
 		parsedAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -141,28 +138,28 @@ func (t *UDPTransport) Init(config map[string]interface{}) error {
 			t.listenAddr = parsedAddr
 		}
 	}
-	
+
 	if bufferSize, ok := config["bufferSize"].(int); ok && bufferSize > 0 {
 		t.bufferSize = bufferSize
 	}
-	
+
 	// 配置超时重传参数
 	if maxRetries, ok := config["maxRetries"].(int); ok && maxRetries >= 0 {
 		t.maxRetries = maxRetries
 	}
-	
+
 	if retryInterval, ok := config["retryInterval"].(time.Duration); ok && retryInterval > 0 {
 		t.retryInterval = retryInterval
 	}
-	
+
 	if retryExponential, ok := config["retryExponential"].(bool); ok {
 		t.retryExponential = retryExponential
 	}
-	
+
 	if ackHandlerEnabled, ok := config["ackHandlerEnabled"].(bool); ok {
 		t.ackHandlerEnabled = ackHandlerEnabled
 	}
-	
+
 	// 尝试多次绑定端口，避免临时端口冲突
 	var conn *net.UDPConn
 	var err error
@@ -181,7 +178,7 @@ func (t *UDPTransport) Init(config map[string]interface{}) error {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	
+
 	// 如果仍然失败且在测试模式下，使用特殊处理
 	if err != nil {
 		if t.isTestMode {
@@ -197,15 +194,15 @@ func (t *UDPTransport) Init(config map[string]interface{}) error {
 		}
 		return fmt.Errorf("failed to bind UDP port after %d attempts: %w", maxRetries, err)
 	}
-	
+
 	t.conn = conn
-	
+
 	// 更新实际绑定的地址（可能包含随机分配的端口）
 	actualAddr := conn.LocalAddr()
 	if udpAddr, ok := actualAddr.(*net.UDPAddr); ok {
 		t.listenAddr = udpAddr
 	}
-	
+
 	return nil
 }
 
@@ -215,7 +212,7 @@ func (t *UDPTransport) sendACK(dstAddr net.Addr, sequenceNum uint32) error {
 	ackData := make([]byte, 5)
 	ackData[0] = packetTypeACK
 	binary.BigEndian.PutUint32(ackData[1:5], sequenceNum)
-	
+
 	// Resolve UDP address if needed
 	udpAddr, ok := dstAddr.(*net.UDPAddr)
 	if !ok {
@@ -225,19 +222,19 @@ func (t *UDPTransport) sendACK(dstAddr net.Addr, sequenceNum uint32) error {
 		}
 		udpAddr = resolvedAddr
 	}
-	
+
 	// Set write deadline
 	writeTimeout := t.getWriteTimeout()
 	if writeTimeout > 0 {
 		t.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	}
-	
+
 	// Send ACK
 	_, err := t.conn.WriteToUDP(ackData, udpAddr)
 	if err != nil {
 		return NewTransportError("failed to send ACK", 3007, err)
 	}
-	
+
 	return nil
 }
 
@@ -245,7 +242,7 @@ func (t *UDPTransport) sendACK(dstAddr net.Addr, sequenceNum uint32) error {
 func (t *UDPTransport) handleACK(srcAddr net.Addr, sequenceNum uint32) {
 	// 生成数据包ID
 	packetID := t.generatePacketID(srcAddr, sequenceNum)
-	
+
 	// 从待确认列表中移除
 	t.mux.Lock()
 	delete(t.pendingPackets, packetID)
@@ -255,11 +252,11 @@ func (t *UDPTransport) handleACK(srcAddr net.Addr, sequenceNum uint32) {
 // retransmissionManager 管理数据包超时重传
 func (t *UDPTransport) retransmissionManager() {
 	defer t.wg.Done()
-	
+
 	// 创建定时器以检查超时数据包
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-t.ctx.Done():
@@ -276,14 +273,14 @@ func (t *UDPTransport) retransmissionManager() {
 						delete(t.pendingPackets, packetID)
 						continue
 					}
-					
+
 					// 准备重传
 					packet.retries++
-					
+
 					// 计算下次重传时间
 					nextRetryInterval := t.calculateRetryInterval(packet.retries)
 					packet.nextRetry = now.Add(nextRetryInterval)
-					
+
 					// 准备重传数据
 					udpAddr, _ := packet.dstAddr.(*net.UDPAddr)
 					if udpAddr == nil {
@@ -296,27 +293,27 @@ func (t *UDPTransport) retransmissionManager() {
 						}
 						udpAddr = resolvedAddr
 					}
-					
+
 					// 保存当前状态，解锁后发送
 					savedPacket := *packet
 					savedUDPAddr := *udpAddr
 					savedConn := t.conn
-					
+
 					// 在锁外执行发送操作
 					t.mux.Unlock()
-					
+
 					// Set write deadline
 					writeTimeout := t.getWriteTimeout()
 					if writeTimeout > 0 {
 						savedConn.SetWriteDeadline(time.Now().Add(writeTimeout))
 					}
-					
+
 					// 重传数据包
 					_, err := savedConn.WriteToUDP(savedPacket.data, &savedUDPAddr)
 					if err != nil {
 						// 发送失败，但继续保留在待确认列表中，下次可能会重试
 					}
-					
+
 					// 重新加锁继续处理其他数据包
 					t.mux.Lock()
 				}
@@ -334,40 +331,40 @@ func (t *UDPTransport) Start(handler PacketHandler) error {
 		// 直接返回成功
 		return nil
 	}
-	
+
 	// Create context
 	t.ctx, t.cancel = context.WithCancel(context.Background())
-	
+
 	// Bind UDP socket
 	conn, err := net.ListenUDP("udp", t.listenAddr)
 	if err != nil {
 		t.cancel()
 		return NewTransportError("failed to bind UDP port", 3001, err)
 	}
-	
+
 	t.conn = conn
 	t.setLocalAddr(conn.LocalAddr())
-	
+
 	// 包装原始处理器以处理ACK和数据
 	wrappedHandler := t.wrapPacketHandler(handler)
-	
+
 	// Set handler and state
 	if err := t.BaseTransport.Start(wrappedHandler); err != nil {
 		t.conn.Close()
 		t.cancel()
 		return err
 	}
-	
+
 	// Start receive loop
 	t.wg.Add(1)
 	go t.receiveLoop()
-	
+
 	// Start retransmission manager if ACK handling is enabled
 	if t.ackHandlerEnabled {
 		t.wg.Add(1)
 		go t.retransmissionManager()
 	}
-	
+
 	return nil
 }
 
@@ -376,15 +373,15 @@ func (t *UDPTransport) Stop() error {
 	if err := t.BaseTransport.Stop(); err != nil {
 		return err
 	}
-	
+
 	// 取消上下文，停止所有goroutine
 	if t.cancel != nil {
 		t.cancel()
 	}
-	
+
 	// 等待所有goroutine退出
 	t.wg.Wait()
-	
+
 	// 关闭UDP连接
 	if t.conn != nil {
 		if err := t.conn.Close(); err != nil {
@@ -392,7 +389,7 @@ func (t *UDPTransport) Stop() error {
 		}
 		t.conn = nil
 	}
-	
+
 	return nil
 }
 
@@ -523,7 +520,7 @@ func (t *UDPTransport) calculateRetryInterval(retries int) time.Duration {
 	if !t.retryExponential {
 		return t.retryInterval
 	}
-	
+
 	// 指数退避: baseInterval * 2^retries
 	interval := t.retryInterval
 	for i := 0; i < retries; i++ {
@@ -540,7 +537,7 @@ func (t *UDPTransport) Send(dstAddr net.Addr, data []byte) error {
 		// 这可以让加密测试在不依赖网络的情况下运行
 		return nil
 	}
-	
+
 	if t.isClosed() {
 		return NewTransportError("transport is closed", 3002, nil)
 	}
@@ -659,7 +656,7 @@ func (t *UDPTransport) Send(dstAddr net.Addr, data []byte) error {
 			retries:     0,
 			sendTime:    now,
 			nextRetry:   nextRetry,
-			nonce:       nonce,     // 保存nonce用于重传
+			nonce:       nonce, // 保存nonce用于重传
 		}
 
 		// 添加到待处理列表
@@ -676,20 +673,20 @@ func (t *UDPTransport) Send(dstAddr net.Addr, data []byte) error {
 func (t *UDPTransport) receiveLoop() {
 	defer t.wg.Done()
 	buffer := make([]byte, t.bufferSize)
-	
+
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
 		default:
 			// Set read deadline
-		readTimeout := t.getReadTimeout()
-		if readTimeout > 0 {
-			t.conn.SetReadDeadline(time.Now().Add(readTimeout))
-		} else {
-			t.conn.SetReadDeadline(time.Time{})
-		}
-			
+			readTimeout := t.getReadTimeout()
+			if readTimeout > 0 {
+				t.conn.SetReadDeadline(time.Now().Add(readTimeout))
+			} else {
+				t.conn.SetReadDeadline(time.Time{})
+			}
+
 			// Read packet
 			n, addr, err := t.conn.ReadFromUDP(buffer)
 			if err != nil {
@@ -701,12 +698,12 @@ func (t *UDPTransport) receiveLoop() {
 				// Just log the error for now as handler only takes addr and data
 				continue
 			}
-			
+
 			if n > 0 {
 				// Copy data and call handler
 				data := make([]byte, n)
 				copy(data, buffer[:n])
-				
+
 				handler := t.getHandler()
 				if handler != nil {
 					handler(addr, data)

@@ -1,6 +1,3 @@
-// Copyright 2023 The Stella Authors
-// SPDX-License-Identifier: Apache-2.0
-
 package switcher
 
 import (
@@ -11,40 +8,39 @@ import (
 	"github.com/stella/virtual-switch/pkg/packet"
 )
 
-// 多播组定义
+// MulticastGroup definition
 type MulticastGroup struct {
-	Mac  address.MAC
-	Adi  uint32 // 额外区分信息(Additional Distinguishing Information)
+	Mac address.MAC
+	Adi uint32 // Additional Distinguishing Information
 }
 
-// 多播组成员
+// MulticastGroupMember
 type MulticastGroupMember struct {
 	PortID    string
 	Timestamp int64
 }
 
-// 多播组状态
+// multicastGroupStatus
 type multicastGroupStatus struct {
 	Members   []MulticastGroupMember
 	LastQuery int64
 }
 
-// 多播组键
+// multicastGroupKey
 type multicastGroupKey struct {
-	VlanID    uint16
-	GroupMac  address.MAC
-	GroupAdi  uint32
+	VlanID   uint16
+	GroupMac address.MAC
+	GroupAdi uint32
 }
 
-// MulticastManager 多播管理器
-// 负责管理多播组、IGMP监听和多播数据包转发
+// MulticastManager manages multicast groups, IGMP snooping, and multicast packet forwarding
 type MulticastManager struct {
-	groups     map[multicastGroupKey]*multicastGroupStatus // 多播组状态映射
-	agingTime  time.Duration                              // 成员老化时间
-	mutex      sync.RWMutex                               // 读写锁，保护并发访问
+	groups    map[multicastGroupKey]*multicastGroupStatus // Multicast group status mapping
+	agingTime time.Duration                               // Member aging time
+	mutex     sync.RWMutex                                // Read-write lock for concurrent access
 }
 
-// NewMulticastManager 创建新的多播管理器实例
+// NewMulticastManager creates a new multicast manager instance
 func NewMulticastManager() *MulticastManager {
 	return &MulticastManager{
 		groups:    make(map[multicastGroupKey]*multicastGroupStatus),
@@ -52,35 +48,35 @@ func NewMulticastManager() *MulticastManager {
 	}
 }
 
-// 添加或更新多播组成员
+// AddMember adds or updates a multicast group member
 func (m *MulticastManager) AddMember(vlanID uint16, groupMac address.MAC, adi uint32, portID string) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
 	key := multicastGroupKey{
-		VlanID:    vlanID,
-		GroupMac:  groupMac,
-		GroupAdi:  adi,
+		VlanID:   vlanID,
+		GroupMac: groupMac,
+		GroupAdi: adi,
 	}
 
 	now := time.Now().UnixNano()
 
 	if status, exists := m.groups[key]; exists {
-		// 检查成员是否已存在
+		// Check if member already exists
 		for i, member := range status.Members {
 			if member.PortID == portID {
-				// 更新时间戳
+				// Update timestamp
 				status.Members[i].Timestamp = now
 				return
 			}
 		}
-		// 添加新成员
+		// Add new member
 		status.Members = append(status.Members, MulticastGroupMember{
 			PortID:    portID,
 			Timestamp: now,
 		})
 	} else {
-		// 创建新的多播组
+		// Create new multicast group
 		m.groups[key] = &multicastGroupStatus{
 			Members: []MulticastGroupMember{
 				{
@@ -93,23 +89,23 @@ func (m *MulticastManager) AddMember(vlanID uint16, groupMac address.MAC, adi ui
 	}
 }
 
-// 移除多播组成员
+// RemoveMember removes a multicast group member
 func (m *MulticastManager) RemoveMember(vlanID uint16, groupMac address.MAC, adi uint32, portID string) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
 	key := multicastGroupKey{
-		VlanID:    vlanID,
-		GroupMac:  groupMac,
-		GroupAdi:  adi,
+		VlanID:   vlanID,
+		GroupMac: groupMac,
+		GroupAdi: adi,
 	}
 
 	if status, exists := m.groups[key]; exists {
 		for i, member := range status.Members {
 			if member.PortID == portID {
-				// 移除成员
+				// Remove member
 				status.Members = append(status.Members[:i], status.Members[i+1:]...)
-				// 如果没有成员了，删除整个组
+				// If no members left, delete the entire group
 				if len(status.Members) == 0 {
 					delete(m.groups, key)
 				}
@@ -119,12 +115,12 @@ func (m *MulticastManager) RemoveMember(vlanID uint16, groupMac address.MAC, adi
 	}
 }
 
-// 获取多播组的所有成员端口ID
+// GetMemberPorts retrieves all member port IDs of a multicast group
 func (m *MulticastManager) GetMemberPorts(vlanID uint16, groupMac address.MAC, excludePortID string) []string {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	// 查找匹配的多播组
+	// Find matching multicast group
 	var result []string
 	for key, status := range m.groups {
 		if key.VlanID == vlanID && key.GroupMac.Equals(&groupMac) {
@@ -139,12 +135,12 @@ func (m *MulticastManager) GetMemberPorts(vlanID uint16, groupMac address.MAC, e
 	return result
 }
 
-// 检查端口是否是多播组成员
+// IsMember checks if a port is a member of a multicast group
 func (m *MulticastManager) IsMember(portID string, vlanID uint16, groupMac address.MAC) bool {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	// 查找匹配的多播组
+	// Find matching multicast group
 	for key, status := range m.groups {
 		if key.VlanID == vlanID && key.GroupMac.Equals(&groupMac) {
 			for _, member := range status.Members {
@@ -158,14 +154,14 @@ func (m *MulticastManager) IsMember(portID string, vlanID uint16, groupMac addre
 	return false
 }
 
-// 清理过期的多播组成员
+// CleanupAgedMembers cleans up expired multicast group members
 func (m *MulticastManager) CleanupAgedMembers() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
 	now := time.Now().UnixNano()
 	for key, status := range m.groups {
-		// 过滤出未过期的成员
+		// Filter out active members
 		var activeMembers []MulticastGroupMember
 		for _, member := range status.Members {
 			if now-m.agingTime.Nanoseconds() < member.Timestamp {
@@ -174,37 +170,37 @@ func (m *MulticastManager) CleanupAgedMembers() {
 		}
 
 		if len(activeMembers) == 0 {
-			// 如果没有活跃成员，删除组
+			// If no active members, delete the group
 			delete(m.groups, key)
 		} else {
-			// 更新成员列表
+			// Update member list
 			status.Members = activeMembers
 		}
 	}
 }
 
-// 处理多播数据包
+// HandleMulticastPacket processes multicast packets
 func (m *MulticastManager) HandleMulticastPacket(switcher *Switcher, portID string, pkt *packet.Packet, vlanID uint16, ethFrame []byte) error {
-	// 解析以太网帧的目标MAC地址
+	// Parse the destination MAC address of the Ethernet frame
 	if len(ethFrame) < 6 {
-		return nil // 无效的以太网帧
+		return nil // Invalid Ethernet frame
 	}
 
 	// 使用NewMACFromBytes创建MAC地址
 	destMac, err := address.NewMACFromBytes(ethFrame[:6])
 	if err != nil {
-		return nil // 无效的MAC地址
+		return nil // Invalid MAC address
 	}
 
-	// 检查是否是多播MAC地址
+	// Check if it's a multicast MAC address
 	if !destMac.IsMulticast() {
-		return nil // 不是多播地址
+		return nil // Not a multicast address
 	}
 
-	// 获取应该接收此多播数据包的端口
+	// Get the ports that should receive this multicast packet
 	memberPorts := m.GetMemberPorts(vlanID, *destMac, portID)
 
-	// 转发数据包到所有目标端口
+	// Forward packet to all destination ports
 	for _, destPortID := range memberPorts {
 		if destPort, err := switcher.GetPort(destPortID); err == nil {
 			destPort.SendPacket(pkt)

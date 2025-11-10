@@ -5,45 +5,45 @@ import (
 	"sync"
 )
 
-// 端口VLAN模式枚举
+// VlanMode represents port VLAN modes
 type VlanMode int
 
 const (
-	// Access端口模式 - 只能属于一个VLAN
+	// VlanModeAccess - Can belong to only one VLAN
 	VlanModeAccess VlanMode = iota
-	// Trunk端口模式 - 可以传输多个VLAN的流量
+	// VlanModeTrunk - Can carry multiple VLAN traffic
 	VlanModeTrunk
-	// Hybrid端口模式 - 混合模式，支持Access和Trunk特性
+	// VlanModeHybrid - Hybrid mode, supports both Access and Trunk features
 	VlanModeHybrid
 )
 
-// 最大VLAN ID
+// MaxVlanID is the maximum VLAN ID allowed
 const MaxVlanID = 4094
 
-// VLAN配置结构
+// VlanConfig represents a VLAN configuration
 type VlanConfig struct {
 	ID          uint16      // VLAN ID (1-4094)
-	Name        string      // VLAN名称
-	Description string      // VLAN描述
-	Enabled     bool        // 是否启用
+	Name        string      // VLAN name
+	Description string      // VLAN description
+	Enabled     bool        // Whether enabled
 }
 
-// VLAN管理器
+// VlanManager manages VLAN configurations
 type VlanManager struct {
-	vlans     map[uint16]*VlanConfig // VLAN配置映射
-	mutex     sync.RWMutex          // 并发控制锁
+	vlans     map[uint16]*VlanConfig // VLAN configuration map
+	mutex     sync.RWMutex          // Concurrency control lock
 }
 
-// 创建新的VLAN管理器
+// NewVlanManager creates a new VLAN manager
 func NewVlanManager() *VlanManager {
 	return &VlanManager{
 		vlans: make(map[uint16]*VlanConfig),
 	}
 }
 
-// 创建新的VLAN配置
+// NewVlanConfig creates a new VLAN configuration
 func NewVlanConfig(id uint16, name string) (*VlanConfig, error) {
-	// 验证VLAN ID
+	// Validate VLAN ID
 	if id == 0 || id > MaxVlanID {
 		return nil, errors.New("invalid VLAN ID, must be between 1 and 4094")
 	}
@@ -56,12 +56,12 @@ func NewVlanConfig(id uint16, name string) (*VlanConfig, error) {
 	}, nil
 }
 
-// 添加VLAN
+// AddVlan adds a VLAN configuration
 func (vm *VlanManager) AddVlan(vlan *VlanConfig) error {
 	vm.mutex.Lock()
 	defer vm.mutex.Unlock()
 
-	// 检查VLAN是否已存在
+	// Check if VLAN already exists
 	if _, exists := vm.vlans[vlan.ID]; exists {
 		return errors.New("VLAN already exists")
 	}
@@ -70,12 +70,12 @@ func (vm *VlanManager) AddVlan(vlan *VlanConfig) error {
 	return nil
 }
 
-// 删除VLAN
+// RemoveVlan removes a VLAN configuration
 func (vm *VlanManager) RemoveVlan(id uint16) error {
 	vm.mutex.Lock()
 	defer vm.mutex.Unlock()
 
-	// 检查VLAN是否存在
+	// Check if VLAN exists
 	if _, exists := vm.vlans[id]; !exists {
 		return errors.New("VLAN not found")
 	}
@@ -84,7 +84,7 @@ func (vm *VlanManager) RemoveVlan(id uint16) error {
 	return nil
 }
 
-// 获取VLAN配置
+// GetVlan retrieves a VLAN configuration
 func (vm *VlanManager) GetVlan(id uint16) (*VlanConfig, error) {
 	vm.mutex.RLock()
 	defer vm.mutex.RUnlock()
@@ -97,7 +97,7 @@ func (vm *VlanManager) GetVlan(id uint16) (*VlanConfig, error) {
 	return vlan, nil
 }
 
-// 获取所有VLAN配置
+// GetAllVlans retrieves all VLAN configurations
 func (vm *VlanManager) GetAllVlans() []*VlanConfig {
 	vm.mutex.RLock()
 	defer vm.mutex.RUnlock()
@@ -110,7 +110,7 @@ func (vm *VlanManager) GetAllVlans() []*VlanConfig {
 	return vlans
 }
 
-// 更新VLAN配置
+// UpdateVlan updates a VLAN configuration
 func (vm *VlanManager) UpdateVlan(vlan *VlanConfig) error {
 	vm.mutex.Lock()
 	defer vm.mutex.Unlock()
@@ -124,7 +124,7 @@ func (vm *VlanManager) UpdateVlan(vlan *VlanConfig) error {
 	return nil
 }
 
-// 检查VLAN是否存在且启用
+// IsVlanActive checks if a VLAN exists and is enabled
 func (vm *VlanManager) IsVlanActive(id uint16) bool {
 	vm.mutex.RLock()
 	defer vm.mutex.RUnlock()
