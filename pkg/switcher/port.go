@@ -27,6 +27,12 @@ type Port struct {
 	Speed       int
 	Duplex      bool // true for full duplex
 
+	// VLAN配置
+	VlanMode       VlanMode // 端口VLAN模式
+	AccessVlanID   uint16   // Access模式下的VLAN ID
+	AllowedVlans   map[uint16]bool // Trunk模式下允许的VLAN列表
+	NativeVlanID   uint16   // Native VLAN ID（用于未标记帧）
+
 	// 连接回调
 	packetHandler func(*packet.Packet) error
 
@@ -44,6 +50,11 @@ func NewPort(id string, name string) *Port {
 		MTU:         1500,
 		Speed:       1000,
 		Duplex:      true,
+		// VLAN默认配置
+		VlanMode:     VlanModeAccess,
+		AccessVlanID: 1,        // 默认VLAN 1
+		AllowedVlans: make(map[uint16]bool),
+		NativeVlanID: 1,        // 默认Native VLAN 1
 	}
 }
 

@@ -49,18 +49,18 @@
 ## 第四阶段：VLAN支持测试
 
 ### 1. VLAN配置测试
-- [ ] 测试VLAN创建和删除
-- [ ] 测试端口VLAN配置（Access、Trunk模式）
-- [ ] 测试Native VLAN配置
+- [x] 测试VLAN创建和删除（在vlan_test.go中实现）
+- [x] 测试端口VLAN配置（Access、Trunk模式）（在vlan_integration_test.go中实现）
+- [x] 测试Native VLAN配置（在vlan_test.go中实现）
 
 ### 2. VLAN数据包处理
-- [ ] 测试Access端口的VLAN标记/去标记
-- [ ] 测试Trunk端口的多VLAN转发
-- [ ] 测试VLAN间隔离功能
+- [x] 测试Access端口的VLAN标记/去标记（在vlan_test.go中实现）
+- [x] 测试Trunk端口的多VLAN转发（在vlan_integration_test.go中实现）
+- [x] 测试VLAN间隔离功能（在vlan_integration_test.go中实现）
 
 ### 3. VLAN过滤测试
-- [ ] 测试VLAN过滤规则应用
-- [ ] 测试未标记帧处理
+- [x] 测试VLAN过滤规则应用（在switcher.go中实现并在集成测试中验证）
+- [x] 测试未标记帧处理（在HandlePacket方法中实现）
 
 ## 第五阶段：多播支持测试
 

@@ -28,13 +28,13 @@ type Switcher struct {
 	State       SwitchState
 
 	// 组件
-	ports    map[string]*Port
-	macTable *MACTable
+	ports      map[string]*Port
+	macTable   *MACTable
+	vlanManager *VlanManager
 
 	// 同步控制
 	mutex    sync.RWMutex
 	stopChan chan struct{}
-	err      error
 }
 
 // 创建新的交换机实例
@@ -43,6 +43,13 @@ func NewSwitcher(id string, name string) (*Switcher, error) {
 		return nil, errors.New("switch ID cannot be empty")
 	}
 
+	// 创建VLAN管理器
+	vlanManager := NewVlanManager()
+	
+	// 创建默认VLAN 1
+	defaultVlan, _ := NewVlanConfig(1, "Default VLAN")
+	vlanManager.AddVlan(defaultVlan)
+
 	return &Switcher{
 		ID:          id,
 		Name:        name,
@@ -50,6 +57,7 @@ func NewSwitcher(id string, name string) (*Switcher, error) {
 		State:       StateStopped,
 		ports:       make(map[string]*Port),
 		macTable:    NewMACTable(1000, 300*time.Second),
+		vlanManager: vlanManager,
 		stopChan:    make(chan struct{}),
 	}, nil
 }
@@ -156,6 +164,14 @@ func (s *Switcher) GetPort(portID string) (*Port, error) {
 	return port, nil
 }
 
+// 获取VLAN管理器
+func (s *Switcher) GetVlanManager() *VlanManager {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	return s.vlanManager
+}
+
 // 处理接收到的数据包
 func (s *Switcher) HandlePacket(portID string, pkt *packet.Packet) error {
 	if !s.IsRunning() {
@@ -163,22 +179,40 @@ func (s *Switcher) HandlePacket(portID string, pkt *packet.Packet) error {
 	}
 
 	// 检查端口是否存在
-	if _, exists := s.ports[portID]; !exists {
+	inPort, exists := s.ports[portID]
+	if !exists {
 		return errors.New("port not found")
 	}
 
-	// 简化转发逻辑，使用泛洪转发（暂时注释掉MAC学习，避免测试中的数组越界错误）
-	// if pkt != nil {
-	// 	// 安全地尝试获取源MAC地址（实际实现中需要更复杂的检查）
-	// 	defer func() {
-	// 		if r := recover(); r != nil {
-			// 处理可能的panic，例如数组越界
-			// log.Printf("Recovered from panic during MAC learning: %v", r)
-		// 	}
-	// }()
-	// 	s.macTable.LearnMAC("test-mac", portID) // 使用固定值代替pkt.Source()
-	// }
+	// 检查端口状态
+	if inPort.State != PortStateUp {
+		return errors.New("port is down")
+	}
 
+	// 处理VLAN相关逻辑
+	// 获取端口的VLAN信息
+	portVlanMode := inPort.VlanMode
+	portVlanID := uint16(0)
+
+	switch portVlanMode {
+	case VlanModeAccess:
+		portVlanID = inPort.AccessVlanID
+		// Access端口：数据包属于该端口的Access VLAN
+		// 在实际实现中，这里可能需要检查数据包是否带有VLAN标签
+		// 如果有，可能需要过滤或移除标签
+	case VlanModeTrunk:
+		// Trunk端口：需要检查数据包的VLAN标签
+		// 简化实现：暂时使用Native VLAN
+		portVlanID = inPort.NativeVlanID
+	}
+
+	// 验证VLAN是否存在且启用
+	if !s.vlanManager.IsVlanActive(portVlanID) {
+		return errors.New("VLAN not active")
+	}
+
+	// 简化转发逻辑，使用泛洪转发
+	// 注意：在实际实现中，我们应该根据VLAN ID进行过滤，只转发到同一VLAN的端口
 	return s.floodPacket(portID, pkt)
 }
 
@@ -189,6 +223,22 @@ func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 
 	var lastErr error
 	sentCount := 0
+
+	// 获取入站端口的VLAN信息
+	inPort, exists := s.ports[inPortID]
+	if !exists {
+		return errors.New("inbound port not found")
+	}
+
+	// 获取入站端口的VLAN ID
+	inPortVlanID := uint16(0)
+	switch inPort.VlanMode {
+	case VlanModeAccess:
+		inPortVlanID = inPort.AccessVlanID
+	case VlanModeTrunk:
+		// 简化实现：使用Native VLAN
+		inPortVlanID = inPort.NativeVlanID
+	}
 
 	for portID, port := range s.ports {
 		// 跳过输入端口
@@ -201,11 +251,30 @@ func (s *Switcher) floodPacket(inPortID string, pkt *packet.Packet) error {
 			continue
 		}
 
-		// 发送数据包
-		if err := port.SendPacket(pkt); err != nil {
-			lastErr = err
-		} else {
-			sentCount++
+		// 根据目标端口的VLAN模式进行过滤
+		shouldSend := false
+
+		switch port.VlanMode {
+		case VlanModeAccess:
+			// Access端口：只有当VLAN ID匹配时才发送
+			shouldSend = (port.AccessVlanID == inPortVlanID)
+		case VlanModeTrunk:
+			// Trunk端口：检查是否允许该VLAN
+			// 简化实现：如果没有配置AllowedVlans，则允许所有VLAN
+			if len(port.AllowedVlans) == 0 {
+				shouldSend = true
+			} else {
+				shouldSend = port.AllowedVlans[inPortVlanID]
+			}
+		}
+
+		// 如果应该发送，则发送数据包
+		if shouldSend {
+			if err := port.SendPacket(pkt); err != nil {
+				lastErr = err
+			} else {
+				sentCount++
+			}
 		}
 	}
 

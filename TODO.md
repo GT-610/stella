@@ -77,10 +77,11 @@
    - [x] 添加地址老化功能（框架已实现）
    - [x] 实现地址表查找优化（实现了MAC表容量限制和最旧条目替换）
 
-3. [ ] 实现VLAN支持
-   - [ ] 定义VLAN配置结构
-   - [ ] 实现基于VLAN的数据包过滤
-   - [ ] 添加VLAN间隔离功能
+3. [x] 实现VLAN支持
+   - [x] 定义VLAN配置结构（vlan.go中实现了VlanConfig和VlanManager）
+   - [x] 实现基于VLAN的数据包过滤（在switcher.go的HandlePacket和floodPacket方法中实现）
+   - [x] 添加VLAN间隔离功能（基于端口VLAN模式的数据包转发控制）
+   - [x] 实现VXLAN封装/解封装功能（vxlan.go中实现了VxlanEncapsulator）
 
 4. [ ] 实现多播支持
    - [ ] 实现IGMP监听功能
