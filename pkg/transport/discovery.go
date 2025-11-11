@@ -383,25 +383,23 @@ func (dm *DiscoveryManager) DiscoverNode(addr net.Addr) error {
 
 	// Check if node has been discovered
 	for i := 0; i < dm.maxRetries; i++ {
-		select {
-		case <-timer.C:
-			// Check if node has been found
-			dm.mu.RLock()
-			_, found := dm.peers[peerAddr]
-			dm.mu.RUnlock()
+		<-timer.C
+		// Check if node has been found
+		dm.mu.RLock()
+		_, found := dm.peers[peerAddr]
+		dm.mu.RUnlock()
 
-			if found {
-				return nil
-			}
+		if found {
+			return nil
+		}
 
-			// Retry sending Hello message
-			if i < dm.maxRetries-1 {
-				err = dm.SendDiscoveryHello(addr)
-				if err != nil {
-					return err
-				}
-				timer.Reset(5 * time.Second)
+		// Retry sending Hello message
+		if i < dm.maxRetries-1 {
+			err = dm.SendDiscoveryHello(addr)
+			if err != nil {
+				return err
 			}
+			timer.Reset(5 * time.Second)
 		}
 	}
 
