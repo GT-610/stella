@@ -125,6 +125,12 @@ pub enum CodecError {
         /// Packet type byte from the wire.
         value: u8,
     },
+    /// The control message type is reserved or unsupported.
+    #[error("unsupported control message type 0x{value:04x}")]
+    UnsupportedControlMessageType {
+        /// Control message type from the wire.
+        value: u16,
+    },
     /// Type-specific flags contain a reserved bit.
     #[error(
         "packet type 0x{packet_type:02x} has reserved flags 0x{flags:02x}; allowed mask is 0x{allowed:02x}"
@@ -136,6 +142,14 @@ pub enum CodecError {
         flags: u8,
         /// Allowed flag mask.
         allowed: u8,
+    },
+    /// Control flags contain a reserved bit.
+    #[error("control flags 0x{flags:04x} exceed allowed mask 0x{allowed:04x}")]
+    ReservedControlFlags {
+        /// Flags supplied by the control header.
+        flags: u16,
+        /// Allowed flag mask.
+        allowed: u16,
     },
     /// A type-specific decoder received a different registered packet type.
     #[error("unexpected packet type 0x{actual:02x}; expected 0x{expected:02x}")]
@@ -243,12 +257,54 @@ pub enum CodecError {
         /// Absolute offset of the extension prefix.
         offset: usize,
     },
+    /// Control field type zero is forbidden.
+    #[error("invalid control field type zero at byte offset {offset}")]
+    InvalidControlFieldType {
+        /// Absolute offset of the field prefix.
+        offset: usize,
+    },
     /// Version 0.1 does not define the supplied critical extension.
     #[error("unknown critical extension 0x{extension_type:04x} at byte offset {offset}")]
     UnknownCriticalExtension {
         /// Critical extension type.
         extension_type: u16,
         /// Absolute offset of the extension prefix.
+        offset: usize,
+    },
+    /// A critical control field is not registered in this version.
+    #[error("unknown critical control field 0x{field_type:04x} at byte offset {offset}")]
+    UnknownCriticalControlField {
+        /// Critical field type.
+        field_type: u16,
+        /// Absolute offset of the field prefix.
+        offset: usize,
+    },
+    /// Control body fields are duplicated or not in increasing order.
+    #[error(
+        "control field 0x{current:04x} at byte offset {offset} does not follow 0x{previous:04x}"
+    )]
+    ControlFieldsOutOfOrder {
+        /// Previous field type.
+        previous: u16,
+        /// Current duplicate or lower field type.
+        current: u16,
+        /// Absolute offset of the current field prefix.
+        offset: usize,
+    },
+    /// A text field is not valid UTF-8.
+    #[error("{field} is not valid UTF-8 at byte offset {offset}")]
+    InvalidUtf8 {
+        /// Name of the text field.
+        field: &'static str,
+        /// Offset within the field value.
+        offset: usize,
+    },
+    /// A text field contains a forbidden C0 or C1 control character.
+    #[error("{field} contains a control character at byte offset {offset}")]
+    InvalidTextCharacter {
+        /// Name of the text field.
+        field: &'static str,
+        /// Offset within the field value.
         offset: usize,
     },
 }

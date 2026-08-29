@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod common;
+mod control;
 mod cursor;
 mod data;
 mod error;
@@ -14,6 +15,12 @@ mod policy;
 pub use common::{
     CommonHeader, PacketType, ProtocolVersion, COMMON_HEADER_LENGTH, MAGIC, MAX_HEADER_LENGTH,
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
+};
+pub use control::{
+    control_fields_encoded_len, decode_control_record_length, encode_control_fields,
+    encode_control_message, encode_control_record_length, ControlFieldIter, ControlFieldRef,
+    ControlFieldType, ControlHeader, ControlMessageType, ControlMessageView, CONTROL_HEADER_LENGTH,
+    CONTROL_MAGIC, CONTROL_RECORD_PREFIX_LENGTH, MAX_CONTROL_RECORD_LENGTH,
 };
 pub use data::{
     encode_data_packet, DataHeader, DataPacketView, AUTHENTICATION_TAG_LENGTH, DATA_ENCRYPTED_FLAG,
