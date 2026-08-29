@@ -1,0 +1,9 @@
+# Architecture Decision Records
+
+ADRs describe decisions that constrain the Stella protocol or its reference
+implementation. Accepted records are immutable except for spelling or link
+fixes. A changed decision is documented by a new ADR that supersedes the old
+one.
+
+Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
+`Rejected`.
