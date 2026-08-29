@@ -9,6 +9,7 @@ mod data;
 mod error;
 mod extension;
 mod grant;
+mod handshake;
 mod keepalive;
 mod nested;
 mod peer;
@@ -35,6 +36,13 @@ pub use grant::{
     ED25519_SIGNATURE_LENGTH, MAX_MEMBERSHIP_GRANT_LIFETIME_SECONDS,
     MEMBERSHIP_GRANT_FORMAT_VERSION, MEMBERSHIP_GRANT_LENGTH, MEMBERSHIP_GRANT_MAGIC,
     MEMBERSHIP_GRANT_SIGNATURE_DOMAIN, MEMBERSHIP_GRANT_SIGNED_BODY_LENGTH,
+};
+pub use handshake::{
+    encode_session_init, encode_session_response, HandshakeHeader, SessionInitRef, SessionInitView,
+    SessionResponseRef, SessionResponseView, HANDSHAKE_FIXED_HEADER_LENGTH, HANDSHAKE_NONCE_LENGTH,
+    SESSION_INIT_PAYLOAD_LENGTH, SESSION_INIT_SIGNATURE_DOMAIN, SESSION_INIT_SIGNED_PAYLOAD_LENGTH,
+    SESSION_RESPONSE_PAYLOAD_LENGTH, SESSION_RESPONSE_SIGNATURE_DOMAIN,
+    SESSION_RESPONSE_SIGNED_PAYLOAD_LENGTH, SHA256_DIGEST_LENGTH, X25519_PUBLIC_KEY_LENGTH,
 };
 pub use keepalive::{
     encode_keepalive_packet, KeepaliveHeader, KeepalivePacketView, KEEPALIVE_FIXED_HEADER_LENGTH,
