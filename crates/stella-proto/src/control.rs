@@ -12,7 +12,7 @@ use crate::{
         ExtensionRef,
     },
     CodecError, EndpointSetView, MembershipGrantView, NetworkPolicy, NetworkRevisionListView,
-    ProtocolVersion, VersionEntry, VersionListView,
+    PeerListView, PeerRecordView, ProtocolVersion, VersionEntry, VersionListView,
 };
 
 /// Magic at the beginning of every control message.
@@ -892,7 +892,14 @@ fn validate_control_field_value(
     value: &[u8],
 ) -> Result<(), CodecError> {
     match field_type {
-        ControlFieldType::PeerList | ControlFieldType::PeerRecord => Ok(()),
+        ControlFieldType::PeerList => {
+            let _peers = PeerListView::decode(value)?;
+            Ok(())
+        }
+        ControlFieldType::PeerRecord => {
+            let _peer = PeerRecordView::decode(value)?;
+            Ok(())
+        }
         ControlFieldType::SupportedVersions => {
             let _versions = VersionListView::decode(value)?;
             Ok(())

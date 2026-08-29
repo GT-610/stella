@@ -11,6 +11,7 @@ mod extension;
 mod grant;
 mod keepalive;
 mod nested;
+mod peer;
 mod policy;
 
 pub use common::{
@@ -43,6 +44,10 @@ pub use nested::{
     EndpointSetView, NetworkRevision, NetworkRevisionIter, NetworkRevisionListView, VersionEntry,
     VersionIter, VersionListView, MAX_ENDPOINTS, MAX_ENDPOINT_DATAGRAM_SIZE, MAX_NETWORK_REVISIONS,
     MAX_SUPPORTED_VERSIONS, MIN_ENDPOINT_DATAGRAM_SIZE,
+};
+pub use peer::{
+    encode_peer_list, encode_peer_record, PeerListIter, PeerListView, PeerRecordRef,
+    PeerRecordView, MAX_PEER_LIST_ENTRIES, MAX_PEER_RECORD_LENGTH, PEER_RECORD_FIXED_LENGTH,
 };
 pub use policy::{
     ConfidentialityPolicy, NetworkPolicy, NETWORK_POLICY_FORMAT_VERSION, NETWORK_POLICY_LENGTH,

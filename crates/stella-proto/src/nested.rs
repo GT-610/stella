@@ -430,26 +430,7 @@ impl<'a> EndpointSetView<'a> {
             needed: 4_usize.saturating_sub(input.len()),
             remaining: 0,
         })?;
-        let mut position = 0;
-        let mut previous: Option<Endpoint> = None;
-        for index in 0..usize::from(count) {
-            let (endpoint, length) = decode_endpoint_record(records, position, 4)?;
-            if let Some(previous_endpoint) = previous {
-                if previous_endpoint.sort_cmp(endpoint) != Ordering::Less {
-                    return Err(CodecError::NestedRecordsOutOfOrder {
-                        context: "endpoint set",
-                        index,
-                    });
-                }
-            }
-            previous = Some(endpoint);
-            position = position
-                .checked_add(length)
-                .ok_or(CodecError::IntegerOverflow {
-                    field: "endpoint set position",
-                })?;
-        }
-        validate_record_length(records.len(), position, "endpoint records")?;
+        validate_endpoint_records(records, count, 4)?;
         Ok(Self { count, records })
     }
 
@@ -468,11 +449,7 @@ impl<'a> EndpointSetView<'a> {
     /// Iterates over validated endpoint values.
     #[must_use]
     pub const fn endpoints(&self) -> EndpointIter<'a> {
-        EndpointIter {
-            records: self.records,
-            position: 0,
-            remaining: self.count,
-        }
+        EndpointIter::new(self.records, self.count)
     }
 }
 
@@ -482,6 +459,16 @@ pub struct EndpointIter<'a> {
     records: &'a [u8],
     position: usize,
     remaining: u8,
+}
+
+impl<'a> EndpointIter<'a> {
+    pub(crate) const fn new(records: &'a [u8], count: u8) -> Self {
+        Self {
+            records,
+            position: 0,
+            remaining: count,
+        }
+    }
 }
 
 impl Iterator for EndpointIter<'_> {
@@ -527,25 +514,13 @@ pub fn encode_endpoint_set(endpoints: &[Endpoint], output: &mut [u8]) -> Result<
             maximum: u64::from(MAX_ENDPOINTS),
         });
     }
-    let mut encoded_length = 4_usize;
-    let mut previous: Option<Endpoint> = None;
-    for (index, endpoint) in endpoints.iter().copied().enumerate() {
-        endpoint.validate()?;
-        if let Some(previous_endpoint) = previous {
-            if previous_endpoint.sort_cmp(endpoint) != Ordering::Less {
-                return Err(CodecError::NestedRecordsOutOfOrder {
-                    context: "endpoint set",
-                    index,
-                });
-            }
-        }
-        previous = Some(endpoint);
-        encoded_length = encoded_length.checked_add(endpoint.encoded_len()).ok_or(
-            CodecError::IntegerOverflow {
+    let records_length = endpoint_records_encoded_len(endpoints)?;
+    let encoded_length =
+        4_usize
+            .checked_add(records_length)
+            .ok_or(CodecError::IntegerOverflow {
                 field: "endpoint set length",
-            },
-        )?;
-    }
+            })?;
     if output.len() < encoded_length {
         return Err(CodecError::OutputTooSmall {
             field: "endpoint set",
@@ -554,13 +529,22 @@ pub fn encode_endpoint_set(endpoints: &[Endpoint], output: &mut [u8]) -> Result<
             remaining: output.len(),
         });
     }
-    let mut cursor = WriteCursor::new(output, 0);
-    cursor.write_u8(count, "endpoint count")?;
-    cursor.write_bytes(&[0; 3], "endpoint set reserved")?;
-    for endpoint in endpoints {
-        encode_endpoint_record(*endpoint, &mut cursor)?;
+    {
+        let mut cursor = WriteCursor::new(output, 0);
+        cursor.write_u8(count, "endpoint count")?;
+        cursor.write_bytes(&[0; 3], "endpoint set reserved")?;
     }
-    Ok(cursor.position())
+    let output_length = output.len();
+    let records_output = output
+        .get_mut(4..encoded_length)
+        .ok_or(CodecError::OutputTooSmall {
+            field: "endpoint records",
+            offset: 4,
+            needed: records_length,
+            remaining: output_length.saturating_sub(4),
+        })?;
+    encode_endpoint_records_at(endpoints, records_output, 4)?;
+    Ok(encoded_length)
 }
 
 /// One network's accepted epoch and snapshot revision.
@@ -800,7 +784,78 @@ fn version_entry_at(entries: &[u8], index: usize) -> Result<VersionEntry, CodecE
     VersionEntry::decode(bytes)
 }
 
-fn decode_endpoint_record(
+pub(crate) fn validate_endpoint_records(
+    records: &[u8],
+    count: u8,
+    base_offset: usize,
+) -> Result<(), CodecError> {
+    let mut position = 0;
+    let mut previous: Option<Endpoint> = None;
+    for index in 0..usize::from(count) {
+        let (endpoint, length) = decode_endpoint_record(records, position, base_offset)?;
+        if let Some(previous_endpoint) = previous {
+            if previous_endpoint.sort_cmp(endpoint) != Ordering::Less {
+                return Err(CodecError::NestedRecordsOutOfOrder {
+                    context: "endpoint records",
+                    index,
+                });
+            }
+        }
+        previous = Some(endpoint);
+        position = position
+            .checked_add(length)
+            .ok_or(CodecError::IntegerOverflow {
+                field: "endpoint records position",
+            })?;
+    }
+    validate_record_length(records.len(), position, "endpoint records")
+}
+
+pub(crate) fn endpoint_records_encoded_len(endpoints: &[Endpoint]) -> Result<usize, CodecError> {
+    let mut encoded_length = 0_usize;
+    let mut previous: Option<Endpoint> = None;
+    for (index, endpoint) in endpoints.iter().copied().enumerate() {
+        endpoint.validate()?;
+        if let Some(previous_endpoint) = previous {
+            if previous_endpoint.sort_cmp(endpoint) != Ordering::Less {
+                return Err(CodecError::NestedRecordsOutOfOrder {
+                    context: "endpoint records",
+                    index,
+                });
+            }
+        }
+        previous = Some(endpoint);
+        encoded_length = encoded_length.checked_add(endpoint.encoded_len()).ok_or(
+            CodecError::IntegerOverflow {
+                field: "endpoint records length",
+            },
+        )?;
+    }
+    Ok(encoded_length)
+}
+
+pub(crate) fn encode_endpoint_records_at(
+    endpoints: &[Endpoint],
+    output: &mut [u8],
+    base_offset: usize,
+) -> Result<usize, CodecError> {
+    let required = endpoint_records_encoded_len(endpoints)?;
+    if output.len() < required {
+        return Err(CodecError::OutputTooSmall {
+            field: "endpoint records",
+            offset: base_offset,
+            needed: required,
+            remaining: output.len(),
+        });
+    }
+    let mut cursor = WriteCursor::new(output, base_offset);
+    for endpoint in endpoints {
+        encode_endpoint_record(*endpoint, &mut cursor)?;
+    }
+    Ok(cursor.position())
+}
+
+pub(crate) fn decode_endpoint_record(
     records: &[u8],
     position: usize,
     base_offset: usize,
@@ -1044,7 +1099,7 @@ mod tests {
         assert_eq!(
             encode_endpoint_set(&reversed, &mut output),
             Err(CodecError::NestedRecordsOutOfOrder {
-                context: "endpoint set",
+                context: "endpoint records",
                 index: 1,
             })
         );
