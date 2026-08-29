@@ -25,6 +25,8 @@ export default defineConfig({
             { text: 'Identity', link: '/protocol/spec/03-identity' },
             { text: 'Network model', link: '/protocol/spec/04-network-model' },
             { text: 'Discovery', link: '/protocol/spec/05-discovery' },
+            { text: 'Broadcast', link: '/protocol/spec/06-broadcast' },
+            { text: 'Transport', link: '/protocol/spec/07-transport' },
             { text: 'Security', link: '/protocol/spec/08-security' }
           ]
         },

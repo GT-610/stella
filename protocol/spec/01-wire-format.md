@@ -64,11 +64,12 @@ or signature state.
 | Value | Name | Header/body definition |
 | ---: | --- | --- |
 | `0x01` | `DATA` | This document |
+| `0x02` | `KEEPALIVE` | This document |
 | `0x10` | `SESSION_INIT` | Security specification |
 | `0x11` | `SESSION_RESPONSE` | Security specification |
 | `0x12` | `SESSION_CONFIRM` | Security specification |
 | `0x13` | `SESSION_REJECT` | Security specification |
-| `0x00`, `0x02`-`0x0f`, `0x14`-`0x7f` | Reserved | Reject in version 0.1 |
+| `0x00`, `0x03`-`0x0f`, `0x14`-`0x7f` | Reserved | Reject in version 0.1 |
 | `0x80`-`0xff` | Experimental/private | Reject unless explicitly enabled outside an interoperable network |
 
 An implementation MUST NOT reinterpret a reserved type as another type after
@@ -160,7 +161,35 @@ The split at `005e` is for readability and has no wire meaning. Implementations
 SHOULD generate equivalent fixed-header vectors directly from the field table
 and MUST treat the table as authoritative if presentation wrapping differs.
 
-## 6. Ethernet frame rules
+## 6. `KEEPALIVE` packet
+
+`KEEPALIVE` uses an 88-byte fixed header and a 16-byte authentication tag:
+
+| Offset | Size | Field | Validation |
+| ---: | ---: | --- | --- |
+| 0 | 32 | `common` | Common header with `packet_type = 0x02` |
+| 32 | 16 | `sender_node_id` | Authenticated sending node |
+| 48 | 8 | `session_id` | Non-zero active peer session |
+| 56 | 8 | `sequence_number` | Next directional protected-packet sequence |
+| 64 | 8 | `controller_epoch` | Epoch authorizing the session |
+| 72 | 8 | `probe_id` | Must equal `sequence_number` |
+| 80 | 8 | `echo_probe_id` | Zero or a previously authenticated peer probe ID |
+
+For version 0.1, flags and payload length are zero, header length is at least 88,
+and no keepalive extension is registered. Exact datagram length is
+`header_length + 16`.
+
+ChaCha20-Poly1305 plaintext is empty. Associated data is the complete header,
+and the nonce uses the normal session prefix and `sequence_number`. Successful
+authentication commits the shared data replay window and updates path liveness.
+It does not update Ethernet forwarding or reassembly state.
+
+A receiver that has not already echoed a valid non-zero `probe_id` schedules a
+keepalive in its own direction with that value in `echo_probe_id`. Retransmitted
+or replayed probes do not create unbounded replies. Probe IDs are scoped to one
+session direction and need not be remembered after session teardown.
+
+## 7. Ethernet frame rules
 
 The reassembled bytes are one Ethernet frame from destination MAC through the
 end of payload, without preamble, start delimiter, inter-packet gap, or FCS.
@@ -198,7 +227,7 @@ Broadcast is destination `ff:ff:ff:ff:ff:ff`. Any other destination with the
 group bit set is multicast. Other destinations are unicast. These rules are
 used by the sender's forwarding decision and are not encoded in a trusted flag.
 
-## 7. Fragmentation
+## 8. Fragmentation
 
 Stella fragments at its data-packet layer so a full Ethernet frame does not
 depend on IP fragmentation. The sender determines the largest fragment that
@@ -226,7 +255,7 @@ session direction. Wrap is forbidden; the session rekeys before exhaustion.
 Fragment offsets need not arrive in order. Senders SHOULD create contiguous
 non-overlapping fragments and SHOULD send them in ascending offset order.
 
-### 7.1 Receiver reassembly
+### 8.1 Receiver reassembly
 
 Reassembly state is keyed by:
 
@@ -252,7 +281,7 @@ the declared frame length discards the entire incomplete frame. Timeout also
 discards the entire incomplete frame. No partial Ethernet frame is written to
 TAP.
 
-## 8. Packet protection
+## 9. Packet protection
 
 The session security specification derives a 32-byte directional key and a
 four-byte nonce prefix. The 12-byte nonce for one `DATA` packet is:
@@ -263,7 +292,7 @@ nonce_prefix || sequence_number
 
 where the sequence number is its eight-byte wire representation.
 
-### 8.1 Encrypted mode
+### 9.1 Encrypted mode
 
 When `ENCRYPTED` is set:
 
@@ -272,7 +301,7 @@ When `ENCRYPTED` is set:
 - AEAD plaintext is this fragment of the Ethernet frame;
 - the packet carries ciphertext of the same length followed by the 16-byte tag.
 
-### 8.2 Authenticate-only mode
+### 9.2 Authenticate-only mode
 
 When `ENCRYPTED` is clear:
 
@@ -289,11 +318,11 @@ In both modes the receiver authenticates before exposing payload bytes to
 reassembly, MAC learning, TAP, or diagnostics. A tag failure does not reveal
 whether any inner field would otherwise have been valid.
 
-## 9. Replay handling
+## 10. Replay handling
 
 Each session direction starts with sequence number 1. Senders increment by one
-for every protected packet, including every fragment, and never transmit zero.
-Lost sequence numbers are not reused.
+for every protected packet, including every fragment and keepalive, and never
+transmit zero. Lost sequence numbers are not reused.
 
 Receivers maintain a 1,024-packet sliding window. A sequence number is a replay
 candidate when it is older than the window or already marked. The receiver MAY
@@ -304,7 +333,7 @@ failure MUST NOT advance the highest accepted number.
 Packets from an expired session, stale controller epoch, revoked member, or
 unknown network are rejected even if their tag would otherwise verify.
 
-## 10. Forwarding and learning implications
+## 11. Forwarding and learning implications
 
 A sender creates a separate protected packet stream for each destination peer.
 Flood replication therefore uses each peer session's distinct key, nonce
@@ -318,7 +347,7 @@ is multicast or zero.
 Version 0.1 never forwards a transport-originated frame to another transport
 peer. After validation it is written to the local network TAP adapter only.
 
-## 11. Malformed input requirements
+## 12. Malformed input requirements
 
 At minimum, the decoder returns distinct typed errors for:
 
@@ -340,7 +369,7 @@ At minimum, the decoder returns distinct typed errors for:
 Network input MUST NOT cause a panic, out-of-bounds access, integer wrap,
 unbounded allocation, or attacker-controlled blocking log volume.
 
-## 12. IANA-style protocol registries
+## 13. IANA-style protocol registries
 
 Until a formal registry exists, the Stella specification repository owns these
 registries:

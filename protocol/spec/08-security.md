@@ -366,9 +366,10 @@ ephemeral values.
 
 ## 12. Session lifecycle and rekey
 
-Once established, both directional data sequence numbers and frame IDs start at
-1. A session stops sending and begins a replacement handshake before the first
-of:
+Once established, both directional protected-packet sequence numbers and frame
+IDs start at 1. Data fragments and keepalives share the protected-packet
+sequence space. A session stops sending and begins a replacement handshake
+before the first of:
 
 - one hour since establishment;
 - 2^32 sent protected packets in either direction;
