@@ -58,6 +58,31 @@ Cryptographic callers reserve space for tags and signatures but own the actual
 primitive operation. The codec returns or exposes the exact header and body
 ranges used as associated data or signature input.
 
+## Peer-handshake codec
+
+All four peer-session datagrams share one parsed 96-byte `HandshakeHeader`.
+The header codec enforces the registered handshake packet types, their exact
+payload lengths, the per-type flag mask, aligned extension bounds, and non-zero
+epoch, handshake, and session identifiers. Timestamp freshness, endpoint rate
+limits, replay caches, and session collision handling require runtime state and
+remain outside `stella-proto`.
+
+Each message has its own borrowed view and encoder:
+
+- `SESSION_INIT` and `SESSION_RESPONSE` decode their embedded membership grant
+  and require its node, network, and epoch to agree with the datagram header;
+- `SESSION_CONFIRM` enforces the role/flag pairing and exposes the exact
+  associated-data header and payload prefix separately from its tag;
+- `SESSION_REJECT` preserves known rejection reasons and future non-zero reason
+  values without treating the diagnostic as authorization.
+
+Signed-message views expose the exact header, signed payload prefix, and
+signature as separate borrowed slices. This keeps domain separation explicit
+and lets `stella-crypto` authenticate the normative byte ranges without the
+codec allocating or selecting a cryptographic implementation. Encoders accept
+the already-produced signature or confirmation tag and explicitly write every
+reserved byte as zero.
+
 ## Errors
 
 `stella-proto` uses one non-exhaustive typed error with stable categories for:
