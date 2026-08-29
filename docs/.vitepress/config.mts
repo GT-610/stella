@@ -32,7 +32,12 @@ export default defineConfig({
             { text: '0003: Transport', link: '/protocol/adr/0003-pluggable-data-transport' },
             { text: '0004: TAP backends', link: '/protocol/adr/0004-native-tap-backends' },
             { text: '0005: Workspace', link: '/protocol/adr/0005-cargo-workspace' },
-            { text: '0006: Licensing', link: '/protocol/adr/0006-license-boundaries' }
+            { text: '0006: Licensing', link: '/protocol/adr/0006-license-boundaries' },
+            { text: '0007: Control TLS', link: '/protocol/adr/0007-control-plane-over-tls' },
+            { text: '0008: Wire encoding', link: '/protocol/adr/0008-explicit-wire-encoding' },
+            { text: '0009: Cryptography', link: '/protocol/adr/0009-cryptographic-suite' },
+            { text: '0010: Flooding', link: '/protocol/adr/0010-head-end-flooding' },
+            { text: '0011: Configuration', link: '/protocol/adr/0011-toml-configuration' }
           ]
         }
       ],
