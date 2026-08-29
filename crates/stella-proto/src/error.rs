@@ -85,6 +85,40 @@ pub enum CodecError {
         /// Inclusive maximum.
         maximum: u64,
     },
+    /// A bit mask contains undefined reserved bits.
+    #[error("{field} bits 0x{bits:x} exceed allowed mask 0x{allowed:x}")]
+    ReservedBits {
+        /// Name of the bit-mask field.
+        field: &'static str,
+        /// Supplied bits.
+        bits: u64,
+        /// Allowed bit mask.
+        allowed: u64,
+    },
+    /// A signed object's validity interval is empty or reversed.
+    #[error("invalid validity interval: not_before {not_before}, not_after {not_after}")]
+    InvalidTimeRange {
+        /// Inclusive validity start.
+        not_before: u64,
+        /// Exclusive validity end.
+        not_after: u64,
+    },
+    /// A signed object's lifetime exceeds its protocol maximum.
+    #[error("validity lifetime {actual} seconds exceeds maximum {maximum}")]
+    LifetimeTooLong {
+        /// Supplied validity lifetime in seconds.
+        actual: u64,
+        /// Maximum validity lifetime in seconds.
+        maximum: u64,
+    },
+    /// Two authenticated or canonical objects disagree on a required field.
+    #[error("inconsistent {field} between {context}")]
+    InconsistentField {
+        /// Objects being compared.
+        context: &'static str,
+        /// Name of the inconsistent field.
+        field: &'static str,
+    },
     /// The packet type is reserved or unsupported.
     #[error("unsupported packet type 0x{value:02x}")]
     UnsupportedPacketType {
