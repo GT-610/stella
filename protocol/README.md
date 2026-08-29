@@ -13,5 +13,19 @@ declared stable.
 - `spec/` contains the normative protocol text.
 - `adr/` records architectural decisions and their rationale.
 
+## Specification index
+
+- `00-overview.md`: architecture, terminology, invariants, and threat model.
+- `01-wire-format.md`: data-plane headers, fragments, protection, and replay.
+- `02-control-plane.md`: TLS-carried messages and controller state machine.
+- `03-identity.md`: identities, enrollment, grants, epochs, and revocation.
+- `04-network-model.md`: TAP, membership, isolation, switching, and MAC state.
+- `05-discovery.md`: endpoint distribution, selection, validation, and liveness.
+- `06-broadcast.md`: broadcast, multicast, ARP, and unknown-unicast replication.
+- `07-transport.md`: datagram abstraction, UDP, path size, and backpressure.
+- `08-security.md`: authentication, peer handshake, keys, and downgrade defense.
+- `09-versioning.md`: negotiation, compatibility, registries, and upgrades.
+- `10-errata.md`: accepted corrections and interoperability clarifications.
+
 The rendered documentation under `docs/protocol/` is a synchronized reading
 copy. If the two disagree, files in this directory are authoritative.

@@ -27,7 +27,9 @@ export default defineConfig({
             { text: 'Discovery', link: '/protocol/spec/05-discovery' },
             { text: 'Broadcast', link: '/protocol/spec/06-broadcast' },
             { text: 'Transport', link: '/protocol/spec/07-transport' },
-            { text: 'Security', link: '/protocol/spec/08-security' }
+            { text: 'Security', link: '/protocol/spec/08-security' },
+            { text: 'Versioning', link: '/protocol/spec/09-versioning' },
+            { text: 'Errata', link: '/protocol/spec/10-errata' }
           ]
         },
         {
