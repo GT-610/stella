@@ -50,6 +50,7 @@ name = "stella-proto"
 version = "0.1.0"
 dependencies = [
  "stella-common",
+ "thiserror",
 ]
 
 [[package]]

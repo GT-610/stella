@@ -9,6 +9,7 @@ version.workspace = true
 
 [dependencies]
 stella-common = { path = "../stella-common" }
+thiserror.workspace = true
 
 [lints]
 workspace = true
