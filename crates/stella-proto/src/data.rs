@@ -5,7 +5,7 @@ use std::fmt;
 use stella_common::{MacAddress, NodeId};
 
 use crate::{
-    common::COMMON_HEADER_LENGTH,
+    common::{validate_record_length, COMMON_HEADER_LENGTH},
     cursor::{ReadCursor, WriteCursor},
     extension::{
         encode_extension_block_at, extensions_encoded_len, validate_extension_block, ExtensionIter,
@@ -570,25 +570,6 @@ pub fn encode_data_packet(
 fn validate_nonzero(value: u64, field: &'static str) -> Result<(), CodecError> {
     if value == 0 {
         return Err(CodecError::ZeroField { field });
-    }
-    Ok(())
-}
-
-fn validate_record_length(
-    actual: usize,
-    expected: usize,
-    field: &'static str,
-) -> Result<(), CodecError> {
-    if actual < expected {
-        return Err(CodecError::Truncated {
-            field,
-            offset: actual,
-            needed: expected - actual,
-            remaining: 0,
-        });
-    }
-    if actual > expected {
-        return Err(CodecError::TrailingBytes { expected, actual });
     }
     Ok(())
 }

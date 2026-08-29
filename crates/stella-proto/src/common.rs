@@ -218,6 +218,25 @@ impl CommonHeader {
     }
 }
 
+pub(crate) fn validate_record_length(
+    actual: usize,
+    expected: usize,
+    field: &'static str,
+) -> Result<(), CodecError> {
+    if actual < expected {
+        return Err(CodecError::Truncated {
+            field,
+            offset: actual,
+            needed: expected - actual,
+            remaining: 0,
+        });
+    }
+    if actual > expected {
+        return Err(CodecError::TrailingBytes { expected, actual });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use stella_common::NetworkId;

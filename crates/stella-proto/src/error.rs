@@ -152,6 +152,14 @@ pub enum CodecError {
         /// Complete frame length.
         frame_length: u16,
     },
+    /// A keepalive probe does not use its packet sequence number.
+    #[error("keepalive probe ID {probe_id} does not equal sequence number {sequence_number}")]
+    ProbeIdMismatch {
+        /// Directional protected-packet sequence number.
+        sequence_number: u64,
+        /// Supplied keepalive probe identifier.
+        probe_id: u64,
+    },
     /// Authenticated Ethernet metadata has an invalid source address.
     #[error("authenticated Ethernet source MAC is zero or a group address")]
     InvalidSourceMac,

@@ -7,6 +7,7 @@ mod cursor;
 mod data;
 mod error;
 mod extension;
+mod keepalive;
 
 pub use common::{
     CommonHeader, PacketType, ProtocolVersion, COMMON_HEADER_LENGTH, MAGIC, MAX_HEADER_LENGTH,
@@ -18,3 +19,6 @@ pub use data::{
 };
 pub use error::CodecError;
 pub use extension::{encode_extensions, extensions_encoded_len, ExtensionIter, ExtensionRef};
+pub use keepalive::{
+    encode_keepalive_packet, KeepaliveHeader, KeepalivePacketView, KEEPALIVE_FIXED_HEADER_LENGTH,
+};
