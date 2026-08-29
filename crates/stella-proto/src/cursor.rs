@@ -52,6 +52,10 @@ impl<'a> ReadCursor<'a> {
         self.read_array(field).map(u32::from_be_bytes)
     }
 
+    pub(crate) fn read_u64(&mut self, field: &'static str) -> Result<u64, CodecError> {
+        self.read_array(field).map(u64::from_be_bytes)
+    }
+
     pub(crate) fn read_slice(
         &mut self,
         length: usize,
@@ -125,6 +129,10 @@ impl<'a> WriteCursor<'a> {
     }
 
     pub(crate) fn write_u32(&mut self, value: u32, field: &'static str) -> Result<(), CodecError> {
+        self.write_bytes(&value.to_be_bytes(), field)
+    }
+
+    pub(crate) fn write_u64(&mut self, value: u64, field: &'static str) -> Result<(), CodecError> {
         self.write_bytes(&value.to_be_bytes(), field)
     }
 }

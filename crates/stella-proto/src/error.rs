@@ -69,6 +69,14 @@ pub enum CodecError {
         /// Allowed flag mask.
         allowed: u8,
     },
+    /// A type-specific decoder received a different registered packet type.
+    #[error("unexpected packet type 0x{actual:02x}; expected 0x{expected:02x}")]
+    UnexpectedPacketType {
+        /// Required packet type byte.
+        expected: u8,
+        /// Actual registered packet type byte.
+        actual: u8,
+    },
     /// A header is shorter than the relevant fixed header.
     #[error("header length {actual} is smaller than minimum {minimum}")]
     HeaderTooShort {
@@ -114,6 +122,44 @@ pub enum CodecError {
         field: &'static str,
         /// Absolute byte offset of the non-zero value.
         offset: usize,
+    },
+    /// A field that must be non-zero is zero.
+    #[error("{field} must be non-zero")]
+    ZeroField {
+        /// Name of the zero-valued field.
+        field: &'static str,
+    },
+    /// A complete Ethernet frame length is outside protocol bounds.
+    #[error("frame length {actual} is outside {minimum}..={maximum}")]
+    InvalidFrameLength {
+        /// Supplied complete frame length.
+        actual: u16,
+        /// Protocol minimum.
+        minimum: u16,
+        /// Protocol maximum.
+        maximum: u16,
+    },
+    /// A fragment has zero length.
+    #[error("fragment length must be non-zero")]
+    InvalidFragmentLength,
+    /// A fragment range is outside its declared complete frame.
+    #[error("fragment range {offset}..{end} is outside frame length {frame_length}")]
+    FragmentOutOfRange {
+        /// Fragment byte offset.
+        offset: u16,
+        /// Exclusive fragment end.
+        end: u32,
+        /// Complete frame length.
+        frame_length: u16,
+    },
+    /// Authenticated Ethernet metadata has an invalid source address.
+    #[error("authenticated Ethernet source MAC is zero or a group address")]
+    InvalidSourceMac,
+    /// Authenticated header metadata disagrees with the complete frame.
+    #[error("authenticated Ethernet {field} does not match the complete frame")]
+    EthernetMetadataMismatch {
+        /// Name of the inconsistent Ethernet field.
+        field: &'static str,
     },
     /// Extension type zero is forbidden.
     #[error("invalid extension type zero at byte offset {offset}")]
