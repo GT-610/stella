@@ -43,6 +43,12 @@ pub enum CodecError {
     /// The four-byte Stella magic is invalid.
     #[error("invalid Stella magic")]
     InvalidMagic,
+    /// A signed or canonical object's format magic is invalid.
+    #[error("invalid {object} magic")]
+    InvalidObjectMagic {
+        /// Name of the object format.
+        object: &'static str,
+    },
     /// The protocol version is not implemented by this codec.
     #[error("unsupported protocol version {major}.{minor}")]
     UnsupportedVersion {
@@ -50,6 +56,34 @@ pub enum CodecError {
         major: u8,
         /// Wire minor version.
         minor: u8,
+    },
+    /// A signed or canonical object's format version is unsupported.
+    #[error("unsupported {object} format version {version}")]
+    UnsupportedObjectVersion {
+        /// Name of the object format.
+        object: &'static str,
+        /// Supplied format version.
+        version: u8,
+    },
+    /// A numeric enum value is not registered.
+    #[error("invalid {field} value {value}")]
+    InvalidEnumValue {
+        /// Name of the enum field.
+        field: &'static str,
+        /// Supplied wire value.
+        value: u64,
+    },
+    /// A numeric value is outside its protocol bounds.
+    #[error("{field} value {actual} is outside {minimum}..={maximum}")]
+    ValueOutOfRange {
+        /// Name of the bounded field.
+        field: &'static str,
+        /// Supplied value.
+        actual: u64,
+        /// Inclusive minimum.
+        minimum: u64,
+        /// Inclusive maximum.
+        maximum: u64,
     },
     /// The packet type is reserved or unsupported.
     #[error("unsupported packet type 0x{value:02x}")]
