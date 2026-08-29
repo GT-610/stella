@@ -11,7 +11,8 @@ use crate::{
         encode_extension_block_at, extensions_encoded_len, validate_extension_block, ExtensionIter,
         ExtensionRef,
     },
-    CodecError, MembershipGrantView, NetworkPolicy, ProtocolVersion,
+    CodecError, EndpointSetView, MembershipGrantView, NetworkPolicy, NetworkRevisionListView,
+    ProtocolVersion, VersionEntry, VersionListView,
 };
 
 /// Magic at the beginning of every control message.
@@ -891,12 +892,15 @@ fn validate_control_field_value(
     value: &[u8],
 ) -> Result<(), CodecError> {
     match field_type {
-        ControlFieldType::SupportedVersions
-        | ControlFieldType::PeerList
-        | ControlFieldType::PeerRecord
-        | ControlFieldType::EndpointSet
-        | ControlFieldType::NetworkRevisions => Ok(()),
-        ControlFieldType::SelectedVersion => validate_exact_width(value, 4, "selected version"),
+        ControlFieldType::PeerList | ControlFieldType::PeerRecord => Ok(()),
+        ControlFieldType::SupportedVersions => {
+            let _versions = VersionListView::decode(value)?;
+            Ok(())
+        }
+        ControlFieldType::SelectedVersion => {
+            let _version = VersionEntry::decode(value)?;
+            Ok(())
+        }
         ControlFieldType::ServerNonce | ControlFieldType::ClientNonce => {
             validate_exact_width(value, 32, "control nonce")
         }
@@ -949,7 +953,15 @@ fn validate_control_field_value(
             }
             Ok(())
         }
+        ControlFieldType::EndpointSet => {
+            let _endpoints = EndpointSetView::decode(value)?;
+            Ok(())
+        }
         ControlFieldType::HeartbeatCounter => validate_nonzero_u64(value, "heartbeat counter"),
+        ControlFieldType::NetworkRevisions => {
+            let _revisions = NetworkRevisionListView::decode(value)?;
+            Ok(())
+        }
         ControlFieldType::ServerTime | ControlFieldType::ShutdownDeadline => {
             validate_exact_width(value, 8, "Unix time")
         }

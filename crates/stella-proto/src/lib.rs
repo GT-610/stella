@@ -10,6 +10,7 @@ mod error;
 mod extension;
 mod grant;
 mod keepalive;
+mod nested;
 mod policy;
 
 pub use common::{
@@ -36,6 +37,12 @@ pub use grant::{
 };
 pub use keepalive::{
     encode_keepalive_packet, KeepaliveHeader, KeepalivePacketView, KEEPALIVE_FIXED_HEADER_LENGTH,
+};
+pub use nested::{
+    encode_endpoint_set, encode_network_revision_list, encode_version_list, Endpoint, EndpointIter,
+    EndpointSetView, NetworkRevision, NetworkRevisionIter, NetworkRevisionListView, VersionEntry,
+    VersionIter, VersionListView, MAX_ENDPOINTS, MAX_ENDPOINT_DATAGRAM_SIZE, MAX_NETWORK_REVISIONS,
+    MAX_SUPPORTED_VERSIONS, MIN_ENDPOINT_DATAGRAM_SIZE,
 };
 pub use policy::{
     ConfidentialityPolicy, NetworkPolicy, NETWORK_POLICY_FORMAT_VERSION, NETWORK_POLICY_LENGTH,

@@ -119,6 +119,34 @@ pub enum CodecError {
         /// Name of the inconsistent field.
         field: &'static str,
     },
+    /// A nested list repeats an entry that must be unique.
+    #[error("duplicate entry {index} in {context}")]
+    DuplicateNestedEntry {
+        /// Name of the nested list.
+        context: &'static str,
+        /// Zero-based index of the duplicate.
+        index: usize,
+    },
+    /// A nested list is not in its required canonical order.
+    #[error("entry {index} in {context} is not strictly ordered")]
+    NestedRecordsOutOfOrder {
+        /// Name of the nested list.
+        context: &'static str,
+        /// Zero-based index of the first non-increasing entry.
+        index: usize,
+    },
+    /// A numeric endpoint kind is not registered.
+    #[error("unsupported endpoint kind {kind}")]
+    UnsupportedEndpointKind {
+        /// Endpoint kind byte.
+        kind: u8,
+    },
+    /// A numeric endpoint address is unusable for unicast transport.
+    #[error("invalid {family} endpoint address")]
+    InvalidEndpointAddress {
+        /// Address family name.
+        family: &'static str,
+    },
     /// The packet type is reserved or unsupported.
     #[error("unsupported packet type 0x{value:02x}")]
     UnsupportedPacketType {
