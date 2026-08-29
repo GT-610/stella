@@ -1,25 +1,23 @@
 ---
-# https://vitepress.dev/reference/default-theme-home-page
 layout: home
 
 hero:
-  name: "Stella Docs"
-  text: "Documents of Stella protocol"
-  tagline: My great project tagline
+  name: Stella
+  text: An open Layer-2 virtual LAN
+  tagline: Self-hosted control, direct peer data paths, and transparent Ethernet frames.
   actions:
     - theme: brand
-      text: Markdown Examples
-      link: /markdown-examples
+      text: Read the protocol
+      link: /protocol/spec/00-overview
     - theme: alt
-      text: API Examples
-      link: /api-examples
+      text: Development status
+      link: /guide/
 
 features:
-  - title: Feature A
-    details: Lorem ipsum dolor sit amet, consectetur adipiscing elit
-  - title: Feature B
-    details: Lorem ipsum dolor sit amet, consectetur adipiscing elit
-  - title: Feature C
-    details: Lorem ipsum dolor sit amet, consectetur adipiscing elit
+  - title: Layer-2 transparent
+    details: Carries complete Ethernet frames for ARP, broadcast, multicast, and legacy LAN discovery.
+  - title: Self-hosted
+    details: Uses a deployment-owned controller for identity, membership, policy, and peer discovery.
+  - title: Direct data plane
+    details: Sends steady-state peer traffic directly over a replaceable datagram transport.
 ---
-
