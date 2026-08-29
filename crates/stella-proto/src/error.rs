@@ -319,6 +319,30 @@ pub enum CodecError {
         /// Absolute offset of the current field prefix.
         offset: usize,
     },
+    /// A required field is absent from a control message.
+    #[error("control message 0x{message_type:04x} is missing required field 0x{field_type:04x}")]
+    MissingControlField {
+        /// Control message type.
+        message_type: u16,
+        /// Missing registered field type.
+        field_type: u16,
+    },
+    /// A registered field is not permitted in a control message.
+    #[error("control field 0x{field_type:04x} is not allowed in message 0x{message_type:04x}")]
+    UnexpectedControlField {
+        /// Control message type.
+        message_type: u16,
+        /// Unexpected registered field type.
+        field_type: u16,
+    },
+    /// Individually valid fields form an invalid message-specific combination.
+    #[error("invalid field combination in control message 0x{message_type:04x}: {detail}")]
+    InvalidControlFieldCombination {
+        /// Control message type.
+        message_type: u16,
+        /// Stable redacted description of the violated rule.
+        detail: &'static str,
+    },
     /// A text field is not valid UTF-8.
     #[error("{field} is not valid UTF-8 at byte offset {offset}")]
     InvalidUtf8 {

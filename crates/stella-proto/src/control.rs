@@ -565,6 +565,7 @@ impl<'a> ControlMessageView<'a> {
                 remaining: record.len().saturating_sub(header_length),
             })?;
         validate_control_field_block(body, header_length)?;
+        validate_control_message_fields(header.message_type, ControlFieldIter::new(body))?;
         Ok(Self {
             header,
             extension_bytes,
@@ -663,6 +664,7 @@ pub fn encode_control_message(
     output: &mut [u8],
 ) -> Result<usize, CodecError> {
     header.validate()?;
+    validate_control_message_fields(header.message_type, fields.iter().copied())?;
     let extension_length = extensions_encoded_len(header_extensions)?;
     let expected_header_length =
         CONTROL_HEADER_LENGTH
@@ -993,6 +995,208 @@ fn validate_control_field_value(
     }
 }
 
+fn validate_control_message_fields<'a>(
+    message_type: ControlMessageType,
+    fields: impl IntoIterator<Item = ControlFieldRef<'a>>,
+) -> Result<(), CodecError> {
+    let mut present = 0_u32;
+    let mut delta_operation = None;
+    for field in fields {
+        let Some(field_type) = field.field_type() else {
+            continue;
+        };
+        if !field_allowed(message_type, field_type) {
+            return Err(CodecError::UnexpectedControlField {
+                message_type: message_type.as_u16(),
+                field_type: field_type.as_u16(),
+            });
+        }
+        present |= field_bit(field_type);
+        if field_type == ControlFieldType::DeltaOperation {
+            delta_operation = field.value.first().copied();
+        }
+    }
+
+    for field_type in ALL_CONTROL_FIELDS {
+        if field_required(message_type, field_type) && present & field_bit(field_type) == 0 {
+            return Err(CodecError::MissingControlField {
+                message_type: message_type.as_u16(),
+                field_type: field_type.as_u16(),
+            });
+        }
+    }
+
+    if message_type == ControlMessageType::PeerDelta {
+        let has_node = present & field_bit(ControlFieldType::NodeId) != 0;
+        let has_peer = present & field_bit(ControlFieldType::PeerRecord) != 0;
+        match delta_operation {
+            Some(1) if !has_node && has_peer => {}
+            Some(2) if has_node && !has_peer => {}
+            Some(1) => {
+                return Err(CodecError::InvalidControlFieldCombination {
+                    message_type: message_type.as_u16(),
+                    detail: "add/replace requires PEER_RECORD and forbids NODE_ID",
+                });
+            }
+            Some(2) => {
+                return Err(CodecError::InvalidControlFieldCombination {
+                    message_type: message_type.as_u16(),
+                    detail: "remove requires NODE_ID and forbids PEER_RECORD",
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+const ALL_CONTROL_FIELDS: [ControlFieldType; 29] = [
+    ControlFieldType::SupportedVersions,
+    ControlFieldType::SelectedVersion,
+    ControlFieldType::ServerNonce,
+    ControlFieldType::ClientNonce,
+    ControlFieldType::ControllerId,
+    ControlFieldType::ControllerPublicKey,
+    ControlFieldType::ControllerSignature,
+    ControlFieldType::NodeId,
+    ControlFieldType::NodePublicKey,
+    ControlFieldType::NodeSignature,
+    ControlFieldType::EnrollmentToken,
+    ControlFieldType::DisplayName,
+    ControlFieldType::StatusCode,
+    ControlFieldType::StatusMessage,
+    ControlFieldType::ControllerEpoch,
+    ControlFieldType::NetworkId,
+    ControlFieldType::JoinToken,
+    ControlFieldType::MembershipGrant,
+    ControlFieldType::NetworkPolicy,
+    ControlFieldType::SnapshotRevision,
+    ControlFieldType::PeerList,
+    ControlFieldType::PeerRecord,
+    ControlFieldType::DeltaOperation,
+    ControlFieldType::EndpointSet,
+    ControlFieldType::HeartbeatCounter,
+    ControlFieldType::NetworkRevisions,
+    ControlFieldType::ServerTime,
+    ControlFieldType::RetryAfterMs,
+    ControlFieldType::ShutdownDeadline,
+];
+
+const fn field_bit(field_type: ControlFieldType) -> u32 {
+    let index = field_type.as_u16() - ControlFieldType::SupportedVersions.as_u16();
+    1_u32 << index
+}
+
+const fn field_allowed(message_type: ControlMessageType, field_type: ControlFieldType) -> bool {
+    field_required(message_type, field_type)
+        || matches!(
+            (message_type, field_type),
+            (
+                ControlMessageType::NodeAuth,
+                ControlFieldType::EnrollmentToken | ControlFieldType::DisplayName
+            ) | (
+                ControlMessageType::AuthResult
+                    | ControlMessageType::JoinResult
+                    | ControlMessageType::LeaveResult
+                    | ControlMessageType::EndpointResult
+                    | ControlMessageType::Error,
+                ControlFieldType::StatusMessage
+            ) | (ControlMessageType::JoinRequest, ControlFieldType::JoinToken)
+                | (
+                    ControlMessageType::JoinResult,
+                    ControlFieldType::MembershipGrant
+                        | ControlFieldType::NetworkPolicy
+                        | ControlFieldType::SnapshotRevision
+                )
+                | (
+                    ControlMessageType::PeerDelta,
+                    ControlFieldType::NodeId | ControlFieldType::PeerRecord
+                )
+                | (ControlMessageType::Error, ControlFieldType::RetryAfterMs)
+        )
+}
+
+const fn field_required(message_type: ControlMessageType, field_type: ControlFieldType) -> bool {
+    matches!(
+        (message_type, field_type),
+        (
+            ControlMessageType::ServerHello,
+            ControlFieldType::SupportedVersions
+                | ControlFieldType::ServerNonce
+                | ControlFieldType::ControllerId
+                | ControlFieldType::ControllerPublicKey
+                | ControlFieldType::ServerTime
+        ) | (
+            ControlMessageType::ClientHello,
+            ControlFieldType::SelectedVersion
+                | ControlFieldType::ClientNonce
+                | ControlFieldType::NodeId
+                | ControlFieldType::NodePublicKey
+        ) | (
+            ControlMessageType::ServerProof,
+            ControlFieldType::ControllerSignature
+        ) | (
+            ControlMessageType::NodeAuth,
+            ControlFieldType::NodeSignature
+        ) | (
+            ControlMessageType::AuthResult
+                | ControlMessageType::JoinResult
+                | ControlMessageType::LeaveResult
+                | ControlMessageType::EndpointResult
+                | ControlMessageType::Error,
+            ControlFieldType::StatusCode
+        ) | (
+            ControlMessageType::AuthResult | ControlMessageType::HeartbeatAck,
+            ControlFieldType::ServerTime
+        ) | (
+            ControlMessageType::JoinRequest
+                | ControlMessageType::JoinResult
+                | ControlMessageType::LeaveRequest
+                | ControlMessageType::LeaveResult
+                | ControlMessageType::EndpointUpdate
+                | ControlMessageType::EndpointResult
+                | ControlMessageType::PeerSnapshot
+                | ControlMessageType::PeerDelta
+                | ControlMessageType::SnapshotRequest
+                | ControlMessageType::GrantRefresh,
+            ControlFieldType::NetworkId
+        ) | (
+            ControlMessageType::JoinResult
+                | ControlMessageType::LeaveResult
+                | ControlMessageType::EndpointResult
+                | ControlMessageType::PeerSnapshot
+                | ControlMessageType::PeerDelta
+                | ControlMessageType::GrantRefresh,
+            ControlFieldType::ControllerEpoch
+        ) | (
+            ControlMessageType::EndpointUpdate,
+            ControlFieldType::EndpointSet
+        ) | (
+            ControlMessageType::EndpointResult
+                | ControlMessageType::PeerSnapshot
+                | ControlMessageType::PeerDelta
+                | ControlMessageType::SnapshotRequest
+                | ControlMessageType::GrantRefresh,
+            ControlFieldType::SnapshotRevision
+        ) | (
+            ControlMessageType::PeerSnapshot | ControlMessageType::GrantRefresh,
+            ControlFieldType::MembershipGrant | ControlFieldType::NetworkPolicy
+        ) | (ControlMessageType::PeerSnapshot, ControlFieldType::PeerList)
+            | (
+                ControlMessageType::PeerDelta,
+                ControlFieldType::DeltaOperation
+            )
+            | (
+                ControlMessageType::Heartbeat | ControlMessageType::HeartbeatAck,
+                ControlFieldType::HeartbeatCounter | ControlFieldType::NetworkRevisions
+            )
+            | (
+                ControlMessageType::ServerShutdown,
+                ControlFieldType::StatusMessage | ControlFieldType::ShutdownDeadline
+            )
+    )
+}
+
 fn validate_exact_width(
     value: &[u8],
     expected: usize,
@@ -1060,6 +1264,9 @@ mod tests {
 
     const NETWORK_ID: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     const JOIN_TOKEN: [u8; 32] = [0x44; 32];
+    const NODE_ID: [u8; 16] = [0x55; 16];
+    const CONTROLLER_EPOCH: [u8; 8] = 9_u64.to_be_bytes();
+    const SNAPSHOT_REVISION: [u8; 8] = 12_u64.to_be_bytes();
 
     fn join_header() -> ControlHeader {
         ControlHeader {
@@ -1080,6 +1287,33 @@ mod tests {
                 .expect("valid network ID"),
             ControlFieldRef::new(ControlFieldType::JoinToken, &JOIN_TOKEN)
                 .expect("valid join token"),
+        ]
+    }
+
+    fn peer_delta_header(body_length: usize) -> ControlHeader {
+        ControlHeader {
+            version: ProtocolVersion::CURRENT,
+            message_type: ControlMessageType::PeerDelta,
+            flags: 0,
+            header_length: u16::try_from(CONTROL_HEADER_LENGTH)
+                .expect("control header length fits u16"),
+            body_length: u32::try_from(body_length).expect("test body length fits u32"),
+            message_id: 8,
+            correlation_id: 0,
+        }
+    }
+
+    fn peer_delta_fields(operation: &'static [u8]) -> [ControlFieldRef<'static>; 5] {
+        [
+            ControlFieldRef::new(ControlFieldType::NodeId, &NODE_ID).expect("valid node ID"),
+            ControlFieldRef::new(ControlFieldType::ControllerEpoch, &CONTROLLER_EPOCH)
+                .expect("valid controller epoch"),
+            ControlFieldRef::new(ControlFieldType::NetworkId, &NETWORK_ID)
+                .expect("valid network ID"),
+            ControlFieldRef::new(ControlFieldType::SnapshotRevision, &SNAPSHOT_REVISION)
+                .expect("valid snapshot revision"),
+            ControlFieldRef::new(ControlFieldType::DeltaOperation, operation)
+                .expect("valid delta operation"),
         ]
     }
 
@@ -1256,5 +1490,101 @@ mod tests {
 
         let mut body = [0; 56];
         assert_eq!(encode_control_fields(&join_fields(), &mut body), Ok(56));
+    }
+
+    #[test]
+    fn control_message_schema_requires_join_network_id() {
+        let fields = [
+            ControlFieldRef::new(ControlFieldType::JoinToken, &JOIN_TOKEN)
+                .expect("valid join token"),
+        ];
+        let mut header = join_header();
+        header.body_length =
+            u32::try_from(control_fields_encoded_len(&fields).expect("valid field lengths"))
+                .expect("test body length fits u32");
+        let mut encoded = [0; 80];
+
+        assert_eq!(
+            encode_control_message(header, &[], &fields, &mut encoded),
+            Err(CodecError::MissingControlField {
+                message_type: ControlMessageType::JoinRequest.as_u16(),
+                field_type: ControlFieldType::NetworkId.as_u16(),
+            })
+        );
+    }
+
+    #[test]
+    fn control_message_schema_rejects_unexpected_join_status() {
+        let status = 0_u16.to_be_bytes();
+        let fields = [
+            ControlFieldRef::new(ControlFieldType::StatusCode, &status).expect("valid status code"),
+            ControlFieldRef::new(ControlFieldType::NetworkId, &NETWORK_ID)
+                .expect("valid network ID"),
+        ];
+        let mut header = join_header();
+        header.body_length =
+            u32::try_from(control_fields_encoded_len(&fields).expect("valid field lengths"))
+                .expect("test body length fits u32");
+        let mut encoded = [0; 80];
+
+        assert_eq!(
+            encode_control_message(header, &[], &fields, &mut encoded),
+            Err(CodecError::UnexpectedControlField {
+                message_type: ControlMessageType::JoinRequest.as_u16(),
+                field_type: ControlFieldType::StatusCode.as_u16(),
+            })
+        );
+    }
+
+    #[test]
+    fn peer_delta_remove_schema_round_trips() {
+        let fields = peer_delta_fields(&[2]);
+        let body_length = control_fields_encoded_len(&fields).expect("valid field lengths");
+        let header = peer_delta_header(body_length);
+        let mut encoded = [0; 104];
+
+        assert_eq!(
+            encode_control_message(header, &[], &fields, &mut encoded),
+            Ok(encoded.len())
+        );
+        let decoded = ControlMessageView::decode(&encoded).expect("valid peer removal");
+        assert_eq!(decoded.header(), header);
+        assert_eq!(decoded.fields().collect::<Vec<_>>(), fields);
+    }
+
+    #[test]
+    fn peer_delta_schema_rejects_wrong_add_and_remove_payloads() {
+        let add_fields = peer_delta_fields(&[1]);
+        let add_body_length = control_fields_encoded_len(&add_fields).expect("valid field lengths");
+        let mut encoded = [0; 104];
+        assert_eq!(
+            encode_control_message(
+                peer_delta_header(add_body_length),
+                &[],
+                &add_fields,
+                &mut encoded,
+            ),
+            Err(CodecError::InvalidControlFieldCombination {
+                message_type: ControlMessageType::PeerDelta.as_u16(),
+                detail: "add/replace requires PEER_RECORD and forbids NODE_ID",
+            })
+        );
+
+        let remove_all_fields = peer_delta_fields(&[2]);
+        let remove_fields = &remove_all_fields[1..];
+        let remove_body_length =
+            control_fields_encoded_len(remove_fields).expect("valid field lengths");
+        assert_eq!(
+            encode_control_message(
+                peer_delta_header(remove_body_length),
+                &[],
+                remove_fields,
+                &mut encoded,
+            ),
+            Err(CodecError::InvalidControlFieldCombination {
+                message_type: ControlMessageType::PeerDelta.as_u16(),
+                detail: "remove requires NODE_ID and forbids PEER_RECORD",
+            })
+        );
     }
 }
