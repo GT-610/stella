@@ -19,7 +19,8 @@ export default defineConfig({
           text: 'Protocol specification',
           items: [
             { text: 'About the specification', link: '/protocol/' },
-            { text: 'Overview', link: '/protocol/spec/00-overview' }
+            { text: 'Overview', link: '/protocol/spec/00-overview' },
+            { text: 'Wire format', link: '/protocol/spec/01-wire-format' }
           ]
         },
         {
