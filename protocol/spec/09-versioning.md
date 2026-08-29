@@ -58,8 +58,10 @@ The client MUST NOT select:
 If there is no intersection, the client sends no node proof or secret and closes
 with an unsupported-version result when framing permits.
 
-The selected tuple appears in `CLIENT_HELLO`, every later control header, the
-TLS-exporter-bound controller and node proofs, and every peer handshake header.
+The selected tuple appears in `CLIENT_HELLO` and the TLS-exporter-bound
+controller and node proofs. Selected major and minor appear in every later
+control and peer-handshake header. Suite `0x0001` is the only suite defined for
+version 0.1 and is therefore implicit in its peer header and key schedule.
 
 ## 5. Network compatibility
 

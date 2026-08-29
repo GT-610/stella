@@ -46,7 +46,7 @@ plain UDP on a reachable network or an existing overlay such as Tailscale.
 | Transport | Replaceable datagram delivery mechanism beneath the Stella data plane. |
 | Endpoint | Transport-specific address at which a node may receive data-plane packets. |
 | Session | Time-bounded security context between two nodes or between a node and controller. |
-| Epoch | Monotonic controller generation used to reject stale membership and peer state. |
+| Epoch | Monotonic, controller-issued generation scoped to one virtual network and used to reject stale authorization. |
 | Flood frame | A broadcast, multicast, or unknown-unicast frame delivered to more than one peer. |
 
 Normative words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
@@ -122,9 +122,10 @@ The control plane is responsible for:
 - revoking membership and rotating security material;
 - reporting errors without exposing secrets.
 
-The exact secure transport and message encoding remain open Phase 1 decisions.
-They MUST provide mutual authentication, confidentiality, integrity, replay
-resistance, explicit version negotiation, and bounded message sizes.
+Version 0.1 uses TLS 1.3 over TCP with the explicit binary control encoding
+defined by the control-plane specification. It provides mutual Stella identity
+authentication, confidentiality, integrity, replay resistance, explicit
+version negotiation, and bounded message sizes.
 
 ### 6.2 Data plane responsibilities
 
@@ -263,15 +264,17 @@ forbidden.
 Detailed compatibility and downgrade rules are defined in the versioning
 specification.
 
-## 12. Open Phase 1 decisions
+## 12. Version 0.1 decision summary
 
-The following choices are intentionally not fixed by this overview:
+The Phase 1 decisions are recorded in ADRs and detailed by the remaining
+specification documents:
 
-- control-plane carrier and application message format;
-- binary serialization strategy for the Rust implementation;
-- identity key type, key agreement, authenticated-encryption algorithm, and
-  credential lifecycle;
-- exact data-plane header and extension layout;
-- flood fan-out limits and controller policy representation.
+- TLS 1.3 over TCP carries explicitly framed binary control messages;
+- all wire layouts use checked, documented big-endian fields and aligned TLVs;
+- Ed25519, X25519, HKDF-SHA256, and ChaCha20-Poly1305 form the mandatory suite;
+- data headers support authenticated fragmentation and keepalive packets;
+- bounded sender-side replication handles broadcast, multicast, and unknown
+  unicast;
+- canonical network policy and signed grants bind limits and authorization.
 
-Each choice requires a dedicated ADR before implementation.
+Changes to these choices require a new ADR and compatibility analysis.

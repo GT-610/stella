@@ -80,6 +80,7 @@ control_exporter ||
 server_nonce ||
 selected_version_major ||
 selected_version_minor ||
+selected_suite_be[2] ||
 controller_id ||
 controller_public_key
 ```
@@ -98,6 +99,7 @@ server_nonce ||
 client_nonce ||
 selected_version_major ||
 selected_version_minor ||
+selected_suite_be[2] ||
 controller_id ||
 node_id ||
 node_public_key
@@ -405,11 +407,12 @@ fallback would create downgrade and oracle behavior.
 
 ## 14. Downgrade prevention
 
-The TLS exporter proofs include the selected protocol version. Peer signatures
-include complete headers containing the protocol version. Membership grants
-include a policy digest and confidentiality policy. Therefore any change to
-version or encryption policy invalidates a proof, signature, transcript, or
-tag.
+The TLS exporter proofs include the selected protocol version and suite. Peer
+signatures include complete headers containing the protocol version; version
+0.1 has one mandatory suite, and future multi-suite handshakes require an
+explicit signed suite field. Membership grants include a policy digest and
+confidentiality policy. Therefore any change to version, suite, or encryption
+policy invalidates a proof, signature, transcript, or tag.
 
 A node advertises the versions and suite IDs it actually implements, selects
 only their intersection, and rejects a controller or peer that selects an

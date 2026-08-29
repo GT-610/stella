@@ -67,9 +67,10 @@ controller treats this as a new identity that requires enrollment and network
 authorization. An administrator may transfer policy from the old identity, but
 that administrative action is not an automatic protocol operation.
 
-The old identity is revoked before or at the same controller epoch that enables
-the replacement. Existing peer sessions using the old identity become invalid
-when nodes apply that epoch and always expire at their existing grant deadline.
+The old identity is revoked before or at the same affected network epochs that
+enable the replacement. Existing peer sessions using the old identity become
+invalid when nodes apply those epochs and always expire at their existing grant
+deadline.
 
 ## 4. Controller identity
 
@@ -217,9 +218,10 @@ stricter receive limit.
 
 ## 8. Controller epoch
 
-Each controller authority maintains a monotonically increasing unsigned 64-bit
-epoch. Epoch zero is reserved. The controller increments the epoch whenever a
-change must invalidate distributed authorization, including:
+Each virtual network under a controller maintains a monotonically increasing
+unsigned 64-bit epoch. Epoch zero is reserved. The controller increments that
+network's epoch whenever a change must invalidate its distributed
+authorization, including:
 
 - membership addition, removal, suspension, or permission change;
 - network security or forwarding policy change;
@@ -229,12 +231,14 @@ change must invalidate distributed authorization, including:
 Ordinary endpoint changes and heartbeats do not require an epoch change. They
 use peer snapshot revisions instead.
 
-A node applies epochs monotonically and persists the highest accepted value. It
-rejects control or peer state below that value. Receiving a higher authenticated
-epoch invalidates all lower-epoch membership grants, peer handshakes, sessions,
-MAC entries, and incomplete reassembly state for the affected controller.
+A node applies epochs monotonically per `(controller_id, network_id)` and
+persists the highest accepted value. It rejects control or peer state below
+that value. Receiving a higher authenticated epoch invalidates all lower-epoch
+membership grants, peer handshakes, sessions, MAC entries, and incomplete
+reassembly state for the affected network.
 
-Epoch exhaustion is a fatal controller condition. The value MUST NOT wrap.
+Epoch exhaustion is a fatal condition for that network. The value MUST NOT
+wrap.
 
 ## 9. Revocation
 

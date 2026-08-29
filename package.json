@@ -5,8 +5,9 @@
   },
   "scripts": {
     "docs:sync": "bun scripts/sync-protocol-docs.mjs",
-    "docs:dev": "bun run docs:sync && vitepress dev docs",
-    "docs:build": "bun run docs:sync && vitepress build docs",
+    "docs:check": "bun scripts/check-protocol-docs.mjs",
+    "docs:dev": "bun run docs:sync && bun run docs:check && vitepress dev docs",
+    "docs:build": "bun run docs:sync && bun run docs:check && vitepress build docs",
     "docs:preview": "vitepress preview docs"
   }
 }

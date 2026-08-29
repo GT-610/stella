@@ -59,8 +59,8 @@ Each framed message begins with this 32-byte header:
 | Offset | Size | Field | Validation |
 | ---: | ---: | --- | --- |
 | 0 | 4 | `magic` | ASCII `STLC`, bytes `53 54 4c 43` |
-| 4 | 1 | `version_major` | Selected major version |
-| 5 | 1 | `version_minor` | Selected minor version |
+| 4 | 1 | `version_major` | Selected major version, or zero in `SERVER_HELLO` |
+| 5 | 1 | `version_minor` | Selected minor version, or zero in `SERVER_HELLO` |
 | 6 | 2 | `message_type` | Registered control message type |
 | 8 | 2 | `flags` | Type-specific; reserved bits zero |
 | 10 | 2 | `header_length` | Header and header extensions in bytes |
@@ -261,7 +261,7 @@ optional field.
 | `0x0002` | `CLIENT_HELLO` | C to S | selected version, client nonce, node ID, node public key |
 | `0x0003` | `SERVER_PROOF` | S to C | controller signature |
 | `0x0004` | `NODE_AUTH` | C to S | node signature, (enrollment token), (display name) |
-| `0x0005` | `AUTH_RESULT` | S to C | status code, (status message), controller epoch, server time |
+| `0x0005` | `AUTH_RESULT` | S to C | status code, (status message), server time |
 | `0x0010` | `JOIN_REQUEST` | C to S | network ID, (join token) |
 | `0x0011` | `JOIN_RESULT` | S to C | status code, (status message), controller epoch, network ID, (grant), (policy), (revision) |
 | `0x0012` | `LEAVE_REQUEST` | C to S | network ID |
@@ -284,9 +284,11 @@ protocol errors.
 
 ### 9.1 `SERVER_HELLO`
 
-The first application message is `SERVER_HELLO` with message ID 1 and
-correlation zero. It advertises all supported `(major, minor, suite)` entries,
-a fresh server nonce, controller identity, and current server time.
+The first application message is `SERVER_HELLO` with message ID 1, correlation
+zero, and header version bytes both zero. The zero tuple is reserved for this
+immutable negotiation envelope and is not an operational protocol version. The
+message advertises all supported `(major, minor, suite)` entries, a fresh server
+nonce, controller identity, and current server time.
 
 ### 9.2 `CLIENT_HELLO`
 
@@ -294,8 +296,8 @@ The client selects exactly one advertised entry that it supports. It sends a
 fresh client nonce and its existing or newly generated node identity. The
 correlation ID references `SERVER_HELLO`.
 
-For `CLIENT_HELLO` only, header version bytes contain the selected version. All
-later messages on the connection use the same bytes.
+`CLIENT_HELLO` header version bytes contain the selected version. All later
+messages on the connection use the same bytes.
 
 ### 9.3 Proof messages
 
@@ -308,11 +310,11 @@ supplies one enrollment token. A known node MUST NOT send an enrollment token
 unless the controller's administrative policy explicitly requests
 re-enrollment after a rejected authentication.
 
-`AUTH_RESULT` correlates to `NODE_AUTH`. On success, status is zero and the
-controller epoch is the highest current epoch for this authority. On failure,
-the controller sends a generic status and closes TLS after a small randomized
-delay. It does not distinguish unknown key, bad token, disabled node, or bad
-signature to an unauthenticated peer.
+`AUTH_RESULT` correlates to `NODE_AUTH`. On success, status is zero. Network
+epochs are sent only in network-scoped results and state. On authentication
+failure, the controller sends a generic status and closes TLS after a small
+randomized delay. It does not distinguish unknown key, bad token, disabled
+node, or bad signature to an unauthenticated peer.
 
 ## 10. Join and leave
 
@@ -422,6 +424,42 @@ Status zero means success. Registered non-zero status classes are:
 | 300-399 | resource or rate limit |
 | 400-499 | transient controller failure |
 | 500-599 | client state or revision error |
+
+Version 0.1 assigns:
+
+| Value | Name | Use |
+| ---: | --- | --- |
+| 0 | `OK` | Request completed successfully |
+| 1 | `MALFORMED_MESSAGE` | Structurally invalid authenticated message |
+| 2 | `UNSUPPORTED_VERSION` | No acceptable version or suite |
+| 3 | `UNSUPPORTED_CRITICAL_FIELD` | Unknown required field or extension |
+| 4 | `INVALID_STATE` | Message is not valid in the current state |
+| 5 | `REQUEST_TIMEOUT` | Correlated request did not finish in time |
+| 100 | `AUTHENTICATION_FAILED` | Generic pre-authentication failure |
+| 101 | `ENROLLMENT_REQUIRED` | Valid node proof but enrollment is required |
+| 102 | `ENROLLMENT_DENIED` | Enrollment policy rejected the request |
+| 103 | `NODE_DISABLED` | Authenticated node is administratively disabled |
+| 110 | `NOT_AUTHORIZED` | Node lacks permission for the operation |
+| 111 | `JOIN_TOKEN_INVALID` | Join credential is invalid, expired, or consumed |
+| 112 | `MEMBERSHIP_SUSPENDED` | Membership exists but is suspended |
+| 200 | `NETWORK_NOT_FOUND` | Network ID is unknown or deleted |
+| 201 | `MEMBERSHIP_CONFLICT` | Requested membership conflicts with current state |
+| 202 | `STALE_EPOCH` | Request or state refers to an older network epoch |
+| 203 | `STALE_REVISION` | Snapshot revision is not current or contiguous |
+| 204 | `POLICY_MISMATCH` | Grant and canonical policy do not agree |
+| 205 | `NETWORK_FULL` | Flood-member policy prevents another membership |
+| 300 | `RATE_LIMITED` | Authenticated request exceeded a rate limit |
+| 301 | `RESOURCE_LIMIT` | Bounded controller or client resource is exhausted |
+| 302 | `TOO_MANY_ENDPOINTS` | Endpoint count exceeds the protocol limit |
+| 303 | `DATAGRAM_SIZE_INVALID` | Endpoint datagram size is outside allowed bounds |
+| 400 | `TEMPORARILY_UNAVAILABLE` | Retryable controller failure |
+| 401 | `PERSISTENCE_FAILURE` | Controller could not commit authoritative state |
+| 500 | `SNAPSHOT_REQUIRED` | Client must request or accept a complete snapshot |
+| 501 | `UNSUPPORTED_POLICY` | Client cannot enforce the signed network policy |
+
+Unassigned values in a class are reserved. Receivers display an unknown code
+as its class plus numeric value and follow the message's fatal or retry rules;
+they do not guess a more specific meaning.
 
 A direct request failure uses its normal result message when possible. `ERROR`
 is used for a connection-level problem or a message type without a result. A
