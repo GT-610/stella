@@ -128,10 +128,10 @@ sequenceDiagram
     R->>I: SESSION_CONFIRM role=responder (key confirmation tag)
 ```
 
-The initiator is the node with the lexicographically smaller node ID. This
-deterministic rule prevents both nodes from continuously initiating. A node MAY
-respond to a valid initiation even when it believed it was the initiator, but
-the smaller-ID initiation wins when simultaneous handshakes are detected.
+The preferred initiator is the node with the lexicographically smaller node ID.
+The other node may initiate after the discovery fallback delay when no valid
+exchange is in progress. A node responds to any valid initiation, but the
+smaller-ID initiation wins when simultaneous handshakes are detected.
 
 The exchange provides mutual long-term authentication, ephemeral key agreement,
 membership and policy binding, forward secrecy, key confirmation, and replay

@@ -23,6 +23,8 @@ export default defineConfig({
             { text: 'Wire format', link: '/protocol/spec/01-wire-format' },
             { text: 'Control plane', link: '/protocol/spec/02-control-plane' },
             { text: 'Identity', link: '/protocol/spec/03-identity' },
+            { text: 'Network model', link: '/protocol/spec/04-network-model' },
+            { text: 'Discovery', link: '/protocol/spec/05-discovery' },
             { text: 'Security', link: '/protocol/spec/08-security' }
           ]
         },
