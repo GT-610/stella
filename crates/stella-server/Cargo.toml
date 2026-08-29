@@ -1,0 +1,17 @@
+[package]
+name = "stella-server"
+description = "Self-hosted Stella control-plane server"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+stella-common = { path = "../stella-common" }
+stella-crypto = { path = "../stella-crypto" }
+stella-proto = { path = "../stella-proto" }
+stella-transport = { path = "../stella-transport" }
+
+[lints]
+workspace = true

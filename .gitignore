@@ -1,5 +1,6 @@
 .vscode/
 node_modules
+target
 
 # Docs
 docs/.vitepress/dist

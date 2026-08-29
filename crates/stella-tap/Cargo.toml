@@ -1,0 +1,11 @@
+[package]
+name = "stella-tap"
+description = "Safe cross-platform TAP device abstraction for Stella"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true

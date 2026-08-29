@@ -1,0 +1,14 @@
+[package]
+name = "stella-crypto"
+description = "Identity and packet protection for Stella"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+stella-common = { path = "../stella-common" }
+
+[lints]
+workspace = true

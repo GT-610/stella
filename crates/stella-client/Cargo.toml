@@ -1,0 +1,18 @@
+[package]
+name = "stella-client"
+description = "Stella Layer-2 virtual LAN client"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+stella-common = { path = "../stella-common" }
+stella-crypto = { path = "../stella-crypto" }
+stella-proto = { path = "../stella-proto" }
+stella-tap = { path = "../stella-tap" }
+stella-transport = { path = "../stella-transport" }
+
+[lints]
+workspace = true
