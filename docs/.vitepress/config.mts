@@ -66,7 +66,8 @@ export default defineConfig({
           items: [
             { text: 'Overview', link: '/development/' },
             { text: 'Architecture', link: '/development/architecture' },
-            { text: 'Protocol codec', link: '/development/protocol-codec' }
+            { text: 'Protocol codec', link: '/development/protocol-codec' },
+            { text: 'Cryptography', link: '/development/cryptography' }
           ]
         }
       ]
