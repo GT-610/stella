@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{
     AuthorityRevision, AuthorityStore, BearerToken, EndpointLeaseRecord, MembershipRecord,
-    MembershipStatus, NetworkRecord, NodeRecord, StoreError,
+    MembershipStatus, NetworkRecord, NetworkSessionView, NodeRecord, StoreError,
 };
 
 type StoreReply<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -331,6 +331,25 @@ impl AuthorityHandle {
             .await
     }
 
+    /// Returns one coherent active-session authority view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, missing or inactive local
+    /// authorization, or corrupt persisted relationships.
+    pub async fn network_session_view(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+    ) -> Result<NetworkSessionView, AuthorityError> {
+        self.request(|reply| Command::NetworkSessionView {
+            node_id,
+            network_id,
+            reply,
+        })
+        .await
+    }
+
     /// Publishes one member's complete endpoint set and refreshes its lease.
     ///
     /// # Errors
@@ -632,6 +651,11 @@ enum Command {
         network_id: NetworkId,
         reply: StoreReply<Vec<MembershipRecord>>,
     },
+    NetworkSessionView {
+        node_id: NodeId,
+        network_id: NetworkId,
+        reply: StoreReply<NetworkSessionView>,
+    },
     Endpoint(EndpointCommand),
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -753,6 +777,13 @@ impl Command {
             } => respond(reply, store.get_membership(node_id, network_id)),
             Self::ListMemberships { network_id, reply } => {
                 respond(reply, store.list_memberships(network_id));
+            }
+            Self::NetworkSessionView {
+                node_id,
+                network_id,
+                reply,
+            } => {
+                respond(reply, store.network_session_view(node_id, network_id));
             }
             Self::Endpoint(command) => command.execute(store),
             Self::Shutdown { reply } => {
@@ -1003,6 +1034,17 @@ mod tests {
             .expect("online record exists");
         assert_eq!(stored.updated_at(), 140);
         assert_eq!(stored.endpoints(), &[endpoint]);
+        let view = authority
+            .network_session_view(node_id, network_id)
+            .await
+            .expect("read coherent session view");
+        assert_eq!(view.local_node().node_id(), node_id);
+        assert_eq!(view.local_membership().node_id(), node_id);
+        assert_eq!(
+            view.network().snapshot_revision(),
+            published.snapshot_revision
+        );
+        assert!(view.peers().is_empty());
         assert_eq!(
             authority
                 .list_endpoints(network_id)

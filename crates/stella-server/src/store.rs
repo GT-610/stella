@@ -989,6 +989,58 @@ impl AuthorityStore {
         Ok(records)
     }
 
+    /// Reads one coherent active-session view in a single redb transaction.
+    ///
+    /// The view contains the authenticated local node and membership plus each
+    /// other active member that currently has a persisted online lease. An
+    /// empty endpoint set remains an online peer, while an absent lease is
+    /// omitted. Peers are returned in node-ID order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the network, local node, or local membership
+    /// is missing or inactive, or when any persisted relationship is corrupt.
+    pub fn network_session_view(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+    ) -> Result<NetworkSessionView, StoreError> {
+        let read = self.database.begin_read()?;
+        let network = load_network_for_read(&read, network_id)?;
+        let local_node = load_node_for_read(&read, node_id)?;
+        require_enabled_node(&local_node)?;
+        let local_membership = load_membership_for_read(&read, node_id, network_id)?;
+        require_active_membership(&local_membership)?;
+
+        let endpoint_table = read.open_table(ENDPOINTS)?;
+        let mut peers = Vec::new();
+        for entry in endpoint_table.iter()? {
+            let (key, value) = entry?;
+            let key = decode_identifier::<32>(key.value(), "endpoints", "endpoint key")?;
+            let endpoint_lease = EndpointLeaseRecord::decode(value.value())?;
+            validate_endpoint_key(&endpoint_lease, &key)?;
+            if endpoint_lease.network_id != network_id || endpoint_lease.node_id == node_id {
+                continue;
+            }
+            let peer_node = load_node_for_read(&read, endpoint_lease.node_id)?;
+            require_enabled_node(&peer_node)?;
+            let membership = load_membership_for_read(&read, endpoint_lease.node_id, network_id)?;
+            require_active_membership(&membership)?;
+            peers.push(OnlinePeerAuthorityRecord {
+                node: peer_node,
+                membership,
+                endpoint_lease,
+            });
+        }
+        peers.sort_by_key(|peer| peer.node.node_id());
+        Ok(NetworkSessionView {
+            local_node,
+            network,
+            local_membership,
+            peers,
+        })
+    }
+
     /// Removes expired online leases in one transaction.
     ///
     /// Every affected network advances its snapshot revision exactly once,
@@ -1812,6 +1864,69 @@ impl EndpointLeaseRecord {
     }
 }
 
+/// Coherent authority records used to serve one joined control session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkSessionView {
+    local_node: NodeRecord,
+    network: NetworkRecord,
+    local_membership: MembershipRecord,
+    peers: Vec<OnlinePeerAuthorityRecord>,
+}
+
+impl NetworkSessionView {
+    /// Returns the authenticated local node record.
+    #[must_use]
+    pub const fn local_node(&self) -> &NodeRecord {
+        &self.local_node
+    }
+
+    /// Returns the virtual network and its coherent authority counters.
+    #[must_use]
+    pub const fn network(&self) -> &NetworkRecord {
+        &self.network
+    }
+
+    /// Returns the local active membership used to issue its grant.
+    #[must_use]
+    pub const fn local_membership(&self) -> &MembershipRecord {
+        &self.local_membership
+    }
+
+    /// Returns online peers in strict node-ID order, excluding the local node.
+    #[must_use]
+    pub fn peers(&self) -> &[OnlinePeerAuthorityRecord] {
+        &self.peers
+    }
+}
+
+/// One online peer's coherent identity, authorization, and endpoint lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnlinePeerAuthorityRecord {
+    node: NodeRecord,
+    membership: MembershipRecord,
+    endpoint_lease: EndpointLeaseRecord,
+}
+
+impl OnlinePeerAuthorityRecord {
+    /// Returns the enabled peer node identity record.
+    #[must_use]
+    pub const fn node(&self) -> &NodeRecord {
+        &self.node
+    }
+
+    /// Returns the peer's active membership record.
+    #[must_use]
+    pub const fn membership(&self) -> &MembershipRecord {
+        &self.membership
+    }
+
+    /// Returns the peer's persisted online lease and endpoint set.
+    #[must_use]
+    pub const fn endpoint_lease(&self) -> &EndpointLeaseRecord {
+        &self.endpoint_lease
+    }
+}
+
 /// Network counters committed by one authority mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthorityRevision {
@@ -2283,6 +2398,73 @@ fn require_active_member_for_write(
         return Err(StoreError::MembershipSuspended {
             network_id,
             node_id,
+        });
+    }
+    Ok(())
+}
+
+fn load_network_for_read(
+    read: &redb::ReadTransaction,
+    network_id: NetworkId,
+) -> Result<NetworkRecord, StoreError> {
+    let networks = read.open_table(NETWORKS)?;
+    let Some(value) = networks.get(network_id.as_bytes().as_slice())? else {
+        return Err(StoreError::NetworkNotFound { network_id });
+    };
+    let record = NetworkRecord::decode(value.value())?;
+    if record.network_id() != network_id {
+        return Err(StoreError::RecordKeyMismatch { table: "networks" });
+    }
+    Ok(record)
+}
+
+fn load_node_for_read(
+    read: &redb::ReadTransaction,
+    node_id: NodeId,
+) -> Result<NodeRecord, StoreError> {
+    let nodes = read.open_table(NODES)?;
+    let Some(value) = nodes.get(node_id.as_bytes().as_slice())? else {
+        return Err(StoreError::NodeNotFound { node_id });
+    };
+    let record = NodeRecord::decode(value.value())?;
+    if record.node_id() != node_id {
+        return Err(StoreError::RecordKeyMismatch { table: "nodes" });
+    }
+    Ok(record)
+}
+
+fn load_membership_for_read(
+    read: &redb::ReadTransaction,
+    node_id: NodeId,
+    network_id: NetworkId,
+) -> Result<MembershipRecord, StoreError> {
+    let key = membership_key(network_id, node_id);
+    let memberships = read.open_table(MEMBERSHIPS)?;
+    let Some(value) = memberships.get(key.as_slice())? else {
+        return Err(StoreError::MembershipNotFound {
+            network_id,
+            node_id,
+        });
+    };
+    let record = MembershipRecord::decode(value.value())?;
+    validate_membership_key(&record, &key)?;
+    Ok(record)
+}
+
+fn require_enabled_node(node: &NodeRecord) -> Result<(), StoreError> {
+    if !node.enabled() {
+        return Err(StoreError::NodeDisabled {
+            node_id: node.node_id(),
+        });
+    }
+    Ok(())
+}
+
+fn require_active_membership(membership: &MembershipRecord) -> Result<(), StoreError> {
+    if membership.status() != MembershipStatus::Active {
+        return Err(StoreError::MembershipSuspended {
+            network_id: membership.network_id(),
+            node_id: membership.node_id(),
         });
     }
     Ok(())
@@ -2999,6 +3181,72 @@ mod tests {
             );
         }
         store.verify().expect("node revocation state is valid");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn network_session_view_keeps_online_peers_and_authority_state_coherent() {
+        let (directory, store, first_id, second_id, network_id) = endpoint_test_store();
+        store
+            .add_member(first_id, network_id, 110)
+            .expect("add local member");
+        store
+            .add_member(second_id, network_id, 110)
+            .expect("add peer member");
+
+        let offline = store
+            .network_session_view(first_id, network_id)
+            .expect("read offline peer view");
+        assert_eq!(offline.local_node().node_id(), first_id);
+        assert_eq!(offline.local_membership().node_id(), first_id);
+        assert_eq!(offline.network().network_id(), network_id);
+        assert!(offline.peers().is_empty());
+
+        store
+            .publish_endpoints(second_id, network_id, &[], 120)
+            .expect("publish online empty endpoint set");
+        store
+            .publish_endpoints(first_id, network_id, &[endpoint(1, 4242)], 120)
+            .expect("publish local endpoint set");
+        let online = store
+            .network_session_view(first_id, network_id)
+            .expect("read online peer view");
+        assert_eq!(online.peers().len(), 1);
+        let peer = &online.peers()[0];
+        assert_eq!(peer.node().node_id(), second_id);
+        assert_eq!(peer.membership().node_id(), second_id);
+        assert_eq!(peer.endpoint_lease().node_id(), second_id);
+        assert!(peer.endpoint_lease().endpoints().is_empty());
+        assert_eq!(
+            online.network().snapshot_revision(),
+            store
+                .get_network(network_id)
+                .expect("read network")
+                .expect("network exists")
+                .snapshot_revision()
+        );
+
+        store
+            .set_membership_status(second_id, network_id, MembershipStatus::Suspended)
+            .expect("suspend peer");
+        assert!(store
+            .network_session_view(first_id, network_id)
+            .expect("read suspended peer view")
+            .peers()
+            .is_empty());
+        assert!(matches!(
+            store.network_session_view(second_id, network_id),
+            Err(StoreError::MembershipSuspended { .. })
+        ));
+        store
+            .set_node_enabled(first_id, false)
+            .expect("disable local node");
+        assert!(matches!(
+            store.network_session_view(first_id, network_id),
+            Err(StoreError::NodeDisabled { .. })
+        ));
+        store.verify().expect("session-view state remains valid");
         drop(store);
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
