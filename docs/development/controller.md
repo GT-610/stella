@@ -67,6 +67,13 @@ writes an example configuration without overwriting existing files. `run`
 loads the configured identities, verifies that stored controller IDs agree,
 and refuses unsupported schema or configuration versions.
 
+Initialization is an explicit transaction rather than a startup side effect.
+The generated Ed25519 TLS certificate contains loopback subject names plus any
+operator-supplied DNS names or IP addresses. The CLI prints a `sha256/` SPKI pin
+for trusted out-of-band enrollment, while both private keys receive the exact
+protected Windows DACL. Failure rolls back only files and empty directories
+created by that invocation; an existing target always stops initialization.
+
 The server enables only TLS 1.3 through `tokio-rustls` and the `ring` provider.
 TLS 1.2, early data, renegotiation, plaintext fallback, and disabled certificate
 validation are not supported. Application authentication must finish within

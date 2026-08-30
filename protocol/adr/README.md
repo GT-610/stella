@@ -25,3 +25,4 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0013: Share control-channel mechanics in a dedicated crate](./0013-shared-control-channel-crate.md)
 - [0014: Store controller authority state in redb](./0014-redb-controller-state.md)
 - [0015: Protect controller identity files with native ACLs](./0015-protect-controller-identity-files.md)
+- [0016: Initialize controller TLS identity explicitly](./0016-initialize-controller-tls-identity.md)
