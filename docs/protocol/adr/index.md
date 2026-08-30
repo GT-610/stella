@@ -30,3 +30,4 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0016: Initialize controller TLS identity explicitly](./0016-initialize-controller-tls-identity.md)
 - [0017: Persist peer leases with endpoint sets](./0017-persist-peer-leases-with-endpoints.md)
 - [0018: Bound controller runtime admission and shutdown](./0018-bound-controller-runtime.md)
+- [0019: Authenticate control sessions before authority use](./0019-authenticate-control-sessions-before-authority-use.md)
