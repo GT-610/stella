@@ -4,11 +4,12 @@ use std::{io, num::NonZeroUsize, path::PathBuf, thread};
 
 use stella_common::{NetworkId, NodeId};
 use stella_crypto::IdentityPublicKey;
+use stella_proto::Endpoint;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{
-    AuthorityRevision, AuthorityStore, BearerToken, MembershipRecord, MembershipStatus,
-    NetworkRecord, NodeRecord, StoreError,
+    AuthorityRevision, AuthorityStore, BearerToken, EndpointLeaseRecord, MembershipRecord,
+    MembershipStatus, NetworkRecord, NodeRecord, StoreError,
 };
 
 type StoreReply<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -330,6 +331,100 @@ impl AuthorityHandle {
             .await
     }
 
+    /// Publishes one member's complete endpoint set and refreshes its lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, authorization, endpoint,
+    /// counter, or store failure.
+    pub async fn publish_endpoints(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+        endpoints: Vec<Endpoint>,
+        now: u64,
+    ) -> Result<AuthorityRevision, AuthorityError> {
+        self.request(|reply| {
+            Command::Endpoint(EndpointCommand::Publish {
+                node_id,
+                network_id,
+                endpoints,
+                now,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Refreshes an existing online peer lease without changing endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, authorization, offline, or
+    /// store failure.
+    pub async fn refresh_endpoint_lease(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+        now: u64,
+    ) -> Result<AuthorityRevision, AuthorityError> {
+        self.request(|reply| {
+            Command::Endpoint(EndpointCommand::Refresh {
+                node_id,
+                network_id,
+                now,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Returns one online peer lease and complete endpoint set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, or store failure.
+    pub async fn get_endpoints(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+    ) -> Result<Option<EndpointLeaseRecord>, AuthorityError> {
+        self.request(|reply| {
+            Command::Endpoint(EndpointCommand::Get {
+                node_id,
+                network_id,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Lists every online peer lease in one network in node-ID order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, or store failure.
+    pub async fn list_endpoints(
+        &self,
+        network_id: NetworkId,
+    ) -> Result<Vec<EndpointLeaseRecord>, AuthorityError> {
+        self.request(|reply| Command::Endpoint(EndpointCommand::List { network_id, reply }))
+            .await
+    }
+
+    /// Removes expired peer leases and returns affected network revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, counter, or store failure.
+    pub async fn expire_endpoints(
+        &self,
+        now: u64,
+    ) -> Result<Vec<AuthorityRevision>, AuthorityError> {
+        self.request(|reply| Command::Endpoint(EndpointCommand::Expire { now, reply }))
+            .await
+    }
+
     async fn request<T>(
         &self,
         build: impl FnOnce(StoreReply<T>) -> Command,
@@ -537,8 +632,38 @@ enum Command {
         network_id: NetworkId,
         reply: StoreReply<Vec<MembershipRecord>>,
     },
+    Endpoint(EndpointCommand),
     Shutdown {
         reply: oneshot::Sender<()>,
+    },
+}
+
+enum EndpointCommand {
+    Publish {
+        node_id: NodeId,
+        network_id: NetworkId,
+        endpoints: Vec<Endpoint>,
+        now: u64,
+        reply: StoreReply<AuthorityRevision>,
+    },
+    Refresh {
+        node_id: NodeId,
+        network_id: NetworkId,
+        now: u64,
+        reply: StoreReply<AuthorityRevision>,
+    },
+    Get {
+        node_id: NodeId,
+        network_id: NetworkId,
+        reply: StoreReply<Option<EndpointLeaseRecord>>,
+    },
+    List {
+        network_id: NetworkId,
+        reply: StoreReply<Vec<EndpointLeaseRecord>>,
+    },
+    Expire {
+        now: u64,
+        reply: StoreReply<Vec<AuthorityRevision>>,
     },
 }
 
@@ -629,12 +754,48 @@ impl Command {
             Self::ListMemberships { network_id, reply } => {
                 respond(reply, store.list_memberships(network_id));
             }
+            Self::Endpoint(command) => command.execute(store),
             Self::Shutdown { reply } => {
                 let _reply_result = reply.send(());
                 return false;
             }
         }
         true
+    }
+}
+
+impl EndpointCommand {
+    fn execute(self, store: &AuthorityStore) {
+        match self {
+            Self::Publish {
+                node_id,
+                network_id,
+                endpoints,
+                now,
+                reply,
+            } => respond(
+                reply,
+                store.publish_endpoints(node_id, network_id, &endpoints, now),
+            ),
+            Self::Refresh {
+                node_id,
+                network_id,
+                now,
+                reply,
+            } => respond(
+                reply,
+                store.refresh_endpoint_lease(node_id, network_id, now),
+            ),
+            Self::Get {
+                node_id,
+                network_id,
+                reply,
+            } => respond(reply, store.get_endpoints(node_id, network_id)),
+            Self::List { network_id, reply } => {
+                respond(reply, store.list_endpoints(network_id));
+            }
+            Self::Expire { now, reply } => respond(reply, store.expire_endpoints(now)),
+        }
     }
 }
 
@@ -654,6 +815,7 @@ fn respond<T>(reply: StoreReply<T>, result: Result<T, StoreError>) {
 #[cfg(test)]
 mod tests {
     use std::{
+        net::Ipv4Addr,
         num::NonZeroUsize,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -661,7 +823,7 @@ mod tests {
 
     use stella_common::{ControllerId, NetworkId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
+    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
 
     use super::{AuthorityError, AuthorityThread};
     use crate::store::{AuthorityStore, MembershipStatus, NetworkRecord, NodeRecord};
@@ -783,6 +945,84 @@ mod tests {
             authority.get_node(node.node_id()).await.expect("get node"),
             Some(node)
         );
+        worker.shutdown().await.expect("shutdown worker");
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn endpoint_commands_preserve_publish_refresh_and_expiry_order() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([36; 16]))
+            .expect("initialize store");
+        let worker = AuthorityThread::spawn(
+            store,
+            NonZeroUsize::new(2).expect("non-zero queue capacity"),
+        )
+        .expect("spawn authority thread");
+        let authority = worker.handle();
+        let node = NodeRecord::new(signing_key(37).public_key(), "Endpoint node", 100)
+            .expect("valid node");
+        let node_id = node.node_id();
+        authority.create_node(node).await.expect("create node");
+        let network_id = NetworkId::from_bytes([38; 16]);
+        authority
+            .create_network(
+                NetworkRecord::new(policy(network_id), "Endpoint LAN", 100).expect("valid network"),
+            )
+            .await
+            .expect("create network");
+        authority
+            .add_member(node_id, network_id, 110)
+            .await
+            .expect("add member");
+        let endpoint = Endpoint::UdpIpv4 {
+            priority: 0,
+            port: 4242,
+            max_datagram_size: 1_200,
+            address: Ipv4Addr::new(192, 0, 2, 38),
+        };
+        let published = authority
+            .publish_endpoints(node_id, network_id, vec![endpoint], 120)
+            .await
+            .expect("publish endpoint");
+        assert_eq!(published.controller_epoch, 2);
+        assert_eq!(published.snapshot_revision, 3);
+        assert_eq!(
+            authority
+                .refresh_endpoint_lease(node_id, network_id, 140)
+                .await
+                .expect("refresh endpoint lease"),
+            published
+        );
+        let stored = authority
+            .get_endpoints(node_id, network_id)
+            .await
+            .expect("get endpoints")
+            .expect("online record exists");
+        assert_eq!(stored.updated_at(), 140);
+        assert_eq!(stored.endpoints(), &[endpoint]);
+        assert_eq!(
+            authority
+                .list_endpoints(network_id)
+                .await
+                .expect("list endpoints"),
+            vec![stored]
+        );
+        assert!(authority
+            .expire_endpoints(169)
+            .await
+            .expect("retain lease")
+            .is_empty());
+        let expired = authority.expire_endpoints(170).await.expect("expire lease");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].snapshot_revision, 4);
+        assert!(authority
+            .list_endpoints(network_id)
+            .await
+            .expect("list expired endpoints")
+            .is_empty());
         worker.shutdown().await.expect("shutdown worker");
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
