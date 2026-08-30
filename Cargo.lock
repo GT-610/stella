@@ -610,6 +610,7 @@ dependencies = [
  "stella-proto",
  "stella-transport",
  "thiserror",
+ "tokio",
  "toml",
  "zeroize",
 ]

@@ -21,6 +21,22 @@ a bounded channel and await a oneshot reply. Slow clients have bounded outbound
 queues; replaceable state is coalesced into a fresh snapshot, and persistently
 slow connections are closed.
 
+The authority queue capacity is a validated non-zero configuration value.
+Every request owns all of its inputs, including a temporary zeroizing copy of
+any bearer token, before it enters the queue. The authority thread processes
+commands strictly in receive order with `blocking_recv`; it completes the redb
+operation synchronously and sends the typed result before taking the next
+command. Dropping a request future may discard its reply but never cancels a
+mutation that has already entered the queue.
+
+Shutdown is itself an ordered command. Once it reaches the head of the queue,
+all earlier requests have completed and the receiver is closed. Senders still
+waiting to enter observe a closed-queue error; any command already admitted
+behind shutdown is discarded and observes a lost reply. The process then joins
+the authority thread. A thread panic, closed request queue, and lost reply are
+distinct application errors and are never confused with a persistence error
+returned by redb.
+
 ## Configuration and identity
 
 Configuration is strict UTF-8 TOML with `version = 1` and unknown fields denied.

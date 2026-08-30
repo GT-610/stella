@@ -1121,6 +1121,10 @@ impl BearerToken {
     pub const fn expose_secret(&self) -> &[u8; TOKEN_LENGTH] {
         &self.0
     }
+
+    pub(crate) const fn duplicate(&self) -> Self {
+        Self(self.0)
+    }
 }
 
 impl std::fmt::Debug for BearerToken {
