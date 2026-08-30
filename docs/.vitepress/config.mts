@@ -52,7 +52,8 @@ export default defineConfig({
             { text: '0013: Control channel', link: '/protocol/adr/0013-shared-control-channel-crate' },
             { text: '0014: Controller state', link: '/protocol/adr/0014-redb-controller-state' },
             { text: '0015: Identity files', link: '/protocol/adr/0015-protect-controller-identity-files' },
-            { text: '0016: TLS initialization', link: '/protocol/adr/0016-initialize-controller-tls-identity' }
+            { text: '0016: TLS initialization', link: '/protocol/adr/0016-initialize-controller-tls-identity' },
+            { text: '0017: Peer leases', link: '/protocol/adr/0017-persist-peer-leases-with-endpoints' }
           ]
         }
       ],

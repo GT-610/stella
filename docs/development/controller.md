@@ -128,6 +128,22 @@ decodes and verifies the completed 240-byte object before returning it to a
 session. Disabled, suspended, mismatched, stale, or overflowing inputs fail
 without producing a grant.
 
+An endpoint-table row represents one online peer lease, including when its
+canonical endpoint set is empty. Creating or changing that visible peer record
+advances only the network snapshot revision; publishing the same set or
+refreshing it from a heartbeat updates the controller-observed activity time
+without revision churn. The timestamp never moves backwards. Expiry uses the
+network's signed `peer_lease_seconds`, removes all expired rows in one
+transaction, and advances each affected network once. Leave, suspension, and
+node disablement remove related rows inside their existing authority
+transactions.
+
+Endpoint values repeat the network and node IDs stored in their composite key.
+Startup verification also requires an existing enabled node, an existing
+network, an active membership, and a canonical zero-to-eight-entry endpoint
+set. Empty sets remain stored because they mean online but currently
+unavailable for direct UDP sessions; a missing row means offline.
+
 Network deletion is idempotent and removes the network record, every
 membership and endpoint keyed to it, and every unconsumed join-token digest
 scoped to it in one write transaction. A deleted network ID may later be
