@@ -130,14 +130,18 @@ authority command remains unsupported.
 
 ## Administrative CLI
 
-The `stella-server` executable provides:
+The current `stella-server` executable provides offline authority management:
 
-- `init` and `run`;
 - network create, list, show, and delete;
 - enrollment-token and join-token generation;
 - node list, enable, and disable;
 - member add, remove, suspend, and resume;
 - coordinated state backup and offline verification.
+
+The full `init` and `run` lifecycle commands are the next server milestone and
+are not advertised as available until their TLS startup path is complete. See
+the [server administration CLI reference](/api/server-cli) for exact syntax,
+defaults, output contracts, and secret-handling guidance.
 
 Mutating commands open the same authority abstraction as the daemon, validate
 all input before starting a write transaction, and print identifiers rather

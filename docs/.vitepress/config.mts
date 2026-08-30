@@ -78,6 +78,14 @@ export default defineConfig({
             { text: 'Controller', link: '/development/controller' }
           ]
         }
+      ],
+      '/api/': [
+        {
+          text: 'Command-line reference',
+          items: [
+            { text: 'Server administration', link: '/api/server-cli' }
+          ]
+        }
       ]
     },
 
