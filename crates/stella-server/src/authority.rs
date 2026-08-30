@@ -1,6 +1,6 @@
 //! Bounded asynchronous access to the blocking controller authority store.
 
-use std::{io, num::NonZeroUsize, thread};
+use std::{io, num::NonZeroUsize, path::PathBuf, thread};
 
 use stella_common::{NetworkId, NodeId};
 use stella_crypto::IdentityPublicKey;
@@ -119,6 +119,32 @@ impl AuthorityHandle {
     /// Returns [`AuthorityError`] for queue, reply, or store failure.
     pub async fn list_networks(&self) -> Result<Vec<NetworkRecord>, AuthorityError> {
         self.request(|reply| Command::ListNetworks { reply }).await
+    }
+
+    /// Deletes a network and all of its scoped authority state atomically.
+    ///
+    /// Returns `true` when the network existed and `false` when it was already
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, or store failure.
+    pub async fn delete_network(&self, network_id: NetworkId) -> Result<bool, AuthorityError> {
+        self.request(|reply| Command::DeleteNetwork { network_id, reply })
+            .await
+    }
+
+    /// Creates and verifies one coordinated create-new database backup.
+    ///
+    /// Returns the number of copied bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, source verification,
+    /// destination I/O, cleanup, or copied-state verification failure.
+    pub async fn backup_state(&self, destination: PathBuf) -> Result<u64, AuthorityError> {
+        self.request(|reply| Command::BackupState { destination, reply })
+            .await
     }
 
     /// Issues one single-use enrollment token.
@@ -452,6 +478,14 @@ enum Command {
     ListNetworks {
         reply: StoreReply<Vec<NetworkRecord>>,
     },
+    DeleteNetwork {
+        network_id: NetworkId,
+        reply: StoreReply<bool>,
+    },
+    BackupState {
+        destination: PathBuf,
+        reply: StoreReply<u64>,
+    },
     IssueEnrollmentToken {
         created_at: u64,
         expires_at: u64,
@@ -527,6 +561,12 @@ impl Command {
                 respond(reply, store.get_network(network_id));
             }
             Self::ListNetworks { reply } => respond(reply, store.list_networks()),
+            Self::DeleteNetwork { network_id, reply } => {
+                respond(reply, store.delete_network(network_id));
+            }
+            Self::BackupState { destination, reply } => {
+                respond(reply, store.backup(&destination));
+            }
             Self::IssueEnrollmentToken {
                 created_at,
                 expires_at,
@@ -744,6 +784,54 @@ mod tests {
             Some(node)
         );
         worker.shutdown().await.expect("shutdown worker");
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backup_and_network_delete_commands_are_serialized() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let backup_path = directory.join("controller.backup.redb");
+        let controller_id = ControllerId::from_bytes([36; 16]);
+        let store = AuthorityStore::initialize(&path, controller_id).expect("initialize store");
+        let worker = AuthorityThread::spawn(
+            store,
+            NonZeroUsize::new(2).expect("non-zero queue capacity"),
+        )
+        .expect("spawn authority thread");
+        let authority = worker.handle();
+        let network_id = NetworkId::from_bytes([37; 16]);
+        authority
+            .create_network(
+                NetworkRecord::new(policy(network_id), "Managed LAN", 100).expect("valid network"),
+            )
+            .await
+            .expect("create network");
+
+        assert!(
+            authority
+                .backup_state(backup_path.clone())
+                .await
+                .expect("backup state")
+                > 0
+        );
+        assert!(authority
+            .delete_network(network_id)
+            .await
+            .expect("delete network"));
+        assert!(!authority
+            .delete_network(network_id)
+            .await
+            .expect("repeat delete"));
+        worker.shutdown().await.expect("shutdown worker");
+
+        let backup = AuthorityStore::open(&backup_path, controller_id).expect("open backup");
+        assert!(backup
+            .get_network(network_id)
+            .expect("network lookup")
+            .is_some());
+        drop(backup);
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 }

@@ -422,6 +422,91 @@ impl AuthorityStore {
         Ok(records)
     }
 
+    /// Deletes a network and every authority object scoped to it atomically.
+    ///
+    /// Returns `true` when the network existed and `false` for an idempotent
+    /// repeated deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for malformed related state or transaction
+    /// failure.
+    pub fn delete_network(&self, network_id: NetworkId) -> Result<bool, StoreError> {
+        let write = self.database.begin_write()?;
+        {
+            let networks = write.open_table(NETWORKS)?;
+            let Some(value) = networks.get(network_id.as_bytes().as_slice())? else {
+                return Ok(false);
+            };
+            let record = NetworkRecord::decode(value.value())?;
+            if record.network_id() != network_id {
+                return Err(StoreError::RecordKeyMismatch { table: "networks" });
+            }
+        }
+
+        let mut membership_keys = Vec::new();
+        {
+            let memberships = write.open_table(MEMBERSHIPS)?;
+            for entry in memberships.iter()? {
+                let (key, value) = entry?;
+                let key = decode_identifier::<32>(key.value(), "memberships", "membership key")?;
+                let record = MembershipRecord::decode(value.value())?;
+                validate_membership_key(&record, &key)?;
+                if record.network_id == network_id {
+                    membership_keys.push(key);
+                }
+            }
+        }
+        let mut endpoint_keys = Vec::new();
+        {
+            let endpoints = write.open_table(ENDPOINTS)?;
+            for entry in endpoints.iter()? {
+                let (key, _) = entry?;
+                let key = decode_identifier::<32>(key.value(), "endpoints", "endpoint key")?;
+                if key[..NetworkId::LENGTH] == *network_id.as_bytes() {
+                    endpoint_keys.push(key);
+                }
+            }
+        }
+        let mut join_token_keys = Vec::new();
+        {
+            let tokens = write.open_table(JOIN_TOKENS)?;
+            for entry in tokens.iter()? {
+                let (key, value) = entry?;
+                let key = decode_identifier::<32>(key.value(), "join_tokens", "token digest")?;
+                let record = JoinTokenRecord::decode(value.value())?;
+                if record.network_id == network_id {
+                    join_token_keys.push(key);
+                }
+            }
+        }
+
+        {
+            let mut memberships = write.open_table(MEMBERSHIPS)?;
+            for key in membership_keys {
+                memberships.remove(key.as_slice())?;
+            }
+        }
+        {
+            let mut endpoints = write.open_table(ENDPOINTS)?;
+            for key in endpoint_keys {
+                endpoints.remove(key.as_slice())?;
+            }
+        }
+        {
+            let mut tokens = write.open_table(JOIN_TOKENS)?;
+            for key in join_token_keys {
+                tokens.remove(key.as_slice())?;
+            }
+        }
+        {
+            let mut networks = write.open_table(NETWORKS)?;
+            networks.remove(network_id.as_bytes().as_slice())?;
+        }
+        write.commit()?;
+        Ok(true)
+    }
+
     /// Creates and stores one single-use enrollment token digest.
     ///
     /// Raw token bytes are returned once and are never persisted.
@@ -790,6 +875,68 @@ impl AuthorityStore {
         }
         write.commit()?;
         Ok(revision)
+    }
+
+    pub(crate) fn backup(&self, destination: &Path) -> Result<u64, StoreError> {
+        self.verify()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|source| StoreError::BackupCreate {
+                path: destination.to_path_buf(),
+                source,
+            })?;
+        match self.populate_backup(file, destination) {
+            Ok(copied) => Ok(copied),
+            Err(error) => Err(cleanup_backup(destination, error)),
+        }
+    }
+
+    fn populate_backup(&self, file: std::fs::File, destination: &Path) -> Result<u64, StoreError> {
+        let backup = redb::Builder::new().create_file(file)?;
+        let source_read = self.database.begin_read()?;
+        let backup_write = backup.begin_write()?;
+        copy_metadata_table(&source_read, &backup_write)?;
+        for definition in [
+            NODES,
+            NETWORKS,
+            MEMBERSHIPS,
+            ENDPOINTS,
+            ENROLLMENT_TOKENS,
+            JOIN_TOKENS,
+        ] {
+            copy_byte_table(&source_read, &backup_write, definition)?;
+        }
+        backup_write.commit()?;
+        drop(source_read);
+        drop(backup);
+
+        let backup_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(destination)
+            .map_err(|source| StoreError::BackupSync {
+                path: destination.to_path_buf(),
+                source,
+            })?;
+        backup_file
+            .sync_all()
+            .map_err(|source| StoreError::BackupSync {
+                path: destination.to_path_buf(),
+                source,
+            })?;
+        let copied = backup_file
+            .metadata()
+            .map_err(|source| StoreError::BackupMetadata {
+                path: destination.to_path_buf(),
+                source,
+            })?
+            .len();
+        drop(backup_file);
+        AuthorityStore::open(destination, self.controller_id)?;
+        Ok(copied)
     }
 }
 
@@ -1545,6 +1692,44 @@ pub enum StoreError {
         /// Network whose counter cannot advance.
         network_id: NetworkId,
     },
+    /// A create-new backup destination could not be opened.
+    #[error("unable to create authority backup {path}")]
+    BackupCreate {
+        /// Requested backup path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Backup bytes could not be durably synchronized.
+    #[error("unable to sync authority backup {path}")]
+    BackupSync {
+        /// Partial backup path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Final backup metadata could not be inspected.
+    #[error("unable to inspect authority backup {path}")]
+    BackupMetadata {
+        /// Completed backup path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A failed partial backup could not be removed.
+    #[error("unable to remove partial authority backup {path} after {cause}")]
+    BackupCleanupFailed {
+        /// Partial backup path.
+        path: PathBuf,
+        /// Failure that triggered cleanup.
+        cause: Box<StoreError>,
+        /// Cleanup filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// A bounded display name is invalid.
     #[error("display name must contain 1 through 64 UTF-8 bytes without control characters")]
     InvalidDisplayName,
@@ -1578,6 +1763,44 @@ fn enrollment_token_digest(token: &BearerToken) -> [u8; 32] {
 
 fn join_token_digest(token: &BearerToken) -> [u8; 32] {
     sha256_segments(&[JOIN_TOKEN_DOMAIN, token.expose_secret()])
+}
+
+fn cleanup_backup(path: &Path, cause: StoreError) -> StoreError {
+    match std::fs::remove_file(path) {
+        Ok(()) => cause,
+        Err(source) => StoreError::BackupCleanupFailed {
+            path: path.to_path_buf(),
+            cause: Box::new(cause),
+            source,
+        },
+    }
+}
+
+fn copy_metadata_table(
+    source: &redb::ReadTransaction,
+    destination: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    let source_table = source.open_table(METADATA)?;
+    let mut destination_table = destination.open_table(METADATA)?;
+    for entry in source_table.iter()? {
+        let (key, value) = entry?;
+        destination_table.insert(key.value(), value.value())?;
+    }
+    Ok(())
+}
+
+fn copy_byte_table(
+    source: &redb::ReadTransaction,
+    destination: &redb::WriteTransaction,
+    definition: TableDefinition<'static, &[u8], &[u8]>,
+) -> Result<(), StoreError> {
+    let source_table = source.open_table(definition)?;
+    let mut destination_table = destination.open_table(definition)?;
+    for entry in source_table.iter()? {
+        let (key, value) = entry?;
+        destination_table.insert(key.value(), value.value())?;
+    }
+    Ok(())
 }
 
 fn membership_key(network_id: NetworkId, node_id: NodeId) -> [u8; 32] {
@@ -1905,6 +2128,111 @@ mod tests {
         );
         assert_eq!(store.list_networks().expect("list networks"), vec![record]);
         store.verify().expect("populated store is valid");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn network_delete_removes_all_scoped_authority_state() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([22; 16]))
+            .expect("initialize store");
+        let first_node =
+            NodeRecord::new(signing_key(23).public_key(), "First node", 100).expect("valid node");
+        let second_node =
+            NodeRecord::new(signing_key(24).public_key(), "Second node", 100).expect("valid node");
+        let first_node_id = first_node.node_id();
+        let second_node_id = second_node.node_id();
+        store.create_node(&first_node).expect("create first node");
+        store.create_node(&second_node).expect("create second node");
+        let deleted_network_id = NetworkId::from_bytes([25; 16]);
+        let retained_network_id = NetworkId::from_bytes([26; 16]);
+        for (network_id, name) in [
+            (deleted_network_id, "Deleted LAN"),
+            (retained_network_id, "Retained LAN"),
+        ] {
+            store
+                .create_network(
+                    &NetworkRecord::new(policy(network_id), name, 100).expect("valid network"),
+                )
+                .expect("create network");
+            store
+                .add_member(first_node_id, network_id, 110)
+                .expect("add member");
+        }
+        let old_token = store
+            .issue_join_token(deleted_network_id, 100, 200)
+            .expect("issue join token");
+
+        assert!(store
+            .delete_network(deleted_network_id)
+            .expect("delete network"));
+        assert!(!store
+            .delete_network(deleted_network_id)
+            .expect("repeat delete"));
+        assert!(store
+            .get_network(deleted_network_id)
+            .expect("network lookup")
+            .is_none());
+        assert!(store
+            .get_membership(first_node_id, deleted_network_id)
+            .expect("membership lookup")
+            .is_none());
+        assert!(store
+            .get_network(retained_network_id)
+            .expect("retained network lookup")
+            .is_some());
+        assert!(store
+            .get_membership(first_node_id, retained_network_id)
+            .expect("retained membership lookup")
+            .is_some());
+
+        store
+            .create_network(
+                &NetworkRecord::new(policy(deleted_network_id), "Recreated LAN", 120)
+                    .expect("valid recreated network"),
+            )
+            .expect("recreate network");
+        assert!(matches!(
+            store.join_with_token(&old_token, second_node_id, deleted_network_id, 150),
+            Err(StoreError::JoinTokenInvalid)
+        ));
+        store.verify().expect("deleted network state is valid");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn coordinated_backup_is_create_new_verified_and_point_in_time() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let backup_path = directory.join("controller.backup.redb");
+        let controller_id = ControllerId::from_bytes([27; 16]);
+        let store = AuthorityStore::initialize(&path, controller_id).expect("initialize store");
+        let node = NodeRecord::new(signing_key(28).public_key(), "Backed up node", 100)
+            .expect("valid node");
+        let node_id = node.node_id();
+        store.create_node(&node).expect("create node");
+
+        assert!(store.backup(&backup_path).expect("create backup") > 0);
+        assert!(matches!(
+            store.backup(&backup_path),
+            Err(StoreError::BackupCreate { .. })
+        ));
+        store
+            .set_node_enabled(node_id, false)
+            .expect("disable original node");
+        let backup = AuthorityStore::open(&backup_path, controller_id).expect("open backup");
+        assert!(backup
+            .get_node(node_id)
+            .expect("read backup node")
+            .expect("backup node exists")
+            .enabled());
+        backup.verify().expect("backup verifies");
+        drop(backup);
         drop(store);
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }

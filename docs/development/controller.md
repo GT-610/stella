@@ -113,6 +113,21 @@ all of its memberships; disabling therefore invalidates old grants and active
 sessions immediately through the new epoch, rather than waiting for their
 normal expiry.
 
+Network deletion is idempotent and removes the network record, every
+membership and endpoint keyed to it, and every unconsumed join-token digest
+scoped to it in one write transaction. A deleted network ID may later be
+recreated, but old join tokens remain unusable and authority counters restart
+from the newly created record rather than inheriting deleted state.
+
+`state backup` is an ordered authority command. With no transaction active and
+no later command able to run, it opens one consistent redb read transaction and
+copies every table's raw keys and values into a create-new redb database. It
+commits and synchronizes the destination, then opens the copy as a separate
+database to run the full invariant verifier. Failures remove the partial
+destination; a failed cleanup is reported explicitly. The command never
+overwrites a prior backup and copying the live database file outside this
+authority command remains unsupported.
+
 ## Administrative CLI
 
 The `stella-server` executable provides:
