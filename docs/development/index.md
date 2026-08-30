@@ -22,3 +22,5 @@ wire parsing, and [Cryptography implementation](./cryptography.md) for secret
 ownership, key derivation, packet protection, and replay handling. See
 [Datagram transport implementation](./transport.md) for the object-safe
 transport contract, UDP socket behavior, cancellation, and truncation defense.
+See [Windows TAP implementation](./tap-windows.md) for adapter selection,
+complete-frame I/O, MTU handling, and cancellation.
