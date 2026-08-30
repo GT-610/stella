@@ -429,6 +429,7 @@ dependencies = [
  "hkdf",
  "sha2",
  "stella-common",
+ "stella-proto",
  "subtle",
  "thiserror",
  "x25519-dalek",

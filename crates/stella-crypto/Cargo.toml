@@ -19,5 +19,8 @@ thiserror.workspace = true
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 
+[dev-dependencies]
+stella-proto = { path = "../stella-proto" }
+
 [lints]
 workspace = true
