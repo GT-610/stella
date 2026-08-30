@@ -12,14 +12,18 @@ anyhow = "=1.0.104"
 base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
 clap = { version = "=4.6.6", features = ["derive"] }
 getrandom = "0.4.3"
+rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring", "zeroize"] }
 redb = "=2.6.3"
+rustls-pemfile = "=2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 stella-common = { path = "../stella-common" }
 stella-crypto = { path = "../stella-crypto" }
 stella-proto = { path = "../stella-proto" }
 stella-transport = { path = "../stella-transport" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+time = "=0.3.44"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring"] }
 toml = "0.9.8"
 zeroize = { version = "1.9.0", features = ["derive"] }
 

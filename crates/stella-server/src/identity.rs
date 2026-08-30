@@ -31,6 +31,14 @@ pub fn create_controller_identity(path: &Path) -> Result<IdentitySigningKey, Ide
     Ok(signing_key)
 }
 
+pub(crate) fn create_protected_secret_file(path: &Path) -> Result<File, IdentityFileError> {
+    platform::create_secure_file(path)
+}
+
+pub(crate) fn open_protected_secret_file(path: &Path) -> Result<File, IdentityFileError> {
+    platform::open_verified_file(path)
+}
+
 /// Loads one protected bounded controller Ed25519 PKCS#8 identity.
 ///
 /// # Errors
