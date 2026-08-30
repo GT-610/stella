@@ -74,4 +74,20 @@ pub enum CryptoError {
     /// A ChaCha20-Poly1305 authentication tag did not verify.
     #[error("ChaCha20-Poly1305 authentication failed")]
     AuthenticationFailed,
+    /// A protected-packet sequence has already been authenticated.
+    #[error("protected-packet sequence {sequence_number} is a duplicate")]
+    DuplicateSequenceNumber {
+        /// Repeated sequence number.
+        sequence_number: u64,
+    },
+    /// A protected-packet sequence falls before the replay window.
+    #[error(
+        "protected-packet sequence {sequence_number} is older than replay-window minimum {minimum}"
+    )]
+    SequenceNumberTooOld {
+        /// Rejected sequence number.
+        sequence_number: u64,
+        /// Oldest sequence that could still be accepted.
+        minimum: u64,
+    },
 }

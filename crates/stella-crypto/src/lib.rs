@@ -6,6 +6,7 @@ mod error;
 mod hash;
 mod identity;
 mod packet;
+mod replay;
 mod session;
 
 pub use error::CryptoError;
@@ -22,6 +23,7 @@ pub use packet::{
     MAX_PACKET_ASSOCIATED_DATA_LENGTH, MAX_PROTECTED_PAYLOAD_LENGTH, PACKET_NONCE_LENGTH,
     SESSION_CONFIRMATION_DOMAIN,
 };
+pub use replay::{ReplayWindow, REPLAY_WINDOW_BITS, REPLAY_WINDOW_WORDS};
 pub use session::{
     derive_session_secrets, session_transcript_hash, EphemeralPublicKey, EphemeralSecret,
     SessionRole, SessionSecrets, SharedSecret, CONFIRMATION_KEY_LENGTH, DATA_KEY_LENGTH,
