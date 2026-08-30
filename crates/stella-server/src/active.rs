@@ -1,0 +1,711 @@
+//! Sequential authenticated control-request serving.
+
+use std::{
+    collections::BTreeSet,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use stella_common::{NetworkId, NodeId};
+use stella_control::{
+    ControlError, InboundSequence, MessageBuilder, OutboundSequence, RecordReader, RecordWriter,
+};
+use stella_crypto::IdentitySigningKey;
+use stella_proto::{ControlFieldType, ControlMessageType};
+use thiserror::Error;
+use tokio::{net::TcpStream, time::timeout};
+use tokio_rustls::server::TlsStream;
+use zeroize::Zeroizing;
+
+use crate::{
+    authority::{AuthorityError, AuthorityHandle},
+    network_state::{encode_network_state, EncodedNetworkState, NetworkStateError},
+    runtime::{AcceptedSession, SessionContext},
+    session::{authenticate_session, AuthenticatedSession, AuthenticationError},
+    store::{AuthorityRevision, BearerToken, MembershipStatus, NetworkRecord, StoreError},
+};
+
+const STATUS_OK: u16 = 0;
+const STATUS_INVALID_STATE: u16 = 4;
+const STATUS_NODE_DISABLED: u16 = 103;
+const STATUS_JOIN_TOKEN_INVALID: u16 = 111;
+const STATUS_MEMBERSHIP_SUSPENDED: u16 = 112;
+const STATUS_NETWORK_NOT_FOUND: u16 = 200;
+const STATUS_NETWORK_FULL: u16 = 205;
+
+/// Authenticates and then serves one complete control connection.
+///
+/// # Errors
+///
+/// Returns [`ControlSessionError`] when authentication or the active request
+/// loop fails.
+pub async fn serve_control_session(session: AcceptedSession) -> Result<(), ControlSessionError> {
+    let authenticated = authenticate_session(session).await?;
+    serve_authenticated_session(authenticated).await?;
+    Ok(())
+}
+
+/// Serves ordered requests on an already authenticated control connection.
+///
+/// # Errors
+///
+/// Returns [`ActiveSessionError`] for timeout, shutdown, framing, protocol,
+/// authority, state-encoding, clock, or carrier failure.
+pub async fn serve_authenticated_session(
+    authenticated: AuthenticatedSession,
+) -> Result<(), ActiveSessionError> {
+    let (stream, _peer_addr, context, node, inbound, outbound) = authenticated.into_parts();
+    let mut shutdown = context.shutdown();
+    let request_timeout = Duration::from_secs(context.limits().request_timeout_seconds);
+    let mut state = ActiveSessionState {
+        stream,
+        context,
+        node_id: node.node_id(),
+        inbound,
+        outbound,
+        joined_networks: BTreeSet::new(),
+    };
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                send_shutdown(&mut state).await?;
+                return Ok(());
+            }
+            result = timeout(request_timeout, process_next_request(&mut state)) => {
+                match result {
+                    Err(_) => return Err(ActiveSessionError::RequestTimeout),
+                    Ok(Ok(ActiveStep::Continue)) => {}
+                    Ok(Ok(ActiveStep::Closed)) => return Ok(()),
+                    Ok(Err(error)) => return Err(error),
+                }
+            }
+        }
+    }
+}
+
+struct ActiveSessionState {
+    stream: TlsStream<TcpStream>,
+    context: SessionContext,
+    node_id: NodeId,
+    inbound: InboundSequence,
+    outbound: OutboundSequence,
+    joined_networks: BTreeSet<NetworkId>,
+}
+
+enum ActiveStep {
+    Continue,
+    Closed,
+}
+
+async fn process_next_request(
+    state: &mut ActiveSessionState,
+) -> Result<ActiveStep, ActiveSessionError> {
+    let Some(message) = RecordReader::new(&mut state.stream).read_message().await? else {
+        return Ok(ActiveStep::Closed);
+    };
+    let header = message.header()?;
+    state.inbound.accept(header.message_id)?;
+    if header.correlation_id != 0 {
+        send_error(state, header.message_id, STATUS_INVALID_STATE).await?;
+        return Err(ActiveSessionError::NonzeroRequestCorrelation {
+            actual: header.correlation_id,
+        });
+    }
+
+    match header.message_type {
+        ControlMessageType::JoinRequest => {
+            let request = parse_join_request(&message)?;
+            handle_join(state, header.message_id, request).await?;
+            Ok(ActiveStep::Continue)
+        }
+        ControlMessageType::LeaveRequest => {
+            let network_id = parse_network_id(&message)?;
+            handle_leave(state, header.message_id, network_id).await?;
+            Ok(ActiveStep::Continue)
+        }
+        actual => {
+            send_error(state, header.message_id, STATUS_INVALID_STATE).await?;
+            Err(ActiveSessionError::UnexpectedMessage { actual })
+        }
+    }
+}
+
+struct JoinRequest {
+    network_id: NetworkId,
+    token: Option<Zeroizing<[u8; 32]>>,
+}
+
+fn parse_join_request(
+    message: &stella_control::OwnedControlMessage,
+) -> Result<JoinRequest, ActiveSessionError> {
+    let view = message.view()?;
+    let mut network_id = None;
+    let mut token = None;
+    for field in view.fields() {
+        match field.field_type() {
+            Some(ControlFieldType::NetworkId) => {
+                network_id = Some(NetworkId::from_bytes(fixed_array(
+                    field.value(),
+                    "network ID",
+                )?));
+            }
+            Some(ControlFieldType::JoinToken) => {
+                token = Some(Zeroizing::new(fixed_array(field.value(), "join token")?));
+            }
+            _ => {}
+        }
+    }
+    Ok(JoinRequest {
+        network_id: network_id.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::NetworkId,
+        })?,
+        token,
+    })
+}
+
+fn parse_network_id(
+    message: &stella_control::OwnedControlMessage,
+) -> Result<NetworkId, ActiveSessionError> {
+    for field in message.view()?.fields() {
+        if field.field_type() == Some(ControlFieldType::NetworkId) {
+            return Ok(NetworkId::from_bytes(fixed_array(
+                field.value(),
+                "network ID",
+            )?));
+        }
+    }
+    Err(ActiveSessionError::ValidatedFieldMissing {
+        field: ControlFieldType::NetworkId,
+    })
+}
+
+async fn handle_join(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    request: JoinRequest,
+) -> Result<(), ActiveSessionError> {
+    match resolve_join(
+        state.context.authority(),
+        state.context.controller_identity(),
+        state.node_id,
+        request,
+        unix_time()?,
+    )
+    .await?
+    {
+        JoinDecision::Accepted(encoded) => {
+            send_join_result(state, correlation_id, STATUS_OK, &encoded).await?;
+            send_peer_snapshot(state, &encoded).await?;
+            state.joined_networks.insert(encoded.network_id());
+        }
+        JoinDecision::Rejected {
+            network,
+            status,
+            close,
+        } => {
+            send_join_rejection(state, correlation_id, status, &network).await?;
+            if close {
+                shutdown_writer(&mut state.stream).await?;
+                return Err(ActiveSessionError::AuthorizationRevoked { status });
+            }
+        }
+        JoinDecision::NetworkNotFound => {
+            send_error(state, correlation_id, STATUS_NETWORK_NOT_FOUND).await?;
+        }
+    }
+    Ok(())
+}
+
+enum JoinDecision {
+    Accepted(Box<EncodedNetworkState>),
+    Rejected {
+        network: NetworkRecord,
+        status: u16,
+        close: bool,
+    },
+    NetworkNotFound,
+}
+
+async fn resolve_join(
+    authority: &AuthorityHandle,
+    controller_identity: &IdentitySigningKey,
+    node_id: NodeId,
+    request: JoinRequest,
+    now: u64,
+) -> Result<JoinDecision, ActiveSessionError> {
+    let Some(network) = authority.get_network(request.network_id).await? else {
+        return Ok(JoinDecision::NetworkNotFound);
+    };
+    match authority
+        .get_membership(node_id, request.network_id)
+        .await?
+    {
+        Some(membership) if membership.status() == MembershipStatus::Active => {}
+        Some(_) => {
+            return Ok(JoinDecision::Rejected {
+                network,
+                status: STATUS_MEMBERSHIP_SUSPENDED,
+                close: false,
+            });
+        }
+        None => {
+            let Some(raw_token) = request.token else {
+                return Ok(JoinDecision::Rejected {
+                    network,
+                    status: STATUS_JOIN_TOKEN_INVALID,
+                    close: false,
+                });
+            };
+            let Ok(token) = BearerToken::from_bytes(*raw_token) else {
+                return Ok(JoinDecision::Rejected {
+                    network,
+                    status: STATUS_JOIN_TOKEN_INVALID,
+                    close: false,
+                });
+            };
+            if let Err(error) = authority
+                .join_with_token(&token, node_id, request.network_id, now)
+                .await
+            {
+                return map_join_authority_error(error, network);
+            }
+        }
+    }
+
+    let view = authority
+        .network_session_view(node_id, request.network_id)
+        .await?;
+    Ok(JoinDecision::Accepted(Box::new(encode_network_state(
+        controller_identity,
+        &view,
+        now,
+    )?)))
+}
+
+fn map_join_authority_error(
+    error: AuthorityError,
+    network: NetworkRecord,
+) -> Result<JoinDecision, ActiveSessionError> {
+    let decision = match &error {
+        AuthorityError::Store(source) => match source.as_ref() {
+            StoreError::InvalidBearerToken | StoreError::JoinTokenInvalid => {
+                Some((STATUS_JOIN_TOKEN_INVALID, false))
+            }
+            StoreError::MembershipSuspended { .. } => Some((STATUS_MEMBERSHIP_SUSPENDED, false)),
+            StoreError::NetworkFull { .. } => Some((STATUS_NETWORK_FULL, false)),
+            StoreError::NodeDisabled { .. } => Some((STATUS_NODE_DISABLED, true)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((status, close)) = decision {
+        Ok(JoinDecision::Rejected {
+            network,
+            status,
+            close,
+        })
+    } else {
+        Err(ActiveSessionError::Authority(error))
+    }
+}
+
+async fn handle_leave(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    network_id: NetworkId,
+) -> Result<(), ActiveSessionError> {
+    match resolve_leave(state.context.authority(), state.node_id, network_id).await? {
+        LeaveDecision::Left(revision) => {
+            send_leave_result(state, correlation_id, &revision).await?;
+            state.joined_networks.remove(&network_id);
+        }
+        LeaveDecision::NetworkNotFound => {
+            send_error(state, correlation_id, STATUS_NETWORK_NOT_FOUND).await?;
+        }
+    }
+    Ok(())
+}
+
+enum LeaveDecision {
+    Left(AuthorityRevision),
+    NetworkNotFound,
+}
+
+async fn resolve_leave(
+    authority: &AuthorityHandle,
+    node_id: NodeId,
+    network_id: NetworkId,
+) -> Result<LeaveDecision, ActiveSessionError> {
+    if authority.get_network(network_id).await?.is_none() {
+        return Ok(LeaveDecision::NetworkNotFound);
+    }
+    Ok(LeaveDecision::Left(
+        authority.leave_network(node_id, network_id).await?,
+    ))
+}
+
+async fn send_join_result(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    status: u16,
+    encoded: &EncodedNetworkState,
+) -> Result<(), ActiveSessionError> {
+    let mut builder =
+        MessageBuilder::new(ControlMessageType::JoinResult).with_correlation(correlation_id);
+    builder.push_field(ControlFieldType::StatusCode, &status.to_be_bytes())?;
+    builder.push_field(
+        ControlFieldType::ControllerEpoch,
+        &encoded.controller_epoch().to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::NetworkId, encoded.network_id().as_bytes())?;
+    builder.push_field(ControlFieldType::MembershipGrant, encoded.local_grant())?;
+    builder.push_field(ControlFieldType::NetworkPolicy, encoded.policy())?;
+    builder.push_field(
+        ControlFieldType::SnapshotRevision,
+        &encoded.snapshot_revision().to_be_bytes(),
+    )?;
+    write_message(state, builder).await
+}
+
+async fn send_join_rejection(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    status: u16,
+    network: &NetworkRecord,
+) -> Result<(), ActiveSessionError> {
+    let mut builder =
+        MessageBuilder::new(ControlMessageType::JoinResult).with_correlation(correlation_id);
+    builder.push_field(ControlFieldType::StatusCode, &status.to_be_bytes())?;
+    builder.push_field(
+        ControlFieldType::ControllerEpoch,
+        &network.controller_epoch().to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::NetworkId, network.network_id().as_bytes())?;
+    write_message(state, builder).await
+}
+
+async fn send_peer_snapshot(
+    state: &mut ActiveSessionState,
+    encoded: &EncodedNetworkState,
+) -> Result<(), ActiveSessionError> {
+    let mut builder = MessageBuilder::new(ControlMessageType::PeerSnapshot);
+    builder.push_field(
+        ControlFieldType::ControllerEpoch,
+        &encoded.controller_epoch().to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::NetworkId, encoded.network_id().as_bytes())?;
+    builder.push_field(ControlFieldType::MembershipGrant, encoded.local_grant())?;
+    builder.push_field(ControlFieldType::NetworkPolicy, encoded.policy())?;
+    builder.push_field(
+        ControlFieldType::SnapshotRevision,
+        &encoded.snapshot_revision().to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::PeerList, encoded.peer_list())?;
+    write_message(state, builder).await
+}
+
+async fn send_leave_result(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    revision: &AuthorityRevision,
+) -> Result<(), ActiveSessionError> {
+    let mut builder =
+        MessageBuilder::new(ControlMessageType::LeaveResult).with_correlation(correlation_id);
+    builder.push_field(ControlFieldType::StatusCode, &STATUS_OK.to_be_bytes())?;
+    builder.push_field(
+        ControlFieldType::ControllerEpoch,
+        &revision.controller_epoch.to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::NetworkId, revision.network_id.as_bytes())?;
+    write_message(state, builder).await
+}
+
+async fn send_error(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    status: u16,
+) -> Result<(), ActiveSessionError> {
+    let mut builder =
+        MessageBuilder::new(ControlMessageType::Error).with_correlation(correlation_id);
+    builder.push_field(ControlFieldType::StatusCode, &status.to_be_bytes())?;
+    write_message(state, builder).await
+}
+
+async fn send_shutdown(state: &mut ActiveSessionState) -> Result<(), ActiveSessionError> {
+    let deadline = unix_time()?
+        .checked_add(state.context.limits().shutdown_timeout_seconds)
+        .ok_or(ActiveSessionError::TimeOverflow)?;
+    let mut builder = MessageBuilder::new(ControlMessageType::ServerShutdown);
+    builder.push_field(ControlFieldType::ShutdownDeadline, &deadline.to_be_bytes())?;
+    write_message(state, builder).await?;
+    shutdown_writer(&mut state.stream).await
+}
+
+async fn write_message(
+    state: &mut ActiveSessionState,
+    builder: MessageBuilder,
+) -> Result<(), ActiveSessionError> {
+    let message = state.outbound.build(builder)?;
+    let mut writer = RecordWriter::new(&mut state.stream);
+    writer.write_message(&message).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn shutdown_writer(stream: &mut TlsStream<TcpStream>) -> Result<(), ActiveSessionError> {
+    RecordWriter::new(stream).shutdown().await?;
+    Ok(())
+}
+
+fn fixed_array<const N: usize>(
+    value: &[u8],
+    field: &'static str,
+) -> Result<[u8; N], ActiveSessionError> {
+    value
+        .try_into()
+        .map_err(|_| ActiveSessionError::ValidatedLengthInvalid {
+            field,
+            expected: N,
+            actual: value.len(),
+        })
+}
+
+fn unix_time() -> Result<u64, ActiveSessionError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ActiveSessionError::ClockBeforeUnixEpoch)?
+        .as_secs())
+}
+
+/// Complete authentication or active-loop failure.
+#[derive(Debug, Error)]
+pub enum ControlSessionError {
+    /// Stella node authentication failed.
+    #[error(transparent)]
+    Authentication(#[from] AuthenticationError),
+    /// An authenticated request or orderly shutdown failed.
+    #[error(transparent)]
+    Active(#[from] ActiveSessionError),
+}
+
+/// Failure while serving authenticated control requests.
+#[derive(Debug, Error)]
+pub enum ActiveSessionError {
+    /// One request did not complete within the configured deadline.
+    #[error("authenticated control request timed out")]
+    RequestTimeout,
+    /// Control framing, sequence, construction, or carrier I/O failed.
+    #[error(transparent)]
+    Control(#[from] ControlError),
+    /// The serialized authority rejected or failed an operation.
+    #[error(transparent)]
+    Authority(#[from] AuthorityError),
+    /// Coherent grants, policy, or peer-list state could not be encoded.
+    #[error(transparent)]
+    NetworkState(#[from] NetworkStateError),
+    /// A client request incorrectly carried a response correlation.
+    #[error("client request correlation ID must be zero, received {actual}")]
+    NonzeroRequestCorrelation {
+        /// Invalid request correlation ID.
+        actual: u64,
+    },
+    /// A message type is not valid in the current active implementation.
+    #[error("unexpected authenticated control message {actual:?}")]
+    UnexpectedMessage {
+        /// Received message type.
+        actual: ControlMessageType,
+    },
+    /// A codec-validated message unexpectedly lacked a required field.
+    #[error("validated control message is missing required field {field:?}")]
+    ValidatedFieldMissing {
+        /// Field required by the codec schema.
+        field: ControlFieldType,
+    },
+    /// A codec-validated fixed-width field unexpectedly had another length.
+    #[error("validated {field} length is {actual}, expected {expected}")]
+    ValidatedLengthInvalid {
+        /// Stable field name.
+        field: &'static str,
+        /// Required byte length.
+        expected: usize,
+        /// Observed byte length.
+        actual: usize,
+    },
+    /// Administrative revocation requires this authenticated connection close.
+    #[error("authenticated authorization was revoked with status {status}")]
+    AuthorizationRevoked {
+        /// Status already sent to the client.
+        status: u16,
+    },
+    /// The host wall clock is earlier than the Unix epoch.
+    #[error("system clock is before the Unix epoch")]
+    ClockBeforeUnixEpoch,
+    /// A shutdown deadline could not be represented.
+    #[error("controller shutdown deadline overflows Unix time")]
+    TimeOverflow,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        num::NonZeroUsize,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use stella_common::{ControllerId, NetworkId};
+    use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
+    use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
+    use zeroize::Zeroizing;
+
+    use super::{resolve_join, resolve_leave, JoinDecision, JoinRequest, LeaveDecision};
+    use crate::{
+        authority::AuthorityThread,
+        store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
+    };
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    fn signing_key(seed: u8) -> IdentitySigningKey {
+        IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([seed; 32]))
+    }
+
+    fn network_policy(network_id: NetworkId) -> NetworkPolicy {
+        NetworkPolicy {
+            confidentiality: ConfidentialityPolicy::Encrypt,
+            max_frame_size: 1_514,
+            max_flood_peers: 8,
+            flood_rate: 1_000,
+            flood_burst: 2_000,
+            mac_age_seconds: 300,
+            heartbeat_seconds: 10,
+            peer_lease_seconds: 30,
+            session_lifetime_seconds: 900,
+            reassembly_timeout_ms: 3_000,
+            network_id,
+            policy_revision: 1,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn join_is_token_gated_idempotent_and_leave_is_repeatable() {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory: PathBuf = std::env::temp_dir().join(format!(
+            "stella-active-session-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create test directory");
+        let controller = signing_key(101);
+        let controller_id: ControllerId = derive_controller_id(controller.public_key());
+        let store = AuthorityStore::initialize(&directory.join("controller.redb"), controller_id)
+            .expect("initialize authority store");
+        let node =
+            NodeRecord::new(signing_key(102).public_key(), "Active node", 100).expect("valid node");
+        let node_id = node.node_id();
+        store.create_node(&node).expect("create node");
+        let network_id = NetworkId::from_bytes([103; 16]);
+        store
+            .create_network(
+                &NetworkRecord::new(network_policy(network_id), "Active LAN", 100)
+                    .expect("valid network"),
+            )
+            .expect("create network");
+        let token = store
+            .issue_join_token(network_id, 100, 1_000)
+            .expect("issue join token");
+        let token_bytes = *token.expose_secret();
+        drop(store);
+        let worker = AuthorityThread::spawn(
+            AuthorityStore::open(&directory.join("controller.redb"), controller_id)
+                .expect("reopen authority store"),
+            NonZeroUsize::new(8).expect("non-zero queue"),
+        )
+        .expect("spawn authority thread");
+        let authority = worker.handle();
+
+        assert!(matches!(
+            resolve_join(
+                &authority,
+                &controller,
+                node_id,
+                JoinRequest {
+                    network_id,
+                    token: None,
+                },
+                200,
+            )
+            .await
+            .expect("resolve missing token"),
+            JoinDecision::Rejected { status: 111, .. }
+        ));
+        let accepted = resolve_join(
+            &authority,
+            &controller,
+            node_id,
+            JoinRequest {
+                network_id,
+                token: Some(Zeroizing::new(token_bytes)),
+            },
+            200,
+        )
+        .await
+        .expect("resolve valid join");
+        assert!(matches!(accepted, JoinDecision::Accepted(_)));
+        let repeated = resolve_join(
+            &authority,
+            &controller,
+            node_id,
+            JoinRequest {
+                network_id,
+                token: Some(Zeroizing::new(token_bytes)),
+            },
+            201,
+        )
+        .await
+        .expect("resolve repeated join");
+        assert!(matches!(repeated, JoinDecision::Accepted(_)));
+
+        authority
+            .set_membership_status(node_id, network_id, MembershipStatus::Suspended)
+            .await
+            .expect("suspend membership");
+        assert!(matches!(
+            resolve_join(
+                &authority,
+                &controller,
+                node_id,
+                JoinRequest {
+                    network_id,
+                    token: Some(Zeroizing::new(token_bytes)),
+                },
+                202,
+            )
+            .await
+            .expect("resolve suspended join"),
+            JoinDecision::Rejected { status: 112, .. }
+        ));
+        authority
+            .set_membership_status(node_id, network_id, MembershipStatus::Active)
+            .await
+            .expect("resume membership");
+        let left = resolve_leave(&authority, node_id, network_id)
+            .await
+            .expect("resolve leave");
+        let first_revision = match left {
+            LeaveDecision::Left(revision) => revision,
+            LeaveDecision::NetworkNotFound => panic!("network should exist"),
+        };
+        let repeated_leave = resolve_leave(&authority, node_id, network_id)
+            .await
+            .expect("resolve repeated leave");
+        match repeated_leave {
+            LeaveDecision::Left(revision) => assert_eq!(revision, first_revision),
+            LeaveDecision::NetworkNotFound => panic!("network should exist"),
+        }
+
+        drop(BearerToken::from_bytes(token_bytes).expect("test token remains non-zero"));
+        worker.shutdown().await.expect("shutdown authority worker");
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+}
