@@ -16,6 +16,13 @@ The process has three explicit boundaries:
 - an event distributor converts committed authority changes into bounded peer
   snapshots, deltas, grant refreshes, and availability changes.
 
+Startup validates the configuration, protected controller key, database
+controller binding, database invariants, and TLS identity before binding TCP.
+Connection admission uses an owned semaphore permit acquired before `accept`;
+the permit remains held through TLS and application teardown. TLS negotiation,
+application authentication, correlated requests, and shutdown drain have
+separate bounded deadlines.
+
 Connection tasks never hold database transactions. They send a command through
 a bounded channel and await a oneshot reply. Slow clients have bounded outbound
 queues; replaceable state is coalesced into a fresh snapshot, and persistently
@@ -36,6 +43,12 @@ behind shutdown is discarded and observes a lost reply. The process then joins
 the authority thread. A thread panic, closed request queue, and lost reply are
 distinct application errors and are never confused with a persistence error
 returned by redb.
+
+Ctrl+C first stops admission and broadcasts cancellation to active sessions.
+The accept loop owns and reaps every connection task, waits up to the configured
+shutdown deadline, aborts any remaining tasks, and only then sends the ordered
+authority shutdown command and joins its thread. A one-second maintenance tick
+expires peer leases through the same serialized queue.
 
 ## Configuration and identity
 
@@ -58,8 +71,8 @@ The reference schema uses `[state]`, `[identity]`, `[tls]`, `[limits]`, and
 Relative paths resolve against the configuration file directory. The parser
 bounds input to 1 MiB, rejects non-UTF-8 input and unknown fields at every
 nesting level, and validates non-zero listen ports, queue sizes, connection
-limits, authentication/request deadlines, and logging-filter text before any
-socket or database is opened.
+limits, TLS-handshake/authentication/request/shutdown deadlines, and
+logging-filter text before any socket or database is opened.
 
 `init` generates the controller Ed25519 identity and a TLS identity suitable
 for an explicitly pinned self-hosted deployment, creates the database, and
