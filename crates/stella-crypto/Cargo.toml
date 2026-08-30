@@ -10,10 +10,12 @@ version.workspace = true
 [dependencies]
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
+hkdf = "0.13.0"
 sha2 = "0.11.0"
 stella-common = { path = "../stella-common" }
 subtle = { version = "2.6.1", default-features = false }
 thiserror.workspace = true
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 [lints]

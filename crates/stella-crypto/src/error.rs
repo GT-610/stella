@@ -32,4 +32,10 @@ pub enum CryptoError {
         /// Stable identity role name.
         identity: &'static str,
     },
+    /// X25519 produced an all-zero, non-contributory shared secret.
+    #[error("X25519 key agreement was non-contributory")]
+    NonContributoryKeyAgreement,
+    /// HKDF could not expand one of the fixed-length session outputs.
+    #[error("HKDF session-key expansion failed")]
+    KeyDerivationFailed,
 }
