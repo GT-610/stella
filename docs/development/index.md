@@ -19,4 +19,6 @@ generated files directly.
 See [Reference implementation architecture](./architecture.md) for crate and
 runtime boundaries, [Protocol codec implementation](./protocol-codec.md) for
 wire parsing, and [Cryptography implementation](./cryptography.md) for secret
-ownership, key derivation, packet protection, and replay handling.
+ownership, key derivation, packet protection, and replay handling. See
+[Datagram transport implementation](./transport.md) for the object-safe
+transport contract, UDP socket behavior, cancellation, and truncation defense.
