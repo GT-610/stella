@@ -120,6 +120,14 @@ all of its memberships; disabling therefore invalidates old grants and active
 sessions immediately through the new epoch, rather than waiting for their
 normal expiry.
 
+Grant issuance combines only a current enabled node, active membership, and
+matching network record. It encodes the canonical policy, hashes those exact 64
+bytes, copies the committed epoch and grant serial, uses the policy's bounded
+session lifetime, signs the version 1 domain-separated 176-byte grant body, and
+decodes and verifies the completed 240-byte object before returning it to a
+session. Disabled, suspended, mismatched, stale, or overflowing inputs fail
+without producing a grant.
+
 Network deletion is idempotent and removes the network record, every
 membership and endpoint keyed to it, and every unconsumed join-token digest
 scoped to it in one write transaction. A deleted network ID may later be
