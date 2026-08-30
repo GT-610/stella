@@ -5,7 +5,7 @@
 use std::{
     fs::File,
     io::BufReader,
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -22,8 +22,8 @@ use stella_control::{
 };
 use stella_crypto::{derive_node_id, IdentitySigningKey};
 use stella_proto::{
-    ConfidentialityPolicy, ControlFieldType, ControlMessageType, MembershipGrantView,
-    NetworkPolicy, PeerListView, VersionEntry, VersionListView,
+    encode_endpoint_set, ConfidentialityPolicy, ControlFieldType, ControlMessageType, Endpoint,
+    MembershipGrantView, NetworkPolicy, PeerListView, VersionEntry, VersionListView,
 };
 use stella_server::{
     active::serve_control_session,
@@ -347,6 +347,30 @@ fn leave_request(network_id: NetworkId) -> MessageBuilder {
     builder
 }
 
+fn endpoint_update(network_id: NetworkId, endpoints: &[Endpoint]) -> MessageBuilder {
+    let mut encoded = [0_u8; 228];
+    let length = encode_endpoint_set(endpoints, &mut encoded).expect("encode endpoint set");
+    let mut builder = MessageBuilder::new(ControlMessageType::EndpointUpdate);
+    builder
+        .push_field(ControlFieldType::NetworkId, network_id.as_bytes())
+        .expect("network ID field");
+    builder
+        .push_field(ControlFieldType::EndpointSet, &encoded[..length])
+        .expect("endpoint set field");
+    builder
+}
+
+fn snapshot_request(network_id: NetworkId, revision: u64) -> MessageBuilder {
+    let mut builder = MessageBuilder::new(ControlMessageType::SnapshotRequest);
+    builder
+        .push_field(ControlFieldType::NetworkId, network_id.as_bytes())
+        .expect("network ID field");
+    builder
+        .push_field(ControlFieldType::SnapshotRevision, &revision.to_be_bytes())
+        .expect("snapshot revision field");
+    builder
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
@@ -448,6 +472,48 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
     );
     assert_eq!(status_code(&repeated_join), 0);
     let _repeated_snapshot = client.read(ControlMessageType::PeerSnapshot).await;
+
+    let endpoint = Endpoint::UdpIpv4 {
+        priority: 10,
+        port: 42_424,
+        max_datagram_size: 1_200,
+        address: Ipv4Addr::new(192, 0, 2, 42),
+    };
+    let endpoint_id = client.send(endpoint_update(network_id, &[endpoint])).await;
+    let endpoint_result = client.read(ControlMessageType::EndpointResult).await;
+    assert_eq!(
+        endpoint_result
+            .header()
+            .expect("endpoint result header")
+            .correlation_id,
+        endpoint_id
+    );
+    assert_eq!(status_code(&endpoint_result), 0);
+    let endpoint_revision = u64::from_be_bytes(
+        field_value(&endpoint_result, ControlFieldType::SnapshotRevision)
+            .try_into()
+            .expect("endpoint revision width"),
+    );
+
+    let snapshot_id = client
+        .send(snapshot_request(network_id, endpoint_revision))
+        .await;
+    let requested_snapshot = client.read(ControlMessageType::PeerSnapshot).await;
+    assert_eq!(
+        requested_snapshot
+            .header()
+            .expect("requested snapshot header")
+            .correlation_id,
+        snapshot_id
+    );
+    assert_eq!(
+        u64::from_be_bytes(
+            field_value(&requested_snapshot, ControlFieldType::SnapshotRevision)
+                .try_into()
+                .expect("requested snapshot revision width")
+        ),
+        endpoint_revision
+    );
 
     let leave_id = client.send(leave_request(network_id)).await;
     let leave_result = client.read(ControlMessageType::LeaveResult).await;
