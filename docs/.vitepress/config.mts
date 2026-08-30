@@ -54,7 +54,10 @@ export default defineConfig({
             { text: '0015: Identity files', link: '/protocol/adr/0015-protect-controller-identity-files' },
             { text: '0016: TLS initialization', link: '/protocol/adr/0016-initialize-controller-tls-identity' },
             { text: '0017: Peer leases', link: '/protocol/adr/0017-persist-peer-leases-with-endpoints' },
-            { text: '0018: Controller runtime', link: '/protocol/adr/0018-bound-controller-runtime' }
+            { text: '0018: Controller runtime', link: '/protocol/adr/0018-bound-controller-runtime' },
+            { text: '0019: Session authentication', link: '/protocol/adr/0019-authenticate-control-sessions-before-authority-use' },
+            { text: '0020: Active requests', link: '/protocol/adr/0020-serve-authenticated-control-requests-from-atomic-views' },
+            { text: '0021: Grant refresh', link: '/protocol/adr/0021-refresh-membership-grants-on-monotonic-deadlines' }
           ]
         }
       ],

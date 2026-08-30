@@ -32,3 +32,4 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0018: Bound controller runtime admission and shutdown](./0018-bound-controller-runtime.md)
 - [0019: Authenticate control sessions before authority use](./0019-authenticate-control-sessions-before-authority-use.md)
 - [0020: Serve authenticated control requests from atomic views](./0020-serve-authenticated-control-requests-from-atomic-views.md)
+- [0021: Refresh membership grants on monotonic deadlines](./0021-refresh-membership-grants-on-monotonic-deadlines.md)
