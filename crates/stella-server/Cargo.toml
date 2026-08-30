@@ -17,6 +17,7 @@ redb = "=2.6.3"
 rustls-pemfile = "=2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 stella-common = { path = "../stella-common" }
+stella-control = { path = "../stella-control" }
 stella-crypto = { path = "../stella-crypto" }
 stella-proto = { path = "../stella-proto" }
 stella-transport = { path = "../stella-transport" }

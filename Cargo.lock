@@ -1065,6 +1065,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "stella-common",
+ "stella-control",
  "stella-crypto",
  "stella-proto",
  "stella-transport",
