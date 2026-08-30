@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+redb = "=2.6.3"
 serde = { version = "1.0.229", features = ["derive"] }
 stella-common = { path = "../stella-common" }
 stella-crypto = { path = "../stella-crypto" }

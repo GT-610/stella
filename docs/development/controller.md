@@ -54,6 +54,13 @@ enrollment-token digests, and join-token digests. Every persisted value begins
 with an internal format version and is decoded with explicit size and semantic
 bounds.
 
+Database creation uses create-new file semantics. Metadata binds schema version
+1 to the controller ID, and startup opens every declared table before serving.
+Node and network values have independent magic/version fields, bounded UTF-8
+display names, explicit big-endian counters, and canonical public-key or policy
+bytes. `state verify` walks every record and confirms that its derived node or
+network identity matches the redb key.
+
 The authority thread enforces these transaction groups:
 
 - consume enrollment token plus register node;
