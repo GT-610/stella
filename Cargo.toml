@@ -2,6 +2,7 @@
 members = [
     "crates/stella-client",
     "crates/stella-common",
+    "crates/stella-control",
     "crates/stella-crypto",
     "crates/stella-proto",
     "crates/stella-server",

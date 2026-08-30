@@ -1,0 +1,19 @@
+[package]
+name = "stella-control"
+description = "Shared asynchronous Stella control-channel mechanics"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+stella-proto = { path = "../stella-proto" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[lints]
+workspace = true
