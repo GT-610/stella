@@ -8,6 +8,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::{sha256_segments, CryptoError, SHA256_OUTPUT_LENGTH};
+use crate::{ConfirmationAuthenticator, PacketProtector, SessionProtectors};
 
 /// Length of an X25519 private scalar input.
 pub const X25519_SECRET_LENGTH: usize = 32;
@@ -153,10 +154,6 @@ impl fmt::Debug for SharedSecret {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "the packet-protection module consumes this derived material"
-)]
 pub(crate) struct DirectionalSecrets {
     pub(crate) key: Zeroizing<[u8; DATA_KEY_LENGTH]>,
     pub(crate) nonce_prefix: [u8; NONCE_PREFIX_LENGTH],
@@ -164,26 +161,23 @@ pub(crate) struct DirectionalSecrets {
 
 /// Session material mapped to the local node's send and receive directions.
 pub struct SessionSecrets {
-    #[allow(
-        dead_code,
-        reason = "the packet-protection module consumes this derived material"
-    )]
     pub(crate) send: DirectionalSecrets,
-    #[allow(
-        dead_code,
-        reason = "the packet-protection module consumes this derived material"
-    )]
     pub(crate) receive: DirectionalSecrets,
-    #[allow(
-        dead_code,
-        reason = "the confirmation module consumes this derived material"
-    )]
     pub(crate) local_confirmation: Zeroizing<[u8; CONFIRMATION_KEY_LENGTH]>,
-    #[allow(
-        dead_code,
-        reason = "the confirmation module consumes this derived material"
-    )]
     pub(crate) remote_confirmation: Zeroizing<[u8; CONFIRMATION_KEY_LENGTH]>,
+}
+
+impl SessionSecrets {
+    /// Consumes derived material into directional packet and confirmation owners.
+    #[must_use]
+    pub fn into_protectors(self) -> SessionProtectors {
+        SessionProtectors::new(
+            PacketProtector::new(self.send.key, self.send.nonce_prefix),
+            PacketProtector::new(self.receive.key, self.receive.nonce_prefix),
+            ConfirmationAuthenticator::new(self.local_confirmation),
+            ConfirmationAuthenticator::new(self.remote_confirmation),
+        )
+    }
 }
 
 impl fmt::Debug for SessionSecrets {
@@ -443,6 +437,37 @@ mod tests {
         assert_ne!(
             initiator.local_confirmation.as_ref(),
             initiator.remote_confirmation.as_ref()
+        );
+
+        let initiator_protectors = initiator.into_protectors();
+        let responder_protectors = responder.into_protectors();
+        let keepalive_tag = initiator_protectors
+            .send()
+            .authenticate_header(1, b"fixed header")
+            .expect("bounded fixed header");
+        assert_eq!(
+            responder_protectors
+                .receive()
+                .verify_header(1, b"fixed header", &keepalive_tag,),
+            Ok(())
+        );
+
+        let confirmation_tag = initiator_protectors
+            .local_confirmation()
+            .create_tag(&transcript_hash, b"fixed header", &[0; 40])
+            .expect("bounded fixed confirmation");
+        assert_eq!(
+            responder_protectors.remote_confirmation().verify_tag(
+                &transcript_hash,
+                b"fixed header",
+                &[0; 40],
+                &confirmation_tag,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            format!("{initiator_protectors:?}"),
+            "SessionProtectors([REDACTED])"
         );
     }
 }

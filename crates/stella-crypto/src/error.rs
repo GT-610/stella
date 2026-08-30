@@ -38,4 +38,40 @@ pub enum CryptoError {
     /// HKDF could not expand one of the fixed-length session outputs.
     #[error("HKDF session-key expansion failed")]
     KeyDerivationFailed,
+    /// Packet sequence zero cannot be used to construct a nonce.
+    #[error("protected-packet sequence number must be non-zero")]
+    InvalidSequenceNumber,
+    /// A bounded packet-protection input exceeds its protocol limit.
+    #[error("protected input length {actual} exceeds maximum {maximum}")]
+    ProtectedInputTooLarge {
+        /// Calculated input length.
+        actual: usize,
+        /// Maximum accepted input length.
+        maximum: usize,
+    },
+    /// Caller-provided plaintext or ciphertext output storage is too small.
+    #[error("packet-protection output has {remaining} bytes but needs {needed}")]
+    ProtectionOutputTooSmall {
+        /// Required output length.
+        needed: usize,
+        /// Available output length.
+        remaining: usize,
+    },
+    /// A session-confirmation payload prefix is not exactly 40 bytes.
+    #[error("confirmation authenticated payload has length {actual}, expected {expected}")]
+    InvalidConfirmationPayloadLength {
+        /// Actual payload-prefix length.
+        actual: usize,
+        /// Required payload-prefix length.
+        expected: usize,
+    },
+    /// Bounded temporary packet-protection storage could not be reserved.
+    #[error("unable to allocate bounded packet-protection storage")]
+    PacketProtectionAllocationFailed,
+    /// ChaCha20-Poly1305 could not protect a structurally bounded input.
+    #[error("ChaCha20-Poly1305 packet protection failed")]
+    PacketProtectionFailed,
+    /// A ChaCha20-Poly1305 authentication tag did not verify.
+    #[error("ChaCha20-Poly1305 authentication failed")]
+    AuthenticationFailed,
 }
