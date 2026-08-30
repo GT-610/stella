@@ -10,7 +10,7 @@ use stella_control::{
     ControlError, InboundSequence, MessageBuilder, OutboundSequence, RecordReader, RecordWriter,
 };
 use stella_crypto::IdentitySigningKey;
-use stella_proto::{ControlFieldType, ControlMessageType};
+use stella_proto::{CodecError, ControlFieldType, ControlMessageType, Endpoint, EndpointSetView};
 use thiserror::Error;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::server::TlsStream;
@@ -27,6 +27,7 @@ use crate::{
 const STATUS_OK: u16 = 0;
 const STATUS_INVALID_STATE: u16 = 4;
 const STATUS_NODE_DISABLED: u16 = 103;
+const STATUS_NOT_AUTHORIZED: u16 = 110;
 const STATUS_JOIN_TOKEN_INVALID: u16 = 111;
 const STATUS_MEMBERSHIP_SUSPENDED: u16 = 112;
 const STATUS_NETWORK_NOT_FOUND: u16 = 200;
@@ -121,6 +122,16 @@ async fn process_request(
             handle_leave(state, header.message_id, network_id).await?;
             Ok(())
         }
+        ControlMessageType::EndpointUpdate => {
+            let request = parse_endpoint_update(&message)?;
+            handle_endpoint_update(state, header.message_id, request).await?;
+            Ok(())
+        }
+        ControlMessageType::SnapshotRequest => {
+            let request = parse_snapshot_request(&message)?;
+            handle_snapshot_request(state, header.message_id, request).await?;
+            Ok(())
+        }
         actual => {
             send_error(state, header.message_id, STATUS_INVALID_STATE).await?;
             Err(ActiveSessionError::UnexpectedMessage { actual })
@@ -131,6 +142,16 @@ async fn process_request(
 struct JoinRequest {
     network_id: NetworkId,
     token: Option<Zeroizing<[u8; 32]>>,
+}
+
+struct EndpointUpdate {
+    network_id: NetworkId,
+    endpoints: Vec<Endpoint>,
+}
+
+struct SnapshotRequest {
+    network_id: NetworkId,
+    _last_revision: u64,
 }
 
 fn parse_join_request(
@@ -177,6 +198,73 @@ fn parse_network_id(
     })
 }
 
+fn parse_endpoint_update(
+    message: &stella_control::OwnedControlMessage,
+) -> Result<EndpointUpdate, ActiveSessionError> {
+    let view = message.view()?;
+    let mut network_id = None;
+    let mut endpoints = None;
+    for field in view.fields() {
+        match field.field_type() {
+            Some(ControlFieldType::NetworkId) => {
+                network_id = Some(NetworkId::from_bytes(fixed_array(
+                    field.value(),
+                    "network ID",
+                )?));
+            }
+            Some(ControlFieldType::EndpointSet) => {
+                endpoints = Some(
+                    EndpointSetView::decode(field.value())?
+                        .endpoints()
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(EndpointUpdate {
+        network_id: network_id.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::NetworkId,
+        })?,
+        endpoints: endpoints.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::EndpointSet,
+        })?,
+    })
+}
+
+fn parse_snapshot_request(
+    message: &stella_control::OwnedControlMessage,
+) -> Result<SnapshotRequest, ActiveSessionError> {
+    let view = message.view()?;
+    let mut network_id = None;
+    let mut last_revision = None;
+    for field in view.fields() {
+        match field.field_type() {
+            Some(ControlFieldType::NetworkId) => {
+                network_id = Some(NetworkId::from_bytes(fixed_array(
+                    field.value(),
+                    "network ID",
+                )?));
+            }
+            Some(ControlFieldType::SnapshotRevision) => {
+                last_revision = Some(u64::from_be_bytes(fixed_array(
+                    field.value(),
+                    "snapshot revision",
+                )?));
+            }
+            _ => {}
+        }
+    }
+    Ok(SnapshotRequest {
+        network_id: network_id.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::NetworkId,
+        })?,
+        _last_revision: last_revision.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::SnapshotRevision,
+        })?,
+    })
+}
+
 async fn handle_join(
     state: &mut ActiveSessionState,
     correlation_id: u64,
@@ -193,7 +281,7 @@ async fn handle_join(
     {
         JoinDecision::Accepted(encoded) => {
             send_join_result(state, correlation_id, STATUS_OK, &encoded).await?;
-            send_peer_snapshot(state, &encoded).await?;
+            send_peer_snapshot(state, 0, &encoded).await?;
             state.joined_networks.insert(encoded.network_id());
         }
         JoinDecision::Rejected {
@@ -342,6 +430,154 @@ async fn resolve_leave(
     ))
 }
 
+async fn handle_endpoint_update(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    request: EndpointUpdate,
+) -> Result<(), ActiveSessionError> {
+    require_joined(state, correlation_id, request.network_id).await?;
+    let network_id = request.network_id;
+    match resolve_endpoint_update(
+        state.context.authority(),
+        state.node_id,
+        request,
+        unix_time()?,
+    )
+    .await?
+    {
+        EndpointDecision::Accepted(revision) => {
+            send_endpoint_result(state, correlation_id, STATUS_OK, &revision).await?;
+        }
+        EndpointDecision::Rejected {
+            revision,
+            status,
+            close,
+        } => {
+            state.joined_networks.remove(&revision.network_id);
+            send_endpoint_result(state, correlation_id, status, &revision).await?;
+            if close {
+                shutdown_writer(&mut state.stream).await?;
+                return Err(ActiveSessionError::AuthorizationRevoked { status });
+            }
+        }
+        EndpointDecision::NetworkNotFound => {
+            state.joined_networks.remove(&network_id);
+            send_error(state, correlation_id, STATUS_NETWORK_NOT_FOUND).await?;
+        }
+    }
+    Ok(())
+}
+
+enum EndpointDecision {
+    Accepted(AuthorityRevision),
+    Rejected {
+        revision: AuthorityRevision,
+        status: u16,
+        close: bool,
+    },
+    NetworkNotFound,
+}
+
+async fn resolve_endpoint_update(
+    authority: &AuthorityHandle,
+    node_id: NodeId,
+    request: EndpointUpdate,
+    now: u64,
+) -> Result<EndpointDecision, ActiveSessionError> {
+    let Some(network) = authority.get_network(request.network_id).await? else {
+        return Ok(EndpointDecision::NetworkNotFound);
+    };
+    match authority
+        .publish_endpoints(node_id, request.network_id, request.endpoints, now)
+        .await
+    {
+        Ok(revision) => Ok(EndpointDecision::Accepted(revision)),
+        Err(error) => {
+            if matches!(
+                &error,
+                AuthorityError::Store(source)
+                    if matches!(source.as_ref(), StoreError::NetworkNotFound { .. })
+            ) {
+                return Ok(EndpointDecision::NetworkNotFound);
+            }
+            let Some((status, close)) = classify_authorization_error(&error) else {
+                return Err(ActiveSessionError::Authority(error));
+            };
+            Ok(EndpointDecision::Rejected {
+                revision: AuthorityRevision {
+                    controller_epoch: network.controller_epoch(),
+                    network_id: network.network_id(),
+                    snapshot_revision: network.snapshot_revision(),
+                },
+                status,
+                close,
+            })
+        }
+    }
+}
+
+async fn handle_snapshot_request(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    request: SnapshotRequest,
+) -> Result<(), ActiveSessionError> {
+    require_joined(state, correlation_id, request.network_id).await?;
+    let view = match state
+        .context
+        .authority()
+        .network_session_view(state.node_id, request.network_id)
+        .await
+    {
+        Ok(view) => view,
+        Err(error) => {
+            let (status, close) = if matches!(
+                &error,
+                AuthorityError::Store(source)
+                    if matches!(source.as_ref(), StoreError::NetworkNotFound { .. })
+            ) {
+                (STATUS_NETWORK_NOT_FOUND, false)
+            } else if let Some(classified) = classify_authorization_error(&error) {
+                classified
+            } else {
+                return Err(ActiveSessionError::Authority(error));
+            };
+            state.joined_networks.remove(&request.network_id);
+            send_error(state, correlation_id, status).await?;
+            if close {
+                shutdown_writer(&mut state.stream).await?;
+                return Err(ActiveSessionError::AuthorizationRevoked { status });
+            }
+            return Ok(());
+        }
+    };
+    let encoded = encode_network_state(state.context.controller_identity(), &view, unix_time()?)?;
+    send_peer_snapshot(state, correlation_id, &encoded).await
+}
+
+async fn require_joined(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    network_id: NetworkId,
+) -> Result<(), ActiveSessionError> {
+    if state.joined_networks.contains(&network_id) {
+        return Ok(());
+    }
+    send_error(state, correlation_id, STATUS_INVALID_STATE).await?;
+    Err(ActiveSessionError::NetworkNotJoined { network_id })
+}
+
+fn classify_authorization_error(error: &AuthorityError) -> Option<(u16, bool)> {
+    match error {
+        AuthorityError::Store(source) => match source.as_ref() {
+            StoreError::NodeDisabled { .. } => Some((STATUS_NODE_DISABLED, true)),
+            StoreError::MembershipNotFound { .. } => Some((STATUS_NOT_AUTHORIZED, false)),
+            StoreError::MembershipSuspended { .. } => Some((STATUS_MEMBERSHIP_SUSPENDED, false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 async fn send_join_result(
     state: &mut ActiveSessionState,
     correlation_id: u64,
@@ -384,9 +620,11 @@ async fn send_join_rejection(
 
 async fn send_peer_snapshot(
     state: &mut ActiveSessionState,
+    correlation_id: u64,
     encoded: &EncodedNetworkState,
 ) -> Result<(), ActiveSessionError> {
-    let mut builder = MessageBuilder::new(ControlMessageType::PeerSnapshot);
+    let mut builder =
+        MessageBuilder::new(ControlMessageType::PeerSnapshot).with_correlation(correlation_id);
     builder.push_field(
         ControlFieldType::ControllerEpoch,
         &encoded.controller_epoch().to_be_bytes(),
@@ -399,6 +637,27 @@ async fn send_peer_snapshot(
         &encoded.snapshot_revision().to_be_bytes(),
     )?;
     builder.push_field(ControlFieldType::PeerList, encoded.peer_list())?;
+    write_message(state, builder).await
+}
+
+async fn send_endpoint_result(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    status: u16,
+    revision: &AuthorityRevision,
+) -> Result<(), ActiveSessionError> {
+    let mut builder =
+        MessageBuilder::new(ControlMessageType::EndpointResult).with_correlation(correlation_id);
+    builder.push_field(ControlFieldType::StatusCode, &status.to_be_bytes())?;
+    builder.push_field(
+        ControlFieldType::ControllerEpoch,
+        &revision.controller_epoch.to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::NetworkId, revision.network_id.as_bytes())?;
+    builder.push_field(
+        ControlFieldType::SnapshotRevision,
+        &revision.snapshot_revision.to_be_bytes(),
+    )?;
     write_message(state, builder).await
 }
 
@@ -495,6 +754,9 @@ pub enum ActiveSessionError {
     /// Control framing, sequence, construction, or carrier I/O failed.
     #[error(transparent)]
     Control(#[from] ControlError),
+    /// A codec-validated nested value could not be reconstructed.
+    #[error(transparent)]
+    Codec(#[from] CodecError),
     /// The serialized authority rejected or failed an operation.
     #[error(transparent)]
     Authority(#[from] AuthorityError),
@@ -512,6 +774,12 @@ pub enum ActiveSessionError {
     UnexpectedMessage {
         /// Received message type.
         actual: ControlMessageType,
+    },
+    /// A request referred to a network not joined on this TLS connection.
+    #[error("network {network_id} is not joined on this authenticated connection")]
+    NetworkNotJoined {
+        /// Network rejected by the session state machine.
+        network_id: NetworkId,
     },
     /// A codec-validated message unexpectedly lacked a required field.
     #[error("validated control message is missing required field {field:?}")]
@@ -546,6 +814,7 @@ pub enum ActiveSessionError {
 #[cfg(test)]
 mod tests {
     use std::{
+        net::Ipv4Addr,
         num::NonZeroUsize,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -553,10 +822,13 @@ mod tests {
 
     use stella_common::{ControllerId, NetworkId};
     use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
+    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
     use zeroize::Zeroizing;
 
-    use super::{resolve_join, resolve_leave, JoinDecision, JoinRequest, LeaveDecision};
+    use super::{
+        resolve_endpoint_update, resolve_join, resolve_leave, EndpointDecision, EndpointUpdate,
+        JoinDecision, JoinRequest, LeaveDecision,
+    };
     use crate::{
         authority::AuthorityThread,
         store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
@@ -664,6 +936,34 @@ mod tests {
         .expect("resolve repeated join");
         assert!(matches!(repeated, JoinDecision::Accepted(_)));
 
+        let endpoint = Endpoint::UdpIpv4 {
+            priority: 10,
+            port: 4_242,
+            max_datagram_size: 1_200,
+            address: Ipv4Addr::new(192, 0, 2, 10),
+        };
+        let endpoint_revision = resolve_endpoint_update(
+            &authority,
+            node_id,
+            EndpointUpdate {
+                network_id,
+                endpoints: vec![endpoint],
+            },
+            201,
+        )
+        .await
+        .expect("publish endpoint");
+        assert!(matches!(endpoint_revision, EndpointDecision::Accepted(_)));
+        assert_eq!(
+            authority
+                .get_endpoints(node_id, network_id)
+                .await
+                .expect("read endpoint lease")
+                .expect("endpoint lease exists")
+                .endpoints(),
+            &[endpoint]
+        );
+
         authority
             .set_membership_status(node_id, network_id, MembershipStatus::Suspended)
             .await
@@ -682,6 +982,20 @@ mod tests {
             .await
             .expect("resolve suspended join"),
             JoinDecision::Rejected { status: 112, .. }
+        ));
+        assert!(matches!(
+            resolve_endpoint_update(
+                &authority,
+                node_id,
+                EndpointUpdate {
+                    network_id,
+                    endpoints: Vec::new(),
+                },
+                202,
+            )
+            .await
+            .expect("resolve suspended endpoint update"),
+            EndpointDecision::Rejected { status: 112, .. }
         ));
         authority
             .set_membership_status(node_id, network_id, MembershipStatus::Active)
