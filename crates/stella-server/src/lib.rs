@@ -7,5 +7,6 @@ pub mod authorization;
 pub mod bootstrap;
 pub mod config;
 pub mod identity;
+pub mod runtime;
 pub mod store;
 pub mod tls;
