@@ -602,6 +602,7 @@ dependencies = [
 name = "stella-server"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "redb",
  "serde",
  "stella-common",
@@ -610,6 +611,7 @@ dependencies = [
  "stella-transport",
  "thiserror",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

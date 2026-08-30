@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+getrandom = "0.4.3"
 redb = "=2.6.3"
 serde = { version = "1.0.229", features = ["derive"] }
 stella-common = { path = "../stella-common" }
@@ -16,6 +17,7 @@ stella-proto = { path = "../stella-proto" }
 stella-transport = { path = "../stella-transport" }
 thiserror.workspace = true
 toml = "0.9.8"
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 [lints]
 workspace = true

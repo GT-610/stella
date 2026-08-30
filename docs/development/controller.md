@@ -68,11 +68,25 @@ The authority thread enforces these transaction groups:
   record new grant state;
 - leave, suspend, resume, revoke, or change policy plus all corresponding epoch,
   revision, and grant changes;
+- enable or disable a node plus one epoch/revision advance and grant-serial
+  rotation for every network in which that node is a member;
 - publish endpoints plus snapshot revision advancement.
 
 Bearer tokens are generated from operating-system randomness, displayed once
-as URL-safe text, and stored only as domain-separated SHA-256 digests with
-expiry and use metadata. Authentication comparisons are constant time.
+and stored only as domain-separated SHA-256 digests with an expiry. Enrollment
+and network-scoped join tokens are single-use: their digest is removed in the
+same write transaction that creates the node or membership, so a failed
+mutation leaves the token available while a committed mutation cannot be
+replayed.
+
+Membership add, token join, leave, suspend, and resume operations are
+idempotent where the requested state is already present. Every effective
+authorization change advances both the network controller epoch and peer
+snapshot revision and rotates the affected grant serial in the same write
+transaction. Changing a node's enabled state performs the same invalidation for
+all of its memberships; disabling therefore invalidates old grants and active
+sessions immediately through the new epoch, rather than waiting for their
+normal expiry.
 
 ## Administrative CLI
 
