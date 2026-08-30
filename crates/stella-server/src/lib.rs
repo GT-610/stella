@@ -7,6 +7,7 @@ pub mod authorization;
 pub mod bootstrap;
 pub mod config;
 pub mod identity;
+pub mod network_state;
 pub mod runtime;
 pub mod session;
 pub mod store;
