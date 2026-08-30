@@ -14,6 +14,7 @@ use stella_crypto::derive_controller_id;
 use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 use stella_server::{
     authority::{AuthorityHandle, AuthorityThread},
+    bootstrap::{initialize_controller, BootstrapOptions},
     config::ServerConfig,
     identity::load_controller_identity,
     store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
@@ -42,6 +43,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Creates a complete controller deployment without overwriting files.
+    Init(InitArgs),
     /// Creates, inspects, and deletes virtual networks.
     Network {
         #[command(subcommand)]
@@ -72,6 +75,16 @@ enum Command {
         #[command(subcommand)]
         command: StateCommand,
     },
+}
+
+#[derive(Clone, Debug, Args)]
+struct InitArgs {
+    #[arg(long, default_value = "0.0.0.0:44900")]
+    listen: std::net::SocketAddr,
+    #[arg(long = "tls-name", value_name = "DNS_OR_IP")]
+    tls_names: Vec<String>,
+    #[arg(long, default_value_t = stella_server::tls::DEFAULT_TLS_VALIDITY_DAYS)]
+    tls_validity_days: u16,
 }
 
 #[derive(Debug, Subcommand)]
@@ -216,6 +229,7 @@ pub(crate) async fn run() -> Result<()> {
 
 async fn execute(cli: Cli, output: &mut dyn Write) -> Result<()> {
     match cli.command {
+        Command::Init(args) => execute_init(&cli.config, args, output),
         Command::Network { command } => execute_network(&cli.config, command, output).await,
         Command::EnrollmentToken { command } => {
             execute_enrollment_token(&cli.config, command, output).await
@@ -225,6 +239,25 @@ async fn execute(cli: Cli, output: &mut dyn Write) -> Result<()> {
         Command::Member { command } => execute_member(&cli.config, command, output).await,
         Command::State { command } => execute_state(&cli.config, command, output).await,
     }
+}
+
+fn execute_init(config_path: &Path, args: InitArgs, output: &mut dyn Write) -> Result<()> {
+    let result = initialize_controller(
+        config_path,
+        &BootstrapOptions {
+            listen: args.listen,
+            tls_subject_alt_names: args.tls_names,
+            tls_validity_days: args.tls_validity_days,
+        },
+    )?;
+    let pin = base64::engine::general_purpose::STANDARD.encode(result.tls_spki_sha256);
+    writeln!(output, "controller_id={}", result.controller_id)
+        .context("could not write controller ID")?;
+    writeln!(output, "tls_spki_pin=sha256/{pin}").context("could not write TLS SPKI pin")?;
+    writeln!(output, "tls_not_after={}", result.tls_not_after_unix)
+        .context("could not write TLS expiration")?;
+    writeln!(output, "config={}", config_path.display())
+        .context("could not write configuration path")
 }
 
 async fn execute_network(
@@ -586,6 +619,7 @@ mod tests {
     use clap::Parser;
     use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
     use stella_server::{
+        config::ServerConfig,
         identity::create_controller_identity,
         store::{AuthorityStore, NodeRecord},
     };
@@ -660,6 +694,38 @@ mod tests {
             Cli::try_parse_from(["stella-server", "member", "add", "--network", "00"]).is_err()
         );
         assert!(Cli::try_parse_from(["stella-server", "state", "verify"]).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn init_command_creates_deployment_and_prints_public_trust_material() {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "stella-server-cli-init-{}-{sequence}",
+            std::process::id()
+        ));
+        let config = directory.join("server.toml");
+        let cli = Cli::try_parse_from([
+            OsString::from("stella-server"),
+            OsString::from("--config"),
+            config.as_os_str().to_owned(),
+            OsString::from("init"),
+            OsString::from("--listen"),
+            OsString::from("127.0.0.1:44902"),
+            OsString::from("--tls-name"),
+            OsString::from("controller.example.test"),
+        ])
+        .expect("parse init command");
+        let mut output = Vec::new();
+        execute(cli, &mut output)
+            .await
+            .expect("execute init command");
+        let text = String::from_utf8(output).expect("UTF-8 init output");
+        assert!(text.contains("controller_id="));
+        assert!(text.contains("tls_spki_pin=sha256/"));
+        assert!(text.contains("tls_not_after="));
+        let loaded = ServerConfig::load(&config).expect("load generated configuration");
+        assert_eq!(loaded.listen.to_string(), "127.0.0.1:44902");
+        std::fs::remove_dir_all(directory).expect("remove init test directory");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1,13 +1,14 @@
 # Server administration CLI
 
-`stella-server` provides offline authority administration commands. Every
-command loads the strict TOML configuration named by `--config` (default:
-`server.toml`), derives the controller ID from the protected controller
-identity, opens the configured redb database, and performs database work on the
-serialized authority thread.
+`stella-server` initializes a controller deployment and provides offline
+authority administration commands. Administrative commands load the strict
+TOML configuration named by `--config` (default: `server.toml`), derive the
+controller ID from the protected controller identity, open the configured redb
+database, and perform database work on the serialized authority thread.
 
-The daemon lifecycle commands are documented separately when they become
-available. The commands on this page are implemented and covered by tests.
+The daemon `run` command is documented when its complete control-session path
+becomes available. The commands on this page are implemented and covered by
+tests.
 
 ## Common syntax
 
@@ -19,6 +20,34 @@ Network IDs and node IDs are canonical 16-byte identifiers written as exactly
 32 hexadecimal digits. Hexadecimal input is case-insensitive; output is lower
 case. Successful mutation commands print only the result needed by scripts.
 Errors and diagnostic context go to stderr and produce a non-zero exit code.
+
+## Initialize a deployment
+
+```powershell
+stella-server --config C:\Stella\server.toml init `
+  --listen 0.0.0.0:44900 `
+  --tls-name controller.example.net
+```
+
+`init` creates the configuration, `state` and `secrets` directories, protected
+controller and TLS private keys, a self-signed Ed25519 TLS certificate, and a
+controller-bound redb database. It never overwrites an existing target. An
+initialization failure removes only files and empty directories created by that
+invocation.
+
+The certificate always contains `localhost`, `127.0.0.1`, and `::1`. Repeat
+`--tls-name` for additional DNS names or IP addresses. `--tls-validity-days`
+defaults to 825 and accepts 1 through 3650. Successful output contains:
+
+```text
+controller_id=<32 lowercase hexadecimal digits>
+tls_spki_pin=sha256/<standard padded base64>
+tls_not_after=<Unix timestamp>
+config=<configuration path>
+```
+
+Transfer the controller ID and SPKI pin to clients over a trusted channel. The
+private keys are never printed, and `run` will not regenerate missing files.
 
 ## Network management
 
