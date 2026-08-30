@@ -13,10 +13,14 @@ flowchart TD
     Client --> Tap[stella-tap]
     Client --> Transport[stella-transport]
     Client --> Crypto[stella-crypto]
+    Client --> Control[stella-control]
     Server[stella-server] --> Common
     Server --> Proto
-    Server --> Transport
     Server --> Crypto
+    Server --> Control
+    Control --> Common
+    Control --> Proto
+    Control --> Crypto
     Proto --> Common
     Transport --> Common
     Crypto --> Common
@@ -57,6 +61,14 @@ not decide membership, forwarding, or cryptographic trust.
 Owns identity, key establishment, session keys, packet protection, replay
 windows, and secret zeroization. It uses audited libraries selected by an ADR;
 it never implements a cryptographic primitive itself.
+
+### `stella-control`
+
+Owns the bounded asynchronous record reader and writer, owned control-message
+construction, per-connection sequencing and correlation, and canonical TLS
+exporter proof transcripts shared by client and server. It delegates wire
+validation to `stella-proto` and cryptographic operations to `stella-crypto`;
+it owns no sockets, TLS trust policy, authority policy, or persistent state.
 
 ### `stella-server`
 

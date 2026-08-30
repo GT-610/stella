@@ -48,7 +48,9 @@ export default defineConfig({
             { text: '0009: Cryptography', link: '/protocol/adr/0009-cryptographic-suite' },
             { text: '0010: Flooding', link: '/protocol/adr/0010-head-end-flooding' },
             { text: '0011: Configuration', link: '/protocol/adr/0011-toml-configuration' },
-            { text: '0012: TAP-Windows', link: '/protocol/adr/0012-preinstalled-tap-windows-adapters' }
+            { text: '0012: TAP-Windows', link: '/protocol/adr/0012-preinstalled-tap-windows-adapters' },
+            { text: '0013: Control channel', link: '/protocol/adr/0013-shared-control-channel-crate' },
+            { text: '0014: Controller state', link: '/protocol/adr/0014-redb-controller-state' }
           ]
         }
       ],
@@ -70,7 +72,9 @@ export default defineConfig({
             { text: 'Protocol codec', link: '/development/protocol-codec' },
             { text: 'Cryptography', link: '/development/cryptography' },
             { text: 'Transport', link: '/development/transport' },
-            { text: 'Windows TAP', link: '/development/tap-windows' }
+            { text: 'Windows TAP', link: '/development/tap-windows' },
+            { text: 'Control channel', link: '/development/control-channel' },
+            { text: 'Controller', link: '/development/controller' }
           ]
         }
       ]

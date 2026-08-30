@@ -24,3 +24,7 @@ ownership, key derivation, packet protection, and replay handling. See
 transport contract, UDP socket behavior, cancellation, and truncation defense.
 See [Windows TAP implementation](./tap-windows.md) for adapter selection,
 complete-frame I/O, MTU handling, and cancellation.
+See [Control-channel implementation](./control-channel.md) for framed async I/O,
+message ownership, sequencing, correlation, and exporter-bound proof inputs.
+See [Controller implementation](./controller.md) for TLS service boundaries,
+transactional authority state, administrative commands, and session behavior.
