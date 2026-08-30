@@ -29,6 +29,13 @@ Secret wrappers redact `Debug`, expose bytes only through an intentionally named
 method, and zeroize on drop. Public keys and signatures are fixed-size public
 values.
 
+Persistent controller and node identities use unencrypted PKCS#8 DER rather
+than a raw seed file. Encoding and strict algorithm-aware decoding are delegated
+to `ed25519-dalek`; inputs are bounded to 4 KiB before parsing. The owned DER
+wrapper is non-cloneable, redacts diagnostics, and zeroizes its buffer on drop.
+Filesystem access, atomic creation, and Windows ACL checks stay at the
+application boundary rather than inside the cryptographic crate.
+
 Node and controller IDs are derived by hashing their distinct normative domain
 prefix followed by the compressed Ed25519 public key, then taking the first 16
 bytes. Verification recomputes that value and compares all bytes in constant

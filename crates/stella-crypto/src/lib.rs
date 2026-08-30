@@ -12,10 +12,10 @@ mod session;
 pub use error::CryptoError;
 pub use hash::{sha256_segments, SHA256_OUTPUT_LENGTH};
 pub use identity::{
-    derive_controller_id, derive_node_id, validate_controller_id, validate_node_id,
+    derive_controller_id, derive_node_id, validate_controller_id, validate_node_id, IdentityPkcs8,
     IdentityPublicKey, IdentitySeed, IdentitySigningKey, CONTROLLER_ID_DOMAIN,
     ED25519_PUBLIC_KEY_LENGTH, ED25519_SIGNATURE_LENGTH, IDENTITY_SEED_LENGTH,
-    MAX_SIGNATURE_INPUT_LENGTH, NODE_ID_DOMAIN,
+    MAX_IDENTITY_PKCS8_LENGTH, MAX_SIGNATURE_INPUT_LENGTH, NODE_ID_DOMAIN,
 };
 pub use packet::{
     ConfirmationAuthenticator, PacketProtector, SessionProtectors, AUTHENTICATION_TAG_LENGTH,

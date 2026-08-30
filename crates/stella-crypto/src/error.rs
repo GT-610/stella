@@ -12,6 +12,15 @@ pub enum CryptoError {
     /// A compressed Ed25519 public key is not valid.
     #[error("invalid Ed25519 public key")]
     InvalidEd25519PublicKey,
+    /// PKCS#8 bytes do not contain one supported Ed25519 private key.
+    #[error("invalid Ed25519 PKCS#8 private key")]
+    InvalidIdentityPrivateKey,
+    /// A valid identity key could not be encoded as PKCS#8 DER.
+    #[error("unable to encode Ed25519 PKCS#8 private key")]
+    IdentityPrivateKeyEncodingFailed,
+    /// Bounded storage for encoded secret material could not be reserved.
+    #[error("unable to allocate encoded secret-key storage")]
+    SecretMaterialAllocationFailed,
     /// An Ed25519 signature did not verify.
     #[error("Ed25519 signature verification failed")]
     SignatureVerificationFailed,

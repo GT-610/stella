@@ -2,7 +2,10 @@
 
 use std::fmt;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{
+    pkcs8::{DecodePrivateKey, EncodePrivateKey},
+    Signature, Signer, SigningKey, VerifyingKey,
+};
 use stella_common::{ControllerId, NodeId};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -17,6 +20,9 @@ pub const ED25519_PUBLIC_KEY_LENGTH: usize = 32;
 
 /// Length of an Ed25519 signature.
 pub const ED25519_SIGNATURE_LENGTH: usize = 64;
+
+/// Maximum accepted Ed25519 PKCS#8 DER document length.
+pub const MAX_IDENTITY_PKCS8_LENGTH: usize = 4_096;
 
 /// Largest message assembled by the segmented signing helpers.
 pub const MAX_SIGNATURE_INPUT_LENGTH: usize = 1_048_576;
@@ -60,6 +66,24 @@ impl IdentitySeed {
 impl fmt::Debug for IdentitySeed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("IdentitySeed([REDACTED])")
+    }
+}
+
+/// Owned PKCS#8 DER identity key that redacts and clears its bytes.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct IdentityPkcs8(Vec<u8>);
+
+impl IdentityPkcs8 {
+    /// Borrows the complete PKCS#8 DER document for persistence.
+    #[must_use]
+    pub fn expose_secret(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for IdentityPkcs8 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("IdentityPkcs8([REDACTED])")
     }
 }
 
@@ -151,6 +175,25 @@ impl IdentitySigningKey {
         Self(SigningKey::from_bytes(seed.expose_secret()))
     }
 
+    /// Restores an Ed25519 signing key from unencrypted PKCS#8 DER.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::InvalidIdentityPrivateKey`] when the document is
+    /// empty, oversized, malformed, uses another algorithm, or has invalid
+    /// Ed25519 key material.
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, CryptoError> {
+        if der.is_empty() || der.len() > MAX_IDENTITY_PKCS8_LENGTH {
+            return Err(CryptoError::InvalidIdentityPrivateKey);
+        }
+        let signing =
+            SigningKey::from_pkcs8_der(der).map_err(|_| CryptoError::InvalidIdentityPrivateKey)?;
+        if signing.verifying_key().is_weak() {
+            return Err(CryptoError::InvalidIdentityPrivateKey);
+        }
+        Ok(Self(signing))
+    }
+
     /// Generates a new signing key with operating-system randomness.
     ///
     /// # Errors
@@ -172,6 +215,29 @@ impl IdentitySigningKey {
     #[must_use]
     pub fn export_seed(&self) -> IdentitySeed {
         IdentitySeed::from_bytes(self.0.to_bytes())
+    }
+
+    /// Encodes this identity as an unencrypted PKCS#8 DER document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError`] when the audited encoder fails or bounded
+    /// secret storage cannot be allocated.
+    pub fn to_pkcs8_der(&self) -> Result<IdentityPkcs8, CryptoError> {
+        let document = self
+            .0
+            .to_pkcs8_der()
+            .map_err(|_| CryptoError::IdentityPrivateKeyEncodingFailed)?;
+        let encoded = document.as_bytes();
+        if encoded.is_empty() || encoded.len() > MAX_IDENTITY_PKCS8_LENGTH {
+            return Err(CryptoError::IdentityPrivateKeyEncodingFailed);
+        }
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(encoded.len())
+            .map_err(|_| CryptoError::SecretMaterialAllocationFailed)?;
+        owned.extend_from_slice(encoded);
+        Ok(IdentityPkcs8(owned))
     }
 
     /// Signs one contiguous message with Ed25519.
@@ -290,7 +356,7 @@ mod tests {
 
     use super::{
         derive_controller_id, derive_node_id, validate_controller_id, validate_node_id,
-        IdentityPublicKey, IdentitySeed, IdentitySigningKey,
+        IdentityPublicKey, IdentitySeed, IdentitySigningKey, MAX_IDENTITY_PKCS8_LENGTH,
     };
     use crate::CryptoError;
 
@@ -397,5 +463,33 @@ mod tests {
         );
         seed.zeroize();
         assert_eq!(seed.expose_secret(), &[0; 32]);
+    }
+
+    #[test]
+    fn pkcs8_round_trip_preserves_identity_and_redacts_der() {
+        let signing = signing_key();
+        let encoded = signing.to_pkcs8_der().expect("PKCS#8 encoding succeeds");
+        assert_eq!(format!("{encoded:?}"), "IdentityPkcs8([REDACTED])");
+        let decoded = IdentitySigningKey::from_pkcs8_der(encoded.expose_secret())
+            .expect("encoded key decodes");
+        assert_eq!(decoded.public_key(), signing.public_key());
+        assert_eq!(decoded.sign(b"stella"), signing.sign(b"stella"));
+    }
+
+    #[test]
+    fn pkcs8_decoder_rejects_empty_malformed_and_oversized_documents() {
+        assert!(matches!(
+            IdentitySigningKey::from_pkcs8_der(&[]),
+            Err(CryptoError::InvalidIdentityPrivateKey)
+        ));
+        assert!(matches!(
+            IdentitySigningKey::from_pkcs8_der(&[0x30, 0x01, 0]),
+            Err(CryptoError::InvalidIdentityPrivateKey)
+        ));
+        let oversized = vec![0; MAX_IDENTITY_PKCS8_LENGTH + 1];
+        assert!(matches!(
+            IdentitySigningKey::from_pkcs8_der(&oversized),
+            Err(CryptoError::InvalidIdentityPrivateKey)
+        ));
     }
 }
