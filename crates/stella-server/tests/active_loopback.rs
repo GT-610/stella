@@ -22,8 +22,9 @@ use stella_control::{
 };
 use stella_crypto::{derive_node_id, IdentitySigningKey};
 use stella_proto::{
-    encode_endpoint_set, ConfidentialityPolicy, ControlFieldType, ControlMessageType, Endpoint,
-    MembershipGrantView, NetworkPolicy, PeerListView, VersionEntry, VersionListView,
+    encode_endpoint_set, encode_network_revision_list, ConfidentialityPolicy, ControlFieldType,
+    ControlMessageType, Endpoint, MembershipGrantView, NetworkPolicy, NetworkRevision,
+    NetworkRevisionListView, PeerListView, VersionEntry, VersionListView,
 };
 use stella_server::{
     active::serve_control_session,
@@ -371,6 +372,20 @@ fn snapshot_request(network_id: NetworkId, revision: u64) -> MessageBuilder {
     builder
 }
 
+fn heartbeat(counter: u64, revisions: &[NetworkRevision]) -> MessageBuilder {
+    let mut encoded = [0_u8; 4 + 32 * 256];
+    let length =
+        encode_network_revision_list(revisions, &mut encoded).expect("encode network revisions");
+    let mut builder = MessageBuilder::new(ControlMessageType::Heartbeat);
+    builder
+        .push_field(ControlFieldType::HeartbeatCounter, &counter.to_be_bytes())
+        .expect("heartbeat counter field");
+    builder
+        .push_field(ControlFieldType::NetworkRevisions, &encoded[..length])
+        .expect("network revisions field");
+    builder
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
@@ -513,6 +528,61 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
                 .expect("requested snapshot revision width")
         ),
         endpoint_revision
+    );
+
+    let stale_revision = NetworkRevision {
+        network_id,
+        controller_epoch: u64::from_be_bytes(
+            field_value(&requested_snapshot, ControlFieldType::ControllerEpoch)
+                .try_into()
+                .expect("requested snapshot epoch width"),
+        ),
+        snapshot_revision: endpoint_revision.saturating_sub(1).max(1),
+    };
+    let heartbeat_id = client.send(heartbeat(1, &[stale_revision])).await;
+    let heartbeat_ack = client.read(ControlMessageType::HeartbeatAck).await;
+    assert_eq!(
+        heartbeat_ack
+            .header()
+            .expect("heartbeat ACK header")
+            .correlation_id,
+        heartbeat_id
+    );
+    assert_eq!(
+        u64::from_be_bytes(
+            field_value(&heartbeat_ack, ControlFieldType::HeartbeatCounter)
+                .try_into()
+                .expect("heartbeat counter width")
+        ),
+        1
+    );
+    let authoritative_revision = NetworkRevisionListView::decode(field_value(
+        &heartbeat_ack,
+        ControlFieldType::NetworkRevisions,
+    ))
+    .expect("decode ACK revisions")
+    .revisions()
+    .next()
+    .expect("joined network revision");
+    assert_eq!(authoritative_revision.network_id, network_id);
+    assert_eq!(authoritative_revision.snapshot_revision, endpoint_revision);
+    let reconciled_snapshot = client.read(ControlMessageType::PeerSnapshot).await;
+    assert_eq!(
+        reconciled_snapshot
+            .header()
+            .expect("reconciled snapshot header")
+            .correlation_id,
+        0
+    );
+
+    let current_heartbeat_id = client.send(heartbeat(2, &[authoritative_revision])).await;
+    let current_heartbeat_ack = client.read(ControlMessageType::HeartbeatAck).await;
+    assert_eq!(
+        current_heartbeat_ack
+            .header()
+            .expect("current heartbeat ACK header")
+            .correlation_id,
+        current_heartbeat_id
     );
 
     let leave_id = client.send(leave_request(network_id)).await;

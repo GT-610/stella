@@ -10,7 +10,10 @@ use stella_control::{
     ControlError, InboundSequence, MessageBuilder, OutboundSequence, RecordReader, RecordWriter,
 };
 use stella_crypto::IdentitySigningKey;
-use stella_proto::{CodecError, ControlFieldType, ControlMessageType, Endpoint, EndpointSetView};
+use stella_proto::{
+    encode_network_revision_list, CodecError, ControlFieldType, ControlMessageType, Endpoint,
+    EndpointSetView, NetworkRevision, NetworkRevisionListView,
+};
 use thiserror::Error;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::server::TlsStream;
@@ -64,6 +67,7 @@ pub async fn serve_authenticated_session(
         inbound,
         outbound,
         joined_networks: BTreeSet::new(),
+        last_heartbeat: None,
     };
 
     loop {
@@ -96,6 +100,7 @@ struct ActiveSessionState {
     inbound: InboundSequence,
     outbound: OutboundSequence,
     joined_networks: BTreeSet<NetworkId>,
+    last_heartbeat: Option<u64>,
 }
 
 async fn process_request(
@@ -132,6 +137,11 @@ async fn process_request(
             handle_snapshot_request(state, header.message_id, request).await?;
             Ok(())
         }
+        ControlMessageType::Heartbeat => {
+            let request = parse_heartbeat(&message)?;
+            handle_heartbeat(state, header.message_id, request).await?;
+            Ok(())
+        }
         actual => {
             send_error(state, header.message_id, STATUS_INVALID_STATE).await?;
             Err(ActiveSessionError::UnexpectedMessage { actual })
@@ -152,6 +162,11 @@ struct EndpointUpdate {
 struct SnapshotRequest {
     network_id: NetworkId,
     _last_revision: u64,
+}
+
+struct HeartbeatRequest {
+    counter: u64,
+    revisions: Vec<NetworkRevision>,
 }
 
 fn parse_join_request(
@@ -261,6 +276,40 @@ fn parse_snapshot_request(
         })?,
         _last_revision: last_revision.ok_or(ActiveSessionError::ValidatedFieldMissing {
             field: ControlFieldType::SnapshotRevision,
+        })?,
+    })
+}
+
+fn parse_heartbeat(
+    message: &stella_control::OwnedControlMessage,
+) -> Result<HeartbeatRequest, ActiveSessionError> {
+    let view = message.view()?;
+    let mut counter = None;
+    let mut revisions = None;
+    for field in view.fields() {
+        match field.field_type() {
+            Some(ControlFieldType::HeartbeatCounter) => {
+                counter = Some(u64::from_be_bytes(fixed_array(
+                    field.value(),
+                    "heartbeat counter",
+                )?));
+            }
+            Some(ControlFieldType::NetworkRevisions) => {
+                revisions = Some(
+                    NetworkRevisionListView::decode(field.value())?
+                        .revisions()
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(HeartbeatRequest {
+        counter: counter.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::HeartbeatCounter,
+        })?,
+        revisions: revisions.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::NetworkRevisions,
         })?,
     })
 }
@@ -554,6 +603,112 @@ async fn handle_snapshot_request(
     send_peer_snapshot(state, correlation_id, &encoded).await
 }
 
+async fn handle_heartbeat(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    request: HeartbeatRequest,
+) -> Result<(), ActiveSessionError> {
+    let counter_valid = match state.last_heartbeat {
+        None => request.counter == 1,
+        Some(previous) => previous.checked_add(1) == Some(request.counter),
+    };
+    if !counter_valid {
+        send_error(state, correlation_id, STATUS_INVALID_STATE).await?;
+        return Err(ActiveSessionError::HeartbeatCounterInvalid {
+            previous: state.last_heartbeat,
+            actual: request.counter,
+        });
+    }
+    if let Some(unjoined) = request
+        .revisions
+        .iter()
+        .find(|revision| !state.joined_networks.contains(&revision.network_id))
+    {
+        require_joined(state, correlation_id, unjoined.network_id).await?;
+    }
+    state.last_heartbeat = Some(request.counter);
+
+    let authority = state.context.authority().clone();
+    let joined_networks = state.joined_networks.iter().copied().collect::<Vec<_>>();
+    let now = unix_time()?;
+    let mut revisions = Vec::new();
+    let mut snapshots = Vec::new();
+    for network_id in joined_networks {
+        let view = match authority
+            .network_session_view(state.node_id, network_id)
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                handle_network_authority_failure(state, correlation_id, network_id, error).await?;
+                return Ok(());
+            }
+        };
+        if authority
+            .get_endpoints(state.node_id, network_id)
+            .await?
+            .is_some()
+        {
+            if let Err(error) = authority
+                .refresh_endpoint_lease(state.node_id, network_id, now)
+                .await
+            {
+                handle_network_authority_failure(state, correlation_id, network_id, error).await?;
+                return Ok(());
+            }
+        }
+        let revision = NetworkRevision {
+            network_id,
+            controller_epoch: view.network().controller_epoch(),
+            snapshot_revision: view.network().snapshot_revision(),
+        };
+        let client_current = request
+            .revisions
+            .iter()
+            .any(|candidate| candidate == &revision);
+        if !client_current {
+            snapshots.push(encode_network_state(
+                state.context.controller_identity(),
+                &view,
+                now,
+            )?);
+        }
+        revisions.push(revision);
+    }
+
+    send_heartbeat_ack(state, correlation_id, request.counter, &revisions, now).await?;
+    for snapshot in &snapshots {
+        send_peer_snapshot(state, 0, snapshot).await?;
+    }
+    Ok(())
+}
+
+async fn handle_network_authority_failure(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    network_id: NetworkId,
+    error: AuthorityError,
+) -> Result<(), ActiveSessionError> {
+    let (status, close) = if matches!(
+        &error,
+        AuthorityError::Store(source)
+            if matches!(source.as_ref(), StoreError::NetworkNotFound { .. })
+    ) {
+        (STATUS_NETWORK_NOT_FOUND, false)
+    } else if let Some(classified) = classify_authorization_error(&error) {
+        classified
+    } else {
+        return Err(ActiveSessionError::Authority(error));
+    };
+    state.joined_networks.remove(&network_id);
+    send_error(state, correlation_id, status).await?;
+    if close {
+        shutdown_writer(&mut state.stream).await?;
+        return Err(ActiveSessionError::AuthorizationRevoked { status });
+    }
+    Ok(())
+}
+
 async fn require_joined(
     state: &mut ActiveSessionState,
     correlation_id: u64,
@@ -658,6 +813,26 @@ async fn send_endpoint_result(
         ControlFieldType::SnapshotRevision,
         &revision.snapshot_revision.to_be_bytes(),
     )?;
+    write_message(state, builder).await
+}
+
+async fn send_heartbeat_ack(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    counter: u64,
+    revisions: &[NetworkRevision],
+    server_time: u64,
+) -> Result<(), ActiveSessionError> {
+    let mut encoded = [0_u8; 4 + 32 * 256];
+    let encoded_length = encode_network_revision_list(revisions, &mut encoded)?;
+    let mut builder =
+        MessageBuilder::new(ControlMessageType::HeartbeatAck).with_correlation(correlation_id);
+    builder.push_field(ControlFieldType::HeartbeatCounter, &counter.to_be_bytes())?;
+    builder.push_field(
+        ControlFieldType::NetworkRevisions,
+        &encoded[..encoded_length],
+    )?;
+    builder.push_field(ControlFieldType::ServerTime, &server_time.to_be_bytes())?;
     write_message(state, builder).await
 }
 
@@ -780,6 +955,14 @@ pub enum ActiveSessionError {
     NetworkNotJoined {
         /// Network rejected by the session state machine.
         network_id: NetworkId,
+    },
+    /// The client heartbeat counter did not start at one or increment by one.
+    #[error("heartbeat counter {actual} does not follow previous value {previous:?}")]
+    HeartbeatCounterInvalid {
+        /// Last accepted counter, or `None` before the first heartbeat.
+        previous: Option<u64>,
+        /// Invalid received counter.
+        actual: u64,
     },
     /// A codec-validated message unexpectedly lacked a required field.
     #[error("validated control message is missing required field {field:?}")]
