@@ -8,6 +8,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+stella-common = { path = "../stella-common" }
+stella-crypto = { path = "../stella-crypto" }
 stella-proto = { path = "../stella-proto" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }

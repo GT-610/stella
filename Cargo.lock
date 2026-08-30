@@ -456,6 +456,8 @@ dependencies = [
 name = "stella-control"
 version = "0.1.0"
 dependencies = [
+ "stella-common",
+ "stella-crypto",
  "stella-proto",
  "thiserror",
  "tokio",
