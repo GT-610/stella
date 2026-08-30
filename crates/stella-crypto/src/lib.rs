@@ -1,25 +1,16 @@
-//! Identity and packet-protection policy types for Stella.
+//! Identity, key establishment, packet protection, and replay defense for Stella.
 
 #![forbid(unsafe_code)]
 
-/// Data-plane confidentiality policy selected for a virtual network.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConfidentialityPolicy {
-    /// Authenticate packets while leaving Ethernet payload bytes visible.
-    AuthenticateOnly,
-    /// Authenticate and encrypt the complete Ethernet payload.
-    Encrypt,
-}
+mod error;
+mod hash;
+mod identity;
 
-#[cfg(test)]
-mod tests {
-    use super::ConfidentialityPolicy;
-
-    #[test]
-    fn encryption_is_distinct_from_authentication_only() {
-        assert_ne!(
-            ConfidentialityPolicy::Encrypt,
-            ConfidentialityPolicy::AuthenticateOnly
-        );
-    }
-}
+pub use error::CryptoError;
+pub use hash::{sha256_segments, SHA256_OUTPUT_LENGTH};
+pub use identity::{
+    derive_controller_id, derive_node_id, validate_controller_id, validate_node_id,
+    IdentityPublicKey, IdentitySeed, IdentitySigningKey, CONTROLLER_ID_DOMAIN,
+    ED25519_PUBLIC_KEY_LENGTH, ED25519_SIGNATURE_LENGTH, IDENTITY_SEED_LENGTH,
+    MAX_SIGNATURE_INPUT_LENGTH, NODE_ID_DOMAIN,
+};
