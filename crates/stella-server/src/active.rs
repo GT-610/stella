@@ -66,19 +66,24 @@ pub async fn serve_authenticated_session(
     };
 
     loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                send_shutdown(&mut state).await?;
-                return Ok(());
+        let read_result = {
+            let mut reader = RecordReader::new(&mut state.stream);
+            tokio::select! {
+                _ = shutdown.changed() => None,
+                result = reader.read_message() => Some(result),
             }
-            result = timeout(request_timeout, process_next_request(&mut state)) => {
-                match result {
-                    Err(_) => return Err(ActiveSessionError::RequestTimeout),
-                    Ok(Ok(ActiveStep::Continue)) => {}
-                    Ok(Ok(ActiveStep::Closed)) => return Ok(()),
-                    Ok(Err(error)) => return Err(error),
-                }
-            }
+        };
+        let Some(read_result) = read_result else {
+            send_shutdown(&mut state).await?;
+            return Ok(());
+        };
+        let Some(message) = read_result? else {
+            return Ok(());
+        };
+        match timeout(request_timeout, process_request(&mut state, message)).await {
+            Err(_) => return Err(ActiveSessionError::RequestTimeout),
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
         }
     }
 }
@@ -92,17 +97,10 @@ struct ActiveSessionState {
     joined_networks: BTreeSet<NetworkId>,
 }
 
-enum ActiveStep {
-    Continue,
-    Closed,
-}
-
-async fn process_next_request(
+async fn process_request(
     state: &mut ActiveSessionState,
-) -> Result<ActiveStep, ActiveSessionError> {
-    let Some(message) = RecordReader::new(&mut state.stream).read_message().await? else {
-        return Ok(ActiveStep::Closed);
-    };
+    message: stella_control::OwnedControlMessage,
+) -> Result<(), ActiveSessionError> {
     let header = message.header()?;
     state.inbound.accept(header.message_id)?;
     if header.correlation_id != 0 {
@@ -116,12 +114,12 @@ async fn process_next_request(
         ControlMessageType::JoinRequest => {
             let request = parse_join_request(&message)?;
             handle_join(state, header.message_id, request).await?;
-            Ok(ActiveStep::Continue)
+            Ok(())
         }
         ControlMessageType::LeaveRequest => {
             let network_id = parse_network_id(&message)?;
             handle_leave(state, header.message_id, network_id).await?;
-            Ok(ActiveStep::Continue)
+            Ok(())
         }
         actual => {
             send_error(state, header.message_id, STATUS_INVALID_STATE).await?;
