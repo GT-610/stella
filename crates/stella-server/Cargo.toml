@@ -20,5 +20,8 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 toml = "0.9.8"
 zeroize = { version = "1.9.0", features = ["derive"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-acl = "=0.3.0"
+
 [lints]
 workspace = true

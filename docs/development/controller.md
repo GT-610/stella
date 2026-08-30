@@ -44,6 +44,15 @@ It names the listen address, database path, TLS certificate chain and PKCS#8
 private key, controller Ed25519 identity key, operational limits, and logging
 filter. Secrets are separate files and are never accepted inline.
 
+The controller identity is unencrypted Ed25519 PKCS#8 DER bounded to 4 KiB.
+`init` creates an empty file with create-new semantics, hardens and verifies its
+permissions, and only then writes and syncs the key. On Windows the DACL is
+protected from inheritance and grants full access only to the current process
+account and LocalSystem. Loading rejects reparse points, non-regular files,
+inherited or additional ACEs, unexpected access masks, malformed PKCS#8, and
+oversized input. Temporary DER buffers are zeroized. Failure during creation
+removes the new file, and a failed cleanup is surfaced explicitly.
+
 The reference schema uses `[state]`, `[identity]`, `[tls]`, `[limits]`, and
 `[logging]` tables; `examples/server.toml` is the canonical deployable sample.
 Relative paths resolve against the configuration file directory. The parser

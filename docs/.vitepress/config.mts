@@ -50,7 +50,8 @@ export default defineConfig({
             { text: '0011: Configuration', link: '/protocol/adr/0011-toml-configuration' },
             { text: '0012: TAP-Windows', link: '/protocol/adr/0012-preinstalled-tap-windows-adapters' },
             { text: '0013: Control channel', link: '/protocol/adr/0013-shared-control-channel-crate' },
-            { text: '0014: Controller state', link: '/protocol/adr/0014-redb-controller-state' }
+            { text: '0014: Controller state', link: '/protocol/adr/0014-redb-controller-state' },
+            { text: '0015: Identity files', link: '/protocol/adr/0015-protect-controller-identity-files' }
           ]
         }
       ],
