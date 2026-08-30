@@ -20,8 +20,10 @@ const MAX_LOG_FILTER_BYTES: usize = 256;
 const MAX_AUTHORITY_QUEUE: usize = 4_096;
 const MAX_CONNECTIONS: usize = 65_535;
 const MAX_OUTBOUND_MESSAGES: usize = 1_024;
+const MAX_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 60;
 const MAX_AUTHENTICATION_TIMEOUT_SECONDS: u64 = 10;
 const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+const MAX_SHUTDOWN_TIMEOUT_SECONDS: u64 = 60;
 
 /// Validated controller process configuration with resolved filesystem paths.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,10 +136,14 @@ pub struct LimitsConfig {
     pub max_connections: usize,
     /// Maximum queued outbound messages per connection.
     pub outbound_messages: usize,
+    /// Deadline for completing one TLS handshake.
+    pub tls_handshake_timeout_seconds: u64,
     /// Deadline for application authentication after TLS establishment.
     pub authentication_timeout_seconds: u64,
     /// Deadline for one correlated control request.
     pub request_timeout_seconds: u64,
+    /// Deadline for draining active sessions during orderly shutdown.
+    pub shutdown_timeout_seconds: u64,
 }
 
 impl LimitsConfig {
@@ -161,6 +167,12 @@ impl LimitsConfig {
             "limits.outbound_messages",
         )?;
         validate_range(
+            &self.tls_handshake_timeout_seconds,
+            &1,
+            &MAX_TLS_HANDSHAKE_TIMEOUT_SECONDS,
+            "limits.tls_handshake_timeout_seconds",
+        )?;
+        validate_range(
             &self.authentication_timeout_seconds,
             &1,
             &MAX_AUTHENTICATION_TIMEOUT_SECONDS,
@@ -171,6 +183,12 @@ impl LimitsConfig {
             &1,
             &MAX_REQUEST_TIMEOUT_SECONDS,
             "limits.request_timeout_seconds",
+        )?;
+        validate_range(
+            &self.shutdown_timeout_seconds,
+            &1,
+            &MAX_SHUTDOWN_TIMEOUT_SECONDS,
+            "limits.shutdown_timeout_seconds",
         )
     }
 }
@@ -181,8 +199,10 @@ impl Default for LimitsConfig {
             authority_queue: 256,
             max_connections: 1_024,
             outbound_messages: 64,
+            tls_handshake_timeout_seconds: 10,
             authentication_timeout_seconds: 10,
             request_timeout_seconds: 10,
+            shutdown_timeout_seconds: 10,
         }
     }
 }
@@ -450,7 +470,7 @@ private_key = "secrets/tls-key.pem"
     #[test]
     fn explicit_limits_and_absolute_paths_are_preserved() {
         let config = format!(
-            "{VALID_CONFIG}\n[limits]\nauthority_queue = 4\nmax_connections = 5\noutbound_messages = 6\nauthentication_timeout_seconds = 7\nrequest_timeout_seconds = 8\n\n[logging]\nfilter = \"stella_server=debug\"\n"
+            "{VALID_CONFIG}\n[limits]\nauthority_queue = 4\nmax_connections = 5\noutbound_messages = 6\ntls_handshake_timeout_seconds = 7\nauthentication_timeout_seconds = 8\nrequest_timeout_seconds = 9\nshutdown_timeout_seconds = 10\n\n[logging]\nfilter = \"stella_server=debug\"\n"
         )
         .replace(
             "database = \"state/controller.redb\"",
@@ -463,6 +483,10 @@ private_key = "secrets/tls-key.pem"
             Path::new("C:/absolute/controller.redb")
         );
         assert_eq!(parsed.limits.authority_queue, 4);
+        assert_eq!(parsed.limits.tls_handshake_timeout_seconds, 7);
+        assert_eq!(parsed.limits.authentication_timeout_seconds, 8);
+        assert_eq!(parsed.limits.request_timeout_seconds, 9);
+        assert_eq!(parsed.limits.shutdown_timeout_seconds, 10);
         assert_eq!(parsed.logging.filter, "stella_server=debug");
     }
 

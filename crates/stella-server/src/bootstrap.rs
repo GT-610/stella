@@ -148,7 +148,7 @@ fn validate_options(options: &BootstrapOptions) -> Result<(), BootstrapError> {
 
 fn configuration_document(listen: SocketAddr) -> String {
     format!(
-        "version = 1\nlisten = \"{listen}\"\n\n[state]\ndatabase = \"{DATABASE_RELATIVE_PATH}\"\n\n[identity]\ncontroller_key = \"{CONTROLLER_KEY_RELATIVE_PATH}\"\n\n[tls]\ncertificate = \"{TLS_CERTIFICATE_RELATIVE_PATH}\"\nprivate_key = \"{TLS_PRIVATE_KEY_RELATIVE_PATH}\"\n\n[limits]\nauthority_queue = 256\nmax_connections = 1024\noutbound_messages = 64\nauthentication_timeout_seconds = 10\nrequest_timeout_seconds = 10\n\n[logging]\nfilter = \"info,stella_server=info\"\n"
+        "version = 1\nlisten = \"{listen}\"\n\n[state]\ndatabase = \"{DATABASE_RELATIVE_PATH}\"\n\n[identity]\ncontroller_key = \"{CONTROLLER_KEY_RELATIVE_PATH}\"\n\n[tls]\ncertificate = \"{TLS_CERTIFICATE_RELATIVE_PATH}\"\nprivate_key = \"{TLS_PRIVATE_KEY_RELATIVE_PATH}\"\n\n[limits]\nauthority_queue = 256\nmax_connections = 1024\noutbound_messages = 64\ntls_handshake_timeout_seconds = 10\nauthentication_timeout_seconds = 10\nrequest_timeout_seconds = 10\nshutdown_timeout_seconds = 10\n\n[logging]\nfilter = \"info,stella_server=info\"\n"
     )
 }
 

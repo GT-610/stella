@@ -15,8 +15,10 @@ private_key = "secrets/tls-key.pem"
 authority_queue = 256
 max_connections = 1024
 outbound_messages = 64
+tls_handshake_timeout_seconds = 10
 authentication_timeout_seconds = 10
 request_timeout_seconds = 10
+shutdown_timeout_seconds = 10
 
 [logging]
 filter = "info,stella_server=info"
