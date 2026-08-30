@@ -1,6 +1,7 @@
 //! Transactional redb controller authority store.
 
 use std::{
+    collections::BTreeMap,
     fs::OpenOptions,
     path::{Path, PathBuf},
     str,
@@ -9,7 +10,10 @@ use std::{
 use redb::{Database, ReadableTable, TableDefinition};
 use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
 use stella_crypto::{derive_node_id, sha256_segments, CryptoError, IdentityPublicKey};
-use stella_proto::{CodecError, MembershipPermissions, NetworkPolicy, NETWORK_POLICY_LENGTH};
+use stella_proto::{
+    encode_endpoint_set, CodecError, Endpoint, EndpointSetView, MembershipPermissions,
+    NetworkPolicy, MAX_ENDPOINTS, NETWORK_POLICY_LENGTH,
+};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -21,10 +25,14 @@ const NETWORK_RECORD_FIXED_LENGTH: usize = 96;
 const NODE_RECORD_MAGIC: [u8; 4] = *b"SNOD";
 const NETWORK_RECORD_MAGIC: [u8; 4] = *b"SNET";
 const MEMBERSHIP_RECORD_MAGIC: [u8; 4] = *b"SMEM";
+const ENDPOINT_RECORD_MAGIC: [u8; 4] = *b"SEPT";
 const ENROLLMENT_TOKEN_RECORD_MAGIC: [u8; 4] = *b"SENT";
 const JOIN_TOKEN_RECORD_MAGIC: [u8; 4] = *b"SJTK";
 const NODE_ENABLED_FLAG: u8 = 0x01;
 const MEMBERSHIP_RECORD_LENGTH: usize = 64;
+const ENDPOINT_RECORD_FIXED_LENGTH: usize = 48;
+const MAX_ENDPOINT_SET_LENGTH: usize = 4 + (MAX_ENDPOINTS as usize) * 28;
+const MAX_ENDPOINT_RECORD_LENGTH: usize = ENDPOINT_RECORD_FIXED_LENGTH + MAX_ENDPOINT_SET_LENGTH;
 const TOKEN_RECORD_LENGTH: usize = 24;
 const JOIN_TOKEN_RECORD_LENGTH: usize = 40;
 const TOKEN_LENGTH: usize = 32;
@@ -201,7 +209,7 @@ impl AuthorityStore {
                 }
             }
         }
-        read.open_table(ENDPOINTS)?;
+        verify_endpoint_records(&read)?;
         {
             let tokens = read.open_table(ENROLLMENT_TOKENS)?;
             for entry in tokens.iter()? {
@@ -355,6 +363,12 @@ impl AuthorityStore {
             let mut networks = write.open_table(NETWORKS)?;
             for (_, _, network_id, encoded_network) in &authority_updates {
                 networks.insert(network_id.as_bytes().as_slice(), encoded_network.as_slice())?;
+            }
+        }
+        if !enabled {
+            let mut endpoints = write.open_table(ENDPOINTS)?;
+            for (key, _, _, _) in &authority_updates {
+                endpoints.remove(key.as_slice())?;
             }
         }
         write.commit()?;
@@ -765,6 +779,10 @@ impl AuthorityStore {
             let mut networks = write.open_table(NETWORKS)?;
             networks.insert(network_id.as_bytes().as_slice(), encoded_network.as_slice())?;
         }
+        if status == MembershipStatus::Suspended {
+            let mut endpoints = write.open_table(ENDPOINTS)?;
+            endpoints.remove(key.as_slice())?;
+        }
         write.commit()?;
         Ok(revision)
     }
@@ -812,6 +830,220 @@ impl AuthorityStore {
             }
         }
         Ok(records)
+    }
+
+    /// Publishes a complete endpoint set and refreshes the peer's online lease.
+    ///
+    /// Creating an online record or changing its endpoint set advances only
+    /// the network snapshot revision. Republishing the identical canonical set
+    /// refreshes the observed activity time without revision churn. Empty sets
+    /// remain persisted and mean online without a direct endpoint candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for an unknown, disabled, or suspended member, an
+    /// invalid endpoint set, exhausted snapshot revision, corrupt state, or
+    /// transaction failure.
+    pub fn publish_endpoints(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+        endpoints: &[Endpoint],
+        now: u64,
+    ) -> Result<AuthorityRevision, StoreError> {
+        let mut candidate = EndpointLeaseRecord::new(network_id, node_id, endpoints, now)?;
+        let key = membership_key(network_id, node_id);
+        let write = self.database.begin_write()?;
+        let mut network = load_network_for_write(&write, network_id)?;
+        require_active_member_for_write(&write, node_id, network_id, &key)?;
+        let existing = {
+            let endpoint_table = write.open_table(ENDPOINTS)?;
+            let record = endpoint_table
+                .get(key.as_slice())?
+                .map(|value| EndpointLeaseRecord::decode(value.value()))
+                .transpose()?;
+            record
+        };
+
+        let endpoint_changed = if let Some(mut record) = existing {
+            validate_endpoint_key(&record, &key)?;
+            candidate.updated_at = candidate.updated_at.max(record.updated_at);
+            if record.endpoints == candidate.endpoints {
+                if !record.refresh(now) {
+                    return Ok(network.revision());
+                }
+                let encoded = record.encode()?;
+                let mut endpoint_table = write.open_table(ENDPOINTS)?;
+                endpoint_table.insert(key.as_slice(), encoded.as_slice())?;
+                false
+            } else {
+                let encoded = candidate.encode()?;
+                let mut endpoint_table = write.open_table(ENDPOINTS)?;
+                endpoint_table.insert(key.as_slice(), encoded.as_slice())?;
+                true
+            }
+        } else {
+            let encoded = candidate.encode()?;
+            let mut endpoint_table = write.open_table(ENDPOINTS)?;
+            endpoint_table.insert(key.as_slice(), encoded.as_slice())?;
+            true
+        };
+
+        let revision = if endpoint_changed {
+            let revision = network.advance_snapshot()?;
+            let encoded_network = network.encode()?;
+            let mut networks = write.open_table(NETWORKS)?;
+            networks.insert(network_id.as_bytes().as_slice(), encoded_network.as_slice())?;
+            revision
+        } else {
+            network.revision()
+        };
+        write.commit()?;
+        Ok(revision)
+    }
+
+    /// Refreshes an existing online peer lease without changing its endpoints.
+    ///
+    /// The stored activity time never moves backwards. The current authority
+    /// counters are returned without advancing either counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for an unknown, disabled, suspended, or offline
+    /// member, corrupt state, or transaction failure.
+    pub fn refresh_endpoint_lease(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+        now: u64,
+    ) -> Result<AuthorityRevision, StoreError> {
+        let key = membership_key(network_id, node_id);
+        let write = self.database.begin_write()?;
+        let network = load_network_for_write(&write, network_id)?;
+        require_active_member_for_write(&write, node_id, network_id, &key)?;
+        let mut record = {
+            let endpoint_table = write.open_table(ENDPOINTS)?;
+            let Some(value) = endpoint_table.get(key.as_slice())? else {
+                return Err(StoreError::EndpointLeaseNotFound {
+                    network_id,
+                    node_id,
+                });
+            };
+            EndpointLeaseRecord::decode(value.value())?
+        };
+        validate_endpoint_key(&record, &key)?;
+        if !record.refresh(now) {
+            return Ok(network.revision());
+        }
+        let encoded = record.encode()?;
+        {
+            let mut endpoint_table = write.open_table(ENDPOINTS)?;
+            endpoint_table.insert(key.as_slice(), encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(network.revision())
+    }
+
+    /// Returns one online peer lease and its complete endpoint set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for persistence, key, or record-decoding failure.
+    pub fn get_endpoints(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+    ) -> Result<Option<EndpointLeaseRecord>, StoreError> {
+        let key = membership_key(network_id, node_id);
+        let read = self.database.begin_read()?;
+        let endpoint_table = read.open_table(ENDPOINTS)?;
+        let Some(value) = endpoint_table.get(key.as_slice())? else {
+            return Ok(None);
+        };
+        let record = EndpointLeaseRecord::decode(value.value())?;
+        validate_endpoint_key(&record, &key)?;
+        Ok(Some(record))
+    }
+
+    /// Lists every online peer lease in one network in node-ID order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for persistence, key, or record-decoding failure.
+    pub fn list_endpoints(
+        &self,
+        network_id: NetworkId,
+    ) -> Result<Vec<EndpointLeaseRecord>, StoreError> {
+        let read = self.database.begin_read()?;
+        let endpoint_table = read.open_table(ENDPOINTS)?;
+        let mut records = Vec::new();
+        for entry in endpoint_table.iter()? {
+            let (key, value) = entry?;
+            let key = decode_identifier::<32>(key.value(), "endpoints", "endpoint key")?;
+            let record = EndpointLeaseRecord::decode(value.value())?;
+            validate_endpoint_key(&record, &key)?;
+            if record.network_id == network_id {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Removes expired online leases in one transaction.
+    ///
+    /// Every affected network advances its snapshot revision exactly once,
+    /// even when multiple peers in that network expire at the same cutoff.
+    /// Returned revisions are ordered by network ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for corrupt state, an exhausted snapshot
+    /// revision, or transaction failure.
+    pub fn expire_endpoints(&self, now: u64) -> Result<Vec<AuthorityRevision>, StoreError> {
+        let write = self.database.begin_write()?;
+        let mut expired = BTreeMap::<NetworkId, Vec<[u8; 32]>>::new();
+        {
+            let endpoint_table = write.open_table(ENDPOINTS)?;
+            for entry in endpoint_table.iter()? {
+                let (key, value) = entry?;
+                let key = decode_identifier::<32>(key.value(), "endpoints", "endpoint key")?;
+                let record = EndpointLeaseRecord::decode(value.value())?;
+                validate_endpoint_key(&record, &key)?;
+                let network = load_network_for_write(&write, record.network_id)?;
+                if record.is_expired(now, network.policy.peer_lease_seconds) {
+                    expired.entry(record.network_id).or_default().push(key);
+                }
+            }
+        }
+        if expired.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut network_updates = Vec::with_capacity(expired.len());
+        for network_id in expired.keys().copied() {
+            let mut network = load_network_for_write(&write, network_id)?;
+            let revision = network.advance_snapshot()?;
+            network_updates.push((network_id, network.encode()?, revision));
+        }
+        {
+            let mut endpoint_table = write.open_table(ENDPOINTS)?;
+            for keys in expired.values() {
+                for key in keys {
+                    endpoint_table.remove(key.as_slice())?;
+                }
+            }
+        }
+        {
+            let mut networks = write.open_table(NETWORKS)?;
+            for (network_id, encoded, _) in &network_updates {
+                networks.insert(network_id.as_bytes().as_slice(), encoded.as_slice())?;
+            }
+        }
+        write.commit()?;
+        Ok(network_updates
+            .into_iter()
+            .map(|(_, _, revision)| revision)
+            .collect())
     }
 
     fn add_membership_transaction(
@@ -1151,6 +1383,16 @@ impl NetworkRecord {
         Ok(self.revision())
     }
 
+    fn advance_snapshot(&mut self) -> Result<AuthorityRevision, StoreError> {
+        self.snapshot_revision =
+            self.snapshot_revision
+                .checked_add(1)
+                .ok_or(StoreError::CounterExhausted {
+                    network_id: self.network_id(),
+                })?;
+        Ok(self.revision())
+    }
+
     const fn revision(&self) -> AuthorityRevision {
         AuthorityRevision {
             network_id: self.policy.network_id,
@@ -1442,6 +1684,134 @@ impl MembershipRecord {
     }
 }
 
+/// Persisted online peer lease and its complete canonical endpoint set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EndpointLeaseRecord {
+    network_id: NetworkId,
+    node_id: NodeId,
+    updated_at: u64,
+    endpoints: Vec<Endpoint>,
+}
+
+impl EndpointLeaseRecord {
+    fn new(
+        network_id: NetworkId,
+        node_id: NodeId,
+        endpoints: &[Endpoint],
+        updated_at: u64,
+    ) -> Result<Self, StoreError> {
+        if network_id.is_zero() || node_id.is_zero() {
+            return Err(malformed("endpoints", "endpoint lease identity is zero"));
+        }
+        let mut encoded = [0_u8; MAX_ENDPOINT_SET_LENGTH];
+        encode_endpoint_set(endpoints, &mut encoded)?;
+        Ok(Self {
+            network_id,
+            node_id,
+            updated_at,
+            endpoints: endpoints.to_vec(),
+        })
+    }
+
+    /// Returns the virtual network containing this online peer.
+    #[must_use]
+    pub const fn network_id(&self) -> NetworkId {
+        self.network_id
+    }
+
+    /// Returns the online peer's stable node identity.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Returns the last controller-observed activity time as Unix seconds.
+    #[must_use]
+    pub const fn updated_at(&self) -> u64 {
+        self.updated_at
+    }
+
+    /// Returns the complete canonical endpoint set.
+    #[must_use]
+    pub fn endpoints(&self) -> &[Endpoint] {
+        &self.endpoints
+    }
+
+    fn refresh(&mut self, now: u64) -> bool {
+        if now <= self.updated_at {
+            return false;
+        }
+        self.updated_at = now;
+        true
+    }
+
+    fn is_expired(&self, now: u64, lease_seconds: u16) -> bool {
+        now >= self.updated_at && now - self.updated_at >= u64::from(lease_seconds)
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        if self.network_id.is_zero() || self.node_id.is_zero() {
+            return Err(malformed("endpoints", "endpoint lease identity is zero"));
+        }
+        let mut endpoint_set = [0_u8; MAX_ENDPOINT_SET_LENGTH];
+        let endpoint_length = encode_endpoint_set(&self.endpoints, &mut endpoint_set)?;
+        let length = ENDPOINT_RECORD_FIXED_LENGTH
+            .checked_add(endpoint_length)
+            .ok_or(StoreError::LengthOverflow)?;
+        let mut bytes = allocate_record(length)?;
+        bytes[0..4].copy_from_slice(&ENDPOINT_RECORD_MAGIC);
+        bytes[4] = RECORD_VERSION;
+        bytes[8..16].copy_from_slice(&self.updated_at.to_be_bytes());
+        bytes[16..32].copy_from_slice(self.network_id.as_bytes());
+        bytes[32..48].copy_from_slice(self.node_id.as_bytes());
+        bytes[ENDPOINT_RECORD_FIXED_LENGTH..].copy_from_slice(&endpoint_set[..endpoint_length]);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
+        if !(ENDPOINT_RECORD_FIXED_LENGTH + 4..=MAX_ENDPOINT_RECORD_LENGTH).contains(&bytes.len()) {
+            return Err(malformed("endpoints", "endpoint record length is invalid"));
+        }
+        if bytes.get(0..4) != Some(ENDPOINT_RECORD_MAGIC.as_slice()) || bytes[4] != RECORD_VERSION {
+            return Err(malformed("endpoints", "endpoint record header is invalid"));
+        }
+        if bytes[5..8].iter().any(|byte| *byte != 0) {
+            return Err(malformed(
+                "endpoints",
+                "endpoint reserved bytes are non-zero",
+            ));
+        }
+        let updated_at = u64::from_be_bytes(copy_array(
+            bytes,
+            8,
+            "endpoints",
+            "endpoint activity time is truncated",
+        )?);
+        let network_id = NetworkId::from_bytes(copy_array(
+            bytes,
+            16,
+            "endpoints",
+            "endpoint network ID is truncated",
+        )?);
+        let node_id = NodeId::from_bytes(copy_array(
+            bytes,
+            32,
+            "endpoints",
+            "endpoint node ID is truncated",
+        )?);
+        if network_id.is_zero() || node_id.is_zero() {
+            return Err(malformed("endpoints", "endpoint lease identity is zero"));
+        }
+        let endpoint_set = EndpointSetView::decode(&bytes[ENDPOINT_RECORD_FIXED_LENGTH..])?;
+        Ok(Self {
+            network_id,
+            node_id,
+            updated_at,
+            endpoints: endpoint_set.endpoints().collect(),
+        })
+    }
+}
+
 /// Network counters committed by one authority mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthorityRevision {
@@ -1680,6 +2050,14 @@ pub enum StoreError {
         /// Missing node ID.
         node_id: NodeId,
     },
+    /// An active membership has no current online endpoint lease.
+    #[error("endpoint lease for node {node_id} in network {network_id} does not exist")]
+    EndpointLeaseNotFound {
+        /// Offline network ID.
+        network_id: NetworkId,
+        /// Offline node ID.
+        node_id: NodeId,
+    },
     /// Network membership reached the signed flood-peer policy limit.
     #[error("network {network_id} has reached its member limit")]
     NetworkFull {
@@ -1810,10 +2188,101 @@ fn membership_key(network_id: NetworkId, node_id: NodeId) -> [u8; 32] {
     key
 }
 
+fn verify_endpoint_records(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+    let endpoints = read.open_table(ENDPOINTS)?;
+    let memberships = read.open_table(MEMBERSHIPS)?;
+    let nodes = read.open_table(NODES)?;
+    let networks = read.open_table(NETWORKS)?;
+    for entry in endpoints.iter()? {
+        let (key, value) = entry?;
+        let key = decode_identifier::<32>(key.value(), "endpoints", "endpoint key")?;
+        let record = EndpointLeaseRecord::decode(value.value())?;
+        validate_endpoint_key(&record, &key)?;
+
+        let Some(node_value) = nodes.get(record.node_id.as_bytes().as_slice())? else {
+            return Err(StoreError::NodeNotFound {
+                node_id: record.node_id,
+            });
+        };
+        let node = NodeRecord::decode(node_value.value())?;
+        if node.node_id() != record.node_id {
+            return Err(StoreError::RecordKeyMismatch { table: "nodes" });
+        }
+        if !node.enabled {
+            return Err(StoreError::NodeDisabled {
+                node_id: record.node_id,
+            });
+        }
+
+        let Some(network_value) = networks.get(record.network_id.as_bytes().as_slice())? else {
+            return Err(StoreError::NetworkNotFound {
+                network_id: record.network_id,
+            });
+        };
+        let network = NetworkRecord::decode(network_value.value())?;
+        if network.network_id() != record.network_id {
+            return Err(StoreError::RecordKeyMismatch { table: "networks" });
+        }
+
+        let Some(membership_value) = memberships.get(key.as_slice())? else {
+            return Err(StoreError::MembershipNotFound {
+                network_id: record.network_id,
+                node_id: record.node_id,
+            });
+        };
+        let membership = MembershipRecord::decode(membership_value.value())?;
+        validate_membership_key(&membership, &key)?;
+        if membership.status != MembershipStatus::Active {
+            return Err(StoreError::MembershipSuspended {
+                network_id: record.network_id,
+                node_id: record.node_id,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_membership_key(record: &MembershipRecord, key: &[u8; 32]) -> Result<(), StoreError> {
     if membership_key(record.network_id, record.node_id) != *key {
         return Err(StoreError::RecordKeyMismatch {
             table: "memberships",
+        });
+    }
+    Ok(())
+}
+
+fn validate_endpoint_key(record: &EndpointLeaseRecord, key: &[u8; 32]) -> Result<(), StoreError> {
+    if membership_key(record.network_id, record.node_id) != *key {
+        return Err(StoreError::RecordKeyMismatch { table: "endpoints" });
+    }
+    Ok(())
+}
+
+fn require_active_member_for_write(
+    write: &redb::WriteTransaction,
+    node_id: NodeId,
+    network_id: NetworkId,
+    key: &[u8; 32],
+) -> Result<(), StoreError> {
+    let node = load_node_for_write(write, node_id)?;
+    if !node.enabled {
+        return Err(StoreError::NodeDisabled { node_id });
+    }
+    let membership = {
+        let memberships = write.open_table(MEMBERSHIPS)?;
+        let Some(value) = memberships.get(key.as_slice())? else {
+            return Err(StoreError::MembershipNotFound {
+                network_id,
+                node_id,
+            });
+        };
+        MembershipRecord::decode(value.value())?
+    };
+    validate_membership_key(&membership, key)?;
+    if membership.status != MembershipStatus::Active {
+        return Err(StoreError::MembershipSuspended {
+            network_id,
+            node_id,
         });
     }
     Ok(())
@@ -1991,13 +2460,14 @@ const fn malformed(table: &'static str, reason: &'static str) -> StoreError {
 #[cfg(test)]
 mod tests {
     use std::{
+        net::Ipv4Addr,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
     use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
+    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
 
     use super::{
         AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord, StoreError,
@@ -2044,6 +2514,39 @@ mod tests {
             .expect("membership lookup")
             .expect("membership exists")
             .grant_serial()
+    }
+
+    fn endpoint(address: u8, port: u16) -> Endpoint {
+        Endpoint::UdpIpv4 {
+            priority: 10,
+            port,
+            max_datagram_size: 1_200,
+            address: Ipv4Addr::new(192, 0, 2, address),
+        }
+    }
+
+    fn endpoint_test_store() -> (PathBuf, AuthorityStore, NodeId, NodeId, NetworkId) {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([40; 16]))
+            .expect("initialize store");
+        let first =
+            NodeRecord::new(signing_key(41).public_key(), "First peer", 100).expect("valid node");
+        let second =
+            NodeRecord::new(signing_key(42).public_key(), "Second peer", 100).expect("valid node");
+        let first_id = first.node_id();
+        let second_id = second.node_id();
+        store.create_node(&first).expect("create first node");
+        store.create_node(&second).expect("create second node");
+        let network_id = NetworkId::from_bytes([43; 16]);
+        store
+            .create_network(
+                &NetworkRecord::new(policy(network_id), "Endpoint LAN", 100)
+                    .expect("valid network"),
+            )
+            .expect("create network");
+        (directory, store, first_id, second_id, network_id)
     }
 
     #[test]
@@ -2496,6 +2999,152 @@ mod tests {
             );
         }
         store.verify().expect("node revocation state is valid");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn endpoint_leases_refresh_change_and_expire_atomically() {
+        let (directory, store, first_id, second_id, network_id) = endpoint_test_store();
+
+        assert!(matches!(
+            store.publish_endpoints(first_id, network_id, &[endpoint(1, 4242)], 110),
+            Err(StoreError::MembershipNotFound { .. })
+        ));
+        store
+            .add_member(first_id, network_id, 110)
+            .expect("add first member");
+        store
+            .add_member(second_id, network_id, 110)
+            .expect("add second member");
+        assert!(matches!(
+            store.refresh_endpoint_lease(first_id, network_id, 120),
+            Err(StoreError::EndpointLeaseNotFound { .. })
+        ));
+
+        let published = store
+            .publish_endpoints(first_id, network_id, &[endpoint(1, 4242)], 120)
+            .expect("publish endpoint");
+        assert_eq!(published.controller_epoch, 3);
+        assert_eq!(published.snapshot_revision, 4);
+        let repeated = store
+            .publish_endpoints(first_id, network_id, &[endpoint(1, 4242)], 125)
+            .expect("repeat endpoint set");
+        assert_eq!(repeated, published);
+        let record = store
+            .get_endpoints(first_id, network_id)
+            .expect("get endpoints")
+            .expect("online record exists");
+        assert_eq!(record.updated_at(), 125);
+        assert_eq!(record.endpoints(), &[endpoint(1, 4242)]);
+        store
+            .publish_endpoints(first_id, network_id, &[endpoint(1, 4242)], 124)
+            .expect("ignore regressed time");
+        assert_eq!(
+            store
+                .get_endpoints(first_id, network_id)
+                .expect("get endpoints")
+                .expect("online record exists")
+                .updated_at(),
+            125
+        );
+
+        let second_online = store
+            .publish_endpoints(second_id, network_id, &[], 125)
+            .expect("publish empty endpoint set");
+        assert_eq!(second_online.snapshot_revision, 5);
+        assert!(store
+            .get_endpoints(second_id, network_id)
+            .expect("get empty endpoints")
+            .expect("empty online record exists")
+            .endpoints()
+            .is_empty());
+        let withdrawn = store
+            .publish_endpoints(first_id, network_id, &[], 130)
+            .expect("withdraw direct endpoint");
+        assert_eq!(withdrawn.snapshot_revision, 6);
+        assert_eq!(
+            store
+                .list_endpoints(network_id)
+                .expect("list online peers")
+                .len(),
+            2
+        );
+
+        let first_refresh = store
+            .refresh_endpoint_lease(first_id, network_id, 140)
+            .expect("refresh first lease");
+        let second_refresh = store
+            .refresh_endpoint_lease(second_id, network_id, 140)
+            .expect("refresh second lease");
+        assert_eq!(first_refresh, withdrawn);
+        assert_eq!(second_refresh, withdrawn);
+        assert!(store
+            .expire_endpoints(169)
+            .expect("retain live endpoints")
+            .is_empty());
+        let expired = store.expire_endpoints(170).expect("expire both endpoints");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].network_id, network_id);
+        assert_eq!(expired[0].controller_epoch, 3);
+        assert_eq!(expired[0].snapshot_revision, 7);
+        assert!(store
+            .list_endpoints(network_id)
+            .expect("list expired endpoints")
+            .is_empty());
+        store.verify().expect("endpoint lease state is valid");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn authorization_changes_remove_endpoint_leases() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([44; 16]))
+            .expect("initialize store");
+        let node =
+            NodeRecord::new(signing_key(45).public_key(), "Online peer", 100).expect("valid node");
+        let node_id = node.node_id();
+        store.create_node(&node).expect("create node");
+        let network_id = NetworkId::from_bytes([46; 16]);
+        store
+            .create_network(
+                &NetworkRecord::new(policy(network_id), "Lease cleanup LAN", 100)
+                    .expect("valid network"),
+            )
+            .expect("create network");
+        store
+            .add_member(node_id, network_id, 110)
+            .expect("add member");
+        store
+            .publish_endpoints(node_id, network_id, &[endpoint(2, 5252)], 120)
+            .expect("publish endpoint");
+
+        store
+            .set_membership_status(node_id, network_id, MembershipStatus::Suspended)
+            .expect("suspend member");
+        assert!(store
+            .get_endpoints(node_id, network_id)
+            .expect("get suspended endpoint")
+            .is_none());
+        store
+            .set_membership_status(node_id, network_id, MembershipStatus::Active)
+            .expect("resume member");
+        store
+            .publish_endpoints(node_id, network_id, &[endpoint(2, 5252)], 130)
+            .expect("republish endpoint");
+        assert!(store
+            .set_node_enabled(node_id, false)
+            .expect("disable node"));
+        assert!(store
+            .get_endpoints(node_id, network_id)
+            .expect("get disabled endpoint")
+            .is_none());
+        store
+            .verify()
+            .expect("authorization cleanup state is valid");
         drop(store);
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
