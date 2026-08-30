@@ -28,6 +28,14 @@ It names the listen address, database path, TLS certificate chain and PKCS#8
 private key, controller Ed25519 identity key, operational limits, and logging
 filter. Secrets are separate files and are never accepted inline.
 
+The reference schema uses `[state]`, `[identity]`, `[tls]`, `[limits]`, and
+`[logging]` tables; `examples/server.toml` is the canonical deployable sample.
+Relative paths resolve against the configuration file directory. The parser
+bounds input to 1 MiB, rejects non-UTF-8 input and unknown fields at every
+nesting level, and validates non-zero listen ports, queue sizes, connection
+limits, authentication/request deadlines, and logging-filter text before any
+socket or database is opened.
+
 `init` generates the controller Ed25519 identity and a TLS identity suitable
 for an explicitly pinned self-hosted deployment, creates the database, and
 writes an example configuration without overwriting existing files. `run`

@@ -1,0 +1,22 @@
+version = 1
+listen = "0.0.0.0:44900"
+
+[state]
+database = "state/controller.redb"
+
+[identity]
+controller_key = "secrets/controller.pk8"
+
+[tls]
+certificate = "secrets/tls-cert.pem"
+private_key = "secrets/tls-key.pem"
+
+[limits]
+authority_queue = 256
+max_connections = 1024
+outbound_messages = 64
+authentication_timeout_seconds = 10
+request_timeout_seconds = 10
+
+[logging]
+filter = "info,stella_server=info"
