@@ -47,13 +47,14 @@ impl fmt::Debug for OwnedControlField {
     }
 }
 
-/// Builder for one version 0.1 control message with owned field bytes.
+/// Builder for one negotiated control message with owned field bytes.
 ///
 /// Fields are not reordered. Callers must add them in strictly increasing
 /// numeric type order, and the protocol codec validates required and optional
 /// fields when [`crate::OutboundSequence::build`] is called.
 #[derive(Debug)]
 pub struct MessageBuilder {
+    version: ProtocolVersion,
     message_type: ControlMessageType,
     correlation_id: u64,
     fields: Vec<OwnedControlField>,
@@ -64,10 +65,21 @@ impl MessageBuilder {
     #[must_use]
     pub const fn new(message_type: ControlMessageType) -> Self {
         Self {
+            version: ProtocolVersion::CURRENT,
             message_type,
             correlation_id: 0,
             fields: Vec::new(),
         }
+    }
+
+    /// Selects the already negotiated operational protocol version.
+    ///
+    /// Version 0.1 remains the default. The immutable `SERVER_HELLO`
+    /// negotiation envelope always uses version bytes `0.0`.
+    #[must_use]
+    pub const fn with_version(mut self, version: ProtocolVersion) -> Self {
+        self.version = version;
+        self
     }
 
     /// Sets the triggering request ID for a direct response.
@@ -127,7 +139,7 @@ impl MessageBuilder {
         let version = if self.message_type == ControlMessageType::ServerHello {
             ProtocolVersion { major: 0, minor: 0 }
         } else {
-            ProtocolVersion::CURRENT
+            self.version
         };
         let header = ControlHeader {
             version,
@@ -234,7 +246,7 @@ impl fmt::Debug for OwnedControlMessage {
 
 #[cfg(test)]
 mod tests {
-    use stella_proto::{ControlFieldType, ControlMessageType};
+    use stella_proto::{ControlFieldType, ControlMessageType, ProtocolVersion};
 
     use super::MessageBuilder;
     use crate::OutboundSequence;
@@ -281,5 +293,27 @@ mod tests {
             .build(valid)
             .expect("failed construction did not consume an ID");
         assert_eq!(message.header().expect("valid message").message_id, 1);
+    }
+
+    #[test]
+    fn builder_uses_explicit_negotiated_version_for_connectivity_messages() {
+        let mut builder = MessageBuilder::new(ControlMessageType::ConnectivityUpdate)
+            .with_version(ProtocolVersion::V0_2);
+        builder
+            .push_field(ControlFieldType::NetworkId, &[1; 16])
+            .expect("valid network ID");
+        let message = OutboundSequence::new()
+            .build(builder)
+            .expect("version 0.2 connectivity withdrawal");
+        assert_eq!(
+            message.header().expect("valid message").version,
+            ProtocolVersion::V0_2
+        );
+
+        let mut unsupported = MessageBuilder::new(ControlMessageType::ConnectivityUpdate);
+        unsupported
+            .push_field(ControlFieldType::NetworkId, &[1; 16])
+            .expect("valid network ID");
+        assert!(OutboundSequence::new().build(unsupported).is_err());
     }
 }

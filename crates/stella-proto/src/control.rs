@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use stella_common::NetworkId;
+use stella_common::{NetworkId, NodeId};
 
 use crate::{
     common::{validate_record_length, MAX_HEADER_LENGTH},
@@ -11,8 +11,10 @@ use crate::{
         encode_extension_block_at, extensions_encoded_len, validate_extension_block, ExtensionIter,
         ExtensionRef,
     },
-    CodecError, EndpointSetView, MembershipGrantView, NetworkPolicy, NetworkRevisionListView,
-    PeerListView, PeerRecordView, ProtocolVersion, VersionEntry, VersionListView,
+    CodecError, ConnectivityGenerationView, ConnectivityListView, ConnectivityRecordView,
+    EndpointSetView, MembershipGrantView, NetworkPolicy, NetworkRevisionListView, PeerListView,
+    PeerRecordView, ProtocolVersion, RelayServiceListView, StunServerListView, VersionEntry,
+    VersionListView,
 };
 
 /// Magic at the beginning of every control message.
@@ -30,7 +32,7 @@ pub const MAX_CONTROL_RECORD_LENGTH: usize = 1_048_576;
 const CONTROL_FIELD_PREFIX_LENGTH: usize = 4;
 const CRITICAL_CONTROL_FIELD_BIT: u16 = 0x8000;
 
-/// Registered version 0.1 control message type.
+/// Registered control message type through version 0.2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum ControlMessageType {
@@ -56,6 +58,10 @@ pub enum ControlMessageType {
     EndpointUpdate = 0x0020,
     /// Endpoint publication result.
     EndpointResult = 0x0021,
+    /// Complete version 0.2 connectivity-generation publication or withdrawal.
+    ConnectivityUpdate = 0x0022,
+    /// Version 0.2 connectivity publication result.
+    ConnectivityResult = 0x0023,
     /// Full authoritative peer snapshot.
     PeerSnapshot = 0x0030,
     /// One peer-state delta.
@@ -68,6 +74,8 @@ pub enum ControlMessageType {
     HeartbeatAck = 0x0041,
     /// Refreshed local membership authorization.
     GrantRefresh = 0x0050,
+    /// Version 0.2 deployment STUN and relay configuration.
+    ConnectivityConfig = 0x0060,
     /// Graceful controller shutdown notice.
     ServerShutdown = 0x00fe,
     /// Fatal or request-scoped protocol error.
@@ -79,6 +87,15 @@ impl ControlMessageType {
     #[must_use]
     pub const fn as_u16(self) -> u16 {
         self as u16
+    }
+
+    const fn minimum_version(self) -> ProtocolVersion {
+        match self {
+            Self::ConnectivityUpdate | Self::ConnectivityResult | Self::ConnectivityConfig => {
+                ProtocolVersion::V0_2
+            }
+            _ => ProtocolVersion::V0_1,
+        }
     }
 }
 
@@ -98,12 +115,15 @@ impl TryFrom<u16> for ControlMessageType {
             0x0013 => Ok(Self::LeaveResult),
             0x0020 => Ok(Self::EndpointUpdate),
             0x0021 => Ok(Self::EndpointResult),
+            0x0022 => Ok(Self::ConnectivityUpdate),
+            0x0023 => Ok(Self::ConnectivityResult),
             0x0030 => Ok(Self::PeerSnapshot),
             0x0031 => Ok(Self::PeerDelta),
             0x0032 => Ok(Self::SnapshotRequest),
             0x0040 => Ok(Self::Heartbeat),
             0x0041 => Ok(Self::HeartbeatAck),
             0x0050 => Ok(Self::GrantRefresh),
+            0x0060 => Ok(Self::ConnectivityConfig),
             0x00fe => Ok(Self::ServerShutdown),
             0x00ff => Ok(Self::Error),
             _ => Err(CodecError::UnsupportedControlMessageType { value }),
@@ -182,7 +202,7 @@ impl ControlHeader {
         Ok(())
     }
 
-    /// Validates all stateless version 0.1 control-header invariants.
+    /// Validates all stateless control-header invariants through version 0.2.
     ///
     /// Message sequence continuity, direction, outstanding correlations, and
     /// connection state remain higher-layer responsibilities.
@@ -190,18 +210,25 @@ impl ControlHeader {
     /// # Errors
     ///
     /// Returns [`CodecError`] for an invalid negotiation/operational version,
-    /// non-zero flags, an unaligned or bounded header length, or message ID
-    /// zero. `SERVER_HELLO` additionally requires ID 1 and correlation zero.
+    /// a message unavailable in that version, non-zero flags, an unaligned or
+    /// bounded header length, or message ID zero. `SERVER_HELLO` additionally
+    /// requires ID 1 and correlation zero.
     pub fn validate(self) -> Result<(), CodecError> {
-        let expected_version = if self.message_type == ControlMessageType::ServerHello {
-            ProtocolVersion { major: 0, minor: 0 }
+        let negotiation = self.message_type == ControlMessageType::ServerHello;
+        let version_supported = if negotiation {
+            self.version.major == 0 && self.version.minor == 0
         } else {
-            ProtocolVersion::CURRENT
+            matches!(self.version, ProtocolVersion::V0_1 | ProtocolVersion::V0_2)
         };
-        if self.version != expected_version {
+        if !version_supported {
             return Err(CodecError::UnsupportedVersion {
                 major: self.version.major,
                 minor: self.version.minor,
+            });
+        }
+        if !negotiation && self.version < self.message_type.minimum_version() {
+            return Err(CodecError::UnsupportedControlMessageType {
+                value: self.message_type.as_u16(),
             });
         }
         if self.flags != 0 {
@@ -255,7 +282,7 @@ impl ControlHeader {
     }
 }
 
-/// Registered version 0.1 control body field type.
+/// Registered control body field type through version 0.2.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u16)]
 pub enum ControlFieldType {
@@ -317,6 +344,18 @@ pub enum ControlFieldType {
     RetryAfterMs = 0x801c,
     /// Graceful shutdown Unix deadline.
     ShutdownDeadline = 0x801d,
+    /// Monotonic deployment connectivity-configuration revision.
+    ConnectivityConfigRevision = 0x801e,
+    /// Complete version 0.2 local connectivity generation.
+    ConnectivityGeneration = 0x801f,
+    /// Version 0.2 peer connectivity list.
+    ConnectivityList = 0x8020,
+    /// One version 0.2 peer connectivity record.
+    ConnectivityRecord = 0x8021,
+    /// Version 0.2 STUN server list.
+    StunServerList = 0x8022,
+    /// Version 0.2 relay service and credential list.
+    RelayServiceList = 0x8023,
 }
 
 impl ControlFieldType {
@@ -324,6 +363,18 @@ impl ControlFieldType {
     #[must_use]
     pub const fn as_u16(self) -> u16 {
         self as u16
+    }
+
+    const fn minimum_version(self) -> ProtocolVersion {
+        match self {
+            Self::ConnectivityConfigRevision
+            | Self::ConnectivityGeneration
+            | Self::ConnectivityList
+            | Self::ConnectivityRecord
+            | Self::StunServerList
+            | Self::RelayServiceList => ProtocolVersion::V0_2,
+            _ => ProtocolVersion::V0_1,
+        }
     }
 }
 
@@ -361,6 +412,12 @@ impl TryFrom<u16> for ControlFieldType {
             0x801b => Ok(Self::ServerTime),
             0x801c => Ok(Self::RetryAfterMs),
             0x801d => Ok(Self::ShutdownDeadline),
+            0x801e => Ok(Self::ConnectivityConfigRevision),
+            0x801f => Ok(Self::ConnectivityGeneration),
+            0x8020 => Ok(Self::ConnectivityList),
+            0x8021 => Ok(Self::ConnectivityRecord),
+            0x8022 => Ok(Self::StunServerList),
+            0x8023 => Ok(Self::RelayServiceList),
             _ => Err(CodecError::UnknownCriticalControlField {
                 field_type: value,
                 offset: 0,
@@ -565,7 +622,11 @@ impl<'a> ControlMessageView<'a> {
                 remaining: record.len().saturating_sub(header_length),
             })?;
         validate_control_field_block(body, header_length)?;
-        validate_control_message_fields(header.message_type, ControlFieldIter::new(body))?;
+        validate_control_message_fields(
+            header.version,
+            header.message_type,
+            ControlFieldIter::new(body),
+        )?;
         Ok(Self {
             header,
             extension_bytes,
@@ -664,7 +725,7 @@ pub fn encode_control_message(
     output: &mut [u8],
 ) -> Result<usize, CodecError> {
     header.validate()?;
-    validate_control_message_fields(header.message_type, fields.iter().copied())?;
+    validate_control_message_fields(header.version, header.message_type, fields.iter().copied())?;
     let extension_length = extensions_encoded_len(header_extensions)?;
     let expected_header_length =
         CONTROL_HEADER_LENGTH
@@ -954,7 +1015,7 @@ fn validate_control_field_value(
         ControlFieldType::SnapshotRevision => validate_nonzero_u64(value, "snapshot revision"),
         ControlFieldType::DeltaOperation => {
             validate_exact_width(value, 1, "delta operation")?;
-            if value[0] != 1 && value[0] != 2 {
+            if !(1..=4).contains(&value[0]) {
                 return Err(CodecError::InvalidEnumValue {
                     field: "delta operation",
                     value: u64::from(value[0]),
@@ -974,38 +1035,78 @@ fn validate_control_field_value(
         ControlFieldType::ServerTime | ControlFieldType::ShutdownDeadline => {
             validate_exact_width(value, 8, "Unix time")
         }
-        ControlFieldType::RetryAfterMs => {
-            validate_exact_width(value, 4, "retry after milliseconds")?;
-            let bytes = <[u8; 4]>::try_from(value).map_err(|_| CodecError::LengthMismatch {
-                field: "retry after milliseconds",
-                expected: 4,
-                actual: value.len(),
-            })?;
-            let retry = u32::from_be_bytes(bytes);
-            if retry != 0 && !(100..=60_000).contains(&retry) {
-                return Err(CodecError::ValueOutOfRange {
-                    field: "retry after milliseconds",
-                    actual: u64::from(retry),
-                    minimum: 100,
-                    maximum: 60_000,
-                });
-            }
-            Ok(())
+        ControlFieldType::RetryAfterMs => validate_retry_after(value),
+        ControlFieldType::ConnectivityConfigRevision
+        | ControlFieldType::ConnectivityGeneration
+        | ControlFieldType::ConnectivityList
+        | ControlFieldType::ConnectivityRecord
+        | ControlFieldType::StunServerList
+        | ControlFieldType::RelayServiceList => {
+            validate_connectivity_control_field_value(field_type, value)
         }
     }
 }
 
+fn validate_retry_after(value: &[u8]) -> Result<(), CodecError> {
+    validate_exact_width(value, 4, "retry after milliseconds")?;
+    let bytes = <[u8; 4]>::try_from(value).map_err(|_| CodecError::LengthMismatch {
+        field: "retry after milliseconds",
+        expected: 4,
+        actual: value.len(),
+    })?;
+    let retry = u32::from_be_bytes(bytes);
+    if retry != 0 && !(100..=60_000).contains(&retry) {
+        return Err(CodecError::ValueOutOfRange {
+            field: "retry after milliseconds",
+            actual: u64::from(retry),
+            minimum: 100,
+            maximum: 60_000,
+        });
+    }
+    Ok(())
+}
+
+fn validate_connectivity_control_field_value(
+    field_type: ControlFieldType,
+    value: &[u8],
+) -> Result<(), CodecError> {
+    match field_type {
+        ControlFieldType::ConnectivityConfigRevision => {
+            validate_nonzero_u64(value, "connectivity configuration revision")
+        }
+        ControlFieldType::ConnectivityGeneration => {
+            ConnectivityGenerationView::decode(value).map(|_| ())
+        }
+        ControlFieldType::ConnectivityList => ConnectivityListView::decode(value).map(|_| ()),
+        ControlFieldType::ConnectivityRecord => ConnectivityRecordView::decode(value).map(|_| ()),
+        ControlFieldType::StunServerList => StunServerListView::decode(value).map(|_| ()),
+        ControlFieldType::RelayServiceList => RelayServiceListView::decode(value).map(|_| ()),
+        _ => Err(CodecError::InvalidEnumValue {
+            field: "connectivity control field",
+            value: u64::from(field_type.as_u16()),
+        }),
+    }
+}
+
 fn validate_control_message_fields<'a>(
+    version: ProtocolVersion,
     message_type: ControlMessageType,
     fields: impl IntoIterator<Item = ControlFieldRef<'a>>,
 ) -> Result<(), CodecError> {
-    let mut present = 0_u32;
+    let schema_version = if message_type == ControlMessageType::ServerHello {
+        ProtocolVersion::V0_1
+    } else {
+        version
+    };
+    let mut present = 0_u64;
     let mut delta_operation = None;
+    let mut delta_node_id = None;
+    let mut connectivity_node_id = None;
     for field in fields {
         let Some(field_type) = field.field_type() else {
             continue;
         };
-        if !field_allowed(message_type, field_type) {
+        if !field_allowed(schema_version, message_type, field_type) {
             return Err(CodecError::UnexpectedControlField {
                 message_type: message_type.as_u16(),
                 field_type: field_type.as_u16(),
@@ -1014,11 +1115,17 @@ fn validate_control_message_fields<'a>(
         present |= field_bit(field_type);
         if field_type == ControlFieldType::DeltaOperation {
             delta_operation = field.value.first().copied();
+        } else if field_type == ControlFieldType::NodeId {
+            delta_node_id = Some(decode_control_node_id(field.value)?);
+        } else if field_type == ControlFieldType::ConnectivityRecord {
+            connectivity_node_id = Some(ConnectivityRecordView::decode(field.value)?.node_id());
         }
     }
 
     for field_type in ALL_CONTROL_FIELDS {
-        if field_required(message_type, field_type) && present & field_bit(field_type) == 0 {
+        if field_required(schema_version, message_type, field_type)
+            && present & field_bit(field_type) == 0
+        {
             return Err(CodecError::MissingControlField {
                 message_type: message_type.as_u16(),
                 field_type: field_type.as_u16(),
@@ -1027,30 +1134,71 @@ fn validate_control_message_fields<'a>(
     }
 
     if message_type == ControlMessageType::PeerDelta {
-        let has_node = present & field_bit(ControlFieldType::NodeId) != 0;
-        let has_peer = present & field_bit(ControlFieldType::PeerRecord) != 0;
-        match delta_operation {
-            Some(1) if !has_node && has_peer => {}
-            Some(2) if has_node && !has_peer => {}
-            Some(1) => {
-                return Err(CodecError::InvalidControlFieldCombination {
-                    message_type: message_type.as_u16(),
-                    detail: "add/replace requires PEER_RECORD and forbids NODE_ID",
-                });
-            }
-            Some(2) => {
-                return Err(CodecError::InvalidControlFieldCombination {
-                    message_type: message_type.as_u16(),
-                    detail: "remove requires NODE_ID and forbids PEER_RECORD",
-                });
-            }
-            _ => {}
-        }
+        validate_peer_delta_fields(
+            schema_version,
+            present,
+            delta_operation,
+            delta_node_id,
+            connectivity_node_id,
+        )?;
     }
     Ok(())
 }
 
-const ALL_CONTROL_FIELDS: [ControlFieldType; 29] = [
+fn validate_peer_delta_fields(
+    version: ProtocolVersion,
+    present: u64,
+    operation: Option<u8>,
+    node_id: Option<NodeId>,
+    connectivity_node_id: Option<NodeId>,
+) -> Result<(), CodecError> {
+    let has_node = present & field_bit(ControlFieldType::NodeId) != 0;
+    let has_peer = present & field_bit(ControlFieldType::PeerRecord) != 0;
+    let has_connectivity = present & field_bit(ControlFieldType::ConnectivityRecord) != 0;
+    let valid_shape = match operation {
+        Some(1) => !has_node && has_peer && !has_connectivity,
+        Some(2 | 4) => has_node && !has_peer && !has_connectivity,
+        Some(3) => !has_peer && has_connectivity,
+        _ => true,
+    };
+    if !valid_shape {
+        let detail = match operation {
+            Some(1) => "add/replace requires PEER_RECORD and forbids NODE_ID",
+            Some(2) => "remove requires NODE_ID and forbids PEER_RECORD",
+            Some(3) => "connectivity replacement requires CONNECTIVITY_RECORD and optional NODE_ID",
+            Some(4) => "connectivity withdrawal requires NODE_ID only",
+            _ => "unknown peer delta operation",
+        };
+        return Err(CodecError::InvalidControlFieldCombination {
+            message_type: ControlMessageType::PeerDelta.as_u16(),
+            detail,
+        });
+    }
+    if version == ProtocolVersion::V0_1 && matches!(operation, Some(3 | 4)) {
+        return Err(CodecError::InvalidControlFieldCombination {
+            message_type: ControlMessageType::PeerDelta.as_u16(),
+            detail: "version 0.1 permits only peer delta operations 1 and 2",
+        });
+    }
+    if operation == Some(3) && node_id.is_some() && node_id != connectivity_node_id {
+        return Err(CodecError::InconsistentField {
+            context: "peer connectivity delta",
+            field: "node ID",
+        });
+    }
+    Ok(())
+}
+
+fn decode_control_node_id(value: &[u8]) -> Result<NodeId, CodecError> {
+    let bytes = <[u8; 16]>::try_from(value).map_err(|_| CodecError::LengthMismatch {
+        field: "node ID",
+        expected: 16,
+        actual: value.len(),
+    })?;
+    Ok(NodeId::from_bytes(bytes))
+}
+
+const ALL_CONTROL_FIELDS: [ControlFieldType; 35] = [
     ControlFieldType::SupportedVersions,
     ControlFieldType::SelectedVersion,
     ControlFieldType::ServerNonce,
@@ -1080,15 +1228,28 @@ const ALL_CONTROL_FIELDS: [ControlFieldType; 29] = [
     ControlFieldType::ServerTime,
     ControlFieldType::RetryAfterMs,
     ControlFieldType::ShutdownDeadline,
+    ControlFieldType::ConnectivityConfigRevision,
+    ControlFieldType::ConnectivityGeneration,
+    ControlFieldType::ConnectivityList,
+    ControlFieldType::ConnectivityRecord,
+    ControlFieldType::StunServerList,
+    ControlFieldType::RelayServiceList,
 ];
 
-const fn field_bit(field_type: ControlFieldType) -> u32 {
+const fn field_bit(field_type: ControlFieldType) -> u64 {
     let index = field_type.as_u16() - ControlFieldType::SupportedVersions.as_u16();
-    1_u32 << index
+    1_u64 << index
 }
 
-const fn field_allowed(message_type: ControlMessageType, field_type: ControlFieldType) -> bool {
-    field_required(message_type, field_type)
+fn field_allowed(
+    version: ProtocolVersion,
+    message_type: ControlMessageType,
+    field_type: ControlFieldType,
+) -> bool {
+    if version < field_type.minimum_version() {
+        return false;
+    }
+    field_required(version, message_type, field_type)
         || matches!(
             (message_type, field_type),
             (
@@ -1099,6 +1260,7 @@ const fn field_allowed(message_type: ControlMessageType, field_type: ControlFiel
                     | ControlMessageType::JoinResult
                     | ControlMessageType::LeaveResult
                     | ControlMessageType::EndpointResult
+                    | ControlMessageType::ConnectivityResult
                     | ControlMessageType::Error,
                 ControlFieldType::StatusMessage
             ) | (ControlMessageType::JoinRequest, ControlFieldType::JoinToken)
@@ -1110,13 +1272,23 @@ const fn field_allowed(message_type: ControlMessageType, field_type: ControlFiel
                 )
                 | (
                     ControlMessageType::PeerDelta,
-                    ControlFieldType::NodeId | ControlFieldType::PeerRecord
+                    ControlFieldType::NodeId
+                        | ControlFieldType::PeerRecord
+                        | ControlFieldType::ConnectivityRecord
+                )
+                | (
+                    ControlMessageType::ConnectivityUpdate,
+                    ControlFieldType::ConnectivityGeneration
                 )
                 | (ControlMessageType::Error, ControlFieldType::RetryAfterMs)
         )
 }
 
-const fn field_required(message_type: ControlMessageType, field_type: ControlFieldType) -> bool {
+fn field_required(
+    version: ProtocolVersion,
+    message_type: ControlMessageType,
+    field_type: ControlFieldType,
+) -> bool {
     matches!(
         (message_type, field_type),
         (
@@ -1143,6 +1315,7 @@ const fn field_required(message_type: ControlMessageType, field_type: ControlFie
                 | ControlMessageType::JoinResult
                 | ControlMessageType::LeaveResult
                 | ControlMessageType::EndpointResult
+                | ControlMessageType::ConnectivityResult
                 | ControlMessageType::Error,
             ControlFieldType::StatusCode
         ) | (
@@ -1155,6 +1328,8 @@ const fn field_required(message_type: ControlMessageType, field_type: ControlFie
                 | ControlMessageType::LeaveResult
                 | ControlMessageType::EndpointUpdate
                 | ControlMessageType::EndpointResult
+                | ControlMessageType::ConnectivityUpdate
+                | ControlMessageType::ConnectivityResult
                 | ControlMessageType::PeerSnapshot
                 | ControlMessageType::PeerDelta
                 | ControlMessageType::SnapshotRequest
@@ -1164,6 +1339,7 @@ const fn field_required(message_type: ControlMessageType, field_type: ControlFie
             ControlMessageType::JoinResult
                 | ControlMessageType::LeaveResult
                 | ControlMessageType::EndpointResult
+                | ControlMessageType::ConnectivityResult
                 | ControlMessageType::PeerSnapshot
                 | ControlMessageType::PeerDelta
                 | ControlMessageType::GrantRefresh,
@@ -1173,6 +1349,7 @@ const fn field_required(message_type: ControlMessageType, field_type: ControlFie
             ControlFieldType::EndpointSet
         ) | (
             ControlMessageType::EndpointResult
+                | ControlMessageType::ConnectivityResult
                 | ControlMessageType::PeerSnapshot
                 | ControlMessageType::PeerDelta
                 | ControlMessageType::SnapshotRequest
@@ -1194,7 +1371,15 @@ const fn field_required(message_type: ControlMessageType, field_type: ControlFie
                 ControlMessageType::ServerShutdown,
                 ControlFieldType::StatusMessage | ControlFieldType::ShutdownDeadline
             )
-    )
+            | (
+                ControlMessageType::ConnectivityConfig,
+                ControlFieldType::ConnectivityConfigRevision
+                    | ControlFieldType::StunServerList
+                    | ControlFieldType::RelayServiceList
+            )
+    ) || (version == ProtocolVersion::V0_2
+        && message_type == ControlMessageType::PeerSnapshot
+        && field_type == ControlFieldType::ConnectivityList)
 }
 
 fn validate_exact_width(
@@ -1254,13 +1439,22 @@ fn validate_text(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use stella_common::{NodeId, RelayId};
+
     use super::{
         control_fields_encoded_len, decode_control_record_length, encode_control_fields,
-        encode_control_message, encode_control_record_length, ControlFieldIter, ControlFieldRef,
-        ControlFieldType, ControlHeader, ControlMessageType, ControlMessageView,
+        encode_control_message, encode_control_record_length, field_required, ControlFieldIter,
+        ControlFieldRef, ControlFieldType, ControlHeader, ControlMessageType, ControlMessageView,
         CONTROL_HEADER_LENGTH,
     };
-    use crate::{CodecError, ExtensionRef, ProtocolVersion};
+    use crate::{
+        encode_connectivity_record, encode_relay_service_list, encode_stun_server_list, CodecError,
+        ConnectivityCarrier, ConnectivityGenerationRef, ConnectivityRecordRef, ExtensionRef,
+        IceCandidate, IceCandidateClass, ProtocolVersion, RelayAddress, RelayCarrierMask,
+        RelayPorts, RelayServiceRef, RelayTrustRequirements, StunServer,
+    };
 
     const NETWORK_ID: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     const JOIN_TOKEN: [u8; 32] = [0x44; 32];
@@ -1315,6 +1509,75 @@ mod tests {
             ControlFieldRef::new(ControlFieldType::DeltaOperation, operation)
                 .expect("valid delta operation"),
         ]
+    }
+
+    fn connectivity_record_bytes(node_id: [u8; 16]) -> Vec<u8> {
+        let candidates = [IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 100,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: SocketAddr::from(([192, 0, 2, 10], 50_000)),
+            related_address: None,
+            relay_id: None,
+        }];
+        let generation = ConnectivityGenerationRef::new(
+            1,
+            2,
+            1_000,
+            1_600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &candidates,
+        )
+        .expect("valid connectivity generation");
+        let record = ConnectivityRecordRef::new(NodeId::from_bytes(node_id), generation)
+            .expect("valid connectivity record");
+        let mut encoded = vec![0; record.encoded_len().expect("connectivity record length")];
+        encode_connectivity_record(record, &mut encoded).expect("encode connectivity record");
+        encoded
+    }
+
+    fn connectivity_config_values() -> (Vec<u8>, Vec<u8>) {
+        let stun_servers = [StunServer {
+            priority: 0,
+            address: SocketAddr::from(([192, 0, 2, 20], 3_478)),
+        }];
+        let mut stun_bytes = vec![0; 28];
+        encode_stun_server_list(&stun_servers, &mut stun_bytes).expect("encode STUN list");
+
+        let addresses = [RelayAddress {
+            priority: 0,
+            address: "192.0.2.30".parse().expect("relay address"),
+        }];
+        let service = RelayServiceRef {
+            relay_id: RelayId::from_bytes([1; 16]),
+            carriers: RelayCarrierMask::TURN_UDP,
+            priority: 0,
+            max_datagram_size: 1_200,
+            allocation_lifetime_seconds: 600,
+            idle_timeout_seconds: 120,
+            credential_issued_at: 1_000,
+            credential_expires_at: 1_600,
+            hostname: "",
+            tls_server_name: "",
+            credential_username: b"node 1",
+            credential_secret: b"0123456789abcdef",
+            region: "test",
+            trust: RelayTrustRequirements::NONE,
+            ports: RelayPorts {
+                turn_udp: 3_478,
+                turn_tcp: 0,
+                turn_tls: 0,
+                secure_websocket: 0,
+            },
+            addresses: &addresses,
+            spki_pins: &[],
+        };
+        let mut relay_bytes = vec![0; 4 + service.encoded_len().expect("relay service length")];
+        encode_relay_service_list(&[service], &mut relay_bytes).expect("encode relay list");
+        (stun_bytes, relay_bytes)
     }
 
     #[test]
@@ -1415,9 +1678,9 @@ mod tests {
         );
 
         assert_eq!(
-            ControlFieldIter::decode(&[0x80, 0x1e, 0, 0]).map(|_| ()),
+            ControlFieldIter::decode(&[0x80, 0x24, 0, 0]).map(|_| ()),
             Err(CodecError::UnknownCriticalControlField {
-                field_type: 0x801e,
+                field_type: 0x8024,
                 offset: 0,
             })
         );
@@ -1586,5 +1849,176 @@ mod tests {
                 detail: "remove requires NODE_ID and forbids PEER_RECORD",
             })
         );
+    }
+
+    #[test]
+    fn control_header_gates_version_0_2_message_types() {
+        for message_type in [
+            ControlMessageType::ConnectivityUpdate,
+            ControlMessageType::ConnectivityResult,
+            ControlMessageType::ConnectivityConfig,
+        ] {
+            let mut header = ControlHeader {
+                version: ProtocolVersion::V0_2,
+                message_type,
+                flags: 0,
+                header_length: 32,
+                body_length: 0,
+                message_id: 1,
+                correlation_id: 0,
+            };
+            assert_eq!(header.validate(), Ok(()));
+            header.version = ProtocolVersion::V0_1;
+            assert_eq!(
+                header.validate(),
+                Err(CodecError::UnsupportedControlMessageType {
+                    value: message_type.as_u16(),
+                })
+            );
+        }
+
+        let mut future = join_header();
+        future.version = ProtocolVersion { major: 0, minor: 3 };
+        assert_eq!(
+            future.validate(),
+            Err(CodecError::UnsupportedVersion { major: 0, minor: 3 })
+        );
+        assert!(!field_required(
+            ProtocolVersion::V0_1,
+            ControlMessageType::PeerSnapshot,
+            ControlFieldType::ConnectivityList,
+        ));
+        assert!(field_required(
+            ProtocolVersion::V0_2,
+            ControlMessageType::PeerSnapshot,
+            ControlFieldType::ConnectivityList,
+        ));
+    }
+
+    #[test]
+    fn connectivity_update_withdrawal_round_trips_only_in_version_0_2() {
+        let fields = [
+            ControlFieldRef::new(ControlFieldType::NetworkId, &NETWORK_ID)
+                .expect("valid network ID"),
+        ];
+        let body_length = control_fields_encoded_len(&fields).expect("field length");
+        let mut header = ControlHeader {
+            version: ProtocolVersion::V0_2,
+            message_type: ControlMessageType::ConnectivityUpdate,
+            flags: 0,
+            header_length: 32,
+            body_length: u32::try_from(body_length).expect("body length fits u32"),
+            message_id: 9,
+            correlation_id: 0,
+        };
+        let mut encoded = vec![0; CONTROL_HEADER_LENGTH + body_length];
+        assert_eq!(
+            encode_control_message(header, &[], &fields, &mut encoded),
+            Ok(encoded.len())
+        );
+        let decoded = ControlMessageView::decode(&encoded).expect("decode connectivity withdrawal");
+        assert_eq!(decoded.header(), header);
+
+        header.version = ProtocolVersion::V0_1;
+        assert!(matches!(
+            encode_control_message(header, &[], &fields, &mut encoded),
+            Err(CodecError::UnsupportedControlMessageType { value: 0x0022 })
+        ));
+    }
+
+    #[test]
+    fn connectivity_delta_operations_are_versioned_and_bind_node_identity() {
+        let withdraw_fields = peer_delta_fields(&[4]);
+        let withdraw_length =
+            control_fields_encoded_len(&withdraw_fields).expect("withdraw field lengths");
+        let mut withdraw_header = peer_delta_header(withdraw_length);
+        withdraw_header.version = ProtocolVersion::V0_2;
+        let mut withdraw_bytes = vec![0; CONTROL_HEADER_LENGTH + withdraw_length];
+        assert_eq!(
+            encode_control_message(withdraw_header, &[], &withdraw_fields, &mut withdraw_bytes,),
+            Ok(withdraw_bytes.len())
+        );
+
+        let version_0_1_header = peer_delta_header(withdraw_length);
+        assert!(matches!(
+            encode_control_message(
+                version_0_1_header,
+                &[],
+                &withdraw_fields,
+                &mut withdraw_bytes,
+            ),
+            Err(CodecError::InvalidControlFieldCombination {
+                detail: "version 0.1 permits only peer delta operations 1 and 2",
+                ..
+            })
+        ));
+
+        let record = connectivity_record_bytes(NODE_ID);
+        let operation = [3];
+        let fields = [
+            ControlFieldRef::new(ControlFieldType::NodeId, &NODE_ID).expect("valid node ID"),
+            ControlFieldRef::new(ControlFieldType::ControllerEpoch, &CONTROLLER_EPOCH)
+                .expect("valid controller epoch"),
+            ControlFieldRef::new(ControlFieldType::NetworkId, &NETWORK_ID)
+                .expect("valid network ID"),
+            ControlFieldRef::new(ControlFieldType::SnapshotRevision, &SNAPSHOT_REVISION)
+                .expect("valid snapshot revision"),
+            ControlFieldRef::new(ControlFieldType::DeltaOperation, &operation)
+                .expect("valid connectivity operation"),
+            ControlFieldRef::new(ControlFieldType::ConnectivityRecord, &record)
+                .expect("valid connectivity record"),
+        ];
+        let body_length = control_fields_encoded_len(&fields).expect("replacement field lengths");
+        let mut header = peer_delta_header(body_length);
+        header.version = ProtocolVersion::V0_2;
+        let mut encoded = vec![0; CONTROL_HEADER_LENGTH + body_length];
+        assert_eq!(
+            encode_control_message(header, &[], &fields, &mut encoded),
+            Ok(encoded.len())
+        );
+
+        let different_node = [0x56; 16];
+        let mut mismatched = fields;
+        mismatched[0] = ControlFieldRef::new(ControlFieldType::NodeId, &different_node)
+            .expect("valid different node ID");
+        assert!(matches!(
+            encode_control_message(header, &[], &mismatched, &mut encoded),
+            Err(CodecError::InconsistentField {
+                context: "peer connectivity delta",
+                field: "node ID",
+            })
+        ));
+    }
+
+    #[test]
+    fn connectivity_config_validates_nested_stun_and_relay_records() {
+        let revision = 7_u64.to_be_bytes();
+        let (stun_servers, relay_services) = connectivity_config_values();
+        let fields = [
+            ControlFieldRef::new(ControlFieldType::ConnectivityConfigRevision, &revision)
+                .expect("valid connectivity configuration revision"),
+            ControlFieldRef::new(ControlFieldType::StunServerList, &stun_servers)
+                .expect("valid STUN server list"),
+            ControlFieldRef::new(ControlFieldType::RelayServiceList, &relay_services)
+                .expect("valid relay service list"),
+        ];
+        let body_length = control_fields_encoded_len(&fields).expect("configuration field lengths");
+        let header = ControlHeader {
+            version: ProtocolVersion::V0_2,
+            message_type: ControlMessageType::ConnectivityConfig,
+            flags: 0,
+            header_length: 32,
+            body_length: u32::try_from(body_length).expect("body length fits u32"),
+            message_id: 10,
+            correlation_id: 0,
+        };
+        let mut encoded = vec![0; CONTROL_HEADER_LENGTH + body_length];
+        assert_eq!(
+            encode_control_message(header, &[], &fields, &mut encoded),
+            Ok(encoded.len())
+        );
+        let decoded = ControlMessageView::decode(&encoded).expect("decode connectivity config");
+        assert_eq!(decoded.header(), header);
+        assert_eq!(decoded.fields().count(), 3);
     }
 }

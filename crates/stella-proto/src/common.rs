@@ -29,11 +29,20 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    /// Version implemented by this crate.
-    pub const CURRENT: Self = Self {
+    /// Stable version 0.1 data plane and control schema.
+    pub const V0_1: Self = Self {
         major: PROTOCOL_MAJOR,
         minor: PROTOCOL_MINOR,
     };
+
+    /// Version 0.2 control-plane automatic-connectivity extension.
+    ///
+    /// The reference runtime does not advertise this version until its
+    /// connectivity state machines are complete.
+    pub const V0_2: Self = Self { major: 0, minor: 2 };
+
+    /// Version currently advertised by the reference runtime.
+    pub const CURRENT: Self = Self::V0_1;
 }
 
 /// Registered version 0.1 data-plane packet type.
