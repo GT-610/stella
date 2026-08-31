@@ -39,6 +39,9 @@ pub enum ClientError {
     /// A Stella identity or proof failed cryptographic validation.
     #[error(transparent)]
     Crypto(#[from] stella_crypto::CryptoError),
+    /// Authenticated network state failed contextual or cryptographic checks.
+    #[error(transparent)]
+    State(#[from] crate::StateError),
     /// The operating-system random generator failed.
     #[error("operating-system randomness is unavailable")]
     RandomnessUnavailable,
