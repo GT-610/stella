@@ -27,9 +27,11 @@ The first implementation targets Windows with TAP-Windows. Linux and macOS
 remain protocol requirements, but their device backends are implemented after
 the Windows path is proven end to end.
 
-Stella does not provide Internet reachability, NAT traversal, or an IP routing
-service. Those concerns belong to the selected transport. A transport may be
-plain UDP on a reachable network or an existing overlay such as Tailscale.
+Version 0.1 does not provide Internet reachability, NAT traversal, or an IP
+routing service. The 0.2 connectivity extension adds controller-signaled
+ICE/STUN discovery and relay fallback while preserving the transport and peer
+security boundaries. A transport may still be plain UDP on a reachable network
+or an existing overlay such as Tailscale.
 
 ## 3. Terminology
 
@@ -105,8 +107,9 @@ specification. Received data-plane packets are authenticated, associated with
 the correct network and session, decoded, validated, and then written to TAP.
 
 The controller performs no Ethernet learning on behalf of a healthy direct
-path. It distributes authenticated membership and reachability information and
-may support a future relay mode, which is outside version 0.1.
+path. It distributes authenticated membership and reachability information.
+Relay is outside version 0.1 and is defined by the version 0.2 connectivity and
+relay extensions without moving Ethernet learning into the controller.
 
 ## 6. Control plane and data plane
 

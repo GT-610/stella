@@ -41,7 +41,9 @@ export default defineConfig({
                 { text: '传输', link: '/zh/protocol/spec/07-transport' },
                 { text: '安全', link: '/zh/protocol/spec/08-security' },
                 { text: '版本控制', link: '/zh/protocol/spec/09-versioning' },
-                { text: '勘误', link: '/zh/protocol/spec/10-errata' }
+                { text: '勘误', link: '/zh/protocol/spec/10-errata' },
+                { text: '自动连接', link: '/zh/protocol/spec/11-connectivity' },
+                { text: 'Relay', link: '/zh/protocol/spec/12-relay' }
               ]
             },
             {
@@ -147,7 +149,9 @@ export default defineConfig({
             { text: 'Transport', link: '/protocol/spec/07-transport' },
             { text: 'Security', link: '/protocol/spec/08-security' },
             { text: 'Versioning', link: '/protocol/spec/09-versioning' },
-            { text: 'Errata', link: '/protocol/spec/10-errata' }
+            { text: 'Errata', link: '/protocol/spec/10-errata' },
+            { text: 'Automatic connectivity', link: '/protocol/spec/11-connectivity' },
+            { text: 'Relay', link: '/protocol/spec/12-relay' }
           ]
         },
         {

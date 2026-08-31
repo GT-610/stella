@@ -18,7 +18,9 @@ const expectedSpecifications = [
   '07-transport.md',
   '08-security.md',
   '09-versioning.md',
-  '10-errata.md'
+  '10-errata.md',
+  '11-connectivity.md',
+  '12-relay.md'
 ]
 
 const generatedNotice = [

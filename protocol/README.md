@@ -26,6 +26,8 @@ declared stable.
 - `08-security.md`: authentication, peer handshake, keys, and downgrade defense.
 - `09-versioning.md`: negotiation, compatibility, registries, and upgrades.
 - `10-errata.md`: accepted corrections and interoperability clarifications.
+- `11-connectivity.md`: ICE/STUN discovery, path nomination, failover, and recovery.
+- `12-relay.md`: TURN, TLS/WebSocket relay, credentials, and resource bounds.
 
 The rendered documentation under `docs/protocol/` is a synchronized reading
 copy. If the two disagree, files in this directory are authoritative.
