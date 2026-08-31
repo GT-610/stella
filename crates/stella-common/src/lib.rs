@@ -153,6 +153,10 @@ identifier_type!(
     GrantSerial,
     "Controller-unique serial of a signed membership grant."
 );
+identifier_type!(
+    RelayId,
+    "Stable identifier of a Stella-compatible relay service."
+);
 
 /// Six-byte IEEE 802 MAC address.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -323,7 +327,7 @@ mod tests {
 
     use super::{
         ControllerId, EthernetDestination, GrantSerial, HexParseError, MacAddress, NetworkId,
-        NodeId,
+        NodeId, RelayId,
     };
 
     #[test]
@@ -346,10 +350,12 @@ mod tests {
         let network = NetworkId::from(bytes);
         let controller = ControllerId::from(bytes);
         let serial = GrantSerial::from(bytes);
+        let relay = RelayId::from(bytes);
 
         assert_eq!(<[u8; NetworkId::LENGTH]>::from(network), bytes);
         assert_eq!(controller.to_string(), network.to_string());
         assert_eq!(serial.to_string(), network.to_string());
+        assert_eq!(relay.to_string(), network.to_string());
     }
 
     #[test]

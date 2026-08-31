@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod common;
+mod connectivity;
 mod control;
 mod cursor;
 mod data;
@@ -18,6 +19,18 @@ mod policy;
 pub use common::{
     CommonHeader, PacketType, ProtocolVersion, COMMON_HEADER_LENGTH, MAGIC, MAX_HEADER_LENGTH,
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
+};
+pub use connectivity::{
+    encode_connectivity_generation, encode_connectivity_list, encode_connectivity_record,
+    encode_stun_server_list, ConnectivityCarrier, ConnectivityGenerationRef,
+    ConnectivityGenerationView, ConnectivityListView, ConnectivityRecordIter,
+    ConnectivityRecordRef, ConnectivityRecordView, IceCandidate, IceCandidateClass,
+    IceCandidateIter, StunServer, StunServerIter, StunServerListView,
+    CONNECTIVITY_GENERATION_FORMAT_VERSION, CONNECTIVITY_GENERATION_HEADER_LENGTH,
+    CONNECTIVITY_GENERATION_MAGIC, CONNECTIVITY_RECORD_FIXED_LENGTH, ICE_CANDIDATE_RECORD_LENGTH,
+    MAX_CONNECTIVITY_GENERATION_LIFETIME_SECONDS, MAX_CONNECTIVITY_RECORDS, MAX_ICE_CANDIDATES,
+    MAX_ICE_PASSWORD_LENGTH, MAX_ICE_USERNAME_FRAGMENT_LENGTH, MAX_STUN_SERVERS,
+    MIN_ICE_PASSWORD_LENGTH, MIN_ICE_USERNAME_FRAGMENT_LENGTH, STUN_SERVER_RECORD_LENGTH,
 };
 pub use control::{
     control_fields_encoded_len, decode_control_record_length, encode_control_fields,

@@ -4,13 +4,14 @@ use proptest::prelude::*;
 use stella_common::{NetworkId, NodeId};
 use stella_proto::{
     decode_control_record_length, encode_session_confirm, encode_session_reject, CommonHeader,
-    ControlFieldIter, ControlHeader, ControlMessageView, DataHeader, DataPacketView,
-    EndpointSetView, HandshakeHeader, KeepaliveHeader, KeepalivePacketView, MembershipGrantView,
+    ConnectivityGenerationView, ConnectivityListView, ConnectivityRecordView, ControlFieldIter,
+    ControlHeader, ControlMessageView, DataHeader, DataPacketView, EndpointSetView,
+    HandshakeHeader, IceCandidate, KeepaliveHeader, KeepalivePacketView, MembershipGrantView,
     NetworkPolicy, NetworkRevisionListView, PacketType, PeerListView, PeerRecordView,
     ProtocolVersion, SessionConfirmRef, SessionConfirmRole, SessionConfirmView, SessionInitView,
-    SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseView, VersionListView,
-    HANDSHAKE_FIXED_HEADER_LENGTH, SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG,
-    SESSION_REJECT_PAYLOAD_LENGTH,
+    SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseView,
+    StunServerListView, VersionListView, HANDSHAKE_FIXED_HEADER_LENGTH,
+    SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG, SESSION_REJECT_PAYLOAD_LENGTH,
 };
 
 #[derive(Clone, Copy)]
@@ -53,7 +54,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
-    fn arbitrary_codec_input_never_panics(input in prop::collection::vec(any::<u8>(), 0..2_049)) {
+    fn arbitrary_codec_input_never_panics(input in prop::collection::vec(any::<u8>(), 0..4_097)) {
         let _common_header = CommonHeader::decode(&input);
         let _data_header = DataHeader::decode(&input);
         let _data_packet = DataPacketView::decode(&input);
@@ -75,6 +76,11 @@ proptest! {
         let _network_revisions = NetworkRevisionListView::decode(&input);
         let _peer_record = PeerRecordView::decode(&input);
         let _peer_list = PeerListView::decode(&input);
+        let _candidate = IceCandidate::decode(&input);
+        let _connectivity_generation = ConnectivityGenerationView::decode(&input);
+        let _connectivity_record = ConnectivityRecordView::decode(&input);
+        let _connectivity_list = ConnectivityListView::decode(&input);
+        let _stun_servers = StunServerListView::decode(&input);
     }
 
     #[test]
