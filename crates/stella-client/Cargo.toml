@@ -8,11 +8,24 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
+getrandom = "0.4.3"
 stella-common = { path = "../stella-common" }
+stella-control = { path = "../stella-control" }
 stella-crypto = { path = "../stella-crypto" }
 stella-proto = { path = "../stella-proto" }
 stella-tap = { path = "../stella-tap" }
 stella-transport = { path = "../stella-transport" }
+subtle = { version = "2.6.1", default-features = false }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring"] }
+x509-parser = { version = "=0.18.1", default-features = false }
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+[dev-dependencies]
+stella-server = { path = "../stella-server" }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [lints]
 workspace = true

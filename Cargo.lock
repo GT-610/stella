@@ -1060,11 +1060,21 @@ dependencies = [
 name = "stella-client"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "getrandom 0.4.3",
  "stella-common",
+ "stella-control",
  "stella-crypto",
  "stella-proto",
+ "stella-server",
  "stella-tap",
  "stella-transport",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
