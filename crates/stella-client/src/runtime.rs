@@ -399,6 +399,18 @@ impl ClientDataRuntime {
                 field: "mtu",
                 reason: "maximum frame size is below Ethernet header length",
             })?;
+        let installed_mtu = WindowsTapDevice::installed_adapters()?
+            .into_iter()
+            .find(|adapter| {
+                adapter
+                    .friendly_name
+                    .eq_ignore_ascii_case(&configured.tap_adapter)
+            })
+            .ok_or_else(|| TapError::AdapterNotFound {
+                selector: Some(configured.tap_adapter.clone()),
+            })?
+            .system_mtu;
+        let mtu = effective_tap_mtu(mtu, installed_mtu)?;
         let tap_config = TapConfig {
             name: Some(configured.tap_adapter.clone()),
             mtu,
@@ -671,9 +683,34 @@ fn configured_datagram_size(config: &ClientConfig) -> usize {
         .min(MAX_UDP_DATAGRAM_SIZE)
 }
 
+fn effective_tap_mtu(policy_mtu: u16, installed_mtu: u32) -> Result<u16, TapError> {
+    u16::try_from(u32::from(policy_mtu).min(installed_mtu)).map_err(|_| TapError::InvalidConfig {
+        field: "mtu",
+        reason: "installed interface MTU cannot be represented",
+    })
+}
+
 fn unix_time() -> Result<u64, RuntimeError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| RuntimeError::SystemTimeBeforeUnixEpoch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_tap_mtu;
+
+    #[test]
+    fn effective_mtu_preserves_lower_host_setting_and_caps_higher_setting() {
+        assert_eq!(
+            effective_tap_mtu(1_500, 1_340).expect("lower host MTU"),
+            1_340
+        );
+        assert_eq!(effective_tap_mtu(1_500, 1_500).expect("equal MTU"), 1_500);
+        assert_eq!(
+            effective_tap_mtu(1_500, 9_000).expect("cap host MTU"),
+            1_500
+        );
+    }
 }

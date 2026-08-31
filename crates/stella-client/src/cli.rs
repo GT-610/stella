@@ -193,10 +193,10 @@ async fn supervise_control(
                 );
                 attempt = 0;
                 if let Err(error) = run_active_control(config, identity, active).await {
-                    tracing::warn!(%error, "active controller session ended");
+                    tracing::warn!(error = ?error, "active controller session ended");
                 }
             }
-            Err(error) => tracing::warn!(%error, "controller activation failed"),
+            Err(error) => tracing::warn!(error = ?error, "controller activation failed"),
         }
         let cap = reconnect_cap(attempt);
         let delay = full_jitter(cap)?;

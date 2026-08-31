@@ -18,6 +18,12 @@ I/O loop becomes active. A peer that has joined but has not published a usable
 endpoint is skipped until a later control update; it cannot prevent this node
 from becoming reachable.
 
+The runtime never raises an installed adapter's current IP MTU merely to reach
+the network frame ceiling. It keeps a lower existing MTU, which remains safe
+because the signed policy is a maximum rather than a required local size. It
+still lowers an oversized adapter to the policy limit and fails closed if
+Windows denies that required restriction.
+
 The top-level loop concurrently handles controller updates, heartbeat
 deadlines, 100-millisecond data maintenance, UDP reception, and TAP events.
 Control reconciliation removes withdrawn networks first, recreates TAP state

@@ -62,3 +62,9 @@ one shared UDP receive buffer. Queue overflow is observable packet loss rather
 than backpressure into the operating-system TAP path. Future batching or IOCP
 work may change the internal mechanism, but it must preserve these bounds,
 path-pinning rules, and shutdown semantics.
+
+An adapter's local IP MTU may remain below the signed network frame ceiling;
+the ceiling constrains accepted Ethernet frames but does not require the
+runtime to raise a conservative host setting. An adapter above the ceiling is
+lowered before activation, and failure to enforce that upper bound remains
+fatal.
