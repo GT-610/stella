@@ -1,7 +1,7 @@
 //! Sequential authenticated control-request serving.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,10 +12,13 @@ use stella_control::{
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
     encode_network_revision_list, CodecError, ControlFieldType, ControlMessageType, Endpoint,
-    EndpointSetView, NetworkRevision, NetworkRevisionListView,
+    EndpointSetView, MembershipGrantView, NetworkRevision, NetworkRevisionListView,
 };
 use thiserror::Error;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::TcpStream,
+    time::{sleep_until, timeout, Instant},
+};
 use tokio_rustls::server::TlsStream;
 use zeroize::Zeroizing;
 
@@ -68,29 +71,56 @@ pub async fn serve_authenticated_session(
         outbound,
         joined_networks: BTreeSet::new(),
         last_heartbeat: None,
+        grant_refreshes: BTreeMap::new(),
     };
 
     loop {
-        let read_result = {
+        let refresh_deadline = state.grant_refreshes.values().min().copied();
+        let wake = {
             let mut reader = RecordReader::new(&mut state.stream);
-            tokio::select! {
-                _ = shutdown.changed() => None,
-                result = reader.read_message() => Some(result),
+            if let Some(deadline) = refresh_deadline {
+                tokio::select! {
+                    _ = shutdown.changed() => SessionWake::Shutdown,
+                    result = reader.read_message() => SessionWake::Message(result),
+                    () = sleep_until(deadline) => SessionWake::GrantRefresh,
+                }
+            } else {
+                tokio::select! {
+                    _ = shutdown.changed() => SessionWake::Shutdown,
+                    result = reader.read_message() => SessionWake::Message(result),
+                }
             }
         };
-        let Some(read_result) = read_result else {
-            send_shutdown(&mut state).await?;
-            return Ok(());
-        };
-        let Some(message) = read_result? else {
-            return Ok(());
-        };
-        match timeout(request_timeout, process_request(&mut state, message)).await {
-            Err(_) => return Err(ActiveSessionError::RequestTimeout),
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
+        match wake {
+            SessionWake::Shutdown => {
+                send_shutdown(&mut state).await?;
+                return Ok(());
+            }
+            SessionWake::Message(result) => {
+                let Some(message) = result? else {
+                    return Ok(());
+                };
+                match timeout(request_timeout, process_request(&mut state, message)).await {
+                    Err(_) => return Err(ActiveSessionError::RequestTimeout),
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                }
+            }
+            SessionWake::GrantRefresh => {
+                match timeout(request_timeout, refresh_due_grants(&mut state)).await {
+                    Err(_) => return Err(ActiveSessionError::RequestTimeout),
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                }
+            }
         }
     }
+}
+
+enum SessionWake {
+    Shutdown,
+    Message(Result<Option<stella_control::OwnedControlMessage>, ControlError>),
+    GrantRefresh,
 }
 
 struct ActiveSessionState {
@@ -101,6 +131,7 @@ struct ActiveSessionState {
     outbound: OutboundSequence,
     joined_networks: BTreeSet<NetworkId>,
     last_heartbeat: Option<u64>,
+    grant_refreshes: BTreeMap<NetworkId, Instant>,
 }
 
 async fn process_request(
@@ -452,9 +483,10 @@ async fn handle_leave(
     match resolve_leave(state.context.authority(), state.node_id, network_id).await? {
         LeaveDecision::Left(revision) => {
             send_leave_result(state, correlation_id, &revision).await?;
-            state.joined_networks.remove(&network_id);
+            forget_network(state, network_id);
         }
         LeaveDecision::NetworkNotFound => {
+            forget_network(state, network_id);
             send_error(state, correlation_id, STATUS_NETWORK_NOT_FOUND).await?;
         }
     }
@@ -502,7 +534,7 @@ async fn handle_endpoint_update(
             status,
             close,
         } => {
-            state.joined_networks.remove(&revision.network_id);
+            forget_network(state, revision.network_id);
             send_endpoint_result(state, correlation_id, status, &revision).await?;
             if close {
                 shutdown_writer(&mut state.stream).await?;
@@ -510,7 +542,7 @@ async fn handle_endpoint_update(
             }
         }
         EndpointDecision::NetworkNotFound => {
-            state.joined_networks.remove(&network_id);
+            forget_network(state, network_id);
             send_error(state, correlation_id, STATUS_NETWORK_NOT_FOUND).await?;
         }
     }
@@ -590,7 +622,7 @@ async fn handle_snapshot_request(
             } else {
                 return Err(ActiveSessionError::Authority(error));
             };
-            state.joined_networks.remove(&request.network_id);
+            forget_network(state, request.network_id);
             send_error(state, correlation_id, status).await?;
             if close {
                 shutdown_writer(&mut state.stream).await?;
@@ -683,6 +715,32 @@ async fn handle_heartbeat(
     Ok(())
 }
 
+async fn refresh_due_grants(state: &mut ActiveSessionState) -> Result<(), ActiveSessionError> {
+    let current = Instant::now();
+    let due_networks = state
+        .grant_refreshes
+        .iter()
+        .filter_map(|(network_id, deadline)| (*deadline <= current).then_some(*network_id))
+        .collect::<Vec<_>>();
+    let authority = state.context.authority().clone();
+    let now = unix_time()?;
+    for network_id in due_networks {
+        let view = match authority
+            .network_session_view(state.node_id, network_id)
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                handle_network_authority_failure(state, 0, network_id, error).await?;
+                continue;
+            }
+        };
+        let encoded = encode_network_state(state.context.controller_identity(), &view, now)?;
+        send_grant_refresh(state, &encoded).await?;
+    }
+    Ok(())
+}
+
 async fn handle_network_authority_failure(
     state: &mut ActiveSessionState,
     correlation_id: u64,
@@ -700,7 +758,7 @@ async fn handle_network_authority_failure(
     } else {
         return Err(ActiveSessionError::Authority(error));
     };
-    state.joined_networks.remove(&network_id);
+    forget_network(state, network_id);
     send_error(state, correlation_id, status).await?;
     if close {
         shutdown_writer(&mut state.stream).await?;
@@ -719,6 +777,11 @@ async fn require_joined(
     }
     send_error(state, correlation_id, STATUS_INVALID_STATE).await?;
     Err(ActiveSessionError::NetworkNotJoined { network_id })
+}
+
+fn forget_network(state: &mut ActiveSessionState, network_id: NetworkId) {
+    state.joined_networks.remove(&network_id);
+    state.grant_refreshes.remove(&network_id);
 }
 
 fn classify_authorization_error(error: &AuthorityError) -> Option<(u16, bool)> {
@@ -792,7 +855,8 @@ async fn send_peer_snapshot(
         &encoded.snapshot_revision().to_be_bytes(),
     )?;
     builder.push_field(ControlFieldType::PeerList, encoded.peer_list())?;
-    write_message(state, builder).await
+    write_message(state, builder).await?;
+    schedule_grant_refresh(state, encoded)
 }
 
 async fn send_endpoint_result(
@@ -834,6 +898,47 @@ async fn send_heartbeat_ack(
     )?;
     builder.push_field(ControlFieldType::ServerTime, &server_time.to_be_bytes())?;
     write_message(state, builder).await
+}
+
+async fn send_grant_refresh(
+    state: &mut ActiveSessionState,
+    encoded: &EncodedNetworkState,
+) -> Result<(), ActiveSessionError> {
+    let mut builder = MessageBuilder::new(ControlMessageType::GrantRefresh);
+    builder.push_field(
+        ControlFieldType::ControllerEpoch,
+        &encoded.controller_epoch().to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::NetworkId, encoded.network_id().as_bytes())?;
+    builder.push_field(ControlFieldType::MembershipGrant, encoded.local_grant())?;
+    builder.push_field(ControlFieldType::NetworkPolicy, encoded.policy())?;
+    builder.push_field(
+        ControlFieldType::SnapshotRevision,
+        &encoded.snapshot_revision().to_be_bytes(),
+    )?;
+    write_message(state, builder).await?;
+    schedule_grant_refresh(state, encoded)
+}
+
+fn schedule_grant_refresh(
+    state: &mut ActiveSessionState,
+    encoded: &EncodedNetworkState,
+) -> Result<(), ActiveSessionError> {
+    let delay = grant_refresh_delay(encoded)?;
+    let deadline = Instant::now()
+        .checked_add(delay)
+        .ok_or(ActiveSessionError::GrantRefreshDeadlineOverflow)?;
+    state.grant_refreshes.insert(encoded.network_id(), deadline);
+    Ok(())
+}
+
+fn grant_refresh_delay(encoded: &EncodedNetworkState) -> Result<Duration, ActiveSessionError> {
+    let grant = MembershipGrantView::decode(encoded.local_grant())?.grant();
+    let lifetime = grant
+        .not_after
+        .checked_sub(grant.not_before)
+        .ok_or(ActiveSessionError::GrantLifetimeInvalid)?;
+    Ok(Duration::from_secs(lifetime / 2))
 }
 
 async fn send_leave_result(
@@ -964,6 +1069,12 @@ pub enum ActiveSessionError {
         /// Invalid received counter.
         actual: u64,
     },
+    /// A decoded grant unexpectedly had an inverted validity interval.
+    #[error("validated membership grant lifetime is invalid")]
+    GrantLifetimeInvalid,
+    /// The monotonic clock could not represent the next refresh deadline.
+    #[error("membership grant refresh deadline overflows monotonic time")]
+    GrantRefreshDeadlineOverflow,
     /// A codec-validated message unexpectedly lacked a required field.
     #[error("validated control message is missing required field {field:?}")]
     ValidatedFieldMissing {
@@ -1001,6 +1112,7 @@ mod tests {
         num::NonZeroUsize,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
     };
 
     use stella_common::{ControllerId, NetworkId};
@@ -1009,8 +1121,8 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        resolve_endpoint_update, resolve_join, resolve_leave, EndpointDecision, EndpointUpdate,
-        JoinDecision, JoinRequest, LeaveDecision,
+        grant_refresh_delay, resolve_endpoint_update, resolve_join, resolve_leave,
+        EndpointDecision, EndpointUpdate, JoinDecision, JoinRequest, LeaveDecision,
     };
     use crate::{
         authority::AuthorityThread,
@@ -1104,7 +1216,16 @@ mod tests {
         )
         .await
         .expect("resolve valid join");
-        assert!(matches!(accepted, JoinDecision::Accepted(_)));
+        let encoded = match accepted {
+            JoinDecision::Accepted(encoded) => encoded,
+            JoinDecision::Rejected { .. } | JoinDecision::NetworkNotFound => {
+                panic!("valid join should be accepted")
+            }
+        };
+        assert_eq!(
+            grant_refresh_delay(&encoded).expect("derive refresh delay"),
+            Duration::from_secs(450)
+        );
         let repeated = resolve_join(
             &authority,
             &controller,
