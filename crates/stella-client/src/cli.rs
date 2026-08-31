@@ -270,6 +270,9 @@ async fn run_active_control(
         .context("could not start Windows UDP/TAP data plane")?;
     let result = async {
         publish_configured_endpoints(config, &mut active).await?;
+        data.reconcile(config, active.networks(), identity)
+            .await
+            .context("could not reconcile data plane after endpoint publication")?;
         tracing::info!(
             udp = %data.local_udp_address(),
             networks = active.networks().len(),

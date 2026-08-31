@@ -235,6 +235,7 @@ impl NetworkDataPlane {
                     .is_none_or(|session| session.rekeying)
                     && !self.handshakes.has_outgoing(*peer)
                     && self.handshakes.can_initiate(*peer, monotonic_now)
+                    && self.select_peer_endpoint(*peer).is_some()
             })
             .collect();
         let mut output = NetworkOutput::default();
@@ -631,25 +632,26 @@ impl NetworkDataPlane {
     }
 
     fn peer_endpoint(&self, peer: NodeId) -> Result<SocketAddr, NetworkDataError> {
-        self.state
-            .peers()
-            .get(&peer)
-            .and_then(|state| {
-                state
-                    .endpoints()
-                    .iter()
-                    .copied()
-                    .filter(|endpoint| self.udp_family.matches(*endpoint))
-                    .min_by_key(|endpoint| {
-                        (
-                            endpoint.priority(),
-                            endpoint_address(*endpoint),
-                            endpoint.port(),
-                        )
-                    })
-                    .map(endpoint_socket_address)
-            })
+        self.select_peer_endpoint(peer)
             .ok_or(NetworkDataError::NoPeerEndpoint { peer_node_id: peer })
+    }
+
+    fn select_peer_endpoint(&self, peer: NodeId) -> Option<SocketAddr> {
+        self.state.peers().get(&peer).and_then(|state| {
+            state
+                .endpoints()
+                .iter()
+                .copied()
+                .filter(|endpoint| self.udp_family.matches(*endpoint))
+                .min_by_key(|endpoint| {
+                    (
+                        endpoint.priority(),
+                        endpoint_address(*endpoint),
+                        endpoint.port(),
+                    )
+                })
+                .map(endpoint_socket_address)
+        })
     }
 
     fn validate_source(&self, peer: NodeId, source: SocketAddr) -> Result<(), NetworkDataError> {
@@ -925,6 +927,42 @@ mod tests {
         frame[6..12].copy_from_slice(source.as_bytes());
         frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
         frame
+    }
+
+    #[test]
+    fn endpointless_preferred_peer_does_not_block_data_plane_startup() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_id = derive_node_id(alice_key.public_key());
+        let bob_id = derive_node_id(bob_key.public_key());
+        let (local_key, remote_id) = if alice_id < bob_id {
+            (&alice_key, bob_id)
+        } else {
+            (&bob_key, alice_id)
+        };
+        store
+            .publish_endpoints(remote_id, network_id, &[], 130)
+            .expect("withdraw remote endpoints");
+        let mut plane = NetworkDataPlane::new(
+            state(&store, &controller, local_key, network_id),
+            MacAddress::from_bytes([0x02, 0, 0, 0, 1, 3]),
+            "127.0.0.1:46003".parse().expect("local address"),
+            1_200,
+            local_key,
+            Duration::ZERO,
+        )
+        .expect("create endpointless-peer data plane");
+
+        assert!(plane
+            .start_handshakes(local_key, WALL_TIME, Duration::ZERO)
+            .expect("skip endpointless peer")
+            .datagrams()
+            .is_empty());
+        assert!(plane
+            .maintain(local_key, WALL_TIME, Duration::from_secs(1))
+            .expect("continue waiting for peer endpoint")
+            .datagrams()
+            .is_empty());
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     #[allow(clippy::too_many_arguments)]

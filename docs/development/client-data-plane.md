@@ -12,6 +12,12 @@ configured UDP address once and creates one `NetworkDataPlane` and one exact
 TAP adapter worker for every active network snapshot. A network is not created
 unless its durable configuration names a matching TAP adapter.
 
+The Windows owner binds UDP and opens every TAP adapter before it publishes its
+receive-ready endpoint set. The publication response is reconciled before the
+I/O loop becomes active. A peer that has joined but has not published a usable
+endpoint is skipped until a later control update; it cannot prevent this node
+from becoming reachable.
+
 The top-level loop concurrently handles controller updates, heartbeat
 deadlines, 100-millisecond data maintenance, UDP reception, and TAP events.
 Control reconciliation removes withdrawn networks first, recreates TAP state
