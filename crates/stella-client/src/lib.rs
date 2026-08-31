@@ -9,6 +9,7 @@ mod data_plane;
 mod error;
 mod handshake;
 mod identity;
+mod network;
 mod state;
 mod switch;
 mod tls;
@@ -28,6 +29,7 @@ pub use identity::{
     create_node_identity, load_node_identity, verify_node_identity_permissions,
     NodeIdentityFileError,
 };
+pub use network::{NetworkDataError, NetworkDataPlane, NetworkOutput, RoutedDatagram};
 pub use state::{
     GrantRefreshInput, NetworkState, PeerDeltaInput, PeerDeltaOperation, PeerState, SnapshotInput,
     StateError,

@@ -730,6 +730,12 @@ impl HandshakeTransmission {
     pub fn datagram(&self) -> &[u8] {
         &self.datagram
     }
+
+    /// Consumes the transmission into its destination peer and exact bytes.
+    #[must_use]
+    pub fn into_parts(self) -> (NodeId, Vec<u8>) {
+        (self.peer_node_id, self.datagram)
+    }
 }
 
 /// Result of dispatching one peer handshake datagram.

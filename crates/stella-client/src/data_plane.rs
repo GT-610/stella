@@ -306,6 +306,15 @@ impl PeerDataSession {
         self.replay.highest()
     }
 
+    /// Returns the number of protected packets emitted in this direction.
+    #[must_use]
+    pub const fn sent_packet_count(&self) -> u64 {
+        match self.next_sequence {
+            Some(next) => next.saturating_sub(1),
+            None => u64::MAX,
+        }
+    }
+
     /// Returns the number of currently incomplete frames.
     #[must_use]
     pub fn incomplete_frame_count(&self) -> usize {

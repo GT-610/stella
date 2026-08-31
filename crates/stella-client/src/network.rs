@@ -1,0 +1,854 @@
+//! Per-network routing between TAP frames, peer sessions, and UDP datagrams.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
+
+use stella_common::{MacAddress, NetworkId, NodeId};
+use stella_crypto::IdentitySigningKey;
+use stella_proto::{CommonHeader, Endpoint, HandshakeHeader, PacketType};
+use thiserror::Error;
+
+use crate::{
+    DataPlaneError, HandshakeError, HandshakeEvent, HandshakeTransmission, L2Switch, NetworkState,
+    PeerDataSession, PeerHandshakeConfig, PeerHandshakeManager, PeerIngress, SwitchError,
+    TapForwarding,
+};
+
+const ROUTINE_REKEY_PACKET_LIMIT: u64 = u32::MAX as u64;
+
+/// Failure while routing one active virtual network.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum NetworkDataError {
+    /// The network has no usable endpoint for an authorized peer.
+    #[error("peer {peer_node_id} has no usable endpoint for this UDP socket family")]
+    NoPeerEndpoint {
+        /// Peer without a compatible endpoint.
+        peer_node_id: NodeId,
+    },
+    /// A datagram source is not one of the sender's authenticated control-plane endpoints.
+    #[error("datagram source {endpoint} is not authorized for peer {peer_node_id}")]
+    UnauthorizedEndpoint {
+        /// Claimed authenticated peer.
+        peer_node_id: NodeId,
+        /// Numeric source observed by UDP.
+        endpoint: SocketAddr,
+    },
+    /// The datagram belongs to another virtual network.
+    #[error("datagram belongs to an unexpected network")]
+    WrongNetwork,
+    /// No confirmed session matches an incoming protected data packet.
+    #[error("no confirmed data session for peer {peer_node_id}")]
+    NoPeerSession {
+        /// Peer without a matching session.
+        peer_node_id: NodeId,
+    },
+    /// A packet or header was structurally malformed.
+    #[error(transparent)]
+    Codec(#[from] stella_proto::CodecError),
+    /// A peer handshake failed.
+    #[error(transparent)]
+    Handshake(#[from] HandshakeError),
+    /// Protected Ethernet data failed validation.
+    #[error(transparent)]
+    DataPlane(#[from] DataPlaneError),
+    /// Ethernet switching input was invalid.
+    #[error(transparent)]
+    Switch(#[from] SwitchError),
+}
+
+/// One complete UDP datagram routed to an authorized peer endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedDatagram {
+    peer_node_id: NodeId,
+    endpoint: SocketAddr,
+    bytes: Vec<u8>,
+}
+
+impl RoutedDatagram {
+    /// Returns the destination peer.
+    #[must_use]
+    pub const fn peer_node_id(&self) -> NodeId {
+        self.peer_node_id
+    }
+
+    /// Returns the selected numeric UDP endpoint.
+    #[must_use]
+    pub const fn endpoint(&self) -> SocketAddr {
+        self.endpoint
+    }
+
+    /// Borrows the complete datagram bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Bounded routing output from one network operation.
+#[derive(Debug, Default)]
+pub struct NetworkOutput {
+    datagrams: Vec<RoutedDatagram>,
+    tap_frame: Option<Vec<u8>>,
+}
+
+impl NetworkOutput {
+    /// Borrows all complete datagrams selected for transmission.
+    #[must_use]
+    pub fn datagrams(&self) -> &[RoutedDatagram] {
+        &self.datagrams
+    }
+
+    /// Borrows one authenticated frame selected for local TAP delivery.
+    #[must_use]
+    pub fn tap_frame(&self) -> Option<&[u8]> {
+        self.tap_frame.as_deref()
+    }
+
+    /// Consumes the output into owned datagrams and optional TAP frame.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<RoutedDatagram>, Option<Vec<u8>>) {
+        (self.datagrams, self.tap_frame)
+    }
+}
+
+struct InstalledSession {
+    data: PeerDataSession,
+    session_id: u64,
+    expires_at: u64,
+}
+
+/// Active, isolated state for one TAP-backed virtual network.
+pub struct NetworkDataPlane {
+    state: NetworkState,
+    udp_family: IpFamily,
+    max_datagram_size: usize,
+    switch: L2Switch,
+    handshakes: PeerHandshakeManager,
+    sessions: BTreeMap<NodeId, InstalledSession>,
+}
+
+impl NetworkDataPlane {
+    /// Creates an inactive-session network router from authoritative control state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] when the primary TAP MAC is invalid or a
+    /// peer handshake configuration cannot be derived from validated state.
+    pub fn new(
+        state: NetworkState,
+        primary_mac: MacAddress,
+        udp_bind: SocketAddr,
+        max_datagram_size: usize,
+        signing_key: &IdentitySigningKey,
+        now: Duration,
+    ) -> Result<Self, NetworkDataError> {
+        let local_node_id = state.local_grant().node_id;
+        let mut handshakes = PeerHandshakeManager::new(local_node_id);
+        for peer in state.peers().keys().copied() {
+            handshakes.upsert_peer(PeerHandshakeConfig::from_network_state(
+                &state,
+                peer,
+                signing_key,
+                max_datagram_size,
+            )?)?;
+        }
+        let switch = L2Switch::new(state.policy(), primary_mac, now)?;
+        Ok(Self {
+            state,
+            udp_family: IpFamily::from(udp_bind.ip()),
+            max_datagram_size,
+            switch,
+            handshakes,
+            sessions: BTreeMap::new(),
+        })
+    }
+
+    /// Returns this isolated virtual network ID.
+    #[must_use]
+    pub const fn network_id(&self) -> NetworkId {
+        self.state.network_id()
+    }
+
+    /// Returns the established peers currently eligible for forwarding.
+    #[must_use]
+    pub fn established_peers(&self) -> BTreeSet<NodeId> {
+        self.sessions.keys().copied().collect()
+    }
+
+    /// Starts preferred-initiator handshakes for peers without a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] if handshake construction or endpoint
+    /// selection fails for any selected peer.
+    pub fn start_handshakes(
+        &mut self,
+        signing_key: &IdentitySigningKey,
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        let peers: Vec<NodeId> = self
+            .state
+            .peers()
+            .keys()
+            .copied()
+            .filter(|peer| !self.sessions.contains_key(peer))
+            .collect();
+        let mut output = NetworkOutput::default();
+        for peer in peers {
+            let config = PeerHandshakeConfig::from_network_state(
+                &self.state,
+                peer,
+                signing_key,
+                self.max_datagram_size,
+            )?;
+            if !config.is_preferred_initiator() {
+                continue;
+            }
+            let transmission =
+                self.handshakes
+                    .initiate(peer, signing_key, wall_time, monotonic_now)?;
+            output.datagrams.push(self.route_handshake(transmission)?);
+        }
+        Ok(output)
+    }
+
+    /// Produces due handshake retries and starts routine rekeys when required.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] when a due peer has no usable endpoint or
+    /// a replacement initiation cannot be constructed.
+    pub fn maintain(
+        &mut self,
+        signing_key: &IdentitySigningKey,
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        let expired: Vec<NodeId> = self
+            .sessions
+            .iter()
+            .filter_map(|(peer, session)| {
+                (wall_time >= session.expires_at
+                    || session.data.sent_packet_count() >= ROUTINE_REKEY_PACKET_LIMIT)
+                    .then_some(*peer)
+            })
+            .collect();
+        for peer in expired {
+            self.remove_session(peer);
+        }
+        let mut output = NetworkOutput::default();
+        for transmission in self.handshakes.poll_retransmissions(monotonic_now) {
+            output.datagrams.push(self.route_handshake(transmission)?);
+        }
+        let starts = self.start_handshakes(signing_key, wall_time, monotonic_now)?;
+        output.datagrams.extend(starts.datagrams);
+        Ok(output)
+    }
+
+    /// Routes one local TAP frame to zero, one, or all established peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] for invalid Ethernet input, missing peer
+    /// endpoint, or packet-protection failure.
+    pub fn accept_tap_frame(
+        &mut self,
+        frame: &[u8],
+        now: Duration,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        let eligible = self.established_peers();
+        let forwarding = self.switch.forward_tap_frame(frame, &eligible, now)?;
+        let peers = match forwarding {
+            TapForwarding::Local | TapForwarding::RateLimited { .. } => Vec::new(),
+            TapForwarding::Unicast(peer) => vec![peer],
+            TapForwarding::Flood { peers, .. } => peers,
+        };
+        let mut output = NetworkOutput::default();
+        for peer in peers {
+            let endpoint = self.peer_endpoint(peer)?;
+            let session = self
+                .sessions
+                .get_mut(&peer)
+                .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+            for bytes in session.data.protect_frame(frame)? {
+                output.datagrams.push(RoutedDatagram {
+                    peer_node_id: peer,
+                    endpoint,
+                    bytes,
+                });
+            }
+        }
+        Ok(output)
+    }
+
+    /// Authenticates and routes one UDP datagram from an authorized endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] for malformed context, endpoint spoofing,
+    /// handshake failure, unknown session, failed packet protection, or invalid
+    /// authenticated Ethernet input.
+    pub fn accept_udp_datagram(
+        &mut self,
+        source: SocketAddr,
+        datagram: &[u8],
+        signing_key: &IdentitySigningKey,
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        let common = CommonHeader::decode(datagram)?;
+        if common.network_id != self.state.network_id() {
+            return Err(NetworkDataError::WrongNetwork);
+        }
+        match common.packet_type {
+            PacketType::Data => self.accept_data(source, datagram, monotonic_now),
+            PacketType::SessionInit
+            | PacketType::SessionResponse
+            | PacketType::SessionConfirm
+            | PacketType::SessionReject => {
+                let header = HandshakeHeader::decode(datagram)?;
+                self.validate_source(header.sender_node_id, source)?;
+                let event = self.handshakes.handle_datagram(
+                    datagram,
+                    signing_key,
+                    wall_time,
+                    monotonic_now,
+                )?;
+                self.apply_handshake_event(event)
+            }
+            PacketType::Keepalive => Ok(NetworkOutput::default()),
+        }
+    }
+
+    /// Replaces authoritative control state and invalidates affected sessions.
+    ///
+    /// Epoch, policy, local-grant, peer-grant, or endpoint changes immediately
+    /// remove the corresponding data keys, replay state, and learned MACs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] when replacement state belongs to another
+    /// network or cannot produce valid peer handshake configuration.
+    pub fn reconcile(
+        &mut self,
+        replacement: NetworkState,
+        signing_key: &IdentitySigningKey,
+        primary_mac: MacAddress,
+        now: Duration,
+    ) -> Result<(), NetworkDataError> {
+        if replacement.network_id() != self.state.network_id() {
+            return Err(NetworkDataError::WrongNetwork);
+        }
+        let reset_all = replacement.controller_epoch() != self.state.controller_epoch()
+            || replacement.policy() != self.state.policy()
+            || replacement.local_grant().grant_serial != self.state.local_grant().grant_serial;
+        let old_peers = self.state.peers().clone();
+        if reset_all {
+            self.sessions.clear();
+            self.switch = L2Switch::new(replacement.policy(), primary_mac, now)?;
+            self.handshakes = PeerHandshakeManager::new(replacement.local_grant().node_id);
+        }
+        self.state = replacement;
+        let current_peers: Vec<NodeId> = self.state.peers().keys().copied().collect();
+        for peer in old_peers.keys().copied() {
+            if !self.state.peers().contains_key(&peer) {
+                self.remove_session(peer);
+                self.handshakes.remove_peer(peer);
+            }
+        }
+        for peer in current_peers {
+            let changed = old_peers.get(&peer).is_none_or(|old| {
+                self.state.peers().get(&peer).is_none_or(|current| {
+                    old.grant().grant_serial != current.grant().grant_serial
+                        || old.endpoints() != current.endpoints()
+                })
+            });
+            if changed {
+                self.remove_session(peer);
+            }
+            self.handshakes
+                .upsert_peer(PeerHandshakeConfig::from_network_state(
+                    &self.state,
+                    peer,
+                    signing_key,
+                    self.max_datagram_size,
+                )?)?;
+        }
+        Ok(())
+    }
+
+    fn accept_data(
+        &mut self,
+        source: SocketAddr,
+        datagram: &[u8],
+        now: Duration,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        let header = stella_proto::DataHeader::decode(datagram)?;
+        let peer = header.sender_node_id;
+        self.validate_source(peer, source)?;
+        let session = self
+            .sessions
+            .get_mut(&peer)
+            .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+        if header.session_id != session.session_id {
+            return Err(NetworkDataError::NoPeerSession { peer_node_id: peer });
+        }
+        let Some(frame) = session.data.accept_datagram(datagram, now)? else {
+            return Ok(NetworkOutput::default());
+        };
+        match self.switch.accept_peer_frame(peer, &frame, now)? {
+            PeerIngress::DeliverToTap => Ok(NetworkOutput {
+                datagrams: Vec::new(),
+                tap_frame: Some(frame),
+            }),
+            PeerIngress::DropLocalMacConflict => Ok(NetworkOutput::default()),
+        }
+    }
+
+    fn apply_handshake_event(
+        &mut self,
+        event: HandshakeEvent,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        match event {
+            HandshakeEvent::Ignored => Ok(NetworkOutput::default()),
+            HandshakeEvent::Transmit(transmission) => Ok(NetworkOutput {
+                datagrams: vec![self.route_handshake(transmission)?],
+                tap_frame: None,
+            }),
+            HandshakeEvent::Established {
+                peer_node_id,
+                transmission,
+                session,
+            } => {
+                let mut output = NetworkOutput::default();
+                if let Some(transmission) = transmission {
+                    output.datagrams.push(self.route_handshake(transmission)?);
+                }
+                let session_id = session.session_id();
+                let expires_at = session.expires_at();
+                let data = session.into_data_session()?;
+                if let Some(previous) = self.sessions.insert(
+                    peer_node_id,
+                    InstalledSession {
+                        data,
+                        session_id,
+                        expires_at,
+                    },
+                ) {
+                    self.handshakes
+                        .retire_session(peer_node_id, previous.session_id);
+                }
+                Ok(output)
+            }
+        }
+    }
+
+    fn route_handshake(
+        &self,
+        transmission: HandshakeTransmission,
+    ) -> Result<RoutedDatagram, NetworkDataError> {
+        let (peer_node_id, bytes) = transmission.into_parts();
+        Ok(RoutedDatagram {
+            peer_node_id,
+            endpoint: self.peer_endpoint(peer_node_id)?,
+            bytes,
+        })
+    }
+
+    fn peer_endpoint(&self, peer: NodeId) -> Result<SocketAddr, NetworkDataError> {
+        self.state
+            .peers()
+            .get(&peer)
+            .and_then(|state| {
+                state
+                    .endpoints()
+                    .iter()
+                    .copied()
+                    .filter(|endpoint| self.udp_family.matches(*endpoint))
+                    .min_by_key(|endpoint| {
+                        (
+                            endpoint.priority(),
+                            endpoint_address(*endpoint),
+                            endpoint.port(),
+                        )
+                    })
+                    .map(endpoint_socket_address)
+            })
+            .ok_or(NetworkDataError::NoPeerEndpoint { peer_node_id: peer })
+    }
+
+    fn validate_source(&self, peer: NodeId, source: SocketAddr) -> Result<(), NetworkDataError> {
+        let authorized = self.state.peers().get(&peer).is_some_and(|state| {
+            state
+                .endpoints()
+                .iter()
+                .copied()
+                .map(endpoint_socket_address)
+                .any(|endpoint| endpoint == source)
+        });
+        if !authorized {
+            return Err(NetworkDataError::UnauthorizedEndpoint {
+                peer_node_id: peer,
+                endpoint: source,
+            });
+        }
+        Ok(())
+    }
+
+    fn remove_session(&mut self, peer: NodeId) {
+        if let Some(previous) = self.sessions.remove(&peer) {
+            self.handshakes.retire_session(peer, previous.session_id);
+        }
+        self.switch.remove_peer(peer);
+    }
+}
+
+impl std::fmt::Debug for NetworkDataPlane {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NetworkDataPlane")
+            .field("network_id", &self.state.network_id())
+            .field("controller_epoch", &self.state.controller_epoch())
+            .field("configured_peers", &self.state.peers().len())
+            .field("established_peers", &self.sessions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    const fn matches(self, endpoint: Endpoint) -> bool {
+        matches!(
+            (self, endpoint),
+            (Self::V4, Endpoint::UdpIpv4 { .. }) | (Self::V6, Endpoint::UdpIpv6 { .. })
+        )
+    }
+}
+
+impl From<IpAddr> for IpFamily {
+    fn from(address: IpAddr) -> Self {
+        match address {
+            IpAddr::V4(_) => Self::V4,
+            IpAddr::V6(_) => Self::V6,
+        }
+    }
+}
+
+fn endpoint_socket_address(endpoint: Endpoint) -> SocketAddr {
+    match endpoint {
+        Endpoint::UdpIpv4 { address, port, .. } => SocketAddr::new(IpAddr::V4(address), port),
+        Endpoint::UdpIpv6 { address, port, .. } => SocketAddr::new(IpAddr::V6(address), port),
+    }
+}
+
+fn endpoint_address(endpoint: Endpoint) -> [u8; 16] {
+    match endpoint {
+        Endpoint::UdpIpv4 { address, .. } => {
+            let mut bytes = [0_u8; 16];
+            bytes[..4].copy_from_slice(&address.octets());
+            bytes
+        }
+        Endpoint::UdpIpv6 { address, .. } => address.octets(),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    use stella_common::{MacAddress, NetworkId};
+    use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
+    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
+    use stella_server::{
+        network_state::encode_network_state,
+        store::{AuthorityStore, NetworkRecord, NodeRecord},
+    };
+
+    use super::NetworkDataPlane;
+    use crate::{NetworkState, SnapshotInput};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    const WALL_TIME: u64 = 200;
+
+    fn signing_key(seed: u8) -> IdentitySigningKey {
+        IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([seed; 32]))
+    }
+
+    fn fixture() -> (
+        PathBuf,
+        AuthorityStore,
+        IdentitySigningKey,
+        IdentitySigningKey,
+        IdentitySigningKey,
+        NetworkId,
+    ) {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "stella-network-data-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create fixture directory");
+        let controller = signing_key(91);
+        let store = AuthorityStore::initialize(
+            &directory.join("controller.redb"),
+            derive_controller_id(controller.public_key()),
+        )
+        .expect("initialize authority store");
+        let network_id = NetworkId::from_bytes([92; 16]);
+        let policy = NetworkPolicy {
+            confidentiality: ConfidentialityPolicy::Encrypt,
+            max_frame_size: 1_514,
+            max_flood_peers: 8,
+            flood_rate: 1_000,
+            flood_burst: 2_000,
+            mac_age_seconds: 300,
+            heartbeat_seconds: 10,
+            peer_lease_seconds: 30,
+            session_lifetime_seconds: 900,
+            reassembly_timeout_ms: 3_000,
+            network_id,
+            policy_revision: 1,
+        };
+        store
+            .create_network(&NetworkRecord::new(policy, "Network data", 100).expect("network"))
+            .expect("create network");
+        let alice = signing_key(93);
+        let bob = signing_key(94);
+        let alice_record = NodeRecord::new(alice.public_key(), "Alice", 100).expect("alice");
+        let bob_record = NodeRecord::new(bob.public_key(), "Bob", 100).expect("bob");
+        store.create_node(&alice_record).expect("create alice");
+        store.create_node(&bob_record).expect("create bob");
+        store
+            .add_member(alice_record.node_id(), network_id, 110)
+            .expect("join alice");
+        store
+            .add_member(bob_record.node_id(), network_id, 110)
+            .expect("join bob");
+        store
+            .publish_endpoints(
+                alice_record.node_id(),
+                network_id,
+                &[Endpoint::UdpIpv4 {
+                    priority: 0,
+                    port: 46_001,
+                    max_datagram_size: 1_200,
+                    address: Ipv4Addr::LOCALHOST,
+                }],
+                120,
+            )
+            .expect("publish alice endpoint");
+        store
+            .publish_endpoints(
+                bob_record.node_id(),
+                network_id,
+                &[Endpoint::UdpIpv4 {
+                    priority: 0,
+                    port: 46_002,
+                    max_datagram_size: 1_200,
+                    address: Ipv4Addr::LOCALHOST,
+                }],
+                121,
+            )
+            .expect("publish bob endpoint");
+        (directory, store, controller, alice, bob, network_id)
+    }
+
+    fn state(
+        store: &AuthorityStore,
+        controller: &IdentitySigningKey,
+        local: &IdentitySigningKey,
+        network_id: NetworkId,
+    ) -> NetworkState {
+        let local_node_id = derive_node_id(local.public_key());
+        let view = store
+            .network_session_view(local_node_id, network_id)
+            .expect("network session view");
+        let encoded = encode_network_state(controller, &view, WALL_TIME).expect("encode state");
+        NetworkState::from_snapshot(&SnapshotInput {
+            controller_id: derive_controller_id(controller.public_key()),
+            controller_public_key: controller.public_key(),
+            local_node_id,
+            local_public_key: local.public_key(),
+            network_id,
+            controller_epoch: encoded.controller_epoch(),
+            snapshot_revision: encoded.snapshot_revision(),
+            local_grant_bytes: encoded.local_grant(),
+            policy_bytes: encoded.policy(),
+            peer_list_bytes: encoded.peer_list(),
+            now: WALL_TIME,
+        })
+        .expect("validate state")
+    }
+
+    fn ethernet_frame(source: MacAddress, destination: MacAddress, marker: u8) -> Vec<u8> {
+        let mut frame = vec![marker; 128];
+        frame[..6].copy_from_slice(destination.as_bytes());
+        frame[6..12].copy_from_slice(source.as_bytes());
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn network_router_establishes_sessions_and_carries_broadcast_both_ways() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_address: SocketAddr = "127.0.0.1:46001".parse().expect("alice address");
+        let bob_address: SocketAddr = "127.0.0.1:46002".parse().expect("bob address");
+        let alice_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 1, 1]);
+        let bob_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 1, 2]);
+        let mut alice = NetworkDataPlane::new(
+            state(&store, &controller, &alice_key, network_id),
+            alice_mac,
+            alice_address,
+            1_200,
+            &alice_key,
+            Duration::ZERO,
+        )
+        .expect("alice data plane");
+        let mut bob = NetworkDataPlane::new(
+            state(&store, &controller, &bob_key, network_id),
+            bob_mac,
+            bob_address,
+            1_200,
+            &bob_key,
+            Duration::ZERO,
+        )
+        .expect("bob data plane");
+
+        let mut pending = alice
+            .start_handshakes(&alice_key, WALL_TIME, Duration::ZERO)
+            .expect("start alice")
+            .into_parts()
+            .0;
+        if pending.is_empty() {
+            pending = bob
+                .start_handshakes(&bob_key, WALL_TIME, Duration::ZERO)
+                .expect("start bob")
+                .into_parts()
+                .0;
+            while !pending.is_empty() {
+                let mut next = Vec::new();
+                for datagram in pending {
+                    let output = alice
+                        .accept_udp_datagram(
+                            bob_address,
+                            datagram.bytes(),
+                            &alice_key,
+                            WALL_TIME,
+                            Duration::ZERO,
+                        )
+                        .expect("alice accepts handshake");
+                    next.extend(output.into_parts().0);
+                }
+                pending = next;
+                if pending.is_empty() {
+                    break;
+                }
+                let mut next = Vec::new();
+                for datagram in pending {
+                    let output = bob
+                        .accept_udp_datagram(
+                            alice_address,
+                            datagram.bytes(),
+                            &bob_key,
+                            WALL_TIME,
+                            Duration::ZERO,
+                        )
+                        .expect("bob accepts handshake");
+                    next.extend(output.into_parts().0);
+                }
+                pending = next;
+            }
+        } else {
+            while !pending.is_empty() {
+                let mut next = Vec::new();
+                for datagram in pending {
+                    let output = bob
+                        .accept_udp_datagram(
+                            alice_address,
+                            datagram.bytes(),
+                            &bob_key,
+                            WALL_TIME,
+                            Duration::ZERO,
+                        )
+                        .expect("bob accepts handshake");
+                    next.extend(output.into_parts().0);
+                }
+                pending = next;
+                if pending.is_empty() {
+                    break;
+                }
+                let mut next = Vec::new();
+                for datagram in pending {
+                    let output = alice
+                        .accept_udp_datagram(
+                            bob_address,
+                            datagram.bytes(),
+                            &alice_key,
+                            WALL_TIME,
+                            Duration::ZERO,
+                        )
+                        .expect("alice accepts handshake");
+                    next.extend(output.into_parts().0);
+                }
+                pending = next;
+            }
+        }
+        assert_eq!(alice.established_peers().len(), 1);
+        assert_eq!(bob.established_peers().len(), 1);
+
+        let broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xa1);
+        let packets = alice
+            .accept_tap_frame(&broadcast, Duration::from_secs(1))
+            .expect("route broadcast")
+            .into_parts()
+            .0;
+        assert_eq!(packets.len(), 1);
+        let received = bob
+            .accept_udp_datagram(
+                alice_address,
+                packets[0].bytes(),
+                &bob_key,
+                WALL_TIME,
+                Duration::from_secs(1),
+            )
+            .expect("receive broadcast");
+        assert_eq!(received.tap_frame(), Some(broadcast.as_slice()));
+
+        let reverse = ethernet_frame(bob_mac, alice_mac, 0xb2);
+        let packets = bob
+            .accept_tap_frame(&reverse, Duration::from_secs(2))
+            .expect("route learned unicast")
+            .into_parts()
+            .0;
+        assert_eq!(packets.len(), 1);
+        let received = alice
+            .accept_udp_datagram(
+                bob_address,
+                packets[0].bytes(),
+                &alice_key,
+                WALL_TIME,
+                Duration::from_secs(2),
+            )
+            .expect("receive reverse frame");
+        assert_eq!(received.tap_frame(), Some(reverse.as_slice()));
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+}
