@@ -103,6 +103,15 @@ pub enum ClientError {
     /// The local wall clock predates the Unix epoch.
     #[error("system time is before the Unix epoch")]
     SystemTimeBeforeUnixEpoch,
+    /// An operation requires a network that has no validated active view.
+    #[error("network {network_id} is not active")]
+    NetworkNotActive {
+        /// Requested network.
+        network_id: NetworkId,
+    },
+    /// The heartbeat counter cannot advance without wrapping.
+    #[error("heartbeat counter is exhausted")]
+    HeartbeatCounterExhausted,
     /// A fixed-width field could not be represented by its protocol type.
     #[error("validated {field} has an unexpected width")]
     InvalidFieldWidth {

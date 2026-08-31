@@ -13,11 +13,12 @@ use std::{
 };
 
 use stella_client::{
-    authenticate_controller, BearerCredential, ClientError, ControllerTrust, Enrollment, SpkiPin,
+    authenticate_controller, ActiveControl, BearerCredential, ClientError, ControllerTrust,
+    Enrollment, SpkiPin,
 };
 use stella_common::NetworkId;
 use stella_crypto::{derive_node_id, IdentitySigningKey};
-use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
+use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
 use stella_server::{
     active::serve_control_session,
     bootstrap::{initialize_controller, BootstrapOptions},
@@ -92,6 +93,10 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .issue_enrollment_token(issued_at, issued_at + 3_600)
         .expect("issue enrollment token");
     let credential = BearerCredential::from_bytes(*enrollment_token.expose_secret());
+    let peer_enrollment_token = store
+        .issue_enrollment_token(issued_at, issued_at + 3_600)
+        .expect("issue peer enrollment token");
+    let peer_credential = BearerCredential::from_bytes(*peer_enrollment_token.expose_secret());
     let network_id = NetworkId::from_bytes([0x44; 16]);
     store
         .create_network(
@@ -107,6 +112,10 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .issue_join_token(network_id, issued_at, issued_at + 3_600)
         .expect("issue join token");
     let join_credential = BearerCredential::from_bytes(*join_token.expose_secret());
+    let peer_join_token = store
+        .issue_join_token(network_id, issued_at, issued_at + 3_600)
+        .expect("issue peer join token");
+    let peer_join_credential = BearerCredential::from_bytes(*peer_join_token.expose_secret());
     drop(store);
 
     let handler: SessionHandler = Arc::new(|session| {
@@ -151,35 +160,97 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         ClientError::Tls(_)
     ));
 
-    let mut first = authenticate_after_listener_ready(
+    let first_connection = authenticate_after_listener_ready(
         &trust,
         &node_key,
         Enrollment::new(&credential, "Windows loopback client"),
     )
     .await;
-    assert_eq!(first.controller_id(), initialized.controller_id);
-    assert_eq!(first.node_id(), node_id);
-    assert!(first.server_time() >= issued_at);
-    let first_state = first
+    assert_eq!(first_connection.controller_id(), initialized.controller_id);
+    assert_eq!(first_connection.node_id(), node_id);
+    assert!(first_connection.server_time() >= issued_at);
+    let mut first = ActiveControl::new(first_connection);
+    let first_epoch = first
         .join_network(network_id, Some(&join_credential))
         .await
-        .expect("join network and activate initial snapshot");
-    assert_eq!(first_state.network_id(), network_id);
-    assert!(first_state.peers().is_empty());
+        .expect("join network and activate initial snapshot")
+        .controller_epoch();
+    assert!(first
+        .network(network_id)
+        .expect("active first network")
+        .peers()
+        .is_empty());
+    let initial_revision = first
+        .network(network_id)
+        .expect("active first network")
+        .snapshot_revision();
+    let endpoint = Endpoint::UdpIpv4 {
+        priority: 0,
+        port: 45_123,
+        max_datagram_size: 1_200,
+        address: Ipv4Addr::LOCALHOST,
+    };
+    let endpoint_revision = first
+        .publish_endpoints(network_id, &[endpoint])
+        .await
+        .expect("publish endpoint and reconcile snapshot")
+        .snapshot_revision();
+    assert!(endpoint_revision >= initial_revision);
+
+    let peer_key = IdentitySigningKey::generate().expect("generate peer identity");
+    let peer_connection = authenticate_controller(
+        &trust,
+        &peer_key,
+        Some(Enrollment::new(&peer_credential, "Windows loopback peer")),
+    )
+    .await
+    .expect("enroll peer while first node is active");
+    let mut peer = ActiveControl::new(peer_connection);
+    peer.join_network(network_id, Some(&peer_join_credential))
+        .await
+        .expect("peer joins loopback network");
+    peer.publish_endpoints(
+        network_id,
+        &[Endpoint::UdpIpv4 {
+            priority: 0,
+            port: 45_124,
+            max_datagram_size: 1_200,
+            address: Ipv4Addr::LOCALHOST,
+        }],
+    )
+    .await
+    .expect("peer publishes endpoint");
+
+    let heartbeat = first.heartbeat().await.expect("heartbeat is acknowledged");
+    assert_eq!(heartbeat.counter(), 1);
+    assert!(heartbeat.server_time() >= issued_at);
+    assert_eq!(heartbeat.updated_networks(), &[network_id]);
+    assert_eq!(
+        first
+            .network(network_id)
+            .expect("heartbeat restored active network")
+            .peers()
+            .len(),
+        1
+    );
+    let reconciled_epoch = first
+        .network(network_id)
+        .expect("heartbeat restored active network")
+        .controller_epoch();
+    assert!(reconciled_epoch > first_epoch);
+    drop(peer);
     drop(first);
 
-    let mut second = authenticate_controller(&trust, &node_key, None)
+    let second_connection = authenticate_controller(&trust, &node_key, None)
         .await
         .expect("known node authenticates without enrollment material");
-    assert_eq!(second.node_id(), node_id);
+    assert_eq!(second_connection.node_id(), node_id);
+    let mut second = ActiveControl::new(second_connection);
     let repeated_state = second
         .join_network(network_id, None)
         .await
         .expect("existing membership rejoins without a token");
-    assert_eq!(
-        repeated_state.controller_epoch(),
-        first_state.controller_epoch()
-    );
+    assert_eq!(repeated_state.controller_epoch(), reconciled_epoch);
     assert!(matches!(
         second
             .join_network(NetworkId::from_bytes([0x45; 16]), None)
