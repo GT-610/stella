@@ -11,6 +11,7 @@ use stella_proto::{
     encode_endpoint_set, encode_network_revision_list, ControlFieldType, ControlMessageType,
     Endpoint, NetworkRevision, NetworkRevisionListView, PeerRecordView,
 };
+use tokio::time::Instant;
 
 use crate::{
     AuthenticatedControl, BearerCredential, ClientError, GrantRefreshInput, NetworkState,
@@ -111,7 +112,9 @@ impl ActiveControl {
         request.push_field(ControlFieldType::NetworkId, network_id.as_bytes())?;
         request.push_field(ControlFieldType::EndpointSet, &encoded[..encoded_length])?;
         let request_id = self.connection.write_message(request).await?;
-        let result = self.connection.read_message().await?;
+        let result = self
+            .read_response_while_applying_updates(request_id)
+            .await?;
         require_network_response(
             &result,
             ControlMessageType::EndpointResult,
@@ -171,7 +174,9 @@ impl ActiveControl {
             &encoded[..encoded_length],
         )?;
         let request_id = self.connection.write_message(request).await?;
-        let acknowledgement = self.connection.read_message().await?;
+        let acknowledgement = self
+            .read_response_while_applying_updates(request_id)
+            .await?;
         require_direct_response(
             &acknowledgement,
             ControlMessageType::HeartbeatAck,
@@ -215,25 +220,69 @@ impl ActiveControl {
     /// network, malformed fields, carrier failure, or failed state recovery.
     pub async fn receive_update(&mut self) -> Result<ControlUpdate, ClientError> {
         let message = self.connection.read_message().await?;
-        require_unsolicited_correlation(&message)?;
+        self.apply_update_message(&message).await
+    }
+
+    /// Waits for one unsolicited update until a monotonic deadline.
+    ///
+    /// `None` means the deadline elapsed without consuming or cancelling a
+    /// partially read control record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] for carrier, sequence, direction, correlation,
+    /// state validation, or recovery failure.
+    pub async fn receive_update_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Option<ControlUpdate>, ClientError> {
+        tokio::select! {
+            message = self.connection.read_message() => {
+                let message = message?;
+                self.apply_update_message(&message).await.map(Some)
+            }
+            () = tokio::time::sleep_until(deadline) => Ok(None),
+        }
+    }
+
+    async fn apply_update_message(
+        &mut self,
+        message: &OwnedControlMessage,
+    ) -> Result<ControlUpdate, ClientError> {
+        require_unsolicited_correlation(message)?;
         match message.header()?.message_type {
-            ControlMessageType::PeerSnapshot => self.apply_unsolicited_snapshot(&message),
-            ControlMessageType::PeerDelta => self.apply_peer_delta(&message).await,
-            ControlMessageType::GrantRefresh => self.apply_grant_refresh(&message),
+            ControlMessageType::PeerSnapshot => self.apply_unsolicited_snapshot(message),
+            ControlMessageType::PeerDelta => self.apply_peer_delta(message).await,
+            ControlMessageType::GrantRefresh => self.apply_grant_refresh(message),
             ControlMessageType::ServerShutdown => Ok(ControlUpdate::ServerShutdown {
                 deadline: decode_u64(
-                    field_value(&message, ControlFieldType::ShutdownDeadline)?,
+                    field_value(message, ControlFieldType::ShutdownDeadline)?,
                     "shutdown deadline",
                 )?,
             }),
             ControlMessageType::Error => Ok(ControlUpdate::ControllerError {
                 status: decode_u16(
-                    field_value(&message, ControlFieldType::StatusCode)?,
+                    field_value(message, ControlFieldType::StatusCode)?,
                     "controller error status",
                 )?,
-                retry_after_ms: optional_u32(&message, ControlFieldType::RetryAfterMs)?,
+                retry_after_ms: optional_u32(message, ControlFieldType::RetryAfterMs)?,
             }),
             actual => Err(ClientError::UnexpectedActiveMessage { actual }),
+        }
+    }
+
+    async fn read_response_while_applying_updates(
+        &mut self,
+        request_id: u64,
+    ) -> Result<OwnedControlMessage, ClientError> {
+        loop {
+            let message = self.connection.read_message().await?;
+            if message.header()?.correlation_id == 0 {
+                self.apply_update_message(&message).await?;
+                continue;
+            }
+            require_correlation(&message, request_id)?;
+            return Ok(message);
         }
     }
 

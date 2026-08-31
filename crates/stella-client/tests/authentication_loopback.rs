@@ -26,7 +26,10 @@ use stella_server::{
     runtime::{run_controller, SessionError, SessionHandler},
     store::{AuthorityStore, NetworkRecord},
 };
-use tokio::{sync::oneshot, time::sleep};
+use tokio::{
+    sync::oneshot,
+    time::{sleep, Instant},
+};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -184,6 +187,11 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .network(network_id)
         .expect("active first network")
         .snapshot_revision();
+    assert!(first
+        .receive_update_until(Instant::now() + Duration::from_millis(10))
+        .await
+        .expect("idle update wait remains valid")
+        .is_none());
     let endpoint = Endpoint::UdpIpv4 {
         priority: 0,
         port: 45_123,
