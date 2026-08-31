@@ -55,3 +55,29 @@ The scenario verifies:
 `summary.md`, `l2-report.json`, and process logs remain in the reported artifact
 directory. Bearer tokens are cleared after join and are not written to those
 reports or logs.
+
+## One-TAP verification mode
+
+When installing a second Windows device is not possible, the non-elevated
+fallback keeps node A on a real TAP-Windows adapter and runs node B through the
+same public `NetworkDataPlane` implementation with a bounded loopback control
+channel instead of a second TAP worker:
+
+```powershell
+.\tests\two-node-lan\run-one-tap.ps1 `
+  -Adapter 'Local Area Connection' `
+  -Python 'C:\Path\To\python.exe'
+```
+
+Npcap injects and captures every node-A frame on the real adapter. The headless
+peer exposes only complete Ethernet-frame injection and delivery, so traffic
+still crosses controller authentication, endpoint publication, the four-flight
+peer handshake, authenticated UDP encapsulation, replay protection, switching,
+and the production Windows TAP reader and writer. It runs the same ARP,
+bidirectional IPv4, broadcast, multicast, and discovery checks as the two-TAP
+scenario. This mode does not replace the separate two-device lifecycle check;
+it isolates that administrator-only prerequisite from end-to-end protocol and
+Windows data-path verification.
+
+The committed Windows run from 2026-08-31 is archived under
+`reports/windows-one-tap-2026-08-31/` with every check passing.

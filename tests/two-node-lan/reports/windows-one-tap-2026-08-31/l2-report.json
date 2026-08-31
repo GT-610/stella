@@ -1,0 +1,46 @@
+{
+  "verification_mode": "one Windows TAP plus headless Stella peer",
+  "left_interface": "Local Area Connection",
+  "right_interface": "headless Stella peer",
+  "left_mac": "00:ff:0d:8e:cb:8c",
+  "right_mac": "02:53:54:45:4c:42",
+  "checks": [
+    {
+      "name": "ARP request A to B",
+      "passed": true,
+      "detail": "Ethernet broadcast ARP request crossed from the Windows TAP to the headless peer"
+    },
+    {
+      "name": "ARP reply B to A",
+      "passed": true,
+      "detail": "Directed ARP reply crossed from the headless peer to the Windows TAP"
+    },
+    {
+      "name": "IPv4 unicast A to B",
+      "passed": true,
+      "detail": "Directed IPv4 payload crossed from the Windows TAP to the headless peer"
+    },
+    {
+      "name": "IPv4 unicast B to A",
+      "passed": true,
+      "detail": "Directed IPv4 payload crossed from the headless peer to the Windows TAP"
+    },
+    {
+      "name": "IPv4 broadcast",
+      "passed": true,
+      "detail": "IPv4 LAN broadcast reached the headless peer"
+    },
+    {
+      "name": "IPv4 multicast",
+      "passed": true,
+      "detail": "IPv4 multicast Ethernet frame reached the headless peer"
+    },
+    {
+      "name": "Broadcast LAN discovery",
+      "passed": true,
+      "detail": "Broadcast discovery query and directed response both crossed Stella"
+    }
+  ],
+  "passed": true
+}
+
