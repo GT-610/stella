@@ -29,5 +29,8 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 stella-server = { path = "../stella-server" }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-acl = "=0.3.0"
+
 [lints]
 workspace = true
