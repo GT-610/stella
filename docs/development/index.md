@@ -28,3 +28,6 @@ See [Control-channel implementation](./control-channel.md) for framed async I/O,
 message ownership, sequencing, correlation, and exporter-bound proof inputs.
 See [Controller implementation](./controller.md) for TLS service boundaries,
 transactional authority state, administrative commands, and session behavior.
+See [Windows client control plane](./client-control.md) for persistent trust,
+authentication, atomic peer state, heartbeats, reconnect, and fail-closed
+forwarding behavior.

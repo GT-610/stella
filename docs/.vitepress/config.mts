@@ -57,7 +57,8 @@ export default defineConfig({
             { text: '0018: Controller runtime', link: '/protocol/adr/0018-bound-controller-runtime' },
             { text: '0019: Session authentication', link: '/protocol/adr/0019-authenticate-control-sessions-before-authority-use' },
             { text: '0020: Active requests', link: '/protocol/adr/0020-serve-authenticated-control-requests-from-atomic-views' },
-            { text: '0021: Grant refresh', link: '/protocol/adr/0021-refresh-membership-grants-on-monotonic-deadlines' }
+            { text: '0021: Grant refresh', link: '/protocol/adr/0021-refresh-membership-grants-on-monotonic-deadlines' },
+            { text: '0022: Client state', link: '/protocol/adr/0022-rebuild-client-state-from-controller' }
           ]
         }
       ],
@@ -82,7 +83,8 @@ export default defineConfig({
             { text: 'Transport', link: '/development/transport' },
             { text: 'Windows TAP', link: '/development/tap-windows' },
             { text: 'Control channel', link: '/development/control-channel' },
-            { text: 'Controller', link: '/development/controller' }
+            { text: 'Controller', link: '/development/controller' },
+            { text: 'Windows client control plane', link: '/development/client-control' }
           ]
         }
       ],
