@@ -3,12 +3,14 @@
 #![forbid(unsafe_code)]
 
 mod active;
+mod config;
 mod control;
 mod error;
 mod state;
 mod tls;
 
 pub use active::{ActiveControl, ControlUpdate, HeartbeatReport};
+pub use config::{ClientConfig, ClientConfigError, ConfiguredNetwork, CONFIG_VERSION};
 pub use control::{
     authenticate_controller, AuthenticatedControl, BearerCredential, ControllerTrust, Enrollment,
 };

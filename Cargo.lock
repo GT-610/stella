@@ -1062,6 +1062,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
+ "serde",
  "stella-common",
  "stella-control",
  "stella-crypto",
@@ -1073,6 +1074,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "toml",
  "x509-parser",
  "zeroize",
 ]

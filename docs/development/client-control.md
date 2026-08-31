@@ -27,6 +27,42 @@ into redacted zeroizing values, never logs them, and never stores them in TOML.
 After a successful join, the network ID is durable intent; reconnect joins that
 existing membership without a token.
 
+The version 1 Windows configuration schema is:
+
+```toml
+version = 1
+
+[controller]
+address = "203.0.113.10:44900"
+tls_name = "controller.example.net"
+id = "0123456789abcdef0123456789abcdef"
+spki_pins = ["sha256/BASE64_SHA256_SPKI_DIGEST="]
+
+[identity]
+node_key = "secrets/node.pk8"
+display_name = "Gaming PC"
+
+[transport]
+udp_bind = "0.0.0.0:45100"
+
+[[transport.advertised_endpoints]]
+address = "192.0.2.20:45100"
+priority = 10
+max_datagram_size = 1200
+
+[[networks]]
+id = "fedcba9876543210fedcba9876543210"
+tap_adapter = "Stella LAN"
+
+[logging]
+filter = "info,stella_client=info"
+```
+
+Relative paths are rooted beside the configuration file. Endpoint and network
+entries are normalized into protocol order, duplicate network IDs are rejected,
+and unknown keys—including any attempted inline enrollment or join token—make
+the complete file invalid.
+
 ## Connection authentication
 
 The TLS client enables only TLS 1.3 and disables early data. Its certificate
