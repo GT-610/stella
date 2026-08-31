@@ -13,7 +13,12 @@ use stella_crypto::{
     ED25519_PUBLIC_KEY_LENGTH, ED25519_SIGNATURE_LENGTH,
 };
 use stella_proto::{ControlFieldType, ControlMessageType, VersionEntry, VersionListView};
-use tokio::net::TcpStream;
+use tokio::{
+    io::{ReadHalf, WriteHalf},
+    net::TcpStream,
+    sync::mpsc,
+    task::JoinHandle,
+};
 use tokio_rustls::{client::TlsStream, rustls::pki_types::ServerName};
 use zeroize::Zeroizing;
 
@@ -126,8 +131,9 @@ impl ControllerTrust {
 
 /// Authenticated TLS control stream and per-connection sequence state.
 pub struct AuthenticatedControl {
-    pub(crate) stream: TlsStream<TcpStream>,
-    pub(crate) inbound: InboundSequence,
+    writer: RecordWriter<WriteHalf<TlsStream<TcpStream>>>,
+    inbox: mpsc::Receiver<Result<OwnedControlMessage, ClientError>>,
+    reader_task: JoinHandle<()>,
     pub(crate) outbound: OutboundSequence,
     controller_id: ControllerId,
     controller_public_key: IdentityPublicKey,
@@ -173,7 +179,11 @@ impl AuthenticatedControl {
     ///
     /// Returns [`ClientError`] when message construction or carrier I/O fails.
     pub async fn write_message(&mut self, builder: MessageBuilder) -> Result<u64, ClientError> {
-        write_built(&mut self.stream, &mut self.outbound, builder).await
+        let message = self.outbound.build(builder)?;
+        let message_id = message_id(&message)?;
+        self.writer.write_message(&message).await?;
+        self.writer.flush().await?;
+        Ok(message_id)
     }
 
     /// Reads one complete control message and enforces inbound sequence continuity.
@@ -183,12 +193,16 @@ impl AuthenticatedControl {
     /// Returns [`ClientError`] when framing, decoding, carrier I/O, EOF, or the
     /// message sequence is invalid.
     pub async fn read_message(&mut self) -> Result<OwnedControlMessage, ClientError> {
-        let message = RecordReader::new(&mut self.stream)
-            .read_message()
-            .await?
-            .ok_or(ClientError::ConnectionClosed)?;
-        self.inbound.accept(message.header()?.message_id)?;
-        Ok(message)
+        self.inbox
+            .recv()
+            .await
+            .unwrap_or(Err(ClientError::ConnectionClosed))
+    }
+}
+
+impl Drop for AuthenticatedControl {
+    fn drop(&mut self) {
+        self.reader_task.abort();
     }
 }
 
@@ -355,9 +369,13 @@ pub async fn authenticate_controller(
         "server time",
     )?;
 
+    let (read_half, write_half) = tokio::io::split(stream);
+    let (sender, inbox) = mpsc::channel(32);
+    let reader_task = tokio::spawn(read_authenticated_messages(read_half, inbound, sender));
     Ok(AuthenticatedControl {
-        stream,
-        inbound,
+        writer: RecordWriter::new(write_half),
+        inbox,
+        reader_task,
         outbound,
         controller_id,
         controller_public_key,
@@ -365,6 +383,31 @@ pub async fn authenticate_controller(
         node_public_key: identity.public_key(),
         server_time,
     })
+}
+
+async fn read_authenticated_messages(
+    read_half: ReadHalf<TlsStream<TcpStream>>,
+    mut inbound: InboundSequence,
+    sender: mpsc::Sender<Result<OwnedControlMessage, ClientError>>,
+) {
+    let mut reader = RecordReader::new(read_half);
+    loop {
+        let result = match reader.read_message().await {
+            Ok(Some(message)) => match message.header() {
+                Ok(header) => inbound
+                    .accept(header.message_id)
+                    .map(|()| message)
+                    .map_err(ClientError::from),
+                Err(error) => Err(ClientError::from(error)),
+            },
+            Ok(None) => Err(ClientError::ConnectionClosed),
+            Err(error) => Err(ClientError::from(error)),
+        };
+        let terminal = result.is_err();
+        if sender.send(result).await.is_err() || terminal {
+            return;
+        }
+    }
 }
 
 async fn read_expected(
