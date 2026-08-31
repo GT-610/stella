@@ -5,6 +5,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -18,8 +19,13 @@ use stella_client::{
 };
 use stella_common::{ControllerId, NetworkId};
 use stella_crypto::derive_node_id;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const DEFAULT_IDENTITY_PATH: &str = "secrets/node.pk8";
+const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MINIMUM_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+const MAXIMUM_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,6 +53,8 @@ enum Command {
     Join(JoinArgs),
     /// Stops forwarding intent and authoritatively leaves one network.
     Leave(LeaveArgs),
+    /// Runs the persistent controller session and data-plane owner.
+    Run,
     /// Prints local identity, controller, and desired-network state.
     Status,
 }
@@ -136,8 +144,167 @@ pub(crate) async fn run() -> Result<()> {
         Command::Leave(args) => {
             leave_network(&cli.config, &args, &mut std::io::stdout().lock()).await
         }
+        Command::Run => run_client(&cli.config).await,
         Command::Status => status(&cli.config, &mut std::io::stdout().lock()),
     }
+}
+
+async fn run_client(config_path: &Path) -> Result<()> {
+    let config = ClientConfig::load(config_path).context("could not load client configuration")?;
+    let identity = load_node_identity(&config.identity_path).with_context(|| {
+        format!(
+            "could not load node identity {}",
+            config.identity_path.display()
+        )
+    })?;
+    let filter = tracing_subscriber::EnvFilter::try_new(&config.log_filter)
+        .context("invalid configured tracing filter")?;
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .try_init()
+        .context("could not initialize client logging")?;
+    tracing::info!(config = %config_path.display(), "starting client runtime");
+    tokio::select! {
+        result = supervise_control(&config, &identity) => result,
+        result = tokio::signal::ctrl_c() => {
+            result.context("could not wait for Ctrl+C")?;
+            tracing::info!("Ctrl+C received; client forwarding state is withdrawn");
+            Ok(())
+        }
+    }
+}
+
+async fn supervise_control(
+    config: &ClientConfig,
+    identity: &stella_crypto::IdentitySigningKey,
+) -> Result<()> {
+    let mut attempt = 0_u32;
+    loop {
+        match activate_control(config, identity).await {
+            Ok(active) => {
+                tracing::info!(
+                    networks = active.networks().len(),
+                    "controller state is active"
+                );
+                attempt = 0;
+                if let Err(error) = run_active_control(active).await {
+                    tracing::warn!(%error, "active controller session ended");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "controller activation failed"),
+        }
+        let cap = reconnect_cap(attempt);
+        let delay = full_jitter(cap)?;
+        tracing::info!(
+            delay_ms = delay.as_millis(),
+            "waiting before controller reconnect"
+        );
+        tokio::time::sleep(delay).await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+async fn activate_control(
+    config: &ClientConfig,
+    identity: &stella_crypto::IdentitySigningKey,
+) -> Result<ActiveControl> {
+    let connection = tokio::time::timeout(
+        CONTROL_OPERATION_TIMEOUT,
+        authenticate_controller(&config.controller, identity, None),
+    )
+    .await
+    .context("controller authentication timed out")?
+    .context("controller authentication failed")?;
+    let mut active = ActiveControl::new(connection);
+    for network in &config.networks {
+        tokio::time::timeout(
+            CONTROL_OPERATION_TIMEOUT,
+            active.join_network(network.network_id, None),
+        )
+        .await
+        .with_context(|| format!("join timed out for network {}", network.network_id))?
+        .with_context(|| format!("could not rejoin network {}", network.network_id))?;
+        tokio::time::timeout(
+            CONTROL_OPERATION_TIMEOUT,
+            active.publish_endpoints(network.network_id, &config.advertised_endpoints),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "endpoint publication timed out for network {}",
+                network.network_id
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "could not publish endpoints for network {}",
+                network.network_id
+            )
+        })?;
+    }
+    Ok(active)
+}
+
+async fn run_active_control(mut active: ActiveControl) -> Result<()> {
+    loop {
+        let interval = heartbeat_interval(&active);
+        let deadline = tokio::time::Instant::now() + interval;
+        if let Some(update) = active.receive_update_until(deadline).await? {
+            match update {
+                stella_client::ControlUpdate::ServerShutdown { deadline } => {
+                    anyhow::bail!("controller requested shutdown with deadline {deadline}")
+                }
+                stella_client::ControlUpdate::ControllerError {
+                    status,
+                    retry_after_ms,
+                } => anyhow::bail!(
+                    "controller sent status {status} with retry delay {retry_after_ms:?}"
+                ),
+                update => tracing::debug!(?update, "applied controller update"),
+            }
+            continue;
+        }
+        let acknowledgement_timeout = interval
+            .checked_mul(3)
+            .ok_or_else(|| anyhow::anyhow!("heartbeat timeout overflow"))?;
+        let report = tokio::time::timeout(acknowledgement_timeout, active.heartbeat())
+            .await
+            .context("three heartbeat acknowledgement periods elapsed")?
+            .context("heartbeat failed")?;
+        tracing::debug!(
+            counter = report.counter(),
+            server_time = report.server_time(),
+            updated_networks = report.updated_networks().len(),
+            "controller heartbeat acknowledged"
+        );
+    }
+}
+
+fn heartbeat_interval(active: &ActiveControl) -> Duration {
+    active
+        .networks()
+        .values()
+        .map(|state| Duration::from_secs(u64::from(state.policy().heartbeat_seconds)))
+        .min()
+        .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL)
+}
+
+fn reconnect_cap(attempt: u32) -> Duration {
+    let exponent = attempt.min(7);
+    let multiplier = 1_u32 << exponent;
+    MINIMUM_RECONNECT_DELAY
+        .checked_mul(multiplier)
+        .unwrap_or(MAXIMUM_RECONNECT_DELAY)
+        .min(MAXIMUM_RECONNECT_DELAY)
+}
+
+fn full_jitter(cap: Duration) -> Result<Duration> {
+    let maximum = u64::try_from(cap.as_millis()).context("reconnect delay is too large")?;
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).context("operating-system randomness is unavailable")?;
+    let milliseconds = u64::from_le_bytes(random) % maximum.saturating_add(1);
+    Ok(Duration::from_millis(milliseconds))
 }
 
 async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Write) -> Result<()> {
@@ -582,8 +749,8 @@ mod tests {
     use stella_common::{ControllerId, NetworkId};
 
     use super::{
-        configuration_document, initialize, persist_network_intent, remove_network_intent, status,
-        CliCredential, InitArgs,
+        configuration_document, full_jitter, initialize, persist_network_intent, reconnect_cap,
+        remove_network_intent, status, CliCredential, InitArgs, MAXIMUM_RECONNECT_DELAY,
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -616,6 +783,18 @@ mod tests {
         assert!(CliCredential::from_str(&format!("{encoded}=")).is_err());
         assert!(CliCredential::from_str(&URL_SAFE_NO_PAD.encode([0x5a; 31])).is_err());
         assert!(CliCredential::from_str("not+a+base64url+credential").is_err());
+    }
+
+    #[test]
+    fn reconnect_backoff_is_capped_and_full_jitter_stays_within_cap() {
+        assert_eq!(reconnect_cap(0), std::time::Duration::from_millis(250));
+        assert_eq!(reconnect_cap(1), std::time::Duration::from_millis(500));
+        assert_eq!(reconnect_cap(6), std::time::Duration::from_secs(16));
+        assert_eq!(reconnect_cap(7), MAXIMUM_RECONNECT_DELAY);
+        assert_eq!(reconnect_cap(u32::MAX), MAXIMUM_RECONNECT_DELAY);
+        for _sample in 0..32 {
+            assert!(full_jitter(reconnect_cap(4)).expect("generate jitter") <= reconnect_cap(4));
+        }
     }
 
     #[test]

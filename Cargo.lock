@@ -1119,6 +1119,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tracing",
+ "tracing-subscriber",
  "windows-acl",
  "x509-parser",
  "zeroize",

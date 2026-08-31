@@ -68,8 +68,21 @@ controller's authoritative `LEAVE_RESULT`, and only then atomically removes the
 network from local configuration. A failed or ambiguous request never enables
 forwarding and preserves durable intent for recovery or retry.
 
-The following runtime command is implemented in a later Phase 2 batch:
+## Run
 
 ```powershell
 stella-client --config C:\Stella\client.toml run
 ```
+
+`run` validates the configuration and protected identity, initializes the
+configured tracing filter, authenticates, rejoins desired networks in stable ID
+order without stored tokens, and publishes the complete configured endpoint
+set. It then owns the active controller state, applying snapshots, peer deltas,
+grant refreshes, and heartbeat reconciliation.
+
+Controller failures withdraw all in-memory forwarding authorization before a
+full-jitter reconnect delay. Backoff starts at 250 ms and caps at 30 seconds.
+A heartbeat is treated as lost only after three policy heartbeat periods elapse
+without its acknowledgement. Ctrl+C cancels the session and drops all active
+state before the process exits. Windows TAP and encrypted UDP forwarding are
+connected to this owner in the subsequent data-plane batches.

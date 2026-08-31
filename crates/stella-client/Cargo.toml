@@ -23,8 +23,10 @@ stella-transport = { path = "../stella-transport" }
 subtle = { version = "2.6.1", default-features = false }
 thiserror.workspace = true
 toml = "0.9.8"
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 x509-parser = { version = "=0.18.1", default-features = false }
 zeroize = { version = "1.9.0", features = ["derive"] }
 
