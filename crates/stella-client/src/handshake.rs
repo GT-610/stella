@@ -1,6 +1,9 @@
 //! Authenticated peer-session handshake state machines.
 
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use stella_common::{GrantSerial, NodeId};
 use stella_crypto::{
@@ -28,6 +31,12 @@ const HANDSHAKE_HEADER_LENGTH: u16 = 96;
 const INIT_PAYLOAD_LENGTH: u32 = 392;
 const RESPONSE_PAYLOAD_LENGTH: u32 = 408;
 const CONFIRM_PAYLOAD_LENGTH: u32 = 56;
+const INITIAL_RETRANSMIT_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRANSMIT_DELAY: Duration = Duration::from_secs(2);
+const HANDSHAKE_ATTEMPT_LIFETIME: Duration = Duration::from_secs(10);
+const RESPONDER_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const MAX_HANDSHAKES_PER_PEER: usize = 32;
+const MAX_CACHED_HANDSHAKES: usize = 256;
 
 /// Failure while constructing or advancing an authenticated peer handshake.
 #[derive(Debug, Error)]
@@ -311,13 +320,13 @@ impl InitiatorHandshake {
     /// Returns [`HandshakeError`] for a wrong phase, stale/mismatched header,
     /// response digest mismatch, or failed confirmation tag.
     pub fn accept_responder_confirmation(
-        mut self,
+        &mut self,
         datagram: &[u8],
         now: u64,
     ) -> Result<EstablishedPeerSession, HandshakeError> {
         let confirmation = self
             .confirmation
-            .take()
+            .as_ref()
             .ok_or(HandshakeError::InvalidPhase {
                 message: "responder SESSION_CONFIRM",
             })?;
@@ -338,8 +347,14 @@ impl InitiatorHandshake {
             view.authenticated_payload(),
             view.confirmation_tag(),
         )?;
+        let confirmation = self
+            .confirmation
+            .take()
+            .ok_or(HandshakeError::InvalidPhase {
+                message: "confirmed responder SESSION_CONFIRM",
+            })?;
         Ok(EstablishedPeerSession::new(
-            self.config,
+            self.config.clone(),
             self.header.session_id,
             confirmation.negotiated_datagram_size,
             confirmation.protectors,
@@ -555,6 +570,18 @@ impl ResponderHandshake {
     ///
     /// Returns [`HandshakeError`] if no valid initiator confirmation has been accepted.
     pub fn into_established(mut self, now: u64) -> Result<EstablishedPeerSession, HandshakeError> {
+        self.take_established(now)
+    }
+
+    /// Takes established key material while retaining cached handshake bytes.
+    ///
+    /// This is used by the replay cache so a lost responder confirmation can
+    /// still be answered after the data session has been installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandshakeError`] before confirmation or after material was already taken.
+    pub fn take_established(&mut self, now: u64) -> Result<EstablishedPeerSession, HandshakeError> {
         if self.responder_confirmation.is_none() {
             return Err(HandshakeError::InvalidPhase {
                 message: "validated initiator SESSION_CONFIRM",
@@ -564,7 +591,7 @@ impl ResponderHandshake {
             message: "available session protectors",
         })?;
         Ok(EstablishedPeerSession::new(
-            self.config,
+            self.config.clone(),
             self.init_header.session_id,
             self.negotiated_datagram_size,
             protectors,
@@ -675,6 +702,460 @@ impl std::fmt::Debug for EstablishedPeerSession {
             .field("expires_at", &self.expires_at)
             .finish_non_exhaustive()
     }
+}
+
+/// One datagram selected by the handshake coordinator for transmission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandshakeTransmission {
+    peer_node_id: NodeId,
+    datagram: Vec<u8>,
+}
+
+impl HandshakeTransmission {
+    fn new(peer_node_id: NodeId, datagram: Vec<u8>) -> Self {
+        Self {
+            peer_node_id,
+            datagram,
+        }
+    }
+
+    /// Returns the intended peer.
+    #[must_use]
+    pub const fn peer_node_id(&self) -> NodeId {
+        self.peer_node_id
+    }
+
+    /// Borrows the exact datagram to send.
+    #[must_use]
+    pub fn datagram(&self) -> &[u8] {
+        &self.datagram
+    }
+}
+
+/// Result of dispatching one peer handshake datagram.
+pub enum HandshakeEvent {
+    /// The packet was a validly classifiable replay conflict or losing simultaneous initiation.
+    Ignored,
+    /// Send one response or confirmation to the named peer.
+    Transmit(HandshakeTransmission),
+    /// Install a confirmed session, optionally after sending the included confirmation.
+    Established {
+        /// Confirmed remote peer.
+        peer_node_id: NodeId,
+        /// Final responder confirmation that must be sent before installation completes.
+        transmission: Option<HandshakeTransmission>,
+        /// Confirmed, non-cloneable session material.
+        session: Box<EstablishedPeerSession>,
+    },
+}
+
+impl std::fmt::Debug for HandshakeEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ignored => formatter.write_str("HandshakeEvent::Ignored"),
+            Self::Transmit(transmission) => formatter
+                .debug_tuple("HandshakeEvent::Transmit")
+                .field(transmission)
+                .finish(),
+            Self::Established {
+                peer_node_id,
+                transmission,
+                session,
+            } => formatter
+                .debug_struct("HandshakeEvent::Established")
+                .field("peer_node_id", peer_node_id)
+                .field("transmission", transmission)
+                .field("session", session)
+                .finish(),
+        }
+    }
+}
+
+/// Bounded per-network handshake retries, replay cache, and simultaneous-initiation policy.
+pub struct PeerHandshakeManager {
+    local_node_id: NodeId,
+    peers: BTreeMap<NodeId, PeerHandshakeConfig>,
+    outgoing: BTreeMap<NodeId, OutgoingHandshake>,
+    responders: BTreeMap<HandshakeCacheKey, CachedResponder>,
+    active_session_ids: BTreeSet<(NodeId, u64)>,
+}
+
+impl PeerHandshakeManager {
+    /// Creates an empty manager for one local node and one network runtime.
+    #[must_use]
+    pub const fn new(local_node_id: NodeId) -> Self {
+        Self {
+            local_node_id,
+            peers: BTreeMap::new(),
+            outgoing: BTreeMap::new(),
+            responders: BTreeMap::new(),
+            active_session_ids: BTreeSet::new(),
+        }
+    }
+
+    /// Adds or replaces authoritative configuration and clears stale exchange state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandshakeError`] when the configuration belongs to another local node.
+    pub fn upsert_peer(&mut self, config: PeerHandshakeConfig) -> Result<(), HandshakeError> {
+        if config.local_node_id != self.local_node_id {
+            return Err(HandshakeError::InvalidConfiguration {
+                reason: "peer configuration belongs to another local node",
+            });
+        }
+        let peer_node_id = config.peer_node_id;
+        if self.peers.get(&peer_node_id).is_some_and(|current| {
+            current.controller_epoch != config.controller_epoch
+                || current.local_grant.grant_serial != config.local_grant.grant_serial
+                || current.peer_grant.grant_serial != config.peer_grant.grant_serial
+                || current.policy != config.policy
+                || current.max_datagram_size != config.max_datagram_size
+        }) {
+            self.clear_peer_exchange(peer_node_id);
+        }
+        self.peers.insert(peer_node_id, config);
+        Ok(())
+    }
+
+    /// Removes all configuration, handshakes, and session collision state for one peer.
+    pub fn remove_peer(&mut self, peer_node_id: NodeId) {
+        self.peers.remove(&peer_node_id);
+        self.clear_peer_exchange(peer_node_id);
+    }
+
+    /// Starts a fresh initiation and returns its first exact datagram.
+    ///
+    /// Repeated calls while an exchange is active return its current cached
+    /// initiation or confirmation without creating new cryptographic state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandshakeError`] for an unknown peer or handshake construction failure.
+    pub fn initiate(
+        &mut self,
+        peer_node_id: NodeId,
+        signing_key: &IdentitySigningKey,
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<HandshakeTransmission, HandshakeError> {
+        if let Some(existing) = self.outgoing.get(&peer_node_id) {
+            return Ok(HandshakeTransmission::new(
+                peer_node_id,
+                existing.current_datagram().to_vec(),
+            ));
+        }
+        let config =
+            self.peers
+                .get(&peer_node_id)
+                .cloned()
+                .ok_or(HandshakeError::InvalidConfiguration {
+                    reason: "cannot initiate to an unknown peer",
+                })?;
+        let handshake = InitiatorHandshake::start(config, signing_key, wall_time)?;
+        let datagram = handshake.initiation_datagram().to_vec();
+        self.outgoing.insert(
+            peer_node_id,
+            OutgoingHandshake {
+                handshake,
+                started_at: monotonic_now,
+                next_send_at: monotonic_now.saturating_add(INITIAL_RETRANSMIT_DELAY),
+                retransmit_delay: INITIAL_RETRANSMIT_DELAY,
+            },
+        );
+        Ok(HandshakeTransmission::new(peer_node_id, datagram))
+    }
+
+    /// Returns due identical retransmissions and abandons attempts after ten seconds.
+    #[must_use]
+    pub fn poll_retransmissions(&mut self, now: Duration) -> Vec<HandshakeTransmission> {
+        let expired: Vec<NodeId> = self
+            .outgoing
+            .iter()
+            .filter_map(|(peer, outgoing)| {
+                (now.saturating_sub(outgoing.started_at) >= HANDSHAKE_ATTEMPT_LIFETIME)
+                    .then_some(*peer)
+            })
+            .collect();
+        for peer in expired {
+            self.outgoing.remove(&peer);
+        }
+        let mut transmissions = Vec::new();
+        for (peer, outgoing) in &mut self.outgoing {
+            if now < outgoing.next_send_at {
+                continue;
+            }
+            transmissions.push(HandshakeTransmission::new(
+                *peer,
+                outgoing.current_datagram().to_vec(),
+            ));
+            outgoing.retransmit_delay = outgoing
+                .retransmit_delay
+                .saturating_mul(2)
+                .min(MAX_RETRANSMIT_DELAY);
+            outgoing.next_send_at = now.saturating_add(outgoing.retransmit_delay);
+        }
+        transmissions
+    }
+
+    /// Dispatches one structurally bounded handshake datagram.
+    ///
+    /// The caller must already have mapped the source endpoint to the claimed
+    /// peer's current advertised endpoint set. Authentication remains mandatory
+    /// here and endpoint mapping never substitutes for identity verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandshakeError`] for malformed, stale, unauthenticated, unknown,
+    /// or phase-inconsistent input. Replay conflicts are silently classified as ignored.
+    pub fn handle_datagram(
+        &mut self,
+        datagram: &[u8],
+        signing_key: &IdentitySigningKey,
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<HandshakeEvent, HandshakeError> {
+        self.expire_responders(monotonic_now);
+        let common = CommonHeader::decode(datagram)?;
+        match common.packet_type {
+            PacketType::SessionInit => {
+                self.handle_init(datagram, signing_key, wall_time, monotonic_now)
+            }
+            PacketType::SessionResponse => self.handle_response(datagram, wall_time),
+            PacketType::SessionConfirm => self.handle_confirmation(datagram, wall_time),
+            PacketType::SessionReject => Ok(HandshakeEvent::Ignored),
+            PacketType::Data | PacketType::Keepalive => Err(HandshakeError::ContextMismatch {
+                field: "handshake packet type",
+            }),
+        }
+    }
+
+    /// Forgets one retired data-session identifier so a future random value may reuse it.
+    pub fn retire_session(&mut self, peer_node_id: NodeId, session_id: u64) {
+        self.active_session_ids.remove(&(peer_node_id, session_id));
+    }
+
+    fn handle_init(
+        &mut self,
+        datagram: &[u8],
+        signing_key: &IdentitySigningKey,
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<HandshakeEvent, HandshakeError> {
+        let init = SessionInitView::decode(datagram)?;
+        let peer = init.header().sender_node_id;
+        let key = HandshakeCacheKey {
+            peer_node_id: peer,
+            controller_epoch: init.header().controller_epoch,
+            handshake_id: init.header().handshake_id,
+        };
+        if let Some(cached) = self.responders.get(&key) {
+            if cached.init_datagram == datagram {
+                return Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
+                    peer,
+                    cached.handshake.response_datagram().to_vec(),
+                )));
+            }
+            return Ok(HandshakeEvent::Ignored);
+        }
+        let config =
+            self.peers
+                .get(&peer)
+                .cloned()
+                .ok_or(HandshakeError::InvalidConfiguration {
+                    reason: "initiation came from an unknown peer",
+                })?;
+        if self
+            .active_session_ids
+            .contains(&(peer, init.header().session_id))
+        {
+            return Ok(HandshakeEvent::Ignored);
+        }
+        if self.outgoing.contains_key(&peer) {
+            if config.is_preferred_initiator() {
+                return Ok(HandshakeEvent::Ignored);
+            }
+            self.outgoing.remove(&peer);
+        }
+        let handshake = ResponderHandshake::respond(config, signing_key, datagram, wall_time)?;
+        let response = handshake.response_datagram().to_vec();
+        self.make_responder_room(peer);
+        self.responders.insert(
+            key,
+            CachedResponder {
+                init_datagram: datagram.to_vec(),
+                handshake,
+                created_at: monotonic_now,
+            },
+        );
+        Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
+            peer, response,
+        )))
+    }
+
+    fn handle_response(
+        &mut self,
+        datagram: &[u8],
+        wall_time: u64,
+    ) -> Result<HandshakeEvent, HandshakeError> {
+        let response = SessionResponseView::decode(datagram)?;
+        let peer = response.header().sender_node_id;
+        let outgoing = self
+            .outgoing
+            .get_mut(&peer)
+            .ok_or(HandshakeError::InvalidPhase {
+                message: "matching outgoing SESSION_INIT",
+            })?;
+        let confirmation = outgoing
+            .handshake
+            .accept_response(datagram, wall_time)?
+            .to_vec();
+        Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
+            peer,
+            confirmation,
+        )))
+    }
+
+    fn handle_confirmation(
+        &mut self,
+        datagram: &[u8],
+        wall_time: u64,
+    ) -> Result<HandshakeEvent, HandshakeError> {
+        let confirmation = SessionConfirmView::decode(datagram)?;
+        let peer = confirmation.header().sender_node_id;
+        match confirmation.role() {
+            SessionConfirmRole::Responder => {
+                let outgoing =
+                    self.outgoing
+                        .get_mut(&peer)
+                        .ok_or(HandshakeError::InvalidPhase {
+                            message: "matching initiator confirmation state",
+                        })?;
+                let session = outgoing
+                    .handshake
+                    .accept_responder_confirmation(datagram, wall_time)?;
+                self.outgoing.remove(&peer);
+                self.active_session_ids.insert((peer, session.session_id()));
+                Ok(HandshakeEvent::Established {
+                    peer_node_id: peer,
+                    transmission: None,
+                    session: Box::new(session),
+                })
+            }
+            SessionConfirmRole::Initiator => {
+                let key = HandshakeCacheKey {
+                    peer_node_id: peer,
+                    controller_epoch: confirmation.header().controller_epoch,
+                    handshake_id: confirmation.header().handshake_id,
+                };
+                let cached = self
+                    .responders
+                    .get_mut(&key)
+                    .ok_or(HandshakeError::InvalidPhase {
+                        message: "matching responder handshake state",
+                    })?;
+                let response = cached
+                    .handshake
+                    .accept_initiator_confirmation(datagram, wall_time)?
+                    .to_vec();
+                match cached.handshake.take_established(wall_time) {
+                    Ok(session) => {
+                        self.active_session_ids.insert((peer, session.session_id()));
+                        Ok(HandshakeEvent::Established {
+                            peer_node_id: peer,
+                            transmission: Some(HandshakeTransmission::new(peer, response)),
+                            session: Box::new(session),
+                        })
+                    }
+                    Err(HandshakeError::InvalidPhase { .. }) => Ok(HandshakeEvent::Transmit(
+                        HandshakeTransmission::new(peer, response),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    fn make_responder_room(&mut self, peer: NodeId) {
+        while self
+            .responders
+            .keys()
+            .filter(|key| key.peer_node_id == peer)
+            .count()
+            >= MAX_HANDSHAKES_PER_PEER
+            || self.responders.len() >= MAX_CACHED_HANDSHAKES
+        {
+            let peer_oldest = self
+                .responders
+                .iter()
+                .filter(|(key, _)| key.peer_node_id == peer)
+                .min_by_key(|(key, cached)| (cached.created_at, **key))
+                .map(|(key, _)| *key);
+            let oldest = peer_oldest.or_else(|| {
+                self.responders
+                    .iter()
+                    .min_by_key(|(key, cached)| (cached.created_at, **key))
+                    .map(|(key, _)| *key)
+            });
+            let Some(key) = oldest else {
+                break;
+            };
+            self.responders.remove(&key);
+        }
+    }
+
+    fn expire_responders(&mut self, now: Duration) {
+        self.responders
+            .retain(|_, cached| now.saturating_sub(cached.created_at) < RESPONDER_CACHE_LIFETIME);
+    }
+
+    fn clear_peer_exchange(&mut self, peer: NodeId) {
+        self.outgoing.remove(&peer);
+        self.responders.retain(|key, _| key.peer_node_id != peer);
+        self.active_session_ids
+            .retain(|(session_peer, _)| *session_peer != peer);
+    }
+}
+
+impl std::fmt::Debug for PeerHandshakeManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PeerHandshakeManager")
+            .field("local_node_id", &self.local_node_id)
+            .field("configured_peers", &self.peers.len())
+            .field("outgoing", &self.outgoing.len())
+            .field("cached_responders", &self.responders.len())
+            .field("active_session_ids", &self.active_session_ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
+struct OutgoingHandshake {
+    handshake: InitiatorHandshake,
+    started_at: Duration,
+    next_send_at: Duration,
+    retransmit_delay: Duration,
+}
+
+impl OutgoingHandshake {
+    fn current_datagram(&self) -> &[u8] {
+        self.handshake
+            .confirmation_datagram()
+            .unwrap_or_else(|| self.handshake.initiation_datagram())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct HandshakeCacheKey {
+    peer_node_id: NodeId,
+    controller_epoch: u64,
+    handshake_id: u64,
+}
+
+struct CachedResponder {
+    init_datagram: Vec<u8>,
+    handshake: ResponderHandshake,
+    created_at: Duration,
 }
 
 fn validate_permissions(grant: MembershipGrant) -> Result<(), HandshakeError> {
@@ -960,7 +1441,10 @@ fn random_nonzero_array<const LENGTH: usize>() -> Result<[u8; LENGTH], Handshake
 
 #[cfg(test)]
 mod tests {
-    use super::{HandshakeError, InitiatorHandshake, PeerHandshakeConfig, ResponderHandshake};
+    use super::{
+        HandshakeError, HandshakeEvent, HandshakeTransmission, InitiatorHandshake,
+        PeerHandshakeConfig, PeerHandshakeManager, ResponderHandshake,
+    };
     use stella_common::{ControllerId, GrantSerial, NetworkId};
     use stella_crypto::{derive_node_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
@@ -1132,5 +1616,169 @@ mod tests {
             ResponderHandshake::respond(bob_config, &bob_key, &mutated, NOW),
             Err(HandshakeError::Crypto(_))
         ));
+    }
+
+    fn transmitted(event: HandshakeEvent) -> HandshakeTransmission {
+        match event {
+            HandshakeEvent::Transmit(transmission) => transmission,
+            other => panic!("expected transmission, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn manager_resolves_simultaneous_initiation_and_caches_replays() {
+        let alice_key = signing_key(51);
+        let bob_key = signing_key(52);
+        let alice_config = config(&alice_key, &bob_key, 61, 62);
+        let bob_config = config(&bob_key, &alice_key, 62, 61);
+        let alice_id = alice_config.local_node_id;
+        let bob_id = bob_config.local_node_id;
+        let alice_preferred = alice_config.is_preferred_initiator();
+        let mut alice = PeerHandshakeManager::new(alice_id);
+        let mut bob = PeerHandshakeManager::new(bob_id);
+        alice.upsert_peer(alice_config).expect("configure alice");
+        bob.upsert_peer(bob_config).expect("configure bob");
+        let alice_init = alice
+            .initiate(bob_id, &alice_key, NOW, std::time::Duration::ZERO)
+            .expect("alice initiation");
+        let bob_init = bob
+            .initiate(alice_id, &bob_key, NOW, std::time::Duration::ZERO)
+            .expect("bob initiation");
+
+        let (preferred, preferred_key, preferred_init, other, other_key, other_init) =
+            if alice_preferred {
+                (
+                    &mut alice, &alice_key, alice_init, &mut bob, &bob_key, bob_init,
+                )
+            } else {
+                (
+                    &mut bob, &bob_key, bob_init, &mut alice, &alice_key, alice_init,
+                )
+            };
+        assert!(matches!(
+            preferred
+                .handle_datagram(
+                    other_init.datagram(),
+                    preferred_key,
+                    NOW,
+                    std::time::Duration::ZERO,
+                )
+                .expect("classify losing initiation"),
+            HandshakeEvent::Ignored
+        ));
+        let response = transmitted(
+            other
+                .handle_datagram(
+                    preferred_init.datagram(),
+                    other_key,
+                    NOW,
+                    std::time::Duration::ZERO,
+                )
+                .expect("respond to preferred initiation"),
+        );
+        let replay_response = transmitted(
+            other
+                .handle_datagram(
+                    preferred_init.datagram(),
+                    other_key,
+                    NOW,
+                    std::time::Duration::from_millis(1),
+                )
+                .expect("replay cached initiation"),
+        );
+        assert_eq!(response.datagram(), replay_response.datagram());
+
+        let initiator_confirm = transmitted(
+            preferred
+                .handle_datagram(
+                    response.datagram(),
+                    preferred_key,
+                    NOW,
+                    std::time::Duration::from_millis(2),
+                )
+                .expect("accept response"),
+        );
+        let (responder_confirm, responder_session_id) = match other
+            .handle_datagram(
+                initiator_confirm.datagram(),
+                other_key,
+                NOW,
+                std::time::Duration::from_millis(3),
+            )
+            .expect("accept initiator confirmation")
+        {
+            HandshakeEvent::Established {
+                transmission: Some(transmission),
+                session,
+                ..
+            } => (transmission, session.session_id()),
+            event => panic!("expected responder establishment, got {event:?}"),
+        };
+        let initiator_session_id = match preferred
+            .handle_datagram(
+                responder_confirm.datagram(),
+                preferred_key,
+                NOW,
+                std::time::Duration::from_millis(4),
+            )
+            .expect("accept responder confirmation")
+        {
+            HandshakeEvent::Established { session, .. } => session.session_id(),
+            event => panic!("expected initiator establishment, got {event:?}"),
+        };
+        assert_eq!(initiator_session_id, responder_session_id);
+        let repeated_confirm = transmitted(
+            other
+                .handle_datagram(
+                    initiator_confirm.datagram(),
+                    other_key,
+                    NOW,
+                    std::time::Duration::from_millis(5),
+                )
+                .expect("repeat cached confirmation"),
+        );
+        assert_eq!(repeated_confirm.datagram(), responder_confirm.datagram());
+    }
+
+    #[test]
+    fn manager_retransmits_with_backoff_and_abandons_at_deadline() {
+        let alice_key = signing_key(71);
+        let bob_key = signing_key(72);
+        let alice_config = config(&alice_key, &bob_key, 81, 82);
+        let bob_id = alice_config.peer_node_id;
+        let alice_id = alice_config.local_node_id;
+        let mut manager = PeerHandshakeManager::new(alice_id);
+        manager.upsert_peer(alice_config).expect("configure peer");
+        let first = manager
+            .initiate(bob_id, &alice_key, NOW, std::time::Duration::ZERO)
+            .expect("initiate");
+        assert!(manager
+            .poll_retransmissions(std::time::Duration::from_millis(249))
+            .is_empty());
+        let retry = manager.poll_retransmissions(std::time::Duration::from_millis(250));
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].datagram(), first.datagram());
+        assert!(manager
+            .poll_retransmissions(std::time::Duration::from_millis(749))
+            .is_empty());
+        assert_eq!(
+            manager
+                .poll_retransmissions(std::time::Duration::from_millis(750))
+                .len(),
+            1
+        );
+        assert!(manager
+            .poll_retransmissions(std::time::Duration::from_secs(10))
+            .is_empty());
+        let replacement = manager
+            .initiate(
+                bob_id,
+                &alice_key,
+                NOW + 10,
+                std::time::Duration::from_secs(10),
+            )
+            .expect("new attempt after abandonment");
+        assert_ne!(replacement.datagram(), first.datagram());
     }
 }
