@@ -8,7 +8,7 @@ mod error;
 mod state;
 mod tls;
 
-pub use active::{ActiveControl, HeartbeatReport};
+pub use active::{ActiveControl, ControlUpdate, HeartbeatReport};
 pub use control::{
     authenticate_controller, AuthenticatedControl, BearerCredential, ControllerTrust, Enrollment,
 };

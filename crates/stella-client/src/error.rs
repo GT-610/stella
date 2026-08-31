@@ -112,6 +112,15 @@ pub enum ClientError {
     /// The heartbeat counter cannot advance without wrapping.
     #[error("heartbeat counter is exhausted")]
     HeartbeatCounterExhausted,
+    /// An authenticated active-session message arrived in the wrong direction.
+    #[error("unexpected active controller message {actual:?}")]
+    UnexpectedActiveMessage {
+        /// Message type rejected in the active client receive path.
+        actual: ControlMessageType,
+    },
+    /// A structurally validated delta carried no registered operation.
+    #[error("peer delta has an invalid operation")]
+    InvalidPeerDeltaOperation,
     /// A fixed-width field could not be represented by its protocol type.
     #[error("validated {field} has an unexpected width")]
     InvalidFieldWidth {

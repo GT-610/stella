@@ -5,14 +5,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use stella_common::NetworkId;
+use stella_common::{NetworkId, NodeId};
 use stella_control::{MessageBuilder, OwnedControlMessage};
 use stella_proto::{
     encode_endpoint_set, encode_network_revision_list, ControlFieldType, ControlMessageType,
-    Endpoint, NetworkRevision, NetworkRevisionListView,
+    Endpoint, NetworkRevision, NetworkRevisionListView, PeerRecordView,
 };
 
-use crate::{AuthenticatedControl, BearerCredential, ClientError, NetworkState, SnapshotInput};
+use crate::{
+    AuthenticatedControl, BearerCredential, ClientError, GrantRefreshInput, NetworkState,
+    PeerDeltaInput, PeerDeltaOperation, SnapshotInput,
+};
 
 const MAX_ENDPOINT_SET_LENGTH: usize = 4 + 8 * 28;
 const MAX_NETWORK_REVISION_LIST_LENGTH: usize = 4 + 256 * 32;
@@ -122,7 +125,7 @@ impl ActiveControl {
             "ENDPOINT_RESULT",
             "snapshot revision",
         )?;
-        self.request_snapshot(network_id, result_epoch, result_revision)
+        self.request_snapshot(network_id, previous_revision, result_epoch, result_revision)
             .await
     }
 
@@ -188,16 +191,47 @@ impl ActiveControl {
         })
     }
 
+    /// Reads and applies one unsolicited controller update.
+    ///
+    /// Invalid deltas preserve same-epoch state and automatically request a
+    /// complete replacement snapshot. A higher delta epoch clears the old
+    /// network before recovery so stale authorization cannot keep forwarding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] for wrong direction/correlation, an unknown
+    /// network, malformed fields, carrier failure, or failed state recovery.
+    pub async fn receive_update(&mut self) -> Result<ControlUpdate, ClientError> {
+        let message = self.connection.read_message().await?;
+        require_unsolicited_correlation(&message)?;
+        match message.header()?.message_type {
+            ControlMessageType::PeerSnapshot => self.apply_unsolicited_snapshot(&message),
+            ControlMessageType::PeerDelta => self.apply_peer_delta(&message).await,
+            ControlMessageType::GrantRefresh => self.apply_grant_refresh(&message),
+            ControlMessageType::ServerShutdown => Ok(ControlUpdate::ServerShutdown {
+                deadline: decode_u64(
+                    field_value(&message, ControlFieldType::ShutdownDeadline)?,
+                    "shutdown deadline",
+                )?,
+            }),
+            ControlMessageType::Error => Ok(ControlUpdate::ControllerError {
+                status: decode_u16(
+                    field_value(&message, ControlFieldType::StatusCode)?,
+                    "controller error status",
+                )?,
+                retry_after_ms: optional_u32(&message, ControlFieldType::RetryAfterMs)?,
+            }),
+            actual => Err(ClientError::UnexpectedActiveMessage { actual }),
+        }
+    }
+
     async fn request_snapshot(
         &mut self,
         network_id: NetworkId,
+        last_revision: u64,
         minimum_epoch: u64,
         minimum_revision: u64,
     ) -> Result<&NetworkState, ClientError> {
-        let last_revision = self
-            .network(network_id)
-            .ok_or(ClientError::NetworkNotActive { network_id })?
-            .snapshot_revision();
         let mut request = MessageBuilder::new(ControlMessageType::SnapshotRequest);
         request.push_field(ControlFieldType::NetworkId, network_id.as_bytes())?;
         request.push_field(
@@ -231,6 +265,133 @@ impl ActiveControl {
         self.networks
             .get(&network_id)
             .ok_or(ClientError::NetworkNotActive { network_id })
+    }
+
+    fn apply_unsolicited_snapshot(
+        &mut self,
+        message: &OwnedControlMessage,
+    ) -> Result<ControlUpdate, ClientError> {
+        let network_id = decode_network_id(message)?;
+        let incoming_epoch = decode_u64(
+            field_value(message, ControlFieldType::ControllerEpoch)?,
+            "controller epoch",
+        )?;
+        let current_epoch = self
+            .networks
+            .get(&network_id)
+            .ok_or(ClientError::NetworkNotActive { network_id })?
+            .controller_epoch();
+        ensure_control_field(
+            incoming_epoch >= current_epoch,
+            "unsolicited PEER_SNAPSHOT",
+            "controller epoch",
+        )?;
+        if incoming_epoch > current_epoch {
+            self.networks.remove(&network_id);
+        }
+        let state = decode_snapshot(&self.connection, message, 0)?;
+        if let Some(current) = self.networks.get(&network_id) {
+            ensure_control_field(
+                state.controller_epoch() > current.controller_epoch()
+                    || (state.controller_epoch() == current.controller_epoch()
+                        && state.snapshot_revision() >= current.snapshot_revision()),
+                "unsolicited PEER_SNAPSHOT",
+                "authority revision",
+            )?;
+        }
+        self.networks.insert(network_id, state);
+        Ok(ControlUpdate::SnapshotReplaced { network_id })
+    }
+
+    fn apply_grant_refresh(
+        &mut self,
+        message: &OwnedControlMessage,
+    ) -> Result<ControlUpdate, ClientError> {
+        let network_id = decode_network_id(message)?;
+        let controller_id = self.connection.controller_id();
+        let controller_public_key = self.connection.controller_public_key();
+        let local_node_id = self.connection.node_id();
+        let local_public_key = self.connection.node_public_key();
+        let state = self
+            .networks
+            .get_mut(&network_id)
+            .ok_or(ClientError::NetworkNotActive { network_id })?;
+        let prior_serial = state.local_grant().grant_serial;
+        state.refresh_local_grant(&GrantRefreshInput {
+            controller_id,
+            controller_public_key,
+            local_node_id,
+            local_public_key,
+            controller_epoch: decode_u64(
+                field_value(message, ControlFieldType::ControllerEpoch)?,
+                "controller epoch",
+            )?,
+            snapshot_revision: decode_u64(
+                field_value(message, ControlFieldType::SnapshotRevision)?,
+                "snapshot revision",
+            )?,
+            grant_bytes: field_value(message, ControlFieldType::MembershipGrant)?,
+            policy_bytes: field_value(message, ControlFieldType::NetworkPolicy)?,
+            now: unix_time()?,
+        })?;
+        Ok(ControlUpdate::GrantRefreshed {
+            network_id,
+            serial_changed: state.local_grant().grant_serial != prior_serial,
+        })
+    }
+
+    async fn apply_peer_delta(
+        &mut self,
+        message: &OwnedControlMessage,
+    ) -> Result<ControlUpdate, ClientError> {
+        let network_id = decode_network_id(message)?;
+        let controller_epoch = decode_u64(
+            field_value(message, ControlFieldType::ControllerEpoch)?,
+            "controller epoch",
+        )?;
+        let snapshot_revision = decode_u64(
+            field_value(message, ControlFieldType::SnapshotRevision)?,
+            "snapshot revision",
+        )?;
+        let (last_revision, current_epoch) = self
+            .networks
+            .get(&network_id)
+            .map(|state| (state.snapshot_revision(), state.controller_epoch()))
+            .ok_or(ClientError::NetworkNotActive { network_id })?;
+        let (operation, changed_node, removed) = decode_delta_operation(message)?;
+        let input = PeerDeltaInput {
+            controller_id: self.connection.controller_id(),
+            controller_public_key: self.connection.controller_public_key(),
+            local_node_id: self.connection.node_id(),
+            network_id,
+            controller_epoch,
+            snapshot_revision,
+            operation,
+            now: unix_time()?,
+        };
+        let applied = self
+            .networks
+            .get_mut(&network_id)
+            .ok_or(ClientError::NetworkNotActive { network_id })?
+            .apply_peer_delta(&input);
+        if applied.is_ok() {
+            return Ok(ControlUpdate::PeerChanged {
+                network_id,
+                node_id: changed_node,
+                removed,
+            });
+        }
+        if controller_epoch > current_epoch {
+            self.networks.remove(&network_id);
+        }
+        self.request_snapshot(
+            network_id,
+            last_revision,
+            current_epoch.max(controller_epoch),
+            last_revision,
+        )
+        .await?;
+        Ok(ControlUpdate::SnapshotRecovered { network_id })
     }
 
     fn reconcile_ack_revisions(
@@ -345,6 +506,50 @@ impl HeartbeatReport {
     pub fn updated_networks(&self) -> &[NetworkId] {
         &self.updated_networks
     }
+}
+
+/// One successfully processed unsolicited controller event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ControlUpdate {
+    /// A complete unsolicited snapshot replaced one network.
+    SnapshotReplaced {
+        /// Replaced network.
+        network_id: NetworkId,
+    },
+    /// One valid add/replace or remove delta changed a peer.
+    PeerChanged {
+        /// Updated network.
+        network_id: NetworkId,
+        /// Added, replaced, or removed peer.
+        node_id: NodeId,
+        /// Whether the peer was removed rather than added/replaced.
+        removed: bool,
+    },
+    /// An invalid or discontinuous delta was recovered with a full snapshot.
+    SnapshotRecovered {
+        /// Recovered network.
+        network_id: NetworkId,
+    },
+    /// The local membership grant was atomically refreshed.
+    GrantRefreshed {
+        /// Refreshed network.
+        network_id: NetworkId,
+        /// Whether peer data sessions must rekey for a new grant serial.
+        serial_changed: bool,
+    },
+    /// The controller announced a graceful shutdown deadline.
+    ServerShutdown {
+        /// Earliest Unix time at which reconnect should begin.
+        deadline: u64,
+    },
+    /// The controller sent an unsolicited registered error notice.
+    ControllerError {
+        /// Registered status code.
+        status: u16,
+        /// Optional retry delay in milliseconds.
+        retry_after_ms: Option<u32>,
+    },
 }
 
 impl AuthenticatedControl {
@@ -634,6 +839,38 @@ fn require_unsolicited(
     Ok(())
 }
 
+fn require_unsolicited_correlation(message: &OwnedControlMessage) -> Result<(), ClientError> {
+    let actual = message.header()?.correlation_id;
+    if actual != 0 {
+        return Err(ClientError::UnexpectedCorrelation {
+            expected: 0,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn decode_delta_operation(
+    message: &OwnedControlMessage,
+) -> Result<(PeerDeltaOperation<'_>, NodeId, bool), ClientError> {
+    let operation = field_value(message, ControlFieldType::DeltaOperation)?;
+    match operation.first().copied() {
+        Some(1) => {
+            let peer_bytes = field_value(message, ControlFieldType::PeerRecord)?;
+            let node_id = PeerRecordView::decode(peer_bytes)?.node_id();
+            Ok((PeerDeltaOperation::AddOrReplace(peer_bytes), node_id, false))
+        }
+        Some(2) => {
+            let node_id = NodeId::from_bytes(fixed_array(
+                field_value(message, ControlFieldType::NodeId)?,
+                "peer delta node ID",
+            )?);
+            Ok((PeerDeltaOperation::Remove(node_id), node_id, true))
+        }
+        _ => Err(ClientError::InvalidPeerDeltaOperation),
+    }
+}
+
 fn field_value(
     message: &OwnedControlMessage,
     field: ControlFieldType,
@@ -671,6 +908,21 @@ fn decode_u64(value: &[u8], field: &'static str) -> Result<u64, ClientError> {
     Ok(u64::from_be_bytes(fixed_array(value, field)?))
 }
 
+fn optional_u32(
+    message: &OwnedControlMessage,
+    field: ControlFieldType,
+) -> Result<Option<u32>, ClientError> {
+    for candidate in message.view()?.fields() {
+        if candidate.field_type() == Some(field) {
+            return Ok(Some(u32::from_be_bytes(fixed_array(
+                candidate.value(),
+                "optional u32 field",
+            )?)));
+        }
+    }
+    Ok(None)
+}
+
 fn ensure_control_field(
     matches: bool,
     context: &'static str,
@@ -687,4 +939,81 @@ fn unix_time() -> Result<u64, ClientError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| ClientError::SystemTimeBeforeUnixEpoch)
+}
+
+#[cfg(test)]
+mod tests {
+    use stella_common::{NetworkId, NodeId};
+    use stella_control::{MessageBuilder, OutboundSequence};
+    use stella_proto::{ControlFieldType, ControlMessageType};
+
+    use super::{decode_delta_operation, optional_u32, require_unsolicited_correlation};
+    use crate::{ClientError, PeerDeltaOperation};
+
+    #[test]
+    fn remove_delta_decodes_target_and_requires_zero_correlation() {
+        let node_id = NodeId::from_bytes([0x31; 16]);
+        let mut builder = MessageBuilder::new(ControlMessageType::PeerDelta);
+        builder
+            .push_field(ControlFieldType::NodeId, node_id.as_bytes())
+            .expect("node ID field");
+        builder
+            .push_field(ControlFieldType::ControllerEpoch, &2_u64.to_be_bytes())
+            .expect("controller epoch field");
+        builder
+            .push_field(
+                ControlFieldType::NetworkId,
+                NetworkId::from_bytes([0x32; 16]).as_bytes(),
+            )
+            .expect("network ID field");
+        builder
+            .push_field(ControlFieldType::SnapshotRevision, &3_u64.to_be_bytes())
+            .expect("snapshot revision field");
+        builder
+            .push_field(ControlFieldType::DeltaOperation, &[2])
+            .expect("delta operation field");
+        let message = OutboundSequence::new()
+            .build(builder)
+            .expect("build remove delta");
+
+        require_unsolicited_correlation(&message).expect("zero correlation is unsolicited");
+        assert_eq!(
+            decode_delta_operation(&message).expect("decode remove operation"),
+            (PeerDeltaOperation::Remove(node_id), node_id, true)
+        );
+    }
+
+    #[test]
+    fn optional_retry_delay_is_decoded_without_defaulting() {
+        let mut builder = MessageBuilder::new(ControlMessageType::Error);
+        builder
+            .push_field(ControlFieldType::StatusCode, &401_u16.to_be_bytes())
+            .expect("status field");
+        builder
+            .push_field(ControlFieldType::RetryAfterMs, &250_u32.to_be_bytes())
+            .expect("retry field");
+        let message = OutboundSequence::new()
+            .build(builder)
+            .expect("build controller error");
+        assert_eq!(
+            optional_u32(&message, ControlFieldType::RetryAfterMs)
+                .expect("decode optional retry delay"),
+            Some(250)
+        );
+
+        let mut correlated = MessageBuilder::new(ControlMessageType::Error).with_correlation(9);
+        correlated
+            .push_field(ControlFieldType::StatusCode, &401_u16.to_be_bytes())
+            .expect("correlated status field");
+        let correlated = OutboundSequence::new()
+            .build(correlated)
+            .expect("build correlated controller error");
+        assert!(matches!(
+            require_unsolicited_correlation(&correlated),
+            Err(ClientError::UnexpectedCorrelation {
+                expected: 0,
+                actual: 9
+            })
+        ));
+    }
 }
