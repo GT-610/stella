@@ -15,6 +15,7 @@ mod keepalive;
 mod nested;
 mod peer;
 mod policy;
+mod relay;
 
 pub use common::{
     CommonHeader, PacketType, ProtocolVersion, COMMON_HEADER_LENGTH, MAGIC, MAX_HEADER_LENGTH,
@@ -79,4 +80,12 @@ pub use peer::{
 pub use policy::{
     ConfidentialityPolicy, NetworkPolicy, NETWORK_POLICY_FORMAT_VERSION, NETWORK_POLICY_LENGTH,
     NETWORK_POLICY_MAGIC,
+};
+pub use relay::{
+    encode_relay_service, encode_relay_service_list, RelayAddress, RelayAddressIter,
+    RelayCarrierMask, RelayPorts, RelayServiceIter, RelayServiceListView, RelayServiceRef,
+    RelayServiceView, RelaySpkiPinIter, RelayTrustRequirements, MAX_RELAY_ADDRESSES,
+    MAX_RELAY_CREDENTIAL_LIFETIME_SECONDS, MAX_RELAY_DNS_NAME_LENGTH, MAX_RELAY_REGION_LENGTH,
+    MAX_RELAY_SECRET_LENGTH, MAX_RELAY_SERVICES, MAX_RELAY_SPKI_PINS, MAX_RELAY_USERNAME_LENGTH,
+    MIN_RELAY_SECRET_LENGTH, RELAY_ADDRESS_RECORD_LENGTH, RELAY_SERVICE_HEADER_LENGTH,
 };

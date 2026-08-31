@@ -8,9 +8,9 @@ use stella_proto::{
     ControlHeader, ControlMessageView, DataHeader, DataPacketView, EndpointSetView,
     HandshakeHeader, IceCandidate, KeepaliveHeader, KeepalivePacketView, MembershipGrantView,
     NetworkPolicy, NetworkRevisionListView, PacketType, PeerListView, PeerRecordView,
-    ProtocolVersion, SessionConfirmRef, SessionConfirmRole, SessionConfirmView, SessionInitView,
-    SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseView,
-    StunServerListView, VersionListView, HANDSHAKE_FIXED_HEADER_LENGTH,
+    ProtocolVersion, RelayServiceListView, RelayServiceView, SessionConfirmRef, SessionConfirmRole,
+    SessionConfirmView, SessionInitView, SessionRejectReason, SessionRejectRef, SessionRejectView,
+    SessionResponseView, StunServerListView, VersionListView, HANDSHAKE_FIXED_HEADER_LENGTH,
     SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG, SESSION_REJECT_PAYLOAD_LENGTH,
 };
 
@@ -81,6 +81,8 @@ proptest! {
         let _connectivity_record = ConnectivityRecordView::decode(&input);
         let _connectivity_list = ConnectivityListView::decode(&input);
         let _stun_servers = StunServerListView::decode(&input);
+        let _relay_service = RelayServiceView::decode(&input);
+        let _relay_services = RelayServiceListView::decode(&input);
     }
 
     #[test]
