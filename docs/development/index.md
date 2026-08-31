@@ -31,3 +31,5 @@ transactional authority state, administrative commands, and session behavior.
 See [Windows client control plane](./client-control.md) for persistent trust,
 authentication, atomic peer state, heartbeats, reconnect, and fail-closed
 forwarding behavior.
+See [Windows client data plane](./client-data-plane.md) for TAP worker ownership,
+authenticated peer routing, keepalives, endpoint pinning, and rekey behavior.

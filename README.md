@@ -9,9 +9,9 @@ implementation focused on:
 - protocol-level authentication independent of the carrying network.
 
 The project is in pre-standard development and is not usable for production
-networking yet. The Windows core libraries and self-hosted controller control
-plane are implemented; Windows client and integrated L2 data-plane work is in
-progress.
+networking yet. The Windows core libraries, self-hosted controller, client
+control plane, and authenticated TAP-to-UDP Layer-2 data path are implemented;
+end-to-end Windows interoperability validation remains in progress.
 
 ## Workspace checks
 

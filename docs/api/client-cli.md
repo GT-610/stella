@@ -84,5 +84,8 @@ Controller failures withdraw all in-memory forwarding authorization before a
 full-jitter reconnect delay. Backoff starts at 250 ms and caps at 30 seconds.
 A heartbeat is treated as lost only after three policy heartbeat periods elapse
 without its acknowledgement. Ctrl+C cancels the session and drops all active
-state before the process exits. Windows TAP and encrypted UDP forwarding are
-connected to this owner in the subsequent data-plane batches.
+state before the process exits. On Windows, the active owner binds the
+configured UDP socket, opens each exact TAP adapter, completes peer handshakes,
+and forwards authenticated Layer-2 frames. Invalid peer datagrams are dropped
+without reconnecting the controller; TAP, UDP, or worker failures end the
+active session and use the normal fail-closed reconnect path.
