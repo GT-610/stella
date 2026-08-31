@@ -92,6 +92,7 @@ export default defineConfig({
         {
           text: 'Command-line reference',
           items: [
+            { text: 'Windows client', link: '/api/client-cli' },
             { text: 'Server administration', link: '/api/server-cli' }
           ]
         }
