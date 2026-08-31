@@ -17,6 +17,8 @@ use stella_client::{
     authenticate_controller, create_node_identity, load_node_identity, ActiveControl,
     BearerCredential, ClientConfig, Enrollment, SpkiPin,
 };
+#[cfg(target_os = "windows")]
+use stella_client::{ClientDataRuntime, RuntimeError};
 use stella_common::{ControllerId, NetworkId};
 use stella_crypto::derive_node_id;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -26,6 +28,8 @@ const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAXIMUM_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(target_os = "windows")]
+const DATA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -188,7 +192,7 @@ async fn supervise_control(
                     "controller state is active"
                 );
                 attempt = 0;
-                if let Err(error) = run_active_control(active).await {
+                if let Err(error) = run_active_control(config, identity, active).await {
                     tracing::warn!(%error, "active controller session ended");
                 }
             }
@@ -246,12 +250,41 @@ async fn activate_control(
     Ok(active)
 }
 
-async fn run_active_control(mut active: ActiveControl) -> Result<()> {
+#[cfg(target_os = "windows")]
+async fn run_active_control(
+    config: &ClientConfig,
+    identity: &stella_crypto::IdentitySigningKey,
+    mut active: ActiveControl,
+) -> Result<()> {
+    let mut data = ClientDataRuntime::start(config, active.networks(), identity)
+        .await
+        .context("could not start Windows UDP/TAP data plane")?;
+    tracing::info!(
+        udp = %data.local_udp_address(),
+        networks = active.networks().len(),
+        "Windows data plane is active"
+    );
+    let result = run_active_io(config, identity, &mut active, &mut data).await;
+    let shutdown = data.shutdown().await.context("data-plane shutdown failed");
+    result.and(shutdown)
+}
+
+#[cfg(target_os = "windows")]
+async fn run_active_io(
+    config: &ClientConfig,
+    identity: &stella_crypto::IdentitySigningKey,
+    active: &mut ActiveControl,
+    data: &mut ClientDataRuntime,
+) -> Result<()> {
+    let heartbeat_sleep = tokio::time::sleep(heartbeat_interval(active));
+    tokio::pin!(heartbeat_sleep);
+    let mut maintenance = tokio::time::interval(DATA_MAINTENANCE_INTERVAL);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let interval = heartbeat_interval(&active);
-        let deadline = tokio::time::Instant::now() + interval;
-        if let Some(update) = active.receive_update_until(deadline).await? {
-            match update {
+        tokio::select! {
+            update = active.receive_update() => {
+                let update = update?;
+                match update {
                 stella_client::ControlUpdate::ServerShutdown { deadline } => {
                     anyhow::bail!("controller requested shutdown with deadline {deadline}")
                 }
@@ -261,23 +294,74 @@ async fn run_active_control(mut active: ActiveControl) -> Result<()> {
                 } => anyhow::bail!(
                     "controller sent status {status} with retry delay {retry_after_ms:?}"
                 ),
-                update => tracing::debug!(?update, "applied controller update"),
+                    update => tracing::debug!(?update, "applied controller update"),
+                }
+                data.reconcile(config, active.networks(), identity)
+                    .await
+                    .context("could not reconcile data plane after control update")?;
+                heartbeat_sleep.as_mut().reset(
+                    tokio::time::Instant::now() + heartbeat_interval(active)
+                );
             }
+            () = &mut heartbeat_sleep => {
+                let interval = heartbeat_interval(active);
+                let acknowledgement_timeout = interval
+                    .checked_mul(3)
+                    .ok_or_else(|| anyhow::anyhow!("heartbeat timeout overflow"))?;
+                let report = tokio::time::timeout(acknowledgement_timeout, active.heartbeat())
+                    .await
+                    .context("three heartbeat acknowledgement periods elapsed")?
+                    .context("heartbeat failed")?;
+                tracing::debug!(
+                    counter = report.counter(),
+                    server_time = report.server_time(),
+                    updated_networks = report.updated_networks().len(),
+                    "controller heartbeat acknowledged"
+                );
+                data.reconcile(config, active.networks(), identity)
+                    .await
+                    .context("could not reconcile data plane after heartbeat")?;
+                heartbeat_sleep.as_mut().reset(
+                    tokio::time::Instant::now() + heartbeat_interval(active)
+                );
+            }
+            _ = maintenance.tick() => {
+                data.maintain(identity)
+                    .await
+                    .context("data-plane maintenance failed")?;
+            }
+            result = data.receive_next(identity) => {
+                match result {
+                    Ok(()) => {}
+                    Err(RuntimeError::Network(error)) => {
+                        tracing::debug!(%error, "dropped invalid peer datagram");
+                    }
+                    Err(RuntimeError::Codec(error)) => {
+                        tracing::debug!(%error, "dropped malformed Stella datagram");
+                    }
+                    Err(RuntimeError::TapWriteQueueFull { network_id }) => {
+                        tracing::warn!(%network_id, "dropped frame because TAP queue is full");
+                    }
+                    Err(error) => return Err(error).context("data-plane I/O failed"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn run_active_control(
+    _config: &ClientConfig,
+    _identity: &stella_crypto::IdentitySigningKey,
+    mut active: ActiveControl,
+) -> Result<()> {
+    loop {
+        let interval = heartbeat_interval(&active);
+        let deadline = tokio::time::Instant::now() + interval;
+        if active.receive_update_until(deadline).await?.is_some() {
             continue;
         }
-        let acknowledgement_timeout = interval
-            .checked_mul(3)
-            .ok_or_else(|| anyhow::anyhow!("heartbeat timeout overflow"))?;
-        let report = tokio::time::timeout(acknowledgement_timeout, active.heartbeat())
-            .await
-            .context("three heartbeat acknowledgement periods elapsed")?
-            .context("heartbeat failed")?;
-        tracing::debug!(
-            counter = report.counter(),
-            server_time = report.server_time(),
-            updated_networks = report.updated_networks().len(),
-            "controller heartbeat acknowledged"
-        );
+        active.heartbeat().await.context("heartbeat failed")?;
     }
 }
 

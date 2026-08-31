@@ -10,6 +10,8 @@ mod error;
 mod handshake;
 mod identity;
 mod network;
+#[cfg(target_os = "windows")]
+mod runtime;
 mod state;
 mod switch;
 mod tls;
@@ -30,6 +32,8 @@ pub use identity::{
     NodeIdentityFileError,
 };
 pub use network::{NetworkDataError, NetworkDataPlane, NetworkOutput, RoutedDatagram};
+#[cfg(target_os = "windows")]
+pub use runtime::{ClientDataRuntime, RuntimeError};
 pub use state::{
     GrantRefreshInput, NetworkState, PeerDeltaInput, PeerDeltaOperation, PeerState, SnapshotInput,
     StateError,
