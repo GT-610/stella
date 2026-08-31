@@ -1,7 +1,7 @@
 # Stella
 
 Stella is an experimental open Layer-2 virtual LAN protocol and Rust reference
-implementation focused on:
+implementation. Its initial scope includes:
 
 - Layer-2 compatibility for LAN-style games and applications;
 - a self-hosted centralized control plane;

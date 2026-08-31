@@ -16,20 +16,20 @@ The build command runs `docs:sync` before VitePress so generated files under
 `docs/protocol/` match the normative protocol source. Do not edit those
 generated files directly.
 
-See [Reference implementation architecture](./architecture.md) for crate and
-runtime boundaries, [Protocol codec implementation](./protocol-codec.md) for
-wire parsing, and [Cryptography implementation](./cryptography.md) for secret
-ownership, key derivation, packet protection, and replay handling. See
-[Datagram transport implementation](./transport.md) for the object-safe
+[Reference implementation architecture](./architecture.md) describes crate and
+runtime boundaries; [Protocol codec implementation](./protocol-codec.md) covers
+wire parsing; and [Cryptography implementation](./cryptography.md) covers secret
+ownership, key derivation, packet protection, and replay handling.
+[Datagram transport implementation](./transport.md) documents the object-safe
 transport contract, UDP socket behavior, cancellation, and truncation defense.
-See [Windows TAP implementation](./tap-windows.md) for adapter selection,
-complete-frame I/O, MTU handling, and cancellation.
-See [Control-channel implementation](./control-channel.md) for framed async I/O,
-message ownership, sequencing, correlation, and exporter-bound proof inputs.
-See [Controller implementation](./controller.md) for TLS service boundaries,
-transactional authority state, administrative commands, and session behavior.
-See [Windows client control plane](./client-control.md) for persistent trust,
+[Windows TAP implementation](./tap-windows.md) covers adapter selection,
+complete-frame I/O, MTU handling, and cancellation; [Control-channel
+implementation](./control-channel.md) covers framed async I/O, message ownership,
+sequencing, correlation, and exporter-bound proof inputs.
+For TLS service boundaries, transactional authority state, administrative commands,
+and session behavior, see [Controller implementation](./controller.md). The
+[Windows client control plane](./client-control.md) documents persistent trust,
 authentication, atomic peer state, heartbeats, reconnect, and fail-closed
-forwarding behavior.
-See [Windows client data plane](./client-data-plane.md) for TAP worker ownership,
-authenticated peer routing, keepalives, endpoint pinning, and rekey behavior.
+forwarding behavior. [Windows client data plane](./client-data-plane.md) covers
+TAP worker ownership, authenticated peer routing, keepalives, endpoint pinning,
+and rekey behavior.
