@@ -45,6 +45,8 @@ enum Command {
     Init(InitArgs),
     /// Authenticates, joins one network, and then persists desired membership.
     Join(JoinArgs),
+    /// Prints local identity, controller, and desired-network state.
+    Status,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -122,7 +124,40 @@ pub(crate) async fn run() -> Result<()> {
         Command::Join(args) => {
             join_network(&cli.config, &args, &mut std::io::stdout().lock()).await
         }
+        Command::Status => status(&cli.config, &mut std::io::stdout().lock()),
     }
+}
+
+fn status(config_path: &Path, output: &mut dyn Write) -> Result<()> {
+    let config = ClientConfig::load(config_path).context("could not load client configuration")?;
+    let identity = load_node_identity(&config.identity_path).with_context(|| {
+        format!(
+            "could not load node identity {}",
+            config.identity_path.display()
+        )
+    })?;
+    writeln!(output, "node_id={}", derive_node_id(identity.public_key()))?;
+    writeln!(output, "controller_address={}", config.controller.address())?;
+    writeln!(
+        output,
+        "controller_tls_name={}",
+        config.controller.tls_name()
+    )?;
+    writeln!(
+        output,
+        "controller_id={}",
+        config.controller.controller_id()
+    )?;
+    writeln!(output, "udp_bind={}", config.udp_bind)?;
+    writeln!(output, "desired_networks={}", config.networks.len())?;
+    for network in &config.networks {
+        writeln!(
+            output,
+            "network={}\ttap_adapter={}",
+            network.network_id, network.tap_adapter
+        )?;
+    }
+    Ok(())
 }
 
 async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Write) -> Result<()> {
@@ -477,7 +512,7 @@ mod tests {
     use stella_common::{ControllerId, NetworkId};
 
     use super::{
-        configuration_document, initialize, persist_network_intent, CliCredential, InitArgs,
+        configuration_document, initialize, persist_network_intent, status, CliCredential, InitArgs,
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -560,6 +595,31 @@ mod tests {
         )));
         assert!(config.networks.is_empty());
         assert!(initialize(&config_path, &args, &mut Vec::new()).is_err());
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn status_reports_only_local_non_secret_configuration() {
+        let directory = directory();
+        let config_path = directory.join("client.toml");
+        let args = init_args();
+        initialize(&config_path, &args, &mut Vec::new()).expect("initialize client");
+        persist_network_intent(
+            &config_path,
+            NetworkId::from_bytes([0x55; 16]),
+            "Stella LAN",
+        )
+        .expect("persist network");
+
+        let mut output = Vec::new();
+        status(&config_path, &mut output).expect("read status");
+        let text = String::from_utf8(output).expect("UTF-8 status");
+        assert!(text.contains("controller_address=127.0.0.1:44900"));
+        assert!(text.contains("desired_networks=1"));
+        assert!(text.contains("network=55555555555555555555555555555555\ttap_adapter=Stella LAN"));
+        assert!(!text.contains("node.pk8"));
+        assert!(!text.contains("sha256/"));
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

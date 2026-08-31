@@ -45,11 +45,21 @@ already accepted join may omit `--token`; repeating it with the same TAP adapter
 is idempotent, while a conflicting adapter is rejected before contacting the
 controller.
 
+## Status
+
+```powershell
+stella-client --config C:\Stella\client.toml status
+```
+
+`status` is an offline command. It validates the configuration and protected
+identity, then prints the derived node ID, controller address/name/ID, UDP bind,
+and each desired network with its TAP adapter. It never prints SPKI pins,
+credentials, private key material, or the private-key path.
+
 The following runtime commands are implemented in later Phase 2 batches:
 
 ```powershell
 stella-client --config C:\Stella\client.toml run
-stella-client --config C:\Stella\client.toml status
 stella-client --config C:\Stella\client.toml leave --network <id>
 ```
 
