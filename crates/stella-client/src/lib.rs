@@ -8,6 +8,7 @@ mod control;
 mod error;
 mod identity;
 mod state;
+mod switch;
 mod tls;
 
 pub use active::{ActiveControl, ControlUpdate, HeartbeatReport};
@@ -24,4 +25,5 @@ pub use state::{
     GrantRefreshInput, NetworkState, PeerDeltaInput, PeerDeltaOperation, PeerState, SnapshotInput,
     StateError,
 };
+pub use switch::{FloodClass, L2Switch, PeerIngress, SwitchError, TapForwarding};
 pub use tls::{SpkiPin, SpkiPinParseError};
