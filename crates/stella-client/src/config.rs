@@ -154,10 +154,6 @@ impl ClientConfig {
                 return Err(invalid("networks", "network IDs must be unique"));
             }
         }
-        if networks.is_empty() {
-            return Err(invalid("networks", "at least one network is required"));
-        }
-
         Ok(Self {
             version: raw.version,
             controller,
@@ -253,6 +249,7 @@ struct RawClientConfig {
     controller: RawController,
     identity: RawIdentity,
     transport: RawTransport,
+    #[serde(default)]
     networks: Vec<RawNetwork>,
     #[serde(default)]
     logging: RawLogging,
@@ -481,6 +478,18 @@ tap_adapter = "Stella LAN"
         assert_eq!(config.advertised_endpoints.len(), 1);
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.log_filter, "info,stella_client=info");
+    }
+
+    #[test]
+    fn initialization_config_may_have_no_networks() {
+        let without_network = VALID
+            .lines()
+            .take_while(|line| *line != "[[networks]]")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = ClientConfig::parse(&without_network, Path::new("C:/stella"))
+            .expect("pre-join configuration is valid");
+        assert!(config.networks.is_empty());
     }
 
     #[test]

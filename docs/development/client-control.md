@@ -61,7 +61,8 @@ filter = "info,stella_client=info"
 Relative paths are rooted beside the configuration file. Endpoint and network
 entries are normalized into protocol order, duplicate network IDs are rejected,
 and unknown keys—including any attempted inline enrollment or join token—make
-the complete file invalid.
+the complete file invalid. The `networks` array may be absent immediately after
+`init`; each successful `join` adds one durable entry.
 
 ## Connection authentication
 
