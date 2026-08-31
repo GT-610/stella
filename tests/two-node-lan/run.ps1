@@ -119,7 +119,7 @@ $leftProcess = $null
 $rightProcess = $null
 
 try {
-    cargo build --release -p stella-server -p stella-client
+    cargo build --manifest-path (Join-Path $repository 'Cargo.toml') --release -p stella-server -p stella-client
     Require-Success 'release build'
 
     $initLines = & $server --config $serverConfig init --listen "127.0.0.1:$ControllerPort" --tls-name localhost

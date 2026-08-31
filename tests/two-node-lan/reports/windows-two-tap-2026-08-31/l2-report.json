@@ -1,0 +1,44 @@
+{
+  "left_interface": "Stella Node A",
+  "right_interface": "Stella Node B",
+  "left_mac": "00:ff:0d:8e:cb:8c",
+  "right_mac": "00:ff:78:e9:28:83",
+  "checks": [
+    {
+      "name": "ARP request A to B",
+      "passed": true,
+      "detail": "Ethernet broadcast ARP request crossed the encrypted peer path"
+    },
+    {
+      "name": "ARP reply B to A",
+      "passed": true,
+      "detail": "Directed ARP reply crossed the reverse peer path"
+    },
+    {
+      "name": "IPv4 unicast A to B",
+      "passed": true,
+      "detail": "Directed IPv4 payload crossed from A to B"
+    },
+    {
+      "name": "IPv4 unicast B to A",
+      "passed": true,
+      "detail": "Directed IPv4 payload crossed from B to A"
+    },
+    {
+      "name": "IPv4 broadcast",
+      "passed": true,
+      "detail": "Limited LAN broadcast reached the other TAP"
+    },
+    {
+      "name": "IPv4 multicast",
+      "passed": true,
+      "detail": "IPv4 multicast Ethernet frame reached the other TAP"
+    },
+    {
+      "name": "Broadcast LAN discovery",
+      "passed": true,
+      "detail": "Broadcast discovery query and directed discovery response both crossed Stella"
+    }
+  ],
+  "passed": true
+}

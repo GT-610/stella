@@ -79,5 +79,6 @@ scenario. This mode does not replace the separate two-device lifecycle check;
 it isolates that administrator-only prerequisite from end-to-end protocol and
 Windows data-path verification.
 
-The committed Windows run from 2026-08-31 is archived under
-`reports/windows-one-tap-2026-08-31/` with every check passing.
+The committed two-device Windows run from 2026-08-31 is archived under
+`reports/windows-two-tap-2026-08-31/` with every check passing. The earlier
+one-TAP fallback run remains under `reports/windows-one-tap-2026-08-31/`.
