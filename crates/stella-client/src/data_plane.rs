@@ -5,9 +5,10 @@ use std::{collections::BTreeMap, time::Duration};
 use stella_common::{MacAddress, NodeId};
 use stella_crypto::{CryptoError, ReplayWindow, SessionProtectors};
 use stella_proto::{
-    encode_data_packet, CommonHeader, ConfidentialityPolicy, DataHeader, DataPacketView,
-    NetworkPolicy, PacketType, ProtocolVersion, AUTHENTICATION_TAG_LENGTH, DATA_ENCRYPTED_FLAG,
-    DATA_FIXED_HEADER_LENGTH, MIN_ETHERNET_FRAME_LENGTH,
+    encode_data_packet, encode_keepalive_packet, CommonHeader, ConfidentialityPolicy, DataHeader,
+    DataPacketView, KeepaliveHeader, KeepalivePacketView, NetworkPolicy, PacketType,
+    ProtocolVersion, AUTHENTICATION_TAG_LENGTH, DATA_ENCRYPTED_FLAG, DATA_FIXED_HEADER_LENGTH,
+    KEEPALIVE_FIXED_HEADER_LENGTH, MIN_ETHERNET_FRAME_LENGTH,
 };
 use thiserror::Error;
 
@@ -15,6 +16,28 @@ const MAX_INCOMPLETE_FRAMES: usize = 64;
 const MAX_REASSEMBLY_BYTES: usize = 1024 * 1024;
 const MAX_FRAGMENTS_PER_FRAME: usize = 128;
 const DATA_HEADER_LENGTH: u16 = 104;
+const KEEPALIVE_HEADER_LENGTH: u16 = 88;
+
+/// Authenticated liveness fields accepted from one peer-session keepalive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthenticatedKeepalive {
+    probe_id: u64,
+    echo_probe_id: u64,
+}
+
+impl AuthenticatedKeepalive {
+    /// Returns the peer's newly authenticated directional probe identifier.
+    #[must_use]
+    pub const fn probe_id(self) -> u64 {
+        self.probe_id
+    }
+
+    /// Returns the local probe identifier echoed by the peer, or zero.
+    #[must_use]
+    pub const fn echo_probe_id(self) -> u64 {
+        self.echo_probe_id
+    }
+}
 
 /// Failure while protecting or accepting Ethernet data for one peer session.
 #[derive(Debug, Error)]
@@ -300,6 +323,76 @@ impl PeerDataSession {
         self.accept_fragment(header, extension_bytes, &plaintext, now)
     }
 
+    /// Protects an empty liveness probe in the shared packet sequence space.
+    ///
+    /// `echo_probe_id` is zero or a previously authenticated probe received
+    /// from this session's peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataPlaneError`] when the packet sequence is exhausted or
+    /// keepalive encoding/authentication fails.
+    pub fn protect_keepalive(&mut self, echo_probe_id: u64) -> Result<Vec<u8>, DataPlaneError> {
+        let sequence_number = self.next_sequence.ok_or(DataPlaneError::CounterExhausted {
+            counter: "sequence",
+        })?;
+        let header = KeepaliveHeader {
+            common: CommonHeader {
+                version: ProtocolVersion::CURRENT,
+                packet_type: PacketType::Keepalive,
+                flags: 0,
+                header_length: KEEPALIVE_HEADER_LENGTH,
+                payload_length: 0,
+                network_id: self.policy.network_id,
+            },
+            sender_node_id: self.local_node_id,
+            session_id: self.session_id,
+            sequence_number,
+            controller_epoch: self.controller_epoch,
+            probe_id: sequence_number,
+            echo_probe_id,
+        };
+        let encoded_length = KEEPALIVE_FIXED_HEADER_LENGTH + AUTHENTICATION_TAG_LENGTH;
+        let mut draft = vec![0_u8; encoded_length];
+        encode_keepalive_packet(header, &[], &[0; AUTHENTICATION_TAG_LENGTH], &mut draft)?;
+        let view = KeepalivePacketView::decode(&draft)?;
+        let tag = self
+            .protectors
+            .send()
+            .authenticate_header(sequence_number, view.authenticated_header())?;
+        let mut encoded = vec![0_u8; encoded_length];
+        encode_keepalive_packet(header, &[], &tag, &mut encoded)?;
+        self.next_sequence = sequence_number.checked_add(1);
+        Ok(encoded)
+    }
+
+    /// Authenticates one liveness probe and commits its shared replay sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataPlaneError`] for malformed packets, wrong session
+    /// context, replay, or failed authentication. Failed tags do not advance
+    /// replay state.
+    pub fn accept_keepalive(
+        &mut self,
+        datagram: &[u8],
+    ) -> Result<AuthenticatedKeepalive, DataPlaneError> {
+        let packet = KeepalivePacketView::decode(datagram)?;
+        let header = packet.header();
+        self.validate_keepalive_context(header)?;
+        self.replay.precheck(header.sequence_number)?;
+        self.protectors.receive().verify_header(
+            header.sequence_number,
+            packet.authenticated_header(),
+            packet.tag(),
+        )?;
+        self.replay.commit(header.sequence_number)?;
+        Ok(AuthenticatedKeepalive {
+            probe_id: header.probe_id,
+            echo_probe_id: header.echo_probe_id,
+        })
+    }
+
     /// Returns the highest authenticated receive sequence, if any.
     #[must_use]
     pub const fn highest_received_sequence(&self) -> Option<u64> {
@@ -425,6 +518,30 @@ impl PeerDataSession {
         let expected_encryption = self.policy.confidentiality == ConfidentialityPolicy::Encrypt;
         if header.is_encrypted() != expected_encryption {
             return Err(DataPlaneError::ConfidentialityMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_keepalive_context(&self, header: KeepaliveHeader) -> Result<(), DataPlaneError> {
+        if header.common.network_id != self.policy.network_id {
+            return Err(DataPlaneError::ContextMismatch {
+                field: "network ID",
+            });
+        }
+        if header.sender_node_id != self.peer_node_id {
+            return Err(DataPlaneError::ContextMismatch {
+                field: "sender node ID",
+            });
+        }
+        if header.session_id != self.session_id {
+            return Err(DataPlaneError::ContextMismatch {
+                field: "session ID",
+            });
+        }
+        if header.controller_epoch != self.controller_epoch {
+            return Err(DataPlaneError::ContextMismatch {
+                field: "controller epoch",
+            });
         }
         Ok(())
     }
@@ -672,7 +789,7 @@ mod tests {
         derive_session_secrets, session_transcript_hash, EphemeralPublicKey, EphemeralSecret,
         SessionRole,
     };
-    use stella_proto::{ConfidentialityPolicy, DataPacketView, NetworkPolicy};
+    use stella_proto::{ConfidentialityPolicy, DataPacketView, KeepalivePacketView, NetworkPolicy};
 
     const ALICE_SECRET: [u8; 32] = [7; 32];
     const BOB_SECRET: [u8; 32] = [9; 32];
@@ -808,6 +925,37 @@ mod tests {
             .expect("valid retry")
             .is_some());
         assert_eq!(bob.highest_received_sequence(), Some(1));
+    }
+
+    #[test]
+    fn keepalives_share_sequence_replay_and_echo_authenticated_probes() {
+        let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 1_500);
+        let data = alice
+            .protect_frame(&frame(64))
+            .expect("protect frame")
+            .remove(0);
+        bob.accept_datagram(&data, Duration::ZERO)
+            .expect("accept data");
+
+        let keepalive = alice.protect_keepalive(0).expect("protect keepalive");
+        let header = KeepalivePacketView::decode(&keepalive)
+            .expect("decode keepalive")
+            .header();
+        assert_eq!(header.sequence_number, 2);
+        let received = bob.accept_keepalive(&keepalive).expect("accept keepalive");
+        assert_eq!(received.probe_id(), 2);
+        assert_eq!(received.echo_probe_id(), 0);
+        assert_eq!(bob.highest_received_sequence(), Some(2));
+        assert!(matches!(
+            bob.accept_keepalive(&keepalive),
+            Err(DataPlaneError::Crypto(_))
+        ));
+
+        let echo = bob
+            .protect_keepalive(received.probe_id())
+            .expect("protect echo");
+        let echoed = alice.accept_keepalive(&echo).expect("accept echo");
+        assert_eq!(echoed.echo_probe_id(), 2);
     }
 
     #[test]

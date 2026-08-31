@@ -18,6 +18,8 @@ use crate::{
 };
 
 const ROUTINE_REKEY_PACKET_LIMIT: u64 = u32::MAX as u64;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const MAX_UNANSWERED_KEEPALIVES: usize = 3;
 
 /// Failure while routing one active virtual network.
 #[derive(Debug, Error)]
@@ -119,6 +121,10 @@ struct InstalledSession {
     data: PeerDataSession,
     session_id: u64,
     expires_at: u64,
+    last_activity_at: Duration,
+    outstanding_probes: BTreeSet<u64>,
+    highest_peer_probe: u64,
+    pending_echo_probe: Option<u64>,
 }
 
 /// Active, isolated state for one TAP-backed virtual network.
@@ -242,6 +248,38 @@ impl NetworkDataPlane {
             self.remove_session(peer);
         }
         let mut output = NetworkOutput::default();
+        let keepalive_due: Vec<NodeId> = self
+            .sessions
+            .iter()
+            .filter_map(|(peer, session)| {
+                (monotonic_now.saturating_sub(session.last_activity_at) >= KEEPALIVE_INTERVAL)
+                    .then_some(*peer)
+            })
+            .collect();
+        for peer in keepalive_due {
+            let timed_out = self.sessions.get(&peer).is_some_and(|session| {
+                session.outstanding_probes.len() >= MAX_UNANSWERED_KEEPALIVES
+            });
+            if timed_out {
+                self.remove_session(peer);
+                continue;
+            }
+            let endpoint = self.peer_endpoint(peer)?;
+            let session = self
+                .sessions
+                .get_mut(&peer)
+                .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+            let echo_probe_id = session.pending_echo_probe.take().unwrap_or(0);
+            let bytes = session.data.protect_keepalive(echo_probe_id)?;
+            let probe_id = session.data.sent_packet_count();
+            session.outstanding_probes.insert(probe_id);
+            session.last_activity_at = monotonic_now;
+            output.datagrams.push(RoutedDatagram {
+                peer_node_id: peer,
+                endpoint,
+                bytes,
+            });
+        }
         for transmission in self.handshakes.poll_retransmissions(monotonic_now) {
             output.datagrams.push(self.route_handshake(transmission)?);
         }
@@ -282,6 +320,7 @@ impl NetworkDataPlane {
                     bytes,
                 });
             }
+            session.last_activity_at = now;
         }
         Ok(output)
     }
@@ -319,9 +358,9 @@ impl NetworkDataPlane {
                     wall_time,
                     monotonic_now,
                 )?;
-                self.apply_handshake_event(event)
+                self.apply_handshake_event(event, monotonic_now)
             }
-            PacketType::Keepalive => Ok(NetworkOutput::default()),
+            PacketType::Keepalive => self.accept_keepalive(source, datagram, monotonic_now),
         }
     }
 
@@ -399,8 +438,10 @@ impl NetworkDataPlane {
             return Err(NetworkDataError::NoPeerSession { peer_node_id: peer });
         }
         let Some(frame) = session.data.accept_datagram(datagram, now)? else {
+            session.last_activity_at = now;
             return Ok(NetworkOutput::default());
         };
+        session.last_activity_at = now;
         match self.switch.accept_peer_frame(peer, &frame, now)? {
             PeerIngress::DeliverToTap => Ok(NetworkOutput {
                 datagrams: Vec::new(),
@@ -413,6 +454,7 @@ impl NetworkDataPlane {
     fn apply_handshake_event(
         &mut self,
         event: HandshakeEvent,
+        now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
         match event {
             HandshakeEvent::Ignored => Ok(NetworkOutput::default()),
@@ -438,6 +480,10 @@ impl NetworkDataPlane {
                         data,
                         session_id,
                         expires_at,
+                        last_activity_at: now,
+                        outstanding_probes: BTreeSet::new(),
+                        highest_peer_probe: 0,
+                        pending_echo_probe: None,
                     },
                 ) {
                     self.handshakes
@@ -446,6 +492,37 @@ impl NetworkDataPlane {
                 Ok(output)
             }
         }
+    }
+
+    fn accept_keepalive(
+        &mut self,
+        source: SocketAddr,
+        datagram: &[u8],
+        now: Duration,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        let header = stella_proto::KeepaliveHeader::decode(datagram)?;
+        let peer = header.sender_node_id;
+        self.validate_source(peer, source)?;
+        let session = self
+            .sessions
+            .get_mut(&peer)
+            .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+        if header.session_id != session.session_id {
+            return Err(NetworkDataError::NoPeerSession { peer_node_id: peer });
+        }
+        let keepalive = session.data.accept_keepalive(datagram)?;
+        let echo_probe_id = keepalive.echo_probe_id();
+        if echo_probe_id != 0 && session.outstanding_probes.contains(&echo_probe_id) {
+            session
+                .outstanding_probes
+                .retain(|probe_id| *probe_id > echo_probe_id);
+        }
+        if keepalive.probe_id() > session.highest_peer_probe {
+            session.highest_peer_probe = keepalive.probe_id();
+            session.pending_echo_probe = Some(keepalive.probe_id());
+        }
+        session.last_activity_at = now;
+        Ok(NetworkOutput::default())
     }
 
     fn route_handshake(
@@ -573,7 +650,7 @@ mod tests {
 
     use stella_common::{MacAddress, NetworkId};
     use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
+    use stella_proto::{CommonHeader, ConfidentialityPolicy, Endpoint, NetworkPolicy, PacketType};
     use stella_server::{
         network_state::encode_network_state,
         store::{AuthorityStore, NetworkRecord, NodeRecord},
@@ -847,6 +924,62 @@ mod tests {
             )
             .expect("receive reverse frame");
         assert_eq!(received.tap_frame(), Some(reverse.as_slice()));
+
+        let keepalive = alice
+            .maintain(&alice_key, WALL_TIME, Duration::from_secs(17))
+            .expect("alice keepalive")
+            .into_parts()
+            .0;
+        assert_eq!(keepalive.len(), 1);
+        assert_eq!(
+            CommonHeader::decode(keepalive[0].bytes())
+                .expect("keepalive header")
+                .packet_type,
+            PacketType::Keepalive
+        );
+        bob.accept_udp_datagram(
+            alice_address,
+            keepalive[0].bytes(),
+            &bob_key,
+            WALL_TIME,
+            Duration::from_secs(17),
+        )
+        .expect("bob accepts keepalive");
+
+        let echo = bob
+            .maintain(&bob_key, WALL_TIME, Duration::from_secs(32))
+            .expect("bob keepalive echo")
+            .into_parts()
+            .0;
+        assert_eq!(echo.len(), 1);
+        alice
+            .accept_udp_datagram(
+                bob_address,
+                echo[0].bytes(),
+                &alice_key,
+                WALL_TIME,
+                Duration::from_secs(32),
+            )
+            .expect("alice accepts keepalive echo");
+
+        for second in [47, 62, 77] {
+            let probes = alice
+                .maintain(&alice_key, WALL_TIME, Duration::from_secs(second))
+                .expect("unanswered keepalive")
+                .into_parts()
+                .0;
+            assert_eq!(probes.len(), 1);
+            assert_eq!(
+                CommonHeader::decode(probes[0].bytes())
+                    .expect("probe header")
+                    .packet_type,
+                PacketType::Keepalive
+            );
+        }
+        alice
+            .maintain(&alice_key, WALL_TIME, Duration::from_secs(92))
+            .expect("keepalive timeout");
+        assert!(alice.established_peers().is_empty());
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");

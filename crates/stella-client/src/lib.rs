@@ -21,7 +21,7 @@ pub use config::{ClientConfig, ClientConfigError, ConfiguredNetwork, CONFIG_VERS
 pub use control::{
     authenticate_controller, AuthenticatedControl, BearerCredential, ControllerTrust, Enrollment,
 };
-pub use data_plane::{DataPlaneError, PeerDataSession};
+pub use data_plane::{AuthenticatedKeepalive, DataPlaneError, PeerDataSession};
 pub use error::ClientError;
 pub use handshake::{
     EstablishedPeerSession, HandshakeError, HandshakeEvent, HandshakeTransmission,
