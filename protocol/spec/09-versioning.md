@@ -21,6 +21,13 @@ An interoperable Stella protocol selection is:
 The version 0.1 mandatory selection is `(0, 1, 0x0001)`. Major and minor are
 one-byte unsigned integers. Suite is a two-byte unsigned integer.
 
+The version 0.2 mandatory selection is `(0, 2, 0x0001)`. It retains the 0.1
+cryptographic suite and protected packet layouts while adding automatic
+connectivity, path identifiers in the local implementation, and the registered
+control messages and nested records defined by `02-control-plane.md`. A binary
+does not advertise 0.2 until it implements required ICE and relay behavior; a
+codec that can parse 0.2 records alone is not a complete 0.2 implementation.
+
 The leading zero means pre-standard maturity; it does not disable negotiation,
 validation, downgrade protection, or compatibility rules.
 

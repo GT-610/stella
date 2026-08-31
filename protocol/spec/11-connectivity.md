@@ -60,7 +60,7 @@ One local connectivity generation contains:
 - one through 32 candidates in descending preference;
 - the generation creation and expiry times;
 - the maximum Stella datagram accepted through each candidate; and
-- relay capabilities and carrier preferences.
+- relay carrier and relay-service identity for each ready relay candidate.
 
 Credentials and candidates are replaced atomically. A new generation does not
 patch or inherit candidates from an older generation. A node keeps the prior
@@ -131,9 +131,10 @@ peers in the same network. Leaving, suspension, disablement, lease expiry, or a
 newer generation invalidates pending checks for the prior state.
 
 The 0.2 control-message and nested-value registries encode generation,
-credentials, candidates, and relay configuration as explicit bounded binary
-records. Their byte layouts are added to the control-plane specification before
-the 0.2 codec is declared interoperable.
+credentials, candidates, and relay configuration as the explicit bounded
+binary records in `02-control-plane.md` and `12-relay.md`. Connectivity changes
+share the network snapshot revision stream but remain separate from stable
+membership records as required by ADR 0027.
 
 ## 8. ICE roles and checks
 

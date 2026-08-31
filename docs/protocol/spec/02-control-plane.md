@@ -148,6 +148,12 @@ All version 0.1 fields are critical:
 | `0x801b` | `SERVER_TIME` | Eight-byte Unix seconds |
 | `0x801c` | `RETRY_AFTER_MS` | Four bytes, zero or 100 through 60,000 |
 | `0x801d` | `SHUTDOWN_DEADLINE` | Eight-byte Unix seconds |
+| `0x801e` | `CONNECTIVITY_CONFIG_REVISION` | Eight bytes, non-zero; version 0.2 |
+| `0x801f` | `CONNECTIVITY_GENERATION` | Connectivity-generation encoding; version 0.2 |
+| `0x8020` | `CONNECTIVITY_LIST` | Connectivity-list encoding; version 0.2 |
+| `0x8021` | `CONNECTIVITY_RECORD` | One connectivity-record encoding; version 0.2 |
+| `0x8022` | `STUN_SERVER_LIST` | STUN-server-list encoding; version 0.2 |
+| `0x8023` | `RELAY_SERVICE_LIST` | Relay-service-list encoding; version 0.2 |
 
 Tokens are permitted only in the messages that name them. A receiver MUST NOT
 echo a token in status text or an error.
@@ -250,6 +256,112 @@ Entries are strictly sorted by network ID and contain no zero value.
 The membership-grant `policy_digest` is SHA-256 over these exact 64 bytes.
 Changing any policy byte requires a new controller epoch and new grants.
 
+### 7.6 Version 0.2 ICE candidate record
+
+Every ICE candidate record is exactly 72 bytes:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | `record_length`, exactly 72 |
+| 2 | 1 | candidate class |
+| 3 | 1 | carrier |
+| 4 | 4 | RFC 8445 candidate priority, non-zero |
+| 8 | 4 | implementation-local foundation value, non-zero |
+| 12 | 4 | maximum Stella datagram, 1,200 through 65,507 |
+| 16 | 2 | candidate port, non-zero |
+| 18 | 2 | related port, or zero when absent |
+| 20 | 1 | address family: 4 IPv4, 6 IPv6 |
+| 21 | 1 | flags, zero in version 0.2 |
+| 22 | 2 | zero reserved |
+| 24 | 16 | candidate address slot |
+| 40 | 16 | related address slot, or all zero |
+| 56 | 16 | relay ID, or all zero |
+
+IPv4 occupies the first four bytes of an address slot and the remaining twelve
+bytes are zero. IPv6 occupies all sixteen bytes. IPv4-mapped IPv6 is invalid.
+Unspecified, multicast, broadcast, and port-zero candidates are invalid.
+IPv6 link-local candidates are not encoded in version 0.2 because no scope ID
+field is defined.
+
+Candidate classes are 1 host, 2 server-reflexive, 3 automatically mapped, 4
+peer-reflexive, and 5 relay. Carriers are 1 direct UDP, 2 TURN over UDP, 3 TURN
+over TCP, 4 TURN over TLS, and 5 secure WebSocket. Non-relay candidates require
+carrier 1 and an all-zero relay ID. Relay candidates require class 5, carrier 2
+through 5, and a non-zero relay ID matching an authenticated relay service.
+
+A host candidate has an absent related address and port. Every other class
+identifies its base or related candidate with a valid same-family address and a
+non-zero related port. Candidate records in one generation are strictly ordered
+by decreasing priority. Equal priorities and exact duplicate records are
+invalid; an implementation chooses distinct priorities when its ICE library
+would otherwise produce a tie.
+
+### 7.7 Version 0.2 connectivity generation
+
+`CONNECTIVITY_GENERATION` begins with this 48-byte header:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | magic ASCII `SCG1` |
+| 4 | 1 | format version, exactly 1 |
+| 5 | 1 | candidate count, 1 through 32 |
+| 6 | 1 | ICE username-fragment byte length, 8 through 32 |
+| 7 | 1 | ICE password byte length, 22 through 64 |
+| 8 | 4 | complete generation length |
+| 12 | 2 | flags, zero in version 0.2 |
+| 14 | 2 | zero reserved |
+| 16 | 8 | random generation ID, non-zero |
+| 24 | 8 | random ICE role tie breaker, non-zero |
+| 32 | 8 | creation Unix time |
+| 40 | 8 | exclusive expiry Unix time |
+| 48 | variable | credentials, padding, then candidate records |
+
+The username fragment immediately follows the header, followed by the password.
+Both use the RFC 8445 `ice-char` alphabet, contain no NUL byte, and are not
+NUL-terminated. Zero padding extends the combined credential area to a
+four-byte boundary. Exactly `candidate_count` 72-byte candidate records follow.
+No trailing bytes are permitted.
+
+Expiry is greater than creation, and the lifetime is at most 600 seconds. The
+generation ID is a correlation value; the password is secret. Diagnostics and
+debug formatting expose only generation ID, times, lengths, counts, and safe
+candidate metadata, never credential bytes.
+
+### 7.8 Version 0.2 connectivity record and list
+
+A connectivity record is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | complete record length |
+| 2 | 2 | zero reserved |
+| 4 | 16 | peer node ID, non-zero |
+| 20 | variable | one complete connectivity generation |
+
+The record length is a multiple of four and exactly 20 plus the embedded
+generation length. A connectivity list begins with `count u16`, two zero bytes,
+then exactly `count` records in strictly increasing node-ID order. Count is at
+most 255. A snapshot validates that every connectivity record names one member
+of its peer list. A peer-list entry without a connectivity record is valid and
+means authorized but currently unreachable.
+
+### 7.9 Version 0.2 STUN server list
+
+A STUN server list begins with `count u8` from 1 through 8 and three zero bytes.
+Each following 24-byte entry is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | address family: 4 IPv4, 6 IPv6 |
+| 1 | 1 | priority, zero highest |
+| 2 | 2 | UDP port, non-zero |
+| 4 | 16 | numeric address slot encoded as in candidate records |
+| 20 | 4 | zero reserved |
+
+Entries are strictly sorted by priority, family, address, and port. Addresses
+are unicast and are not treated as identity or trust anchors. `RELAY_SERVICE_LIST`
+uses the encoding and validation rules in `12-relay.md`.
+
 ## 8. Message registry and required fields
 
 Fields in each row are listed in required numeric order. Parentheses mark an
@@ -268,12 +380,15 @@ optional field.
 | `0x0013` | `LEAVE_RESULT` | S to C | status code, (status message), controller epoch, network ID |
 | `0x0020` | `ENDPOINT_UPDATE` | C to S | network ID, endpoint set |
 | `0x0021` | `ENDPOINT_RESULT` | S to C | status code, (status message), controller epoch, network ID, snapshot revision |
-| `0x0030` | `PEER_SNAPSHOT` | S to C | controller epoch, network ID, grant, policy, snapshot revision, peer list |
-| `0x0031` | `PEER_DELTA` | S to C | (node ID), controller epoch, network ID, snapshot revision, (peer record), delta operation |
+| `0x0022` | `CONNECTIVITY_UPDATE` | C to S | network ID, (connectivity generation); version 0.2 |
+| `0x0023` | `CONNECTIVITY_RESULT` | S to C | status code, (status message), controller epoch, network ID, snapshot revision; version 0.2 |
+| `0x0030` | `PEER_SNAPSHOT` | S to C | controller epoch, network ID, grant, policy, snapshot revision, peer list, connectivity list in version 0.2 |
+| `0x0031` | `PEER_DELTA` | S to C | (node ID), controller epoch, network ID, snapshot revision, (peer record), delta operation, (connectivity record in version 0.2) |
 | `0x0032` | `SNAPSHOT_REQUEST` | C to S | network ID, snapshot revision |
 | `0x0040` | `HEARTBEAT` | C to S | heartbeat counter, network revisions |
 | `0x0041` | `HEARTBEAT_ACK` | S to C | heartbeat counter, network revisions, server time |
 | `0x0050` | `GRANT_REFRESH` | S to C | controller epoch, network ID, grant, policy, snapshot revision |
+| `0x0060` | `CONNECTIVITY_CONFIG` | S to C | connectivity-config revision, STUN server list, relay service list; version 0.2 |
 | `0x00fe` | `SERVER_SHUTDOWN` | S to C | status message, shutdown deadline |
 | `0x00ff` | `ERROR` | Both | status code, (status message), (retry after) |
 
@@ -372,6 +487,8 @@ last accepted revision. `DELTA_OPERATION` values are:
 | ---: | --- | --- |
 | 1 | Add or replace peer | `PEER_RECORD` |
 | 2 | Remove peer | `NODE_ID` |
+| 3 | Add or replace peer connectivity | `CONNECTIVITY_RECORD` |
+| 4 | Withdraw peer connectivity | `NODE_ID` |
 
 A gap, duplicate with different content, lower revision, missing target, or
 policy inconsistency causes no partial update and triggers `SNAPSHOT_REQUEST`.
@@ -380,6 +497,33 @@ The controller answers with a full snapshot, not a chain of guessed deltas.
 A higher authenticated controller epoch invalidates all lower-epoch local
 state before the new snapshot is activated. A removal immediately erases the
 peer's sessions, forwarding entries, and reassembly buffers.
+
+In version 0.2, operations 3 and 4 share this exact revision sequence. Operation
+3 is invalid unless the connectivity record's node ID names an existing peer
+and agrees with an optional `NODE_ID` field. Operation 4 removes only
+connectivity and path state; it does not revoke membership. Version 0.1 rejects
+operations 3 and 4.
+
+### 12.1 Version 0.2 connectivity publication and configuration
+
+An authenticated version 0.2 client sends `CONNECTIVITY_UPDATE` only after a
+successful network join. A present generation atomically replaces the prior
+generation. Omitting `CONNECTIVITY_GENERATION` withdraws reachability without
+leaving. The controller validates credentials, times, counts, candidate
+addresses, relay IDs, ordering, and deployment policy before committing the
+replacement.
+
+A successful replacement or withdrawal increments the ordinary network
+snapshot revision once. `CONNECTIVITY_RESULT` reports that committed revision,
+and the controller distributes operation 3 or 4 to other online members. A
+failed update changes no stored generation or revision.
+
+After version 0.2 authentication, and whenever service information or relay
+credentials change, the controller sends `CONNECTIVITY_CONFIG`. Its revision is
+deployment-scoped and monotonic. The relay service list contains credentials
+only for the receiving node. A client replaces the complete configuration
+atomically and renews it before credential expiry. It never republishes relay
+allocation credentials to peers.
 
 ## 13. Grant refresh
 
@@ -452,6 +596,10 @@ Version 0.1 assigns:
 | 301 | `RESOURCE_LIMIT` | Bounded controller or client resource is exhausted |
 | 302 | `TOO_MANY_ENDPOINTS` | Endpoint count exceeds the protocol limit |
 | 303 | `DATAGRAM_SIZE_INVALID` | Endpoint datagram size is outside allowed bounds |
+| 304 | `TOO_MANY_CANDIDATES` | ICE candidate count exceeds the version 0.2 limit |
+| 305 | `CONNECTIVITY_GENERATION_INVALID` | Candidate generation or credentials are malformed or inconsistent |
+| 306 | `CONNECTIVITY_GENERATION_EXPIRED` | Published generation is already expired or outside the accepted clock window |
+| 307 | `RELAY_CONFIGURATION_UNAVAILABLE` | No policy-compatible relay configuration can currently be issued |
 | 400 | `TEMPORARILY_UNAVAILABLE` | Retryable controller failure |
 | 401 | `PERSISTENCE_FAILURE` | Controller could not commit authoritative state |
 | 500 | `SNAPSHOT_REQUIRED` | Client must request or accept a complete snapshot |
@@ -491,6 +639,9 @@ The reference implementation enforces at least these bounds per connection:
 - 256 outstanding correlated requests;
 - 256 joined networks, with deployments expected to configure fewer;
 - eight endpoints per network;
+- 32 candidates per version 0.2 connectivity generation;
+- 255 peer connectivity records per network snapshot;
+- eight STUN services and eight relay services per version 0.2 configuration;
 - 256 total members per version 0.1 network;
 - 64 KiB maximum aggregate buffered outbound control data;
 - ten-second authentication and request timeout;

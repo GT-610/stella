@@ -32,6 +32,72 @@ Relay configuration is authority metadata from the controller, not a network
 membership grant. The client validates every address, size, name, expiry, and
 carrier before connecting.
 
+### 2.1 Version 0.2 relay-service encoding
+
+`RELAY_SERVICE_LIST` begins with `count u8` from 1 through 8 and three zero
+bytes, followed by exactly `count` self-sized relay service records. Records are
+strictly sorted by numeric priority and then relay ID.
+
+Each service record begins with this 68-byte header:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | complete record length, a multiple of four |
+| 2 | 1 | numeric address count, 0 through 8 |
+| 3 | 1 | SHA-256 SPKI pin count, 0 through 4 |
+| 4 | 16 | stable non-zero relay ID |
+| 20 | 2 | carrier bit mask |
+| 22 | 2 | service priority, zero highest |
+| 24 | 4 | maximum relayed Stella datagram, 1,200 through 65,507 |
+| 28 | 4 | advertised allocation lifetime, 60 through 3,600 seconds |
+| 32 | 4 | idle timeout, 30 through 3,600 seconds |
+| 36 | 8 | credential issue Unix time |
+| 44 | 8 | exclusive credential expiry Unix time |
+| 52 | 1 | DNS hostname length, 0 through 253 |
+| 53 | 1 | TLS server-name length, 0 through 253 |
+| 54 | 1 | credential username length, 1 through 128 |
+| 55 | 1 | credential secret length, 16 through 128 |
+| 56 | 1 | region-label length, 0 through 32 |
+| 57 | 1 | TLS trust requirements |
+| 58 | 2 | zero reserved |
+| 60 | 2 | TURN/UDP port or zero |
+| 62 | 2 | TURN/TCP port or zero |
+| 64 | 2 | TURN/TLS port or zero |
+| 66 | 2 | secure WebSocket port or zero |
+| 68 | variable | strings, padding, addresses, then SPKI pins |
+
+Carrier-mask bits 0 through 3 mean TURN/UDP, TURN/TCP, TURN/TLS, and secure
+WebSocket respectively. At least one bit is set and all higher bits are zero.
+The port corresponding to a set bit is non-zero; every other carrier port is
+zero. The WebSocket path and subprotocol remain the fixed values in section 4.
+
+The variable strings occur without terminators in header order: DNS hostname,
+TLS server name, credential username, credential secret, and region label.
+Zero bytes then pad the combined string area to a four-byte boundary. Hostname,
+TLS name, username, and region use printable ASCII without control characters;
+DNS and TLS names use canonical lower-case A-label form. The credential secret
+is opaque and may contain any byte. Neither credential field appears in debug,
+status, error, or ordinary trace output.
+
+TLS trust value 0 is permitted only when neither TLS nor WebSocket is offered.
+Bit 0 requires normal Web PKI validation against the advertised TLS name. Bit 1
+requires one advertised SHA-256 SPKI pin to match. No other bits are defined;
+when both bits are set both checks are required. Pin count is non-zero exactly
+when bit 1 is set. TLS name is non-empty whenever bit 0 is set.
+
+Each numeric relay address is a 20-byte record containing address family `u8`,
+address priority `u8`, zero reserved `u16`, and a 16-byte address slot encoded
+as in `02-control-plane.md`. Records are sorted by priority, family, and address.
+At least one numeric address or a DNS hostname is present. Numeric addresses are
+unicast and never establish relay identity; TLS validation and relay
+authentication remain mandatory where applicable.
+
+The exact address records are followed by `pin_count` raw 32-byte SHA-256 SPKI
+digests in strictly increasing byte order. The service record ends immediately
+after the final pin. Credential expiry is greater than issue time and no more
+than 600 seconds later. Relay IDs, service endpoints, and credentials are
+validated as one complete replacement configuration before use.
+
 ## 3. TURN profile
 
 The standards-based relay follows TURN and its current updates. One active
