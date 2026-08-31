@@ -131,6 +131,7 @@ pub struct AuthenticatedControl {
     controller_id: ControllerId,
     controller_public_key: IdentityPublicKey,
     node_id: NodeId,
+    node_public_key: IdentityPublicKey,
     server_time: u64,
 }
 
@@ -151,6 +152,12 @@ impl AuthenticatedControl {
     #[must_use]
     pub const fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// Returns the node public key authenticated on this connection.
+    #[must_use]
+    pub const fn node_public_key(&self) -> IdentityPublicKey {
+        self.node_public_key
     }
 
     /// Returns the controller Unix time from the successful authentication.
@@ -354,6 +361,7 @@ pub async fn authenticate_controller(
         controller_id,
         controller_public_key,
         node_id,
+        node_public_key: identity.public_key(),
         server_time,
     })
 }

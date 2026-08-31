@@ -2,6 +2,7 @@
 
 use std::{io, net::SocketAddr};
 
+use stella_common::NetworkId;
 use stella_proto::{ControlFieldType, ControlMessageType};
 use thiserror::Error;
 
@@ -81,6 +82,27 @@ pub enum ClientError {
         /// Protocol status code from `AUTH_RESULT`.
         status: u16,
     },
+    /// An authenticated network-scoped request was rejected.
+    #[error("controller rejected {operation} for network {network_id} with status {status}")]
+    NetworkRequestRejected {
+        /// Stable operation name.
+        operation: &'static str,
+        /// Requested virtual network.
+        network_id: NetworkId,
+        /// Registered controller status code.
+        status: u16,
+    },
+    /// Two authenticated control objects disagree about one field.
+    #[error("{context} has inconsistent {field}")]
+    InconsistentControlField {
+        /// Relationship being checked.
+        context: &'static str,
+        /// First inconsistent field.
+        field: &'static str,
+    },
+    /// The local wall clock predates the Unix epoch.
+    #[error("system time is before the Unix epoch")]
+    SystemTimeBeforeUnixEpoch,
     /// A fixed-width field could not be represented by its protocol type.
     #[error("validated {field} has an unexpected width")]
     InvalidFieldWidth {

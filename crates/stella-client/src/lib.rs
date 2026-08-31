@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod active;
 mod control;
 mod error;
 mod state;

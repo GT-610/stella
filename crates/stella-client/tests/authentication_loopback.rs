@@ -15,13 +15,15 @@ use std::{
 use stella_client::{
     authenticate_controller, BearerCredential, ClientError, ControllerTrust, Enrollment, SpkiPin,
 };
+use stella_common::NetworkId;
 use stella_crypto::{derive_node_id, IdentitySigningKey};
+use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 use stella_server::{
     active::serve_control_session,
     bootstrap::{initialize_controller, BootstrapOptions},
     config::ServerConfig,
     runtime::{run_controller, SessionError, SessionHandler},
-    store::AuthorityStore,
+    store::{AuthorityStore, NetworkRecord},
 };
 use tokio::{sync::oneshot, time::sleep};
 
@@ -48,7 +50,28 @@ fn now() -> u64 {
         .as_secs()
 }
 
+fn network_policy(network_id: NetworkId) -> NetworkPolicy {
+    NetworkPolicy {
+        confidentiality: ConfidentialityPolicy::Encrypt,
+        max_frame_size: 1_514,
+        max_flood_peers: 8,
+        flood_rate: 1_000,
+        flood_burst: 2_000,
+        mac_age_seconds: 300,
+        heartbeat_seconds: 10,
+        peer_lease_seconds: 30,
+        session_lifetime_seconds: 900,
+        reassembly_timeout_ms: 3_000,
+        network_id,
+        policy_revision: 1,
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered end-to-end authentication and join transcript is clearer as one scenario"
+)]
 async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     let directory = temp_directory();
     let config_path = directory.join("server.toml");
@@ -69,6 +92,21 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .issue_enrollment_token(issued_at, issued_at + 3_600)
         .expect("issue enrollment token");
     let credential = BearerCredential::from_bytes(*enrollment_token.expose_secret());
+    let network_id = NetworkId::from_bytes([0x44; 16]);
+    store
+        .create_network(
+            &NetworkRecord::new(
+                network_policy(network_id),
+                "Windows loopback LAN",
+                issued_at,
+            )
+            .expect("valid network"),
+        )
+        .expect("create loopback network");
+    let join_token = store
+        .issue_join_token(network_id, issued_at, issued_at + 3_600)
+        .expect("issue join token");
+    let join_credential = BearerCredential::from_bytes(*join_token.expose_secret());
     drop(store);
 
     let handler: SessionHandler = Arc::new(|session| {
@@ -113,7 +151,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         ClientError::Tls(_)
     ));
 
-    let first = authenticate_after_listener_ready(
+    let mut first = authenticate_after_listener_ready(
         &trust,
         &node_key,
         Enrollment::new(&credential, "Windows loopback client"),
@@ -122,12 +160,36 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     assert_eq!(first.controller_id(), initialized.controller_id);
     assert_eq!(first.node_id(), node_id);
     assert!(first.server_time() >= issued_at);
+    let first_state = first
+        .join_network(network_id, Some(&join_credential))
+        .await
+        .expect("join network and activate initial snapshot");
+    assert_eq!(first_state.network_id(), network_id);
+    assert!(first_state.peers().is_empty());
     drop(first);
 
-    let second = authenticate_controller(&trust, &node_key, None)
+    let mut second = authenticate_controller(&trust, &node_key, None)
         .await
         .expect("known node authenticates without enrollment material");
     assert_eq!(second.node_id(), node_id);
+    let repeated_state = second
+        .join_network(network_id, None)
+        .await
+        .expect("existing membership rejoins without a token");
+    assert_eq!(
+        repeated_state.controller_epoch(),
+        first_state.controller_epoch()
+    );
+    assert!(matches!(
+        second
+            .join_network(NetworkId::from_bytes([0x45; 16]), None)
+            .await,
+        Err(ClientError::NetworkRequestRejected {
+            operation: "join",
+            status: 200,
+            ..
+        })
+    ));
     drop(second);
 
     shutdown_sender.send(()).expect("request server shutdown");
