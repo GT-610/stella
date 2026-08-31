@@ -30,3 +30,6 @@ ADR 记录约束 Stella 协议或其参考实现的决策。已接受的记录�
 - [0021：按单调期限刷新成员授权](./0021-refresh-membership-grants-on-monotonic-deadlines.md)
 - [0022：从控制器重建客户端转发状态](./0022-rebuild-client-state-from-controller.md)
 - [0023：限制 Windows 客户端数据运行时](./0023-bound-windows-client-data-runtime.md)
+- [0024：使用 ICE 和 STUN 建立自动对等连接](./0024-use-ice-for-connectivity.md)
+- [0025：维持待命 Relay 兜底路径](./0025-maintain-warm-relay-fallback.md)
+- [0026：将对等会话绑定到已验证路径](./0026-bind-sessions-to-validated-paths.md)

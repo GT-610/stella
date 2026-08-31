@@ -35,3 +35,6 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0021: Refresh membership grants on monotonic deadlines](./0021-refresh-membership-grants-on-monotonic-deadlines.md)
 - [0022: Rebuild client forwarding state from the controller](./0022-rebuild-client-state-from-controller.md)
 - [0023: Bound the Windows client data runtime](./0023-bound-windows-client-data-runtime.md)
+- [0024: Use ICE and STUN for automatic peer connectivity](./0024-use-ice-for-connectivity.md)
+- [0025: Maintain a warm relay fallback](./0025-maintain-warm-relay-fallback.md)
+- [0026: Bind peer sessions to validated paths](./0026-bind-sessions-to-validated-paths.md)
