@@ -3,6 +3,7 @@ use std::{
     io::Write,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,12 +14,15 @@ use stella_common::{NetworkId, NodeId};
 use stella_crypto::derive_controller_id;
 use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 use stella_server::{
+    active::serve_control_session,
     authority::{AuthorityHandle, AuthorityThread},
     bootstrap::{initialize_controller, BootstrapOptions},
     config::ServerConfig,
     identity::load_controller_identity,
+    runtime::{run_controller, SessionError, SessionHandler},
     store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
 };
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zeroize::Zeroizing;
 
 const DEFAULT_TOKEN_TTL_SECONDS: u64 = 3_600;
@@ -45,6 +49,8 @@ struct Cli {
 enum Command {
     /// Creates a complete controller deployment without overwriting files.
     Init(InitArgs),
+    /// Runs the TLS controller until Ctrl+C requests orderly shutdown.
+    Run,
     /// Creates, inspects, and deletes virtual networks.
     Network {
         #[command(subcommand)]
@@ -230,6 +236,7 @@ pub(crate) async fn run() -> Result<()> {
 async fn execute(cli: Cli, output: &mut dyn Write) -> Result<()> {
     match cli.command {
         Command::Init(args) => execute_init(&cli.config, args, output),
+        Command::Run => execute_run(&cli.config).await,
         Command::Network { command } => execute_network(&cli.config, command, output).await,
         Command::EnrollmentToken { command } => {
             execute_enrollment_token(&cli.config, command, output).await
@@ -238,6 +245,40 @@ async fn execute(cli: Cli, output: &mut dyn Write) -> Result<()> {
         Command::Node { command } => execute_node(&cli.config, command, output).await,
         Command::Member { command } => execute_member(&cli.config, command, output).await,
         Command::State { command } => execute_state(&cli.config, command, output).await,
+    }
+}
+
+async fn execute_run(config_path: &Path) -> Result<()> {
+    let config = ServerConfig::load(config_path)
+        .with_context(|| format!("could not load {}", config_path.display()))?;
+    let filter = tracing_subscriber::EnvFilter::try_new(&config.logging.filter)
+        .context("invalid configured tracing filter")?;
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .try_init()
+        .context("could not initialize controller logging")?;
+
+    let handler: SessionHandler = Arc::new(|session| {
+        Box::pin(async move {
+            serve_control_session(session)
+                .await
+                .map_err(|error| Box::new(error) as SessionError)
+        })
+    });
+    tracing::info!(config = %config_path.display(), "starting controller");
+    run_controller(config_path, ctrl_c_shutdown(), handler)
+        .await
+        .context("controller runtime failed")
+}
+
+async fn ctrl_c_shutdown() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("Ctrl+C received; starting orderly shutdown"),
+        Err(error) => {
+            tracing::error!(%error, "could not install Ctrl+C shutdown handler");
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -693,6 +734,7 @@ mod tests {
         assert!(
             Cli::try_parse_from(["stella-server", "member", "add", "--network", "00"]).is_err()
         );
+        assert!(Cli::try_parse_from(["stella-server", "run"]).is_ok());
         assert!(Cli::try_parse_from(["stella-server", "state", "verify"]).is_ok());
     }
 
