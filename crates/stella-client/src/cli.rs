@@ -229,6 +229,15 @@ async fn activate_control(
         .await
         .with_context(|| format!("join timed out for network {}", network.network_id))?
         .with_context(|| format!("could not rejoin network {}", network.network_id))?;
+    }
+    Ok(active)
+}
+
+async fn publish_configured_endpoints(
+    config: &ClientConfig,
+    active: &mut ActiveControl,
+) -> Result<()> {
+    for network in &config.networks {
         tokio::time::timeout(
             CONTROL_OPERATION_TIMEOUT,
             active.publish_endpoints(network.network_id, &config.advertised_endpoints),
@@ -247,7 +256,7 @@ async fn activate_control(
             )
         })?;
     }
-    Ok(active)
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -259,12 +268,16 @@ async fn run_active_control(
     let mut data = ClientDataRuntime::start(config, active.networks(), identity)
         .await
         .context("could not start Windows UDP/TAP data plane")?;
-    tracing::info!(
-        udp = %data.local_udp_address(),
-        networks = active.networks().len(),
-        "Windows data plane is active"
-    );
-    let result = run_active_io(config, identity, &mut active, &mut data).await;
+    let result = async {
+        publish_configured_endpoints(config, &mut active).await?;
+        tracing::info!(
+            udp = %data.local_udp_address(),
+            networks = active.networks().len(),
+            "Windows data plane is active"
+        );
+        run_active_io(config, identity, &mut active, &mut data).await
+    }
+    .await;
     let shutdown = data.shutdown().await.context("data-plane shutdown failed");
     result.and(shutdown)
 }
@@ -351,10 +364,11 @@ async fn run_active_io(
 
 #[cfg(not(target_os = "windows"))]
 async fn run_active_control(
-    _config: &ClientConfig,
+    config: &ClientConfig,
     _identity: &stella_crypto::IdentitySigningKey,
     mut active: ActiveControl,
 ) -> Result<()> {
+    publish_configured_endpoints(config, &mut active).await?;
     loop {
         let interval = heartbeat_interval(&active);
         let deadline = tokio::time::Instant::now() + interval;
