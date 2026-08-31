@@ -6,8 +6,9 @@ mod cli;
 
 use std::{io::Write, process::ExitCode};
 
-fn main() -> ExitCode {
-    match cli::run() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    match cli::run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let mut stderr = std::io::stderr().lock();

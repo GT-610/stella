@@ -25,16 +25,34 @@ Successful output contains the lowercase node ID and configuration path. The
 configuration initially has no network entries. Enrollment and join tokens are
 never accepted by `init` and are never written to disk.
 
-The remaining commands will use ephemeral token arguments:
+## Join
 
 ```powershell
-stella-client --config C:\Stella\client.toml join --network <id> --token <token> --tap-adapter "Stella LAN"
+stella-client --config C:\Stella\client.toml join `
+  --network <id> `
+  --token <unpadded-base64url-token> `
+  --tap-adapter "Stella LAN"
+```
+
+For a node not yet enrolled with the controller, add the one-use
+`--enrollment-token <unpadded-base64url-token>` argument. Both token forms must
+decode to exactly 32 bytes. They remain process-local, are redacted from debug
+output, and are never written to the configuration.
+
+`join` authenticates and waits for a complete validated controller snapshot
+before atomically persisting the network ID and TAP adapter. Repeating an
+already accepted join may omit `--token`; repeating it with the same TAP adapter
+is idempotent, while a conflicting adapter is rejected before contacting the
+controller.
+
+The following runtime commands are implemented in later Phase 2 batches:
+
+```powershell
 stella-client --config C:\Stella\client.toml run
 stella-client --config C:\Stella\client.toml status
 stella-client --config C:\Stella\client.toml leave --network <id>
 ```
 
-`join` persists only the network ID and TAP adapter after the controller has
-accepted membership. `leave` stops forwarding before requesting removal and
-deletes durable intent only after authoritative success. `status` never prints
-credentials or private key material.
+`leave` stops forwarding before requesting removal and deletes durable intent
+only after authoritative success. `status` never prints credentials or private
+key material.

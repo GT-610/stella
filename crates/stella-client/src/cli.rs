@@ -1,4 +1,4 @@
-//! Command-line parsing and create-new client initialization.
+//! Windows client command-line parsing, initialization, and network intent.
 
 use std::{
     fs::OpenOptions,
@@ -8,10 +8,15 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use atomic_write_file::AtomicWriteFile;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
-use stella_client::{create_node_identity, ClientConfig, SpkiPin};
-use stella_common::ControllerId;
+use stella_client::{
+    authenticate_controller, create_node_identity, load_node_identity, ActiveControl,
+    BearerCredential, ClientConfig, Enrollment, SpkiPin,
+};
+use stella_common::{ControllerId, NetworkId};
 use stella_crypto::derive_node_id;
 
 const DEFAULT_IDENTITY_PATH: &str = "secrets/node.pk8";
@@ -38,6 +43,8 @@ struct Cli {
 enum Command {
     /// Creates protected node identity and strict configuration files.
     Init(InitArgs),
+    /// Authenticates, joins one network, and then persists desired membership.
+    Join(JoinArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -65,11 +72,152 @@ struct InitArgs {
     identity: PathBuf,
 }
 
-pub(crate) fn run() -> Result<()> {
+#[derive(Debug, Args)]
+struct JoinArgs {
+    /// Virtual network to join.
+    #[arg(long)]
+    network: NetworkId,
+    /// Single-use network join token; omit when membership already exists.
+    #[arg(long)]
+    token: Option<CliCredential>,
+    /// Single-use node enrollment token for a node unknown to the controller.
+    #[arg(long)]
+    enrollment_token: Option<CliCredential>,
+    /// Exact TAP-Windows adapter display name for this network.
+    #[arg(long)]
+    tap_adapter: String,
+}
+
+#[derive(Clone)]
+struct CliCredential(BearerCredential);
+
+impl std::fmt::Debug for CliCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CliCredential([REDACTED])")
+    }
+}
+
+impl std::str::FromStr for CliCredential {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        let decoded = URL_SAFE_NO_PAD
+            .decode(text)
+            .map_err(|_| "credential must be unpadded base64url".to_owned())?;
+        let bytes = decoded.try_into().map_err(|value: Vec<u8>| {
+            format!(
+                "credential must decode to {} bytes, got {}",
+                BearerCredential::LENGTH,
+                value.len()
+            )
+        })?;
+        Ok(Self(BearerCredential::from_bytes(bytes)))
+    }
+}
+
+pub(crate) async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => initialize(&cli.config, &args, &mut std::io::stdout().lock()),
+        Command::Join(args) => {
+            join_network(&cli.config, &args, &mut std::io::stdout().lock()).await
+        }
     }
+}
+
+async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Write) -> Result<()> {
+    let config = ClientConfig::load(config_path).context("could not load client configuration")?;
+    validate_intent_compatibility(&config, args)?;
+    let identity = load_node_identity(&config.identity_path).with_context(|| {
+        format!(
+            "could not load node identity {}",
+            config.identity_path.display()
+        )
+    })?;
+    let enrollment = args
+        .enrollment_token
+        .as_ref()
+        .map(|credential| Enrollment::new(&credential.0, &config.display_name));
+    let connection = authenticate_controller(&config.controller, &identity, enrollment)
+        .await
+        .context("controller authentication failed")?;
+    let mut active = ActiveControl::new(connection);
+    let state = active
+        .join_network(args.network, args.token.as_ref().map(|value| &value.0))
+        .await
+        .context("controller network join failed")?;
+    let epoch = state.controller_epoch();
+    let revision = state.snapshot_revision();
+    persist_network_intent(config_path, args.network, &args.tap_adapter)?;
+    writeln!(output, "network_id={}", args.network)?;
+    writeln!(output, "controller_epoch={epoch}")?;
+    writeln!(output, "snapshot_revision={revision}")?;
+    Ok(())
+}
+
+fn validate_intent_compatibility(config: &ClientConfig, args: &JoinArgs) -> Result<()> {
+    if let Some(existing) = config
+        .networks
+        .iter()
+        .find(|network| network.network_id == args.network)
+    {
+        if existing.tap_adapter != args.tap_adapter {
+            anyhow::bail!(
+                "network {} is already configured for TAP adapter {:?}",
+                args.network,
+                existing.tap_adapter
+            );
+        }
+    }
+    Ok(())
+}
+
+fn persist_network_intent(config_path: &Path, network_id: NetworkId, tap: &str) -> Result<()> {
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("could not reread {}", config_path.display()))?;
+    let mut document = text
+        .parse::<toml::Table>()
+        .context("could not decode configuration for network persistence")?;
+    let networks = document
+        .entry("networks")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("configuration networks field is not an array"))?;
+    let id = network_id.to_string();
+    for entry in networks.iter() {
+        let table = entry
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("configuration network entry is not a table"))?;
+        if table.get("id").and_then(toml::Value::as_str) == Some(id.as_str()) {
+            if table.get("tap_adapter").and_then(toml::Value::as_str) == Some(tap) {
+                return Ok(());
+            }
+            anyhow::bail!("network {network_id} has a conflicting TAP adapter");
+        }
+    }
+    let mut entry = toml::Table::new();
+    entry.insert("id".to_owned(), toml::Value::String(id));
+    entry.insert(
+        "tap_adapter".to_owned(),
+        toml::Value::String(tap.to_owned()),
+    );
+    networks.push(toml::Value::Table(entry));
+    networks.sort_by(|left, right| {
+        left.get("id")
+            .and_then(toml::Value::as_str)
+            .cmp(&right.get("id").and_then(toml::Value::as_str))
+    });
+    let encoded = toml::to_string_pretty(&document)
+        .context("could not encode configuration with joined network")?;
+    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+    ClientConfig::parse(&encoded, base).context("updated client configuration is invalid")?;
+    let mut file = AtomicWriteFile::open(config_path)
+        .with_context(|| format!("could not open {} for atomic update", config_path.display()))?;
+    file.write_all(encoded.as_bytes())
+        .context("could not write updated client configuration")?;
+    file.commit()
+        .context("could not atomically commit updated client configuration")?;
+    Ok(())
 }
 
 fn initialize(config_path: &Path, args: &InitArgs, output: &mut dyn Write) -> Result<()> {
@@ -320,13 +468,17 @@ mod tests {
     use std::{
         net::{Ipv4Addr, SocketAddr},
         path::PathBuf,
+        str::FromStr,
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use stella_client::{load_node_identity, ClientConfig, SpkiPin};
-    use stella_common::ControllerId;
+    use stella_common::{ControllerId, NetworkId};
 
-    use super::{initialize, InitArgs};
+    use super::{
+        configuration_document, initialize, persist_network_intent, CliCredential, InitArgs,
+    };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -338,12 +490,8 @@ mod tests {
         ))
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn init_is_create_new_transactional_and_self_consistent() {
-        let directory = directory();
-        let config_path = directory.join("client.toml");
-        let args = InitArgs {
+    fn init_args() -> InitArgs {
+        InitArgs {
             controller: SocketAddr::from((Ipv4Addr::LOCALHOST, 44_900)),
             tls_name: "localhost".to_owned(),
             controller_id: ControllerId::from_bytes([0x41; 16]),
@@ -351,7 +499,56 @@ mod tests {
             display_name: "Windows node".to_owned(),
             udp_bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 45_100)),
             identity: PathBuf::from("secrets/node.pk8"),
-        };
+        }
+    }
+
+    #[test]
+    fn cli_credentials_require_exact_unpadded_base64url_and_redact() {
+        let encoded = URL_SAFE_NO_PAD.encode([0x5a; 32]);
+        let credential = CliCredential::from_str(&encoded).expect("parse credential");
+        assert_eq!(format!("{credential:?}"), "CliCredential([REDACTED])");
+        assert!(CliCredential::from_str(&format!("{encoded}=")).is_err());
+        assert!(CliCredential::from_str(&URL_SAFE_NO_PAD.encode([0x5a; 31])).is_err());
+        assert!(CliCredential::from_str("not+a+base64url+credential").is_err());
+    }
+
+    #[test]
+    fn network_intent_update_is_valid_atomic_idempotent_and_conflict_safe() {
+        let directory = directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let config_path = directory.join("client.toml");
+        let initial = configuration_document(&init_args()).expect("encode configuration");
+        std::fs::write(&config_path, initial).expect("write configuration");
+        let network_id = NetworkId::from_bytes([0x33; 16]);
+
+        persist_network_intent(&config_path, network_id, "Stella LAN")
+            .expect("persist network intent");
+        let first = std::fs::read_to_string(&config_path).expect("read updated configuration");
+        let loaded = ClientConfig::load(&config_path).expect("load updated configuration");
+        assert_eq!(loaded.networks.len(), 1);
+        assert_eq!(loaded.networks[0].network_id, network_id);
+        assert_eq!(loaded.networks[0].tap_adapter, "Stella LAN");
+
+        persist_network_intent(&config_path, network_id, "Stella LAN")
+            .expect("repeat identical persistence");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("reread configuration"),
+            first
+        );
+        assert!(persist_network_intent(&config_path, network_id, "Other TAP").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read after conflict"),
+            first
+        );
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn init_is_create_new_transactional_and_self_consistent() {
+        let directory = directory();
+        let config_path = directory.join("client.toml");
+        let args = init_args();
         let mut output = Vec::new();
         initialize(&config_path, &args, &mut output).expect("initialize client");
         let config = ClientConfig::load(&config_path).expect("load generated config");

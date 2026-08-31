@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use crate::{tls, ClientError, SpkiPin};
 
 /// One redacted fixed-width enrollment or join bearer credential.
+#[derive(Clone)]
 pub struct BearerCredential(Zeroizing<[u8; Self::LENGTH]>);
 
 impl BearerCredential {
