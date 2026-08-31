@@ -172,19 +172,22 @@ destination; a failed cleanup is reported explicitly. The command never
 overwrites a prior backup and copying the live database file outside this
 authority command remains unsupported.
 
-## Administrative CLI
+## Administrative CLI and daemon
 
-The current `stella-server` executable provides offline authority management:
+The current `stella-server` executable initializes and runs a complete
+control-plane deployment and provides authority management:
 
+- deployment initialization and the long-running TLS controller;
 - network create, list, show, and delete;
 - enrollment-token and join-token generation;
 - node list, enable, and disable;
 - member add, remove, suspend, and resume;
 - coordinated state backup and offline verification.
 
-The full `init` and `run` lifecycle commands are the next server milestone and
-are not advertised as available until their TLS startup path is complete. See
-the [server administration CLI reference](/api/server-cli) for exact syntax,
+`run` installs the configured logging filter, serves the active authenticated
+session state machine, and maps Ctrl+C to the bounded shutdown path described
+above. See the [Windows deployment guide](/guide/server-deployment) and
+[server administration CLI reference](/api/server-cli) for exact syntax,
 defaults, output contracts, and secret-handling guidance.
 
 Mutating commands open the same authority abstraction as the daemon, validate
@@ -201,9 +204,19 @@ known disabled nodes receive only the protocol's generic pre-authentication
 failure behavior.
 
 Only an active session may join, leave, publish endpoints, request snapshots,
-or send heartbeats. Successful commits are the sole source of response epochs,
-revisions, grants, and distributed peer state. A connection-local failure never
-partially updates authority state.
+or send heartbeats. Requests are handled sequentially per connection, and each
+successful response is built from one committed authority view. Successful
+commits are the sole source of response epochs, revisions, grants, and
+distributed peer state. A connection-local failure never partially updates
+authority state.
+
+Endpoint publication creates or refreshes a bounded peer lease. Heartbeats use
+monotonic counters, acknowledge the authoritative network epoch and snapshot
+revision, and trigger a complete atomic snapshot when the client's revision is
+stale. Membership grants are refreshed proactively at the midpoint of their
+validity using a monotonic local deadline. Authorization changes clear obsolete
+grant deadlines immediately, so a revoked, suspended, or departed membership
+cannot be refreshed from connection-local state.
 
 ## Verification
 

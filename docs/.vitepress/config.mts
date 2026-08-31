@@ -66,7 +66,8 @@ export default defineConfig({
           text: 'User guide',
           items: [
             { text: 'Project status', link: '/guide/' },
-            { text: 'Windows development setup', link: '/guide/windows-development' }
+            { text: 'Windows development setup', link: '/guide/windows-development' },
+            { text: 'Deploy a Windows controller', link: '/guide/server-deployment' }
           ]
         }
       ],

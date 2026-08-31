@@ -37,14 +37,32 @@ cargo test -p stella-tap --test windows_tap -- --ignored --nocapture
 The test restores media-disconnected state and does not install, remove,
 rename, enable, or disable an adapter.
 
-## Run the placeholder binaries
+## Run a development controller
 
-Phase 0 contains compileable entry points only:
+Initialize a disposable deployment outside the source tree, create a network
+and one pair of single-use client tokens, then run the TLS controller:
 
 ```powershell
-cargo run -p stella-server
-cargo run -p stella-client
+$Config = Join-Path $env:TEMP 'stella-dev\server.toml'
+
+cargo run -p stella-server -- --config $Config init `
+  --listen 127.0.0.1:44900
+
+$NetworkId = cargo run -q -p stella-server -- `
+  --config $Config network create --name 'Development LAN'
+$EnrollmentToken = cargo run -q -p stella-server -- `
+  --config $Config enrollment-token create
+$JoinToken = cargo run -q -p stella-server -- `
+  --config $Config join-token create --network $NetworkId
+
+cargo run -p stella-server -- --config $Config run
 ```
 
-They intentionally report that the functional implementation is not yet
-available.
+Record the initialization output, network ID, and tokens before starting the
+daemon. The tokens are sensitive and printed only once. Press Ctrl+C to drain
+active sessions and shut down cleanly.
+
+The controller control plane is functional. `stella-client` does not yet form a
+usable virtual LAN; its Windows control-plane and data-plane integration are
+the next implementation milestone. For a persistent deployment, follow the
+[Windows controller deployment guide](./server-deployment.md).

@@ -1,14 +1,11 @@
 # Server administration CLI
 
-`stella-server` initializes a controller deployment and provides offline
-authority administration commands. Administrative commands load the strict
-TOML configuration named by `--config` (default: `server.toml`), derive the
-controller ID from the protected controller identity, open the configured redb
-database, and perform database work on the serialized authority thread.
-
-The daemon `run` command is documented when its complete control-session path
-becomes available. The commands on this page are implemented and covered by
-tests.
+`stella-server` initializes a controller deployment, runs its TLS control-plane
+service, and provides authority administration commands. Every command loads
+the strict TOML configuration named by `--config` (default: `server.toml`).
+Commands that access authority state derive the controller ID from the
+protected controller identity, open the configured redb database, and perform
+database work on the serialized authority thread.
 
 ## Common syntax
 
@@ -48,6 +45,35 @@ config=<configuration path>
 
 Transfer the controller ID and SPKI pin to clients over a trusted channel. The
 private keys are never printed, and `run` will not regenerate missing files.
+
+## Run the controller
+
+```powershell
+stella-server --config C:\Stella\server.toml run
+```
+
+`run` validates the complete configuration, protected controller identity, TLS
+certificate and private key, controller-bound database, and persisted
+invariants before binding the configured TCP address. It then serves TLS 1.3
+control sessions for registration, authentication, network membership,
+endpoint publication, snapshots, heartbeats, and proactive membership-grant
+refreshes.
+
+The `[logging].filter` value uses `tracing-subscriber` filter syntax. The
+generated value `info,stella_server=info` writes human-readable operational
+logs to stderr without exposing bearer tokens or private keys. Invalid filters
+are rejected before the listener starts.
+
+Press Ctrl+C once to stop accepting connections. The daemon asks active
+sessions to shut down, waits up to `limits.shutdown_timeout_seconds`, aborts any
+remaining session tasks, orders authority shutdown after already admitted
+commands, and joins the authority thread. A clean shutdown exits with code 0.
+Configuration, identity, TLS, persistence, bind, session-runtime, or shutdown
+failures are reported to stderr and exit with a non-zero code.
+
+`run` never creates or repairs missing deployment files. Use `init` once, keep
+both files under `secrets` readable only by the controller account, and use the
+state maintenance commands below for verification and backups.
 
 ## Network management
 

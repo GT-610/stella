@@ -9,7 +9,9 @@ implementation focused on:
 - protocol-level authentication independent of the carrying network.
 
 The project is in pre-standard development and is not usable for production
-networking yet. Windows is the first implementation target.
+networking yet. The Windows core libraries and self-hosted controller control
+plane are implemented; Windows client and integrated L2 data-plane work is in
+progress.
 
 ## Workspace checks
 
@@ -21,4 +23,5 @@ bun run docs:build
 
 The normative protocol source is under [`protocol/`](protocol/README.md). The
 VitePress site is generated from `docs/` and synchronizes protocol pages before
-each development or production build.
+each development or production build. Controller setup and operation are
+documented in [`docs/guide/server-deployment.md`](docs/guide/server-deployment.md).
