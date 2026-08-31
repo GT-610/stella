@@ -16,8 +16,8 @@ use stella_crypto::IdentitySigningKey;
 use stella_proto::CommonHeader;
 use stella_tap::{TapCancellationHandle, TapConfig, TapDevice, TapError, WindowsTapDevice};
 use stella_transport::{
-    DatagramTransport, Endpoint as TransportEndpoint, TransportError, UdpConfig, UdpTransport,
-    DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
+    DatagramTransport, TransportError, UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE,
+    MAX_UDP_DATAGRAM_SIZE,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -163,10 +163,6 @@ impl ClientDataRuntime {
             .to_vec();
         let common = CommonHeader::decode(&datagram)?;
         let network_id = common.network_id;
-        let source = received
-            .source
-            .as_udp()
-            .ok_or(TransportError::UnsupportedEndpoint)?;
         let wall_time = unix_time()?;
         let monotonic_now = self.monotonic_now();
         let output = self
@@ -174,7 +170,13 @@ impl ClientDataRuntime {
             .get_mut(&network_id)
             .ok_or(NetworkDataError::WrongNetwork)?
             .plane
-            .accept_udp_datagram(source, &datagram, signing_key, wall_time, monotonic_now)?;
+            .accept_datagram(
+                &received.source,
+                &datagram,
+                signing_key,
+                wall_time,
+                monotonic_now,
+            )?;
         self.apply_output(network_id, output).await
     }
 
@@ -260,10 +262,6 @@ impl ClientDataRuntime {
             .to_vec();
         let common = CommonHeader::decode(&datagram)?;
         let network_id = common.network_id;
-        let source = received
-            .source
-            .as_udp()
-            .ok_or(TransportError::UnsupportedEndpoint)?;
         let wall_time = unix_time()?;
         let monotonic_now = self.monotonic_now();
         let output = self
@@ -271,7 +269,13 @@ impl ClientDataRuntime {
             .get_mut(&network_id)
             .ok_or(NetworkDataError::WrongNetwork)?
             .plane
-            .accept_udp_datagram(source, &datagram, signing_key, wall_time, monotonic_now)?;
+            .accept_datagram(
+                &received.source,
+                &datagram,
+                signing_key,
+                wall_time,
+                monotonic_now,
+            )?;
         self.apply_output(network_id, output).await
     }
 
@@ -445,12 +449,14 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         let (datagrams, tap_frame) = output.into_parts();
         for datagram in datagrams {
-            self.udp
-                .send_to(
-                    &TransportEndpoint::Udp(datagram.endpoint()),
-                    datagram.bytes(),
-                )
-                .await?;
+            let endpoint = self
+                .networks
+                .get(&network_id)
+                .ok_or(RuntimeError::TapWorkerStopped { network_id })?
+                .plane
+                .transport_endpoint(datagram.path_id())?
+                .clone();
+            self.udp.send_to(&endpoint, datagram.bytes()).await?;
         }
         if let Some(frame) = tap_frame {
             self.networks

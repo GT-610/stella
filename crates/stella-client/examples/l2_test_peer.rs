@@ -108,14 +108,10 @@ async fn main() -> Result<()> {
         Duration::ZERO,
     )
     .context("could not create headless data plane")?;
-    send_output(
-        &udp,
-        plane
-            .start_handshakes(&identity, unix_time()?, Duration::ZERO)
-            .context("could not start peer handshake")?,
-        None,
-    )
-    .await?;
+    let output = plane
+        .start_handshakes(&identity, unix_time()?, Duration::ZERO)
+        .context("could not start peer handshake")?;
+    send_output(&udp, &plane, output, None).await?;
 
     let (control, _) = listener
         .accept()
@@ -159,7 +155,7 @@ async fn main() -> Result<()> {
                         let output = plane
                             .accept_tap_frame(&frame, started_at.elapsed())
                             .context("headless frame injection failed")?;
-                        send_output(&udp, output, Some(&mut writer)).await?;
+                        send_output(&udp, &plane, output, Some(&mut writer)).await?;
                         write_line(&mut writer, "OK").await?;
                     }
                     Command::Quit => break,
@@ -182,7 +178,7 @@ async fn main() -> Result<()> {
                     unix_time()?,
                     started_at.elapsed(),
                 ) {
-                    Ok(output) => send_output(&udp, output, Some(&mut writer)).await?,
+                    Ok(output) => send_output(&udp, &plane, output, Some(&mut writer)).await?,
                     Err(error) => eprintln!("dropped invalid peer datagram: {error}"),
                 }
             }
@@ -223,7 +219,7 @@ async fn main() -> Result<()> {
                 let output = plane
                     .maintain(&identity, unix_time()?, started_at.elapsed())
                     .context("headless data-plane maintenance failed")?;
-                send_output(&udp, output, Some(&mut writer)).await?;
+                send_output(&udp, &plane, output, Some(&mut writer)).await?;
             }
         }
     }
@@ -235,6 +231,7 @@ async fn main() -> Result<()> {
 
 async fn send_output(
     udp: &UdpSocket,
+    plane: &NetworkDataPlane,
     output: NetworkOutput,
     mut writer: Option<&mut OwnedWriteHalf>,
 ) -> Result<()> {
@@ -243,6 +240,11 @@ async fn send_output(
         eprintln!("sending {} peer datagram(s)", datagrams.len());
     }
     for datagram in datagrams {
+        let endpoint = plane
+            .transport_endpoint(datagram.path_id())
+            .context("routed datagram path was withdrawn")?
+            .as_udp()
+            .context("headless peer only supports UDP paths")?;
         let packet_type = CommonHeader::decode(datagram.bytes()).map_or_else(
             |_| "malformed".to_owned(),
             |header| format!("{:?}", header.packet_type),
@@ -254,10 +256,18 @@ async fn send_output(
                 eprintln!("session rejection reason: {:?}", rejection.reason());
             }
         }
-        eprintln!("sending {packet_type} to {}", datagram.endpoint());
-        udp.send_to(datagram.bytes(), datagram.endpoint())
+        eprintln!(
+            "sending {packet_type} on path {} to {endpoint}",
+            datagram.path_id()
+        );
+        udp.send_to(datagram.bytes(), endpoint)
             .await
-            .with_context(|| format!("could not send datagram to {}", datagram.endpoint()))?;
+            .with_context(|| {
+                format!(
+                    "could not send datagram on path {} to {endpoint}",
+                    datagram.path_id()
+                )
+            })?;
     }
     if let (Some(frame), Some(writer)) = (tap_frame, writer.as_mut()) {
         write_line(writer, &format!("FRAME {}", encode_hex(&frame))).await?;

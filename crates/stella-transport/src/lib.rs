@@ -5,7 +5,7 @@
 mod error;
 mod udp;
 
-use std::{future::Future, net::SocketAddr, pin::Pin};
+use std::{future::Future, net::SocketAddr, num::NonZeroU64, pin::Pin};
 
 pub use error::{IoErrorClass, IoOperation, TransportError};
 pub use udp::{
@@ -18,6 +18,33 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 
 /// Boxed object-safe future returned by asynchronous transport methods.
 pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+/// Locally unique identifier for one validated datagram path generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PathId(NonZeroU64);
+
+impl PathId {
+    /// Creates a path identifier, rejecting zero.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the non-zero numeric identifier.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for PathId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
 
 /// Transport endpoint advertised to an authorized peer.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -33,6 +60,14 @@ impl Endpoint {
     pub const fn as_udp(&self) -> Option<SocketAddr> {
         match self {
             Self::Udp(address) => Some(*address),
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Udp(address) => write!(formatter, "udp://{address}"),
         }
     }
 }
@@ -89,4 +124,25 @@ pub trait DatagramTransport: Send + Sync {
     /// Shutdown is idempotent. The owning runtime drops the transport after its
     /// bounded drain deadline to release the operating-system socket.
     fn shutdown(&self) -> TransportFuture<'_, ()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Endpoint, PathId};
+
+    #[test]
+    fn path_ids_are_nonzero_ordered_and_displayed_canonically() {
+        assert_eq!(PathId::new(0), None);
+        let first = PathId::new(1).expect("non-zero path ID");
+        let second = PathId::new(2).expect("non-zero path ID");
+        assert!(first < second);
+        assert_eq!(first.get(), 1);
+        assert_eq!(first.to_string(), "1");
+    }
+
+    #[test]
+    fn transport_endpoints_include_their_carrier_in_diagnostics() {
+        let endpoint = Endpoint::Udp("127.0.0.1:44900".parse().expect("UDP endpoint"));
+        assert_eq!(endpoint.to_string(), "udp://127.0.0.1:44900");
+    }
 }

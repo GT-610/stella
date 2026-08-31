@@ -9,6 +9,7 @@ use std::{
 use stella_common::{MacAddress, NetworkId, NodeId};
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{CommonHeader, Endpoint, HandshakeHeader, PacketType};
+use stella_transport::{Endpoint as TransportEndpoint, PathId};
 use thiserror::Error;
 
 use crate::{
@@ -27,32 +28,41 @@ const MAX_UNANSWERED_KEEPALIVES: usize = 3;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NetworkDataError {
-    /// The network has no usable endpoint for an authorized peer.
-    #[error("peer {peer_node_id} has no usable endpoint for this UDP socket family")]
-    NoPeerEndpoint {
-        /// Peer without a compatible endpoint.
+    /// The network has no usable path for an authorized peer.
+    #[error("peer {peer_node_id} has no usable path for this transport")]
+    NoPeerPath {
+        /// Peer without a compatible path.
         peer_node_id: NodeId,
     },
-    /// A datagram source is not one of the sender's authenticated control-plane endpoints.
+    /// A datagram source does not resolve to an authorized peer path.
     #[error("datagram source {endpoint} is not authorized for peer {peer_node_id}")]
     UnauthorizedEndpoint {
         /// Claimed authenticated peer.
         peer_node_id: NodeId,
-        /// Numeric source observed by UDP.
-        endpoint: SocketAddr,
+        /// Transport source observed by the runtime.
+        endpoint: TransportEndpoint,
     },
-    /// An authenticated packet arrived from a different endpoint than the confirmed session.
+    /// An authenticated packet arrived through a different path than the confirmed session.
     #[error(
-        "datagram source {actual} does not match pinned endpoint {expected} for peer {peer_node_id}"
+        "datagram path {actual} does not match pinned path {expected} for peer {peer_node_id}"
     )]
-    SessionEndpointMismatch {
+    SessionPathMismatch {
         /// Peer whose session is pinned.
         peer_node_id: NodeId,
-        /// Endpoint confirmed by the handshake.
-        expected: SocketAddr,
-        /// Endpoint that supplied this datagram.
-        actual: SocketAddr,
+        /// Path confirmed by the handshake.
+        expected: PathId,
+        /// Path that supplied this datagram.
+        actual: PathId,
     },
+    /// A routed datagram refers to a path no longer owned by this network.
+    #[error("network does not own path {path_id}")]
+    UnknownPath {
+        /// Missing local path identifier.
+        path_id: PathId,
+    },
+    /// The local path identifier space was exhausted.
+    #[error("local path identifier space is exhausted")]
+    PathIdExhausted,
     /// The datagram belongs to another virtual network.
     #[error("datagram belongs to an unexpected network")]
     WrongNetwork,
@@ -76,11 +86,11 @@ pub enum NetworkDataError {
     Switch(#[from] SwitchError),
 }
 
-/// One complete UDP datagram routed to an authorized peer endpoint.
+/// One complete datagram routed to an authorized peer path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutedDatagram {
     peer_node_id: NodeId,
-    endpoint: SocketAddr,
+    path_id: PathId,
     bytes: Vec<u8>,
 }
 
@@ -91,10 +101,10 @@ impl RoutedDatagram {
         self.peer_node_id
     }
 
-    /// Returns the selected numeric UDP endpoint.
+    /// Returns the selected validated path.
     #[must_use]
-    pub const fn endpoint(&self) -> SocketAddr {
-        self.endpoint
+    pub const fn path_id(&self) -> PathId {
+        self.path_id
     }
 
     /// Borrows the complete datagram bytes.
@@ -135,7 +145,7 @@ struct InstalledSession {
     data: PeerDataSession,
     session_id: u64,
     expires_at: u64,
-    endpoint: SocketAddr,
+    path_id: PathId,
     last_activity_at: Duration,
     outstanding_probes: BTreeSet<u64>,
     highest_peer_probe: u64,
@@ -145,8 +155,14 @@ struct InstalledSession {
 
 struct RetiredSession {
     data: PeerDataSession,
-    endpoint: SocketAddr,
+    path_id: PathId,
     remove_at: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PeerPath {
+    peer_node_id: NodeId,
+    endpoint: TransportEndpoint,
 }
 
 /// Active, isolated state for one TAP-backed virtual network.
@@ -156,6 +172,9 @@ pub struct NetworkDataPlane {
     max_datagram_size: usize,
     switch: L2Switch,
     handshakes: PeerHandshakeManager,
+    paths: BTreeMap<PathId, PeerPath>,
+    peer_paths: BTreeMap<NodeId, Vec<PathId>>,
+    next_path_id: u64,
     sessions: BTreeMap<NodeId, InstalledSession>,
     retired_sessions: BTreeMap<(NodeId, u64), RetiredSession>,
 }
@@ -186,15 +205,23 @@ impl NetworkDataPlane {
             )?)?;
         }
         let switch = L2Switch::new(state.policy(), primary_mac, now)?;
-        Ok(Self {
+        let mut plane = Self {
             state,
             udp_family: IpFamily::from(udp_bind.ip()),
             max_datagram_size,
             switch,
             handshakes,
+            paths: BTreeMap::new(),
+            peer_paths: BTreeMap::new(),
+            next_path_id: 1,
             sessions: BTreeMap::new(),
             retired_sessions: BTreeMap::new(),
-        })
+        };
+        let peers: Vec<NodeId> = plane.state.peers().keys().copied().collect();
+        for peer in peers {
+            plane.install_peer_paths(peer)?;
+        }
+        Ok(plane)
     }
 
     /// Returns this isolated virtual network ID.
@@ -235,7 +262,7 @@ impl NetworkDataPlane {
                     .is_none_or(|session| session.rekeying)
                     && !self.handshakes.has_outgoing(*peer)
                     && self.handshakes.can_initiate(*peer, monotonic_now)
-                    && self.select_peer_endpoint(*peer).is_some()
+                    && self.select_peer_path(*peer).is_some()
             })
             .collect();
         let mut output = NetworkOutput::default();
@@ -307,7 +334,7 @@ impl NetworkDataPlane {
                 .sessions
                 .get_mut(&peer)
                 .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
-            let endpoint = session.endpoint;
+            let path_id = session.path_id;
             let echo_probe_id = session.pending_echo_probe.take().unwrap_or(0);
             let bytes = session.data.protect_keepalive(echo_probe_id)?;
             let probe_id = session.data.sent_packet_count();
@@ -315,7 +342,7 @@ impl NetworkDataPlane {
             session.last_activity_at = monotonic_now;
             output.datagrams.push(RoutedDatagram {
                 peer_node_id: peer,
-                endpoint,
+                path_id,
                 bytes,
             });
         }
@@ -351,11 +378,11 @@ impl NetworkDataPlane {
                 .sessions
                 .get_mut(&peer)
                 .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
-            let endpoint = session.endpoint;
+            let path_id = session.path_id;
             for bytes in session.data.protect_frame(frame)? {
                 output.datagrams.push(RoutedDatagram {
                     peer_node_id: peer,
-                    endpoint,
+                    path_id,
                     bytes,
                 });
             }
@@ -364,16 +391,16 @@ impl NetworkDataPlane {
         Ok(output)
     }
 
-    /// Authenticates and routes one UDP datagram from an authorized endpoint.
+    /// Authenticates and routes one datagram from an authorized transport path.
     ///
     /// # Errors
     ///
     /// Returns [`NetworkDataError`] for malformed context, endpoint spoofing,
     /// handshake failure, unknown session, failed packet protection, or invalid
     /// authenticated Ethernet input.
-    pub fn accept_udp_datagram(
+    pub fn accept_datagram(
         &mut self,
-        source: SocketAddr,
+        source: &TransportEndpoint,
         datagram: &[u8],
         signing_key: &IdentitySigningKey,
         wall_time: u64,
@@ -390,17 +417,43 @@ impl NetworkDataPlane {
             | PacketType::SessionConfirm
             | PacketType::SessionReject => {
                 let header = HandshakeHeader::decode(datagram)?;
-                self.validate_source(header.sender_node_id, source)?;
+                let path_id = self.resolve_peer_path(header.sender_node_id, source)?;
                 let event = self.handshakes.handle_datagram(
                     datagram,
                     signing_key,
                     wall_time,
                     monotonic_now,
                 )?;
-                self.apply_handshake_event(event, source, monotonic_now)
+                self.apply_handshake_event(event, path_id, monotonic_now)
             }
             PacketType::Keepalive => self.accept_keepalive(source, datagram, monotonic_now),
         }
+    }
+
+    /// Authenticates and routes one UDP datagram from an authorized endpoint.
+    ///
+    /// This compatibility entry point wraps the endpoint in the generic
+    /// transport-path representation used by [`Self::accept_datagram`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] for the same conditions as
+    /// [`Self::accept_datagram`].
+    pub fn accept_udp_datagram(
+        &mut self,
+        source: SocketAddr,
+        datagram: &[u8],
+        signing_key: &IdentitySigningKey,
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        self.accept_datagram(
+            &TransportEndpoint::Udp(source),
+            datagram,
+            signing_key,
+            wall_time,
+            monotonic_now,
+        )
     }
 
     /// Replaces authoritative control state and invalidates affected sessions.
@@ -429,6 +482,8 @@ impl NetworkDataPlane {
         if reset_all {
             self.sessions.clear();
             self.retired_sessions.clear();
+            self.paths.clear();
+            self.peer_paths.clear();
             self.switch = L2Switch::new(replacement.policy(), primary_mac, now)?;
             self.handshakes = PeerHandshakeManager::new(replacement.local_grant().node_id);
         }
@@ -437,10 +492,18 @@ impl NetworkDataPlane {
         for peer in old_peers.keys().copied() {
             if !self.state.peers().contains_key(&peer) {
                 self.remove_session(peer);
+                self.remove_peer_paths(peer);
                 self.handshakes.remove_peer(peer);
             }
         }
         for peer in current_peers {
+            let endpoints_changed = reset_all
+                || old_peers.get(&peer).is_none_or(|old| {
+                    self.state
+                        .peers()
+                        .get(&peer)
+                        .is_none_or(|current| old.endpoints() != current.endpoints())
+                });
             let changed = old_peers.get(&peer).is_none_or(|old| {
                 self.state.peers().get(&peer).is_none_or(|current| {
                     old.grant().grant_serial != current.grant().grant_serial
@@ -449,6 +512,10 @@ impl NetworkDataPlane {
             });
             if changed {
                 self.remove_session(peer);
+            }
+            if endpoints_changed {
+                self.remove_peer_paths(peer);
+                self.install_peer_paths(peer)?;
             }
             self.handshakes
                 .upsert_peer(PeerHandshakeConfig::from_network_state(
@@ -463,24 +530,24 @@ impl NetworkDataPlane {
 
     fn accept_data(
         &mut self,
-        source: SocketAddr,
+        source: &TransportEndpoint,
         datagram: &[u8],
         now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
         let header = stella_proto::DataHeader::decode(datagram)?;
         let peer = header.sender_node_id;
-        self.validate_source(peer, source)?;
+        let path_id = self.resolve_peer_path(peer, source)?;
         let frame = if let Some(session) = self.sessions.get_mut(&peer) {
             if header.session_id == session.session_id {
-                validate_pinned_endpoint(peer, session.endpoint, source)?;
+                validate_pinned_path(peer, session.path_id, path_id)?;
                 let frame = session.data.accept_datagram(datagram, now)?;
                 session.last_activity_at = now;
                 frame
             } else {
-                self.accept_retired_data(peer, header.session_id, source, datagram, now)?
+                self.accept_retired_data(peer, header.session_id, path_id, datagram, now)?
             }
         } else {
-            self.accept_retired_data(peer, header.session_id, source, datagram, now)?
+            self.accept_retired_data(peer, header.session_id, path_id, datagram, now)?
         };
         let Some(frame) = frame else {
             return Ok(NetworkOutput::default());
@@ -498,7 +565,7 @@ impl NetworkDataPlane {
         &mut self,
         peer: NodeId,
         session_id: u64,
-        source: SocketAddr,
+        path_id: PathId,
         datagram: &[u8],
         now: Duration,
     ) -> Result<Option<Vec<u8>>, NetworkDataError> {
@@ -506,14 +573,14 @@ impl NetworkDataPlane {
             .retired_sessions
             .get_mut(&(peer, session_id))
             .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
-        validate_pinned_endpoint(peer, retired.endpoint, source)?;
+        validate_pinned_path(peer, retired.path_id, path_id)?;
         Ok(retired.data.accept_datagram(datagram, now)?)
     }
 
     fn apply_handshake_event(
         &mut self,
         event: HandshakeEvent,
-        source: SocketAddr,
+        path_id: PathId,
         now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
         match event {
@@ -521,7 +588,7 @@ impl NetworkDataPlane {
                 Ok(NetworkOutput::default())
             }
             HandshakeEvent::Transmit(transmission) => Ok(NetworkOutput {
-                datagrams: vec![route_handshake_to(transmission, source)],
+                datagrams: vec![route_handshake_to(transmission, path_id)],
                 tap_frame: None,
             }),
             HandshakeEvent::Established {
@@ -533,7 +600,7 @@ impl NetworkDataPlane {
                 if let Some(transmission) = transmission {
                     output
                         .datagrams
-                        .push(route_handshake_to(transmission, source));
+                        .push(route_handshake_to(transmission, path_id));
                 }
                 let session_id = session.session_id();
                 let established_at = session.established_at();
@@ -545,7 +612,7 @@ impl NetworkDataPlane {
                         data,
                         session_id,
                         expires_at,
-                        endpoint: source,
+                        path_id,
                         last_activity_at: now,
                         outstanding_probes: BTreeSet::new(),
                         highest_peer_probe: 0,
@@ -558,7 +625,7 @@ impl NetworkDataPlane {
                             (peer_node_id, previous.session_id),
                             RetiredSession {
                                 data: previous.data,
-                                endpoint: previous.endpoint,
+                                path_id: previous.path_id,
                                 remove_at: now.saturating_add(OLD_SESSION_RECEIVE_GRACE),
                             },
                         );
@@ -574,20 +641,20 @@ impl NetworkDataPlane {
 
     fn accept_keepalive(
         &mut self,
-        source: SocketAddr,
+        source: &TransportEndpoint,
         datagram: &[u8],
         now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
         let header = stella_proto::KeepaliveHeader::decode(datagram)?;
         let peer = header.sender_node_id;
-        self.validate_source(peer, source)?;
+        let path_id = self.resolve_peer_path(peer, source)?;
         let Some(session) = self.sessions.get_mut(&peer) else {
-            return self.accept_retired_keepalive(peer, header.session_id, source, datagram);
+            return self.accept_retired_keepalive(peer, header.session_id, path_id, datagram);
         };
         if header.session_id != session.session_id {
-            return self.accept_retired_keepalive(peer, header.session_id, source, datagram);
+            return self.accept_retired_keepalive(peer, header.session_id, path_id, datagram);
         }
-        validate_pinned_endpoint(peer, session.endpoint, source)?;
+        validate_pinned_path(peer, session.path_id, path_id)?;
         let keepalive = session.data.accept_keepalive(datagram)?;
         let echo_probe_id = keepalive.echo_probe_id();
         if echo_probe_id != 0 && session.outstanding_probes.contains(&echo_probe_id) {
@@ -607,14 +674,14 @@ impl NetworkDataPlane {
         &mut self,
         peer: NodeId,
         session_id: u64,
-        source: SocketAddr,
+        path_id: PathId,
         datagram: &[u8],
     ) -> Result<NetworkOutput, NetworkDataError> {
         let retired = self
             .retired_sessions
             .get_mut(&(peer, session_id))
             .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
-        validate_pinned_endpoint(peer, retired.endpoint, source)?;
+        validate_pinned_path(peer, retired.path_id, path_id)?;
         retired.data.accept_keepalive(datagram)?;
         Ok(NetworkOutput::default())
     }
@@ -626,50 +693,109 @@ impl NetworkDataPlane {
         let (peer_node_id, bytes) = transmission.into_parts();
         Ok(RoutedDatagram {
             peer_node_id,
-            endpoint: self.peer_endpoint(peer_node_id)?,
+            path_id: self.peer_path(peer_node_id)?,
             bytes,
         })
     }
 
-    fn peer_endpoint(&self, peer: NodeId) -> Result<SocketAddr, NetworkDataError> {
-        self.select_peer_endpoint(peer)
-            .ok_or(NetworkDataError::NoPeerEndpoint { peer_node_id: peer })
+    /// Resolves one locally owned path to its transport-specific endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError::UnknownPath`] after path withdrawal or when
+    /// a routed datagram belongs to another network plane.
+    pub fn transport_endpoint(
+        &self,
+        path_id: PathId,
+    ) -> Result<&TransportEndpoint, NetworkDataError> {
+        self.paths
+            .get(&path_id)
+            .map(|path| &path.endpoint)
+            .ok_or(NetworkDataError::UnknownPath { path_id })
     }
 
-    fn select_peer_endpoint(&self, peer: NodeId) -> Option<SocketAddr> {
-        self.state.peers().get(&peer).and_then(|state| {
-            state
-                .endpoints()
-                .iter()
-                .copied()
-                .filter(|endpoint| self.udp_family.matches(*endpoint))
-                .min_by_key(|endpoint| {
-                    (
-                        endpoint.priority(),
-                        endpoint_address(*endpoint),
-                        endpoint.port(),
-                    )
+    fn peer_path(&self, peer: NodeId) -> Result<PathId, NetworkDataError> {
+        self.select_peer_path(peer)
+            .ok_or(NetworkDataError::NoPeerPath { peer_node_id: peer })
+    }
+
+    fn select_peer_path(&self, peer: NodeId) -> Option<PathId> {
+        self.peer_paths
+            .get(&peer)
+            .and_then(|paths| paths.first())
+            .copied()
+    }
+
+    fn resolve_peer_path(
+        &self,
+        peer: NodeId,
+        source: &TransportEndpoint,
+    ) -> Result<PathId, NetworkDataError> {
+        self.peer_paths
+            .get(&peer)
+            .and_then(|path_ids| {
+                path_ids.iter().copied().find(|path_id| {
+                    self.paths
+                        .get(path_id)
+                        .is_some_and(|path| path.peer_node_id == peer && &path.endpoint == source)
                 })
-                .map(endpoint_socket_address)
-        })
+            })
+            .ok_or_else(|| NetworkDataError::UnauthorizedEndpoint {
+                peer_node_id: peer,
+                endpoint: source.clone(),
+            })
     }
 
-    fn validate_source(&self, peer: NodeId, source: SocketAddr) -> Result<(), NetworkDataError> {
-        let authorized = self.state.peers().get(&peer).is_some_and(|state| {
-            state
-                .endpoints()
-                .iter()
-                .copied()
-                .map(endpoint_socket_address)
-                .any(|endpoint| endpoint == source)
+    fn install_peer_paths(&mut self, peer: NodeId) -> Result<(), NetworkDataError> {
+        let mut endpoints = self
+            .state
+            .peers()
+            .get(&peer)
+            .map(|state| {
+                state
+                    .endpoints()
+                    .iter()
+                    .copied()
+                    .filter(|endpoint| self.udp_family.matches(*endpoint))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        endpoints.sort_by_key(|endpoint| {
+            (
+                endpoint.priority(),
+                endpoint_address(*endpoint),
+                endpoint.port(),
+            )
         });
-        if !authorized {
-            return Err(NetworkDataError::UnauthorizedEndpoint {
-                peer_node_id: peer,
-                endpoint: source,
-            });
+        let mut path_ids = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let path_id = self.allocate_path_id()?;
+            self.paths.insert(
+                path_id,
+                PeerPath {
+                    peer_node_id: peer,
+                    endpoint: TransportEndpoint::Udp(endpoint_socket_address(endpoint)),
+                },
+            );
+            path_ids.push(path_id);
         }
+        self.peer_paths.insert(peer, path_ids);
         Ok(())
+    }
+
+    fn remove_peer_paths(&mut self, peer: NodeId) {
+        if let Some(path_ids) = self.peer_paths.remove(&peer) {
+            for path_id in path_ids {
+                self.paths.remove(&path_id);
+            }
+        }
+    }
+
+    fn allocate_path_id(&mut self) -> Result<PathId, NetworkDataError> {
+        let value = self.next_path_id;
+        let path_id = PathId::new(value).ok_or(NetworkDataError::PathIdExhausted)?;
+        self.next_path_id = value.checked_add(1).unwrap_or(0);
+        Ok(path_id)
     }
 
     fn remove_session(&mut self, peer: NodeId) {
@@ -756,22 +882,22 @@ fn endpoint_address(endpoint: Endpoint) -> [u8; 16] {
     }
 }
 
-fn route_handshake_to(transmission: HandshakeTransmission, endpoint: SocketAddr) -> RoutedDatagram {
+fn route_handshake_to(transmission: HandshakeTransmission, path_id: PathId) -> RoutedDatagram {
     let (peer_node_id, bytes) = transmission.into_parts();
     RoutedDatagram {
         peer_node_id,
-        endpoint,
+        path_id,
         bytes,
     }
 }
 
-fn validate_pinned_endpoint(
+fn validate_pinned_path(
     peer_node_id: NodeId,
-    expected: SocketAddr,
-    actual: SocketAddr,
+    expected: PathId,
+    actual: PathId,
 ) -> Result<(), NetworkDataError> {
     if actual != expected {
-        return Err(NetworkDataError::SessionEndpointMismatch {
+        return Err(NetworkDataError::SessionPathMismatch {
             peer_node_id,
             expected,
             actual,
@@ -796,6 +922,7 @@ mod tests {
         network_state::encode_network_state,
         store::{AuthorityStore, NetworkRecord, NodeRecord},
     };
+    use stella_transport::Endpoint as TransportEndpoint;
 
     use super::{NetworkDataError, NetworkDataPlane};
     use crate::{NetworkState, SnapshotInput};
@@ -965,6 +1092,132 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
+    #[test]
+    fn authorized_udp_endpoints_receive_distinct_resolvable_paths() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_id = derive_node_id(alice_key.public_key());
+        let bob_address: SocketAddr = "127.0.0.1:46002".parse().expect("bob address");
+        let primary =
+            TransportEndpoint::Udp("127.0.0.1:46001".parse().expect("primary alice address"));
+        let alternate =
+            TransportEndpoint::Udp("127.0.0.1:46003".parse().expect("alternate alice address"));
+        let plane = NetworkDataPlane::new(
+            state(&store, &controller, &bob_key, network_id),
+            MacAddress::from_bytes([0x02, 0, 0, 0, 1, 4]),
+            bob_address,
+            1_200,
+            &bob_key,
+            Duration::ZERO,
+        )
+        .expect("bob data plane");
+
+        let primary_path = plane
+            .resolve_peer_path(alice_id, &primary)
+            .expect("primary path");
+        let alternate_path = plane
+            .resolve_peer_path(alice_id, &alternate)
+            .expect("alternate path");
+        assert_ne!(primary_path, alternate_path);
+        assert_eq!(
+            plane
+                .transport_endpoint(primary_path)
+                .expect("resolve primary path"),
+            &primary
+        );
+        assert_eq!(
+            plane
+                .transport_endpoint(alternate_path)
+                .expect("resolve alternate path"),
+            &alternate
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn reconcile_preserves_paths_until_authoritative_endpoints_change() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_id = derive_node_id(alice_key.public_key());
+        let bob_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 1, 5]);
+        let bob_address: SocketAddr = "127.0.0.1:46002".parse().expect("bob address");
+        let old_endpoint =
+            TransportEndpoint::Udp("127.0.0.1:46001".parse().expect("old alice address"));
+        let new_address: SocketAddr = "127.0.0.1:46004".parse().expect("new alice address");
+        let new_endpoint = TransportEndpoint::Udp(new_address);
+        let mut plane = NetworkDataPlane::new(
+            state(&store, &controller, &bob_key, network_id),
+            bob_mac,
+            bob_address,
+            1_200,
+            &bob_key,
+            Duration::ZERO,
+        )
+        .expect("bob data plane");
+        let old_path = plane
+            .resolve_peer_path(alice_id, &old_endpoint)
+            .expect("old path");
+
+        plane
+            .reconcile(
+                state(&store, &controller, &bob_key, network_id),
+                &bob_key,
+                bob_mac,
+                Duration::from_secs(1),
+            )
+            .expect("reconcile unchanged state");
+        assert_eq!(
+            plane
+                .resolve_peer_path(alice_id, &old_endpoint)
+                .expect("preserved path"),
+            old_path
+        );
+
+        store
+            .publish_endpoints(
+                alice_id,
+                network_id,
+                &[Endpoint::UdpIpv4 {
+                    priority: 0,
+                    port: new_address.port(),
+                    max_datagram_size: 1_200,
+                    address: Ipv4Addr::LOCALHOST,
+                }],
+                130,
+            )
+            .expect("replace alice endpoints");
+        plane
+            .reconcile(
+                state(&store, &controller, &bob_key, network_id),
+                &bob_key,
+                bob_mac,
+                Duration::from_secs(2),
+            )
+            .expect("reconcile replacement state");
+
+        assert!(matches!(
+            plane.transport_endpoint(old_path),
+            Err(NetworkDataError::UnknownPath { path_id }) if path_id == old_path
+        ));
+        assert!(matches!(
+            plane.resolve_peer_path(alice_id, &old_endpoint),
+            Err(NetworkDataError::UnauthorizedEndpoint { .. })
+        ));
+        let new_path = plane
+            .resolve_peer_path(alice_id, &new_endpoint)
+            .expect("replacement path");
+        assert_ne!(new_path, old_path);
+        assert_eq!(
+            plane
+                .transport_endpoint(new_path)
+                .expect("resolve replacement path"),
+            &new_endpoint
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn establish(
         alice: &mut NetworkDataPlane,
@@ -1071,6 +1324,12 @@ mod tests {
             .into_parts()
             .0;
         assert_eq!(packets.len(), 1);
+        assert_eq!(
+            alice
+                .transport_endpoint(packets[0].path_id())
+                .expect("resolve routed datagram path"),
+            &TransportEndpoint::Udp(bob_address)
+        );
         let received = bob
             .accept_udp_datagram(
                 alice_address,
@@ -1117,11 +1376,11 @@ mod tests {
                 WALL_TIME,
                 Duration::from_secs(3),
             ),
-            Err(NetworkDataError::SessionEndpointMismatch {
+            Err(NetworkDataError::SessionPathMismatch {
                 peer_node_id: _,
                 expected,
                 actual,
-            }) if expected == alice_address && actual == alternate_alice_address
+            }) if expected != actual
         ));
 
         let keepalive = alice
