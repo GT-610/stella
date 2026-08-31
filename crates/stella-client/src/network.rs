@@ -39,6 +39,18 @@ pub enum NetworkDataError {
         /// Numeric source observed by UDP.
         endpoint: SocketAddr,
     },
+    /// An authenticated packet arrived from a different endpoint than the confirmed session.
+    #[error(
+        "datagram source {actual} does not match pinned endpoint {expected} for peer {peer_node_id}"
+    )]
+    SessionEndpointMismatch {
+        /// Peer whose session is pinned.
+        peer_node_id: NodeId,
+        /// Endpoint confirmed by the handshake.
+        expected: SocketAddr,
+        /// Endpoint that supplied this datagram.
+        actual: SocketAddr,
+    },
     /// The datagram belongs to another virtual network.
     #[error("datagram belongs to an unexpected network")]
     WrongNetwork,
@@ -121,6 +133,7 @@ struct InstalledSession {
     data: PeerDataSession,
     session_id: u64,
     expires_at: u64,
+    endpoint: SocketAddr,
     last_activity_at: Duration,
     outstanding_probes: BTreeSet<u64>,
     highest_peer_probe: u64,
@@ -264,11 +277,11 @@ impl NetworkDataPlane {
                 self.remove_session(peer);
                 continue;
             }
-            let endpoint = self.peer_endpoint(peer)?;
             let session = self
                 .sessions
                 .get_mut(&peer)
                 .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+            let endpoint = session.endpoint;
             let echo_probe_id = session.pending_echo_probe.take().unwrap_or(0);
             let bytes = session.data.protect_keepalive(echo_probe_id)?;
             let probe_id = session.data.sent_packet_count();
@@ -308,11 +321,11 @@ impl NetworkDataPlane {
         };
         let mut output = NetworkOutput::default();
         for peer in peers {
-            let endpoint = self.peer_endpoint(peer)?;
             let session = self
                 .sessions
                 .get_mut(&peer)
                 .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+            let endpoint = session.endpoint;
             for bytes in session.data.protect_frame(frame)? {
                 output.datagrams.push(RoutedDatagram {
                     peer_node_id: peer,
@@ -358,7 +371,7 @@ impl NetworkDataPlane {
                     wall_time,
                     monotonic_now,
                 )?;
-                self.apply_handshake_event(event, monotonic_now)
+                self.apply_handshake_event(event, source, monotonic_now)
             }
             PacketType::Keepalive => self.accept_keepalive(source, datagram, monotonic_now),
         }
@@ -434,6 +447,13 @@ impl NetworkDataPlane {
             .sessions
             .get_mut(&peer)
             .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+        if source != session.endpoint {
+            return Err(NetworkDataError::SessionEndpointMismatch {
+                peer_node_id: peer,
+                expected: session.endpoint,
+                actual: source,
+            });
+        }
         if header.session_id != session.session_id {
             return Err(NetworkDataError::NoPeerSession { peer_node_id: peer });
         }
@@ -454,12 +474,13 @@ impl NetworkDataPlane {
     fn apply_handshake_event(
         &mut self,
         event: HandshakeEvent,
+        source: SocketAddr,
         now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
         match event {
             HandshakeEvent::Ignored => Ok(NetworkOutput::default()),
             HandshakeEvent::Transmit(transmission) => Ok(NetworkOutput {
-                datagrams: vec![self.route_handshake(transmission)?],
+                datagrams: vec![route_handshake_to(transmission, source)],
                 tap_frame: None,
             }),
             HandshakeEvent::Established {
@@ -469,7 +490,9 @@ impl NetworkDataPlane {
             } => {
                 let mut output = NetworkOutput::default();
                 if let Some(transmission) = transmission {
-                    output.datagrams.push(self.route_handshake(transmission)?);
+                    output
+                        .datagrams
+                        .push(route_handshake_to(transmission, source));
                 }
                 let session_id = session.session_id();
                 let expires_at = session.expires_at();
@@ -480,6 +503,7 @@ impl NetworkDataPlane {
                         data,
                         session_id,
                         expires_at,
+                        endpoint: source,
                         last_activity_at: now,
                         outstanding_probes: BTreeSet::new(),
                         highest_peer_probe: 0,
@@ -507,6 +531,13 @@ impl NetworkDataPlane {
             .sessions
             .get_mut(&peer)
             .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+        if source != session.endpoint {
+            return Err(NetworkDataError::SessionEndpointMismatch {
+                peer_node_id: peer,
+                expected: session.endpoint,
+                actual: source,
+            });
+        }
         if header.session_id != session.session_id {
             return Err(NetworkDataError::NoPeerSession { peer_node_id: peer });
         }
@@ -639,6 +670,15 @@ fn endpoint_address(endpoint: Endpoint) -> [u8; 16] {
     }
 }
 
+fn route_handshake_to(transmission: HandshakeTransmission, endpoint: SocketAddr) -> RoutedDatagram {
+    let (peer_node_id, bytes) = transmission.into_parts();
+    RoutedDatagram {
+        peer_node_id,
+        endpoint,
+        bytes,
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::{
@@ -656,7 +696,7 @@ mod tests {
         store::{AuthorityStore, NetworkRecord, NodeRecord},
     };
 
-    use super::NetworkDataPlane;
+    use super::{NetworkDataError, NetworkDataPlane};
     use crate::{NetworkState, SnapshotInput};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -720,12 +760,20 @@ mod tests {
             .publish_endpoints(
                 alice_record.node_id(),
                 network_id,
-                &[Endpoint::UdpIpv4 {
-                    priority: 0,
-                    port: 46_001,
-                    max_datagram_size: 1_200,
-                    address: Ipv4Addr::LOCALHOST,
-                }],
+                &[
+                    Endpoint::UdpIpv4 {
+                        priority: 0,
+                        port: 46_001,
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::LOCALHOST,
+                    },
+                    Endpoint::UdpIpv4 {
+                        priority: 1,
+                        port: 46_003,
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::LOCALHOST,
+                    },
+                ],
                 120,
             )
             .expect("publish alice endpoint");
@@ -925,8 +973,32 @@ mod tests {
             .expect("receive reverse frame");
         assert_eq!(received.tap_frame(), Some(reverse.as_slice()));
 
+        let alternate_alice_address: SocketAddr =
+            "127.0.0.1:46003".parse().expect("alternate alice address");
+        let alternate_frame = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xc3);
+        let alternate_packet = alice
+            .accept_tap_frame(&alternate_frame, Duration::from_secs(3))
+            .expect("route alternate-source test")
+            .into_parts()
+            .0
+            .remove(0);
+        assert!(matches!(
+            bob.accept_udp_datagram(
+                alternate_alice_address,
+                alternate_packet.bytes(),
+                &bob_key,
+                WALL_TIME,
+                Duration::from_secs(3),
+            ),
+            Err(NetworkDataError::SessionEndpointMismatch {
+                peer_node_id: _,
+                expected,
+                actual,
+            }) if expected == alice_address && actual == alternate_alice_address
+        ));
+
         let keepalive = alice
-            .maintain(&alice_key, WALL_TIME, Duration::from_secs(17))
+            .maintain(&alice_key, WALL_TIME, Duration::from_secs(18))
             .expect("alice keepalive")
             .into_parts()
             .0;
@@ -942,12 +1014,12 @@ mod tests {
             keepalive[0].bytes(),
             &bob_key,
             WALL_TIME,
-            Duration::from_secs(17),
+            Duration::from_secs(18),
         )
         .expect("bob accepts keepalive");
 
         let echo = bob
-            .maintain(&bob_key, WALL_TIME, Duration::from_secs(32))
+            .maintain(&bob_key, WALL_TIME, Duration::from_secs(33))
             .expect("bob keepalive echo")
             .into_parts()
             .0;
@@ -958,11 +1030,11 @@ mod tests {
                 echo[0].bytes(),
                 &alice_key,
                 WALL_TIME,
-                Duration::from_secs(32),
+                Duration::from_secs(33),
             )
             .expect("alice accepts keepalive echo");
 
-        for second in [47, 62, 77] {
+        for second in [48, 63, 78] {
             let probes = alice
                 .maintain(&alice_key, WALL_TIME, Duration::from_secs(second))
                 .expect("unanswered keepalive")
@@ -977,7 +1049,7 @@ mod tests {
             );
         }
         alice
-            .maintain(&alice_key, WALL_TIME, Duration::from_secs(92))
+            .maintain(&alice_key, WALL_TIME, Duration::from_secs(93))
             .expect("keepalive timeout");
         assert!(alice.established_peers().is_empty());
 
