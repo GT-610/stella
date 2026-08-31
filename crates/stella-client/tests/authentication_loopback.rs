@@ -261,7 +261,34 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
             ..
         })
     ));
+    let leave_epoch = second
+        .leave_network(network_id)
+        .await
+        .expect("authoritatively leave network");
+    assert!(leave_epoch > reconciled_epoch);
+    assert!(second.network(network_id).is_none());
+    assert_eq!(
+        second
+            .leave_network(network_id)
+            .await
+            .expect("repeat leave is idempotent"),
+        leave_epoch
+    );
     drop(second);
+
+    let third_connection = authenticate_controller(&trust, &node_key, None)
+        .await
+        .expect("left node remains enrolled");
+    let mut third = ActiveControl::new(third_connection);
+    assert!(matches!(
+        third.join_network(network_id, None).await,
+        Err(ClientError::NetworkRequestRejected {
+            operation: "join",
+            status: 111,
+            ..
+        })
+    ));
+    drop(third);
 
     shutdown_sender.send(()).expect("request server shutdown");
     server

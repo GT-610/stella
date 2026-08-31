@@ -56,13 +56,20 @@ identity, then prints the derived node ID, controller address/name/ID, UDP bind,
 and each desired network with its TAP adapter. It never prints SPKI pins,
 credentials, private key material, or the private-key path.
 
-The following runtime commands are implemented in later Phase 2 batches:
+## Leave
 
 ```powershell
-stella-client --config C:\Stella\client.toml run
 stella-client --config C:\Stella\client.toml leave --network <id>
 ```
 
-`leave` stops forwarding before requesting removal and deletes durable intent
-only after authoritative success. `status` never prints credentials or private
-key material.
+`leave` requires an existing desired-network entry. It starts with no active
+forwarding state, authenticates without accepting token material, validates the
+controller's authoritative `LEAVE_RESULT`, and only then atomically removes the
+network from local configuration. A failed or ambiguous request never enables
+forwarding and preserves durable intent for recovery or retry.
+
+The following runtime command is implemented in a later Phase 2 batch:
+
+```powershell
+stella-client --config C:\Stella\client.toml run
+```

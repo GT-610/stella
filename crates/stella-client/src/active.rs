@@ -75,6 +75,18 @@ impl ActiveControl {
             .ok_or(ClientError::NetworkNotActive { network_id })
     }
 
+    /// Stops local forwarding state before authoritatively leaving one
+    /// network and keeps the network inactive even if the request fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] for construction, carrier, correlation,
+    /// rejection, or inconsistent response failure.
+    pub async fn leave_network(&mut self, network_id: NetworkId) -> Result<u64, ClientError> {
+        self.networks.remove(&network_id);
+        self.connection.leave_network(network_id).await
+    }
+
     /// Publishes the complete receive-ready endpoint set and reconciles the
     /// resulting authoritative snapshot before returning.
     ///
@@ -580,6 +592,33 @@ impl AuthenticatedControl {
         let pending = PendingJoin::parse(&result, request_id, network_id)?;
         let snapshot = self.read_message().await?;
         pending.activate(self, &snapshot)
+    }
+
+    /// Requests authoritative removal from one network and returns the new
+    /// controller epoch after validating the complete direct response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] for construction, I/O, direction, correlation,
+    /// status, network identity, or epoch inconsistency.
+    pub async fn leave_network(&mut self, network_id: NetworkId) -> Result<u64, ClientError> {
+        let mut request = MessageBuilder::new(ControlMessageType::LeaveRequest);
+        request.push_field(ControlFieldType::NetworkId, network_id.as_bytes())?;
+        let request_id = self.write_message(request).await?;
+        let result = self.read_message().await?;
+        require_network_response(
+            &result,
+            ControlMessageType::LeaveResult,
+            request_id,
+            "leave",
+            network_id,
+        )?;
+        let controller_epoch = decode_u64(
+            field_value(&result, ControlFieldType::ControllerEpoch)?,
+            "leave controller epoch",
+        )?;
+        ensure_control_field(controller_epoch != 0, "LEAVE_RESULT", "controller epoch")?;
+        Ok(controller_epoch)
     }
 }
 

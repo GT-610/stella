@@ -45,6 +45,8 @@ enum Command {
     Init(InitArgs),
     /// Authenticates, joins one network, and then persists desired membership.
     Join(JoinArgs),
+    /// Stops forwarding intent and authoritatively leaves one network.
+    Leave(LeaveArgs),
     /// Prints local identity, controller, and desired-network state.
     Status,
 }
@@ -90,6 +92,13 @@ struct JoinArgs {
     tap_adapter: String,
 }
 
+#[derive(Clone, Debug, Args)]
+struct LeaveArgs {
+    /// Configured virtual network to leave.
+    #[arg(long)]
+    network: NetworkId,
+}
+
 #[derive(Clone)]
 struct CliCredential(BearerCredential);
 
@@ -124,8 +133,40 @@ pub(crate) async fn run() -> Result<()> {
         Command::Join(args) => {
             join_network(&cli.config, &args, &mut std::io::stdout().lock()).await
         }
+        Command::Leave(args) => {
+            leave_network(&cli.config, &args, &mut std::io::stdout().lock()).await
+        }
         Command::Status => status(&cli.config, &mut std::io::stdout().lock()),
     }
+}
+
+async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Write) -> Result<()> {
+    let config = ClientConfig::load(config_path).context("could not load client configuration")?;
+    if !config
+        .networks
+        .iter()
+        .any(|network| network.network_id == args.network)
+    {
+        anyhow::bail!("network {} is not configured", args.network);
+    }
+    let identity = load_node_identity(&config.identity_path).with_context(|| {
+        format!(
+            "could not load node identity {}",
+            config.identity_path.display()
+        )
+    })?;
+    let connection = authenticate_controller(&config.controller, &identity, None)
+        .await
+        .context("controller authentication failed")?;
+    let mut active = ActiveControl::new(connection);
+    let epoch = active
+        .leave_network(args.network)
+        .await
+        .context("controller network leave failed")?;
+    remove_network_intent(config_path, args.network)?;
+    writeln!(output, "network_id={}", args.network)?;
+    writeln!(output, "controller_epoch={epoch}")?;
+    Ok(())
 }
 
 fn status(config_path: &Path, output: &mut dyn Write) -> Result<()> {
@@ -244,6 +285,35 @@ fn persist_network_intent(config_path: &Path, network_id: NetworkId, tap: &str) 
     });
     let encoded = toml::to_string_pretty(&document)
         .context("could not encode configuration with joined network")?;
+    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+    ClientConfig::parse(&encoded, base).context("updated client configuration is invalid")?;
+    let mut file = AtomicWriteFile::open(config_path)
+        .with_context(|| format!("could not open {} for atomic update", config_path.display()))?;
+    file.write_all(encoded.as_bytes())
+        .context("could not write updated client configuration")?;
+    file.commit()
+        .context("could not atomically commit updated client configuration")?;
+    Ok(())
+}
+
+fn remove_network_intent(config_path: &Path, network_id: NetworkId) -> Result<()> {
+    let text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("could not reread {}", config_path.display()))?;
+    let mut document = text
+        .parse::<toml::Table>()
+        .context("could not decode configuration for network removal")?;
+    let networks = document
+        .get_mut("networks")
+        .and_then(toml::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("configuration networks field is not an array"))?;
+    let id = network_id.to_string();
+    let original_length = networks.len();
+    networks.retain(|entry| entry.get("id").and_then(toml::Value::as_str) != Some(id.as_str()));
+    if networks.len() == original_length {
+        anyhow::bail!("network {network_id} is not configured");
+    }
+    let encoded = toml::to_string_pretty(&document)
+        .context("could not encode configuration after network removal")?;
     let base = config_path.parent().unwrap_or_else(|| Path::new("."));
     ClientConfig::parse(&encoded, base).context("updated client configuration is invalid")?;
     let mut file = AtomicWriteFile::open(config_path)
@@ -512,7 +582,8 @@ mod tests {
     use stella_common::{ControllerId, NetworkId};
 
     use super::{
-        configuration_document, initialize, persist_network_intent, status, CliCredential, InitArgs,
+        configuration_document, initialize, persist_network_intent, remove_network_intent, status,
+        CliCredential, InitArgs,
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -574,6 +645,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&config_path).expect("read after conflict"),
             first
+        );
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn network_intent_removal_is_valid_atomic_and_missing_safe() {
+        let directory = directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let config_path = directory.join("client.toml");
+        let initial = configuration_document(&init_args()).expect("encode configuration");
+        std::fs::write(&config_path, initial).expect("write configuration");
+        let first = NetworkId::from_bytes([0x31; 16]);
+        let second = NetworkId::from_bytes([0x32; 16]);
+        persist_network_intent(&config_path, first, "First TAP").expect("persist first network");
+        persist_network_intent(&config_path, second, "Second TAP").expect("persist second network");
+
+        remove_network_intent(&config_path, first).expect("remove first network");
+        let remaining = ClientConfig::load(&config_path).expect("load updated configuration");
+        assert_eq!(remaining.networks.len(), 1);
+        assert_eq!(remaining.networks[0].network_id, second);
+        let after_removal = std::fs::read_to_string(&config_path).expect("read after removal");
+        assert!(remove_network_intent(&config_path, first).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read after missing removal"),
+            after_removal
         );
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
