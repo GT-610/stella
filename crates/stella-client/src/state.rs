@@ -9,6 +9,7 @@ use stella_crypto::{
 use stella_proto::{
     CodecError, Endpoint, MembershipGrant, MembershipGrantView, NetworkPolicy, PeerListView,
     PeerRecordView, MEMBERSHIP_GRANT_LENGTH, MEMBERSHIP_GRANT_SIGNATURE_DOMAIN,
+    NETWORK_POLICY_LENGTH,
 };
 use thiserror::Error;
 
@@ -107,6 +108,82 @@ impl NetworkState {
     #[must_use]
     pub const fn peers(&self) -> &BTreeMap<NodeId, PeerState> {
         &self.peers
+    }
+
+    /// Applies exactly the next authenticated peer delta atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] without changing the accepted revision or peer
+    /// map when controller context, revision, peer validation, capacity, or
+    /// removal-target checks fail.
+    pub fn apply_peer_delta(&mut self, input: &PeerDeltaInput<'_>) -> Result<(), StateError> {
+        validate_controller_id(input.controller_id, input.controller_public_key)?;
+        ensure_equal(
+            input.controller_id == self.local_grant.controller_id,
+            "peer delta",
+            "controller ID",
+        )?;
+        ensure_equal(
+            input.local_node_id == self.local_grant.node_id,
+            "peer delta",
+            "local node ID",
+        )?;
+        ensure_equal(
+            input.network_id == self.network_id,
+            "peer delta",
+            "network ID",
+        )?;
+        ensure_equal(
+            input.controller_epoch == self.controller_epoch,
+            "peer delta",
+            "controller epoch",
+        )?;
+        let expected_revision = self
+            .snapshot_revision
+            .checked_add(1)
+            .ok_or(StateError::SnapshotRevisionExhausted)?;
+        if input.snapshot_revision != expected_revision {
+            return Err(StateError::DeltaRevisionMismatch {
+                current: self.snapshot_revision,
+                actual: input.snapshot_revision,
+            });
+        }
+        let mut policy_bytes = [0_u8; NETWORK_POLICY_LENGTH];
+        self.policy.encode(&mut policy_bytes)?;
+
+        match input.operation {
+            PeerDeltaOperation::AddOrReplace(peer_bytes) => {
+                let peer = PeerRecordView::decode(peer_bytes)?;
+                if peer.node_id() == input.local_node_id {
+                    return Err(StateError::DeltaTargetsLocalNode);
+                }
+                let owned = validate_peer(
+                    &peer,
+                    NetworkValidationContext {
+                        controller_id: input.controller_id,
+                        controller_public_key: input.controller_public_key,
+                        network_id: input.network_id,
+                        controller_epoch: input.controller_epoch,
+                        policy: self.policy,
+                        policy_bytes: &policy_bytes,
+                        now: input.now,
+                    },
+                )?;
+                let maximum = usize::from(self.policy.max_flood_peers.saturating_sub(1));
+                if !self.peers.contains_key(&owned.node_id) && self.peers.len() >= maximum {
+                    return Err(StateError::PeerCapacityExceeded { maximum });
+                }
+                self.peers.insert(owned.node_id, owned);
+            }
+            PeerDeltaOperation::Remove(node_id) => {
+                if self.peers.remove(&node_id).is_none() {
+                    return Err(StateError::UnknownPeerRemoval { node_id });
+                }
+            }
+        }
+        self.snapshot_revision = input.snapshot_revision;
+        Ok(())
     }
 
     /// Replaces the local grant after validating one `GRANT_REFRESH` view.
@@ -270,6 +347,36 @@ pub struct GrantRefreshInput<'a> {
     pub policy_bytes: &'a [u8],
     /// Unix time used for grant validity checking.
     pub now: u64,
+}
+
+/// Borrowed fields from one authenticated `PEER_DELTA` message.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerDeltaInput<'a> {
+    /// Authenticated Stella controller ID.
+    pub controller_id: ControllerId,
+    /// Public key whose ID equals `controller_id`.
+    pub controller_public_key: IdentityPublicKey,
+    /// Locally authenticated node ID.
+    pub local_node_id: NodeId,
+    /// Network named by the enclosing delta.
+    pub network_id: NetworkId,
+    /// Authoritative controller epoch, which must equal the active epoch.
+    pub controller_epoch: u64,
+    /// Delta revision, which must equal the active revision plus one.
+    pub snapshot_revision: u64,
+    /// Add/replace or remove operation.
+    pub operation: PeerDeltaOperation<'a>,
+    /// Unix time used for peer grant validity checking.
+    pub now: u64,
+}
+
+/// Payload selected by a validated peer-delta operation field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerDeltaOperation<'a> {
+    /// Add a new peer or replace an existing peer with one complete record.
+    AddOrReplace(&'a [u8]),
+    /// Remove one peer that must already exist in the active map.
+    Remove(NodeId),
 }
 
 #[derive(Clone, Copy)]
@@ -442,6 +549,32 @@ pub enum StateError {
         /// Exclusive grant end.
         not_after: u64,
     },
+    /// The active snapshot revision cannot advance without wrapping.
+    #[error("snapshot revision is exhausted")]
+    SnapshotRevisionExhausted,
+    /// A delta did not immediately follow the accepted revision.
+    #[error("peer delta revision {actual} does not follow current revision {current}")]
+    DeltaRevisionMismatch {
+        /// Last accepted complete or delta revision.
+        current: u64,
+        /// Received delta revision.
+        actual: u64,
+    },
+    /// An add/replace delta attempted to insert the receiving node.
+    #[error("peer delta targets the local node")]
+    DeltaTargetsLocalNode,
+    /// An add delta would exceed the network's bounded peer map.
+    #[error("peer delta exceeds the maximum of {maximum} remote peers")]
+    PeerCapacityExceeded {
+        /// Maximum remote peers allowed by policy.
+        maximum: usize,
+    },
+    /// A remove delta named a peer absent from the accepted map.
+    #[error("peer delta removes unknown node {node_id}")]
+    UnknownPeerRemoval {
+        /// Absent removal target.
+        node_id: NodeId,
+    },
 }
 
 #[cfg(all(test, windows))]
@@ -454,13 +587,16 @@ mod tests {
 
     use stella_common::NetworkId;
     use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
+    use stella_proto::{
+        encode_peer_record, ConfidentialityPolicy, Endpoint, NetworkPolicy, PeerListView,
+        PeerRecordRef, MEMBERSHIP_GRANT_LENGTH,
+    };
     use stella_server::{
         network_state::encode_network_state,
         store::{AuthorityStore, NetworkRecord, NodeRecord},
     };
 
-    use super::{NetworkState, SnapshotInput, StateError};
+    use super::{NetworkState, PeerDeltaInput, PeerDeltaOperation, SnapshotInput, StateError};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -603,6 +739,113 @@ mod tests {
             NetworkState::from_snapshot(&expired_input),
             Err(StateError::GrantInactive { .. })
         ));
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn peer_deltas_require_exact_revision_and_known_removal_target() {
+        let (directory, store, controller, local, network_id) = fixture();
+        let view = store
+            .network_session_view(derive_node_id(local.public_key()), network_id)
+            .expect("read network view");
+        let encoded = encode_network_state(&controller, &view, 200).expect("encode state");
+        let mut state = NetworkState::from_snapshot(&SnapshotInput {
+            controller_id: derive_controller_id(controller.public_key()),
+            controller_public_key: controller.public_key(),
+            local_node_id: derive_node_id(local.public_key()),
+            local_public_key: local.public_key(),
+            network_id,
+            controller_epoch: encoded.controller_epoch(),
+            snapshot_revision: encoded.snapshot_revision(),
+            local_grant_bytes: encoded.local_grant(),
+            policy_bytes: encoded.policy(),
+            peer_list_bytes: encoded.peer_list(),
+            now: 200,
+        })
+        .expect("snapshot validates");
+        let peer_view = PeerListView::decode(encoded.peer_list())
+            .expect("decode peer list")
+            .peers()
+            .next()
+            .expect("fixture peer");
+        let peer_id = peer_view.node_id();
+        let grant_view = peer_view.membership_grant();
+        let mut grant_bytes = [0_u8; MEMBERSHIP_GRANT_LENGTH];
+        let signed_length = grant_view.signed_body().len();
+        grant_bytes[..signed_length].copy_from_slice(grant_view.signed_body());
+        grant_bytes[signed_length..].copy_from_slice(grant_view.signature());
+        let endpoints = peer_view.endpoints().collect::<Vec<_>>();
+        let record = PeerRecordRef::new(
+            peer_id,
+            peer_view.node_public_key(),
+            &grant_bytes,
+            &endpoints,
+        )
+        .expect("rebuild peer record");
+        let mut peer_bytes = vec![0_u8; record.encoded_len().expect("peer record length")];
+        encode_peer_record(record, &mut peer_bytes).expect("encode peer record");
+
+        let first_revision = state.snapshot_revision() + 1;
+        state
+            .apply_peer_delta(&PeerDeltaInput {
+                controller_id: derive_controller_id(controller.public_key()),
+                controller_public_key: controller.public_key(),
+                local_node_id: derive_node_id(local.public_key()),
+                network_id,
+                controller_epoch: encoded.controller_epoch(),
+                snapshot_revision: first_revision,
+                operation: PeerDeltaOperation::Remove(peer_id),
+                now: 200,
+            })
+            .expect("remove known peer");
+        assert!(state.peers().is_empty());
+        assert_eq!(state.snapshot_revision(), first_revision);
+
+        assert!(matches!(
+            state.apply_peer_delta(&PeerDeltaInput {
+                controller_id: derive_controller_id(controller.public_key()),
+                controller_public_key: controller.public_key(),
+                local_node_id: derive_node_id(local.public_key()),
+                network_id,
+                controller_epoch: encoded.controller_epoch(),
+                snapshot_revision: first_revision + 1,
+                operation: PeerDeltaOperation::Remove(peer_id),
+                now: 200,
+            }),
+            Err(StateError::UnknownPeerRemoval { .. })
+        ));
+        assert_eq!(state.snapshot_revision(), first_revision);
+
+        state
+            .apply_peer_delta(&PeerDeltaInput {
+                controller_id: derive_controller_id(controller.public_key()),
+                controller_public_key: controller.public_key(),
+                local_node_id: derive_node_id(local.public_key()),
+                network_id,
+                controller_epoch: encoded.controller_epoch(),
+                snapshot_revision: first_revision + 1,
+                operation: PeerDeltaOperation::AddOrReplace(&peer_bytes),
+                now: 200,
+            })
+            .expect("restore peer from complete record");
+        assert_eq!(state.peers().len(), 1);
+        assert!(matches!(
+            state.apply_peer_delta(&PeerDeltaInput {
+                controller_id: derive_controller_id(controller.public_key()),
+                controller_public_key: controller.public_key(),
+                local_node_id: derive_node_id(local.public_key()),
+                network_id,
+                controller_epoch: encoded.controller_epoch(),
+                snapshot_revision: first_revision + 3,
+                operation: PeerDeltaOperation::Remove(peer_id),
+                now: 200,
+            }),
+            Err(StateError::DeltaRevisionMismatch { .. })
+        ));
+        assert_eq!(state.peers().len(), 1);
+        assert_eq!(state.snapshot_revision(), first_revision + 1);
+
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
