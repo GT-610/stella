@@ -12,14 +12,15 @@ use stella_crypto::{
     SessionRole,
 };
 use stella_proto::{
-    encode_session_confirm, encode_session_init, encode_session_response, CommonHeader,
-    HandshakeHeader, MembershipGrant, NetworkPolicy, PacketType, ProtocolVersion,
+    encode_session_confirm, encode_session_init, encode_session_reject, encode_session_response,
+    CommonHeader, HandshakeHeader, MembershipGrant, NetworkPolicy, PacketType, ProtocolVersion,
     SessionConfirmRef, SessionConfirmRole, SessionConfirmView, SessionInitRef, SessionInitView,
-    SessionResponseRef, SessionResponseView, HANDSHAKE_FIXED_HEADER_LENGTH, HANDSHAKE_NONCE_LENGTH,
+    SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseRef,
+    SessionResponseView, HANDSHAKE_FIXED_HEADER_LENGTH, HANDSHAKE_NONCE_LENGTH,
     MAX_ENDPOINT_DATAGRAM_SIZE, MEMBERSHIP_GRANT_LENGTH, MIN_ENDPOINT_DATAGRAM_SIZE,
     SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG, SESSION_INIT_PAYLOAD_LENGTH,
-    SESSION_INIT_SIGNATURE_DOMAIN, SESSION_RESPONSE_PAYLOAD_LENGTH,
-    SESSION_RESPONSE_SIGNATURE_DOMAIN,
+    SESSION_INIT_SIGNATURE_DOMAIN, SESSION_REJECT_PAYLOAD_LENGTH, SESSION_REJECT_SIGNATURE_DOMAIN,
+    SESSION_RESPONSE_PAYLOAD_LENGTH, SESSION_RESPONSE_SIGNATURE_DOMAIN,
 };
 use thiserror::Error;
 
@@ -31,12 +32,14 @@ const HANDSHAKE_HEADER_LENGTH: u16 = 96;
 const INIT_PAYLOAD_LENGTH: u32 = 392;
 const RESPONSE_PAYLOAD_LENGTH: u32 = 408;
 const CONFIRM_PAYLOAD_LENGTH: u32 = 56;
+const REJECT_PAYLOAD_LENGTH: u32 = 104;
 const INITIAL_RETRANSMIT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RETRANSMIT_DELAY: Duration = Duration::from_secs(2);
 const HANDSHAKE_ATTEMPT_LIFETIME: Duration = Duration::from_secs(10);
 const RESPONDER_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAX_HANDSHAKES_PER_PEER: usize = 32;
 const MAX_CACHED_HANDSHAKES: usize = 256;
+const DEFAULT_REJECT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Failure while constructing or advancing an authenticated peer handshake.
 #[derive(Debug, Error)]
@@ -744,6 +747,15 @@ pub enum HandshakeEvent {
     Ignored,
     /// Send one response or confirmation to the named peer.
     Transmit(HandshakeTransmission),
+    /// A signed rejection terminated the current outgoing attempt.
+    Rejected {
+        /// Authenticated rejecting peer.
+        peer_node_id: NodeId,
+        /// Authenticated diagnostic reason.
+        reason: SessionRejectReason,
+        /// Delay applied before a completely new initiation.
+        retry_after: Duration,
+    },
     /// Install a confirmed session, optionally after sending the included confirmation.
     Established {
         /// Confirmed remote peer.
@@ -762,6 +774,16 @@ impl std::fmt::Debug for HandshakeEvent {
             Self::Transmit(transmission) => formatter
                 .debug_tuple("HandshakeEvent::Transmit")
                 .field(transmission)
+                .finish(),
+            Self::Rejected {
+                peer_node_id,
+                reason,
+                retry_after,
+            } => formatter
+                .debug_struct("HandshakeEvent::Rejected")
+                .field("peer_node_id", peer_node_id)
+                .field("reason", reason)
+                .field("retry_after", retry_after)
                 .finish(),
             Self::Established {
                 peer_node_id,
@@ -784,6 +806,7 @@ pub struct PeerHandshakeManager {
     outgoing: BTreeMap<NodeId, OutgoingHandshake>,
     responders: BTreeMap<HandshakeCacheKey, CachedResponder>,
     active_session_ids: BTreeSet<(NodeId, u64)>,
+    rejected_until: BTreeMap<NodeId, Duration>,
 }
 
 impl PeerHandshakeManager {
@@ -796,6 +819,7 @@ impl PeerHandshakeManager {
             outgoing: BTreeMap::new(),
             responders: BTreeMap::new(),
             active_session_ids: BTreeSet::new(),
+            rejected_until: BTreeMap::new(),
         }
     }
 
@@ -820,6 +844,7 @@ impl PeerHandshakeManager {
         }) {
             self.clear_peer_exchange(peer_node_id);
         }
+        self.rejected_until.remove(&peer_node_id);
         self.peers.insert(peer_node_id, config);
         Ok(())
     }
@@ -834,6 +859,14 @@ impl PeerHandshakeManager {
     #[must_use]
     pub fn has_outgoing(&self, peer_node_id: NodeId) -> bool {
         self.outgoing.contains_key(&peer_node_id)
+    }
+
+    /// Returns whether rejection backoff permits a new initiation now.
+    #[must_use]
+    pub fn can_initiate(&self, peer_node_id: NodeId, now: Duration) -> bool {
+        self.rejected_until
+            .get(&peer_node_id)
+            .is_none_or(|deadline| now >= *deadline)
     }
 
     /// Starts a fresh initiation and returns its first exact datagram.
@@ -935,7 +968,7 @@ impl PeerHandshakeManager {
             }
             PacketType::SessionResponse => self.handle_response(datagram, wall_time),
             PacketType::SessionConfirm => self.handle_confirmation(datagram, wall_time),
-            PacketType::SessionReject => Ok(HandshakeEvent::Ignored),
+            PacketType::SessionReject => self.handle_reject(datagram, wall_time, monotonic_now),
             PacketType::Data | PacketType::Keepalive => Err(HandshakeError::ContextMismatch {
                 field: "handshake packet type",
             }),
@@ -977,11 +1010,36 @@ impl PeerHandshakeManager {
                 .ok_or(HandshakeError::InvalidConfiguration {
                     reason: "initiation came from an unknown peer",
                 })?;
+        if let Some(reason) = classify_authenticated_initiation(&config, &init, wall_time)? {
+            let rejection = encode_signed_rejection(
+                &config,
+                init.header(),
+                datagram,
+                reason,
+                0,
+                signing_key,
+                wall_time,
+            )?;
+            return Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
+                peer, rejection,
+            )));
+        }
         if self
             .active_session_ids
             .contains(&(peer, init.header().session_id))
         {
-            return Ok(HandshakeEvent::Ignored);
+            let rejection = encode_signed_rejection(
+                &config,
+                init.header(),
+                datagram,
+                SessionRejectReason::SessionCollision,
+                0,
+                signing_key,
+                wall_time,
+            )?;
+            return Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
+                peer, rejection,
+            )));
         }
         if self.outgoing.contains_key(&peer) {
             if config.is_preferred_initiator() {
@@ -1003,6 +1061,51 @@ impl PeerHandshakeManager {
         Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
             peer, response,
         )))
+    }
+
+    fn handle_reject(
+        &mut self,
+        datagram: &[u8],
+        wall_time: u64,
+        monotonic_now: Duration,
+    ) -> Result<HandshakeEvent, HandshakeError> {
+        let rejection = SessionRejectView::decode(datagram)?;
+        let peer = rejection.header().sender_node_id;
+        let outgoing = self
+            .outgoing
+            .get(&peer)
+            .ok_or(HandshakeError::InvalidPhase {
+                message: "matching outgoing SESSION_INIT",
+            })?;
+        validate_header_pair(
+            outgoing.handshake.header,
+            rejection.header(),
+            PacketType::SessionReject,
+            true,
+        )?;
+        validate_timestamp(rejection.header().timestamp, wall_time)?;
+        let expected_init_hash = sha256_segments(&[outgoing.handshake.initiation_datagram()]);
+        if rejection.init_hash() != &expected_init_hash {
+            return Err(HandshakeError::DigestMismatch { digest: "init" });
+        }
+        outgoing.handshake.config.peer_public_key.verify_segments(
+            SESSION_REJECT_SIGNATURE_DOMAIN,
+            &[rejection.signed_header(), rejection.signed_payload()],
+            rejection.signature(),
+        )?;
+        let retry_after = if rejection.retry_after_ms() == 0 {
+            DEFAULT_REJECT_RETRY_DELAY
+        } else {
+            Duration::from_millis(u64::from(rejection.retry_after_ms()))
+        };
+        self.outgoing.remove(&peer);
+        self.rejected_until
+            .insert(peer, monotonic_now.saturating_add(retry_after));
+        Ok(HandshakeEvent::Rejected {
+            peer_node_id: peer,
+            reason: rejection.reason(),
+            retry_after,
+        })
     }
 
     fn handle_response(
@@ -1126,6 +1229,7 @@ impl PeerHandshakeManager {
         self.responders.retain(|key, _| key.peer_node_id != peer);
         self.active_session_ids
             .retain(|(session_peer, _)| *session_peer != peer);
+        self.rejected_until.remove(&peer);
     }
 }
 
@@ -1138,6 +1242,7 @@ impl std::fmt::Debug for PeerHandshakeManager {
             .field("outgoing", &self.outgoing.len())
             .field("cached_responders", &self.responders.len())
             .field("active_session_ids", &self.active_session_ids.len())
+            .field("rejection_backoffs", &self.rejected_until.len())
             .finish_non_exhaustive()
     }
 }
@@ -1198,6 +1303,55 @@ fn validate_grant_time(grant: MembershipGrant, now: u64) -> Result<(), Handshake
         });
     }
     Ok(())
+}
+
+fn classify_authenticated_initiation(
+    config: &PeerHandshakeConfig,
+    init: &SessionInitView<'_>,
+    now: u64,
+) -> Result<Option<SessionRejectReason>, HandshakeError> {
+    let header = init.header();
+    if header.common.network_id != config.policy.network_id {
+        return Err(HandshakeError::ContextMismatch {
+            field: "network ID",
+        });
+    }
+    if header.sender_node_id != config.peer_node_id {
+        return Err(HandshakeError::ContextMismatch {
+            field: "sender node ID",
+        });
+    }
+    if header.receiver_node_id != config.local_node_id {
+        return Err(HandshakeError::ContextMismatch {
+            field: "receiver node ID",
+        });
+    }
+    validate_timestamp(header.timestamp, now)?;
+    config.peer_public_key.verify_segments(
+        SESSION_INIT_SIGNATURE_DOMAIN,
+        &[init.signed_header(), init.signed_payload()],
+        init.signature(),
+    )?;
+    if header.controller_epoch != config.controller_epoch {
+        return Ok(Some(SessionRejectReason::StaleEpoch));
+    }
+    let supplied_grant = init.initiator_grant().grant();
+    if now < supplied_grant.not_before || now >= supplied_grant.not_after {
+        return Ok(Some(SessionRejectReason::GrantExpired));
+    }
+    if supplied_grant != config.peer_grant
+        || init.signed_payload().get(..MEMBERSHIP_GRANT_LENGTH)
+            != Some(config.peer_grant_bytes.as_slice())
+        || init.receiver_grant_serial() != config.local_grant.grant_serial
+    {
+        return Ok(Some(SessionRejectReason::PolicyMismatch));
+    }
+    if validate_grant_time(config.local_grant, now).is_err()
+        || validate_grant_time(config.peer_grant, now).is_err()
+    {
+        return Ok(Some(SessionRejectReason::GrantExpired));
+    }
+    Ok(None)
 }
 
 fn validate_timestamp(timestamp: u64, now: u64) -> Result<(), HandshakeError> {
@@ -1393,6 +1547,64 @@ fn encode_signed_response(
     Ok(encoded)
 }
 
+fn encode_signed_rejection(
+    config: &PeerHandshakeConfig,
+    initiation: HandshakeHeader,
+    init_datagram: &[u8],
+    reason: SessionRejectReason,
+    retry_after_ms: u32,
+    signing_key: &IdentitySigningKey,
+    timestamp: u64,
+) -> Result<Vec<u8>, HandshakeError> {
+    validate_local_signing_key(config, signing_key)?;
+    let header = HandshakeHeader {
+        common: CommonHeader {
+            version: ProtocolVersion::CURRENT,
+            packet_type: PacketType::SessionReject,
+            flags: 0,
+            header_length: HANDSHAKE_HEADER_LENGTH,
+            payload_length: REJECT_PAYLOAD_LENGTH,
+            network_id: initiation.common.network_id,
+        },
+        sender_node_id: config.local_node_id,
+        receiver_node_id: config.peer_node_id,
+        controller_epoch: initiation.controller_epoch,
+        handshake_id: initiation.handshake_id,
+        timestamp,
+        session_id: initiation.session_id,
+    };
+    let init_hash = sha256_segments(&[init_datagram]);
+    let mut encoded = vec![0_u8; HANDSHAKE_FIXED_HEADER_LENGTH + SESSION_REJECT_PAYLOAD_LENGTH];
+    encode_session_reject(
+        header,
+        &[],
+        SessionRejectRef {
+            reason,
+            retry_after_ms,
+            init_hash: &init_hash,
+            signature: &[0; 64],
+        },
+        &mut encoded,
+    )?;
+    let draft = SessionRejectView::decode(&encoded)?;
+    let signature = signing_key.sign_segments(
+        SESSION_REJECT_SIGNATURE_DOMAIN,
+        &[draft.signed_header(), draft.signed_payload()],
+    )?;
+    encode_session_reject(
+        header,
+        &[],
+        SessionRejectRef {
+            reason,
+            retry_after_ms,
+            init_hash: &init_hash,
+            signature: &signature,
+        },
+        &mut encoded,
+    )?;
+    Ok(encoded)
+}
+
 fn encode_confirmation(
     header: HandshakeHeader,
     response_hash: &[u8; 32],
@@ -1454,14 +1666,16 @@ fn random_nonzero_array<const LENGTH: usize>() -> Result<[u8; LENGTH], Handshake
 #[cfg(test)]
 mod tests {
     use super::{
-        HandshakeError, HandshakeEvent, HandshakeTransmission, InitiatorHandshake,
-        PeerHandshakeConfig, PeerHandshakeManager, ResponderHandshake,
+        encode_signed_init, encode_signed_rejection, HandshakeError, HandshakeEvent,
+        HandshakeTransmission, InitiatorHandshake, PeerHandshakeConfig, PeerHandshakeManager,
+        ResponderHandshake,
     };
     use stella_common::{ControllerId, GrantSerial, NetworkId};
     use stella_crypto::{derive_node_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
         encode_membership_grant, ConfidentialityPolicy, MembershipGrant, MembershipPermissions,
-        NetworkPolicy, MEMBERSHIP_GRANT_LENGTH,
+        NetworkPolicy, SessionInitView, SessionRejectReason, SessionRejectView,
+        MEMBERSHIP_GRANT_LENGTH,
     };
 
     const NOW: u64 = 1_788_000_000;
@@ -1751,6 +1965,41 @@ mod tests {
                 .expect("repeat cached confirmation"),
         );
         assert_eq!(repeated_confirm.datagram(), responder_confirm.datagram());
+
+        let original_init =
+            SessionInitView::decode(preferred_init.datagram()).expect("decode original init");
+        let mut collision_header = original_init.header();
+        collision_header.handshake_id = collision_header.handshake_id.wrapping_add(1).max(1);
+        let preferred_config = preferred
+            .peers
+            .get(&other.local_node_id)
+            .expect("preferred peer configuration");
+        let collision_init = encode_signed_init(
+            collision_header,
+            &preferred_config.local_grant_bytes,
+            preferred_config.peer_grant.grant_serial,
+            original_init.initiator_ephemeral(),
+            original_init.initiator_nonce(),
+            original_init.max_datagram_size(),
+            preferred_key,
+        )
+        .expect("signed colliding initiation");
+        let collision_reject = transmitted(
+            other
+                .handle_datagram(
+                    &collision_init,
+                    other_key,
+                    NOW,
+                    std::time::Duration::from_millis(6),
+                )
+                .expect("reject session collision"),
+        );
+        assert_eq!(
+            SessionRejectView::decode(collision_reject.datagram())
+                .expect("decode collision rejection")
+                .reason(),
+            SessionRejectReason::SessionCollision
+        );
     }
 
     #[test]
@@ -1792,5 +2041,111 @@ mod tests {
             )
             .expect("new attempt after abandonment");
         assert_ne!(replacement.datagram(), first.datagram());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn signed_rejections_are_classified_verified_and_backed_off() {
+        let alice_key = signing_key(91);
+        let bob_key = signing_key(92);
+        let alice_config = config(&alice_key, &bob_key, 101, 102);
+        let bob_config = config(&bob_key, &alice_key, 102, 101);
+        let alice_id = alice_config.local_node_id;
+        let bob_id = bob_config.local_node_id;
+        let mut alice = PeerHandshakeManager::new(alice_id);
+        alice
+            .upsert_peer(alice_config.clone())
+            .expect("configure alice");
+        let initiation = alice
+            .initiate(bob_id, &alice_key, NOW, std::time::Duration::ZERO)
+            .expect("alice initiation");
+        let init = SessionInitView::decode(initiation.datagram()).expect("decode initiation");
+        let rejection = encode_signed_rejection(
+            &bob_config,
+            init.header(),
+            initiation.datagram(),
+            SessionRejectReason::SessionCollision,
+            500,
+            &bob_key,
+            NOW,
+        )
+        .expect("signed rejection");
+        match alice
+            .handle_datagram(
+                &rejection,
+                &alice_key,
+                NOW,
+                std::time::Duration::from_secs(1),
+            )
+            .expect("verify rejection")
+        {
+            HandshakeEvent::Rejected {
+                peer_node_id,
+                reason,
+                retry_after,
+            } => {
+                assert_eq!(peer_node_id, bob_id);
+                assert_eq!(reason, SessionRejectReason::SessionCollision);
+                assert_eq!(retry_after, std::time::Duration::from_millis(500));
+            }
+            event => panic!("expected authenticated rejection, got {event:?}"),
+        }
+        assert!(!alice.has_outgoing(bob_id));
+        assert!(!alice.can_initiate(bob_id, std::time::Duration::from_millis(1_499)));
+        assert!(alice.can_initiate(bob_id, std::time::Duration::from_millis(1_500)));
+
+        let mut bob = PeerHandshakeManager::new(bob_id);
+        bob.upsert_peer(bob_config.clone()).expect("configure bob");
+        let mut stale_header = init.header();
+        stale_header.controller_epoch -= 1;
+        let mut stale_grant = alice_config.local_grant;
+        stale_grant.controller_epoch -= 1;
+        let stale_grant_bytes = grant_bytes(stale_grant);
+        let stale_init = encode_signed_init(
+            stale_header,
+            &stale_grant_bytes,
+            bob_config.local_grant.grant_serial,
+            init.initiator_ephemeral(),
+            init.initiator_nonce(),
+            init.max_datagram_size(),
+            &alice_key,
+        )
+        .expect("stale signed initiation");
+        let stale_reject = transmitted(
+            bob.handle_datagram(&stale_init, &bob_key, NOW, std::time::Duration::ZERO)
+                .expect("reject stale epoch"),
+        );
+        assert_eq!(
+            SessionRejectView::decode(stale_reject.datagram())
+                .expect("decode stale rejection")
+                .reason(),
+            SessionRejectReason::StaleEpoch
+        );
+
+        let policy_init = encode_signed_init(
+            init.header(),
+            &alice_config.local_grant_bytes,
+            GrantSerial::from_bytes([0xee; 16]),
+            init.initiator_ephemeral(),
+            init.initiator_nonce(),
+            init.max_datagram_size(),
+            &alice_key,
+        )
+        .expect("policy-mismatched signed initiation");
+        let policy_reject = transmitted(
+            bob.handle_datagram(
+                &policy_init,
+                &bob_key,
+                NOW,
+                std::time::Duration::from_millis(1),
+            )
+            .expect("reject policy mismatch"),
+        );
+        assert_eq!(
+            SessionRejectView::decode(policy_reject.datagram())
+                .expect("decode policy rejection")
+                .reason(),
+            SessionRejectReason::PolicyMismatch
+        );
     }
 }

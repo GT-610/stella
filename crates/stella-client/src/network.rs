@@ -234,6 +234,7 @@ impl NetworkDataPlane {
                     .get(peer)
                     .is_none_or(|session| session.rekeying)
                     && !self.handshakes.has_outgoing(*peer)
+                    && self.handshakes.can_initiate(*peer, monotonic_now)
             })
             .collect();
         let mut output = NetworkOutput::default();
@@ -515,7 +516,9 @@ impl NetworkDataPlane {
         now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
         match event {
-            HandshakeEvent::Ignored => Ok(NetworkOutput::default()),
+            HandshakeEvent::Ignored | HandshakeEvent::Rejected { .. } => {
+                Ok(NetworkOutput::default())
+            }
             HandshakeEvent::Transmit(transmission) => Ok(NetworkOutput {
                 datagrams: vec![route_handshake_to(transmission, source)],
                 tap_frame: None,
