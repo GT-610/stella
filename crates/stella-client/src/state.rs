@@ -58,6 +58,7 @@ impl PeerState {
 /// Atomic authoritative view for one joined virtual network.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkState {
+    controller_public_key: IdentityPublicKey,
     network_id: NetworkId,
     controller_epoch: u64,
     snapshot_revision: u64,
@@ -68,6 +69,12 @@ pub struct NetworkState {
 }
 
 impl NetworkState {
+    /// Returns the validated controller key that signs network grants.
+    #[must_use]
+    pub const fn controller_public_key(&self) -> IdentityPublicKey {
+        self.controller_public_key
+    }
+
     /// Returns the virtual network ID.
     #[must_use]
     pub const fn network_id(&self) -> NetworkId {
@@ -119,6 +126,11 @@ impl NetworkState {
     /// removal-target checks fail.
     pub fn apply_peer_delta(&mut self, input: &PeerDeltaInput<'_>) -> Result<(), StateError> {
         validate_controller_id(input.controller_id, input.controller_public_key)?;
+        ensure_equal(
+            input.controller_public_key == self.controller_public_key,
+            "peer delta",
+            "controller public key",
+        )?;
         ensure_equal(
             input.controller_id == self.local_grant.controller_id,
             "peer delta",
@@ -197,6 +209,11 @@ impl NetworkState {
     /// revision, policy, identity, time, digest, or signature validation fails.
     pub fn refresh_local_grant(&mut self, input: &GrantRefreshInput<'_>) -> Result<(), StateError> {
         validate_controller_id(input.controller_id, input.controller_public_key)?;
+        ensure_equal(
+            input.controller_public_key == self.controller_public_key,
+            "grant refresh",
+            "controller public key",
+        )?;
         ensure_equal(
             self.controller_epoch == input.controller_epoch,
             "grant refresh",
@@ -288,6 +305,7 @@ impl NetworkState {
             peers.insert(owned.node_id, owned);
         }
         Ok(Self {
+            controller_public_key: input.controller_public_key,
             network_id: input.network_id,
             controller_epoch: input.controller_epoch,
             snapshot_revision: input.snapshot_revision,

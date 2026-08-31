@@ -13,14 +13,15 @@ use stella_crypto::{
 };
 use stella_proto::{
     encode_session_confirm, encode_session_init, encode_session_reject, encode_session_response,
-    CommonHeader, HandshakeHeader, MembershipGrant, NetworkPolicy, PacketType, ProtocolVersion,
-    SessionConfirmRef, SessionConfirmRole, SessionConfirmView, SessionInitRef, SessionInitView,
-    SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseRef,
+    CommonHeader, HandshakeHeader, MembershipGrant, MembershipGrantView, NetworkPolicy, PacketType,
+    ProtocolVersion, SessionConfirmRef, SessionConfirmRole, SessionConfirmView, SessionInitRef,
+    SessionInitView, SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseRef,
     SessionResponseView, HANDSHAKE_FIXED_HEADER_LENGTH, HANDSHAKE_NONCE_LENGTH,
-    MAX_ENDPOINT_DATAGRAM_SIZE, MEMBERSHIP_GRANT_LENGTH, MIN_ENDPOINT_DATAGRAM_SIZE,
-    SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG, SESSION_INIT_PAYLOAD_LENGTH,
-    SESSION_INIT_SIGNATURE_DOMAIN, SESSION_REJECT_PAYLOAD_LENGTH, SESSION_REJECT_SIGNATURE_DOMAIN,
-    SESSION_RESPONSE_PAYLOAD_LENGTH, SESSION_RESPONSE_SIGNATURE_DOMAIN,
+    MAX_ENDPOINT_DATAGRAM_SIZE, MEMBERSHIP_GRANT_LENGTH, MEMBERSHIP_GRANT_SIGNATURE_DOMAIN,
+    MIN_ENDPOINT_DATAGRAM_SIZE, SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG,
+    SESSION_INIT_PAYLOAD_LENGTH, SESSION_INIT_SIGNATURE_DOMAIN, SESSION_REJECT_PAYLOAD_LENGTH,
+    SESSION_REJECT_SIGNATURE_DOMAIN, SESSION_RESPONSE_PAYLOAD_LENGTH,
+    SESSION_RESPONSE_SIGNATURE_DOMAIN,
 };
 use thiserror::Error;
 
@@ -87,13 +88,13 @@ pub enum HandshakeError {
 #[derive(Clone, Debug)]
 pub struct PeerHandshakeConfig {
     policy: NetworkPolicy,
+    controller_public_key: IdentityPublicKey,
     controller_epoch: u64,
     local_node_id: NodeId,
     peer_node_id: NodeId,
     local_grant: MembershipGrant,
     local_grant_bytes: [u8; MEMBERSHIP_GRANT_LENGTH],
     peer_grant: MembershipGrant,
-    peer_grant_bytes: [u8; MEMBERSHIP_GRANT_LENGTH],
     peer_public_key: IdentityPublicKey,
     max_datagram_size: u32,
 }
@@ -138,13 +139,13 @@ impl PeerHandshakeConfig {
         }
         Ok(Self {
             policy: network.policy(),
+            controller_public_key: network.controller_public_key(),
             controller_epoch: network.controller_epoch(),
             local_node_id,
             peer_node_id,
             local_grant: network.local_grant(),
             local_grant_bytes: *network.local_grant_bytes(),
             peer_grant: peer.grant(),
-            peer_grant_bytes: *peer.grant_bytes(),
             peer_public_key: peer.public_key(),
             max_datagram_size,
         })
@@ -186,7 +187,6 @@ impl InitiatorHandshake {
     ) -> Result<Self, HandshakeError> {
         validate_local_signing_key(&config, local_signing_key)?;
         validate_grant_time(config.local_grant, timestamp)?;
-        validate_grant_time(config.peer_grant, timestamp)?;
         let ephemeral = EphemeralSecret::generate()?;
         let ephemeral_public = ephemeral.public_key().to_bytes();
         let nonce = random_nonzero_array::<HANDSHAKE_NONCE_LENGTH>()?;
@@ -246,11 +246,7 @@ impl InitiatorHandshake {
         )?;
         validate_timestamp(response.header().timestamp, now)?;
         validate_grant_time(self.config.local_grant, now)?;
-        validate_grant_time(self.config.peer_grant, now)?;
-        if response.responder_grant().grant() != self.config.peer_grant
-            || response.signed_payload().get(..MEMBERSHIP_GRANT_LENGTH)
-                != Some(self.config.peer_grant_bytes.as_slice())
-        {
+        if presented_grant_rejection(&self.config, &response.responder_grant(), now)?.is_some() {
             return Err(HandshakeError::ContextMismatch {
                 field: "responder membership grant",
             });
@@ -420,11 +416,7 @@ impl ResponderHandshake {
         validate_initiation_header(&config, init.header())?;
         validate_timestamp(init.header().timestamp, now)?;
         validate_grant_time(config.local_grant, now)?;
-        validate_grant_time(config.peer_grant, now)?;
-        if init.initiator_grant().grant() != config.peer_grant
-            || init.signed_payload().get(..MEMBERSHIP_GRANT_LENGTH)
-                != Some(config.peer_grant_bytes.as_slice())
-        {
+        if presented_grant_rejection(&config, &init.initiator_grant(), now)?.is_some() {
             return Err(HandshakeError::ContextMismatch {
                 field: "initiator membership grant",
             });
@@ -1335,23 +1327,52 @@ fn classify_authenticated_initiation(
     if header.controller_epoch != config.controller_epoch {
         return Ok(Some(SessionRejectReason::StaleEpoch));
     }
-    let supplied_grant = init.initiator_grant().grant();
-    if now < supplied_grant.not_before || now >= supplied_grant.not_after {
-        return Ok(Some(SessionRejectReason::GrantExpired));
+    if let Some(reason) = presented_grant_rejection(config, &init.initiator_grant(), now)? {
+        return Ok(Some(reason));
     }
-    if supplied_grant != config.peer_grant
-        || init.signed_payload().get(..MEMBERSHIP_GRANT_LENGTH)
-            != Some(config.peer_grant_bytes.as_slice())
-        || init.receiver_grant_serial() != config.local_grant.grant_serial
-    {
+    if init.receiver_grant_serial() != config.local_grant.grant_serial {
         return Ok(Some(SessionRejectReason::PolicyMismatch));
     }
-    if validate_grant_time(config.local_grant, now).is_err()
-        || validate_grant_time(config.peer_grant, now).is_err()
-    {
+    if validate_grant_time(config.local_grant, now).is_err() {
         return Ok(Some(SessionRejectReason::GrantExpired));
     }
     Ok(None)
+}
+
+fn presented_grant_rejection(
+    config: &PeerHandshakeConfig,
+    view: &MembershipGrantView<'_>,
+    now: u64,
+) -> Result<Option<SessionRejectReason>, HandshakeError> {
+    config.controller_public_key.verify_segments(
+        MEMBERSHIP_GRANT_SIGNATURE_DOMAIN,
+        &[view.signed_body()],
+        view.signature(),
+    )?;
+    let supplied = view.grant();
+    if now < supplied.not_before || now >= supplied.not_after {
+        return Ok(Some(SessionRejectReason::GrantExpired));
+    }
+    if !same_grant_authority(supplied, config.peer_grant) {
+        return Ok(Some(SessionRejectReason::PolicyMismatch));
+    }
+    Ok(None)
+}
+
+fn same_grant_authority(left: MembershipGrant, right: MembershipGrant) -> bool {
+    left.confidentiality == right.confidentiality
+        && left.permissions == right.permissions
+        && left.network_id == right.network_id
+        && left.node_id == right.node_id
+        && left.node_public_key == right.node_public_key
+        && left.controller_id == right.controller_id
+        && left.controller_epoch == right.controller_epoch
+        && left.max_frame_size == right.max_frame_size
+        && left.max_flood_peers == right.max_flood_peers
+        && left.flood_rate == right.flood_rate
+        && left.flood_burst == right.flood_burst
+        && left.policy_digest == right.policy_digest
+        && left.grant_serial == right.grant_serial
 }
 
 fn validate_timestamp(timestamp: u64, now: u64) -> Result<(), HandshakeError> {
@@ -1670,18 +1691,23 @@ mod tests {
         HandshakeTransmission, InitiatorHandshake, PeerHandshakeConfig, PeerHandshakeManager,
         ResponderHandshake,
     };
-    use stella_common::{ControllerId, GrantSerial, NetworkId};
-    use stella_crypto::{derive_node_id, IdentitySeed, IdentitySigningKey};
+    use stella_common::{GrantSerial, NetworkId};
+    use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
         encode_membership_grant, ConfidentialityPolicy, MembershipGrant, MembershipPermissions,
         NetworkPolicy, SessionInitView, SessionRejectReason, SessionRejectView,
-        MEMBERSHIP_GRANT_LENGTH,
+        MEMBERSHIP_GRANT_LENGTH, MEMBERSHIP_GRANT_SIGNATURE_DOMAIN,
+        MEMBERSHIP_GRANT_SIGNED_BODY_LENGTH,
     };
 
     const NOW: u64 = 1_788_000_000;
 
     fn signing_key(byte: u8) -> IdentitySigningKey {
         IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([byte; 32]))
+    }
+
+    fn controller_key() -> IdentitySigningKey {
+        signing_key(99)
     }
 
     fn policy() -> NetworkPolicy {
@@ -1709,7 +1735,7 @@ mod tests {
             network_id: policy().network_id,
             node_id: derive_node_id(public_key),
             node_public_key: public_key.to_bytes(),
-            controller_id: ControllerId::from_bytes([4; 16]),
+            controller_id: derive_controller_id(controller_key().public_key()),
             controller_epoch: 7,
             not_before: NOW - 60,
             not_after: NOW + 3_600,
@@ -1723,8 +1749,15 @@ mod tests {
     }
 
     fn grant_bytes(grant: MembershipGrant) -> [u8; MEMBERSHIP_GRANT_LENGTH] {
+        let mut signed_body = [0_u8; MEMBERSHIP_GRANT_SIGNED_BODY_LENGTH];
+        grant
+            .encode_signed_body(&mut signed_body)
+            .expect("encode test grant body");
+        let signature = controller_key()
+            .sign_segments(MEMBERSHIP_GRANT_SIGNATURE_DOMAIN, &[&signed_body])
+            .expect("sign test grant");
         let mut bytes = [0_u8; MEMBERSHIP_GRANT_LENGTH];
-        encode_membership_grant(grant, &[6; 64], &mut bytes).expect("encode test grant");
+        encode_membership_grant(grant, &signature, &mut bytes).expect("encode test grant");
         bytes
     }
 
@@ -1738,13 +1771,13 @@ mod tests {
         let peer_grant = grant(peer_key, peer_serial);
         PeerHandshakeConfig {
             policy: policy(),
+            controller_public_key: controller_key().public_key(),
             controller_epoch: 7,
             local_node_id: local_grant.node_id,
             peer_node_id: peer_grant.node_id,
             local_grant,
             local_grant_bytes: grant_bytes(local_grant),
             peer_grant,
-            peer_grant_bytes: grant_bytes(peer_grant),
             peer_public_key: peer_key.public_key(),
             max_datagram_size: 1_200,
         }
@@ -1762,8 +1795,10 @@ mod tests {
     fn four_message_handshake_establishes_bidirectional_data() {
         let alice_key = signing_key(11);
         let bob_key = signing_key(12);
-        let alice_config = config(&alice_key, &bob_key, 21, 22);
-        let bob_config = config(&bob_key, &alice_key, 22, 21);
+        let mut alice_config = config(&alice_key, &bob_key, 21, 22);
+        let mut bob_config = config(&bob_key, &alice_key, 22, 21);
+        alice_config.peer_grant.not_before -= 30;
+        bob_config.peer_grant.not_after += 30;
         assert_ne!(
             alice_config.is_preferred_initiator(),
             bob_config.is_preferred_initiator()

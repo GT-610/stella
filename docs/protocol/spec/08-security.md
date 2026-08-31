@@ -195,6 +195,14 @@ receiver ID, expected controller epoch, grant structure and controller
 signature, timestamp, receiver grant serial, node ID derivation, and initiator
 signature. It performs X25519 only after those checks.
 
+The presented grant MUST match the cached peer authorization in every field
+except `not_before` and `not_after`, and it MUST be valid at the receiver's
+current time. The controller may sign equivalent grants for different refresh
+windows, so implementations MUST verify the presented controller signature and
+MUST NOT require byte-for-byte equality with a grant received in another
+snapshot. The grant serial, identity, epoch, permissions, limits, and policy
+digest still match exactly.
+
 The receiver rejects an all-zero or low-order X25519 shared secret according to
 the X25519 library's contributory-behavior check.
 
@@ -227,6 +235,8 @@ The initiator performs the symmetric grant, identity, policy, timestamp, hash,
 and signature checks. The two grants MUST agree on controller ID, network ID,
 epoch, confidentiality policy, policy digest, frame limit, and flood-peer
 limit. Each grant must contain the permission required for its direction.
+The responder grant uses the same semantic-match rule for independently issued
+validity windows described for `SESSION_INIT`.
 
 ## 8. Transcript and key schedule
 
