@@ -7,6 +7,7 @@ mod config;
 mod control;
 mod data_plane;
 mod error;
+mod handshake;
 mod identity;
 mod state;
 mod switch;
@@ -19,6 +20,10 @@ pub use control::{
 };
 pub use data_plane::{DataPlaneError, PeerDataSession};
 pub use error::ClientError;
+pub use handshake::{
+    EstablishedPeerSession, HandshakeError, InitiatorHandshake, PeerHandshakeConfig,
+    ResponderHandshake,
+};
 pub use identity::{
     create_node_identity, load_node_identity, verify_node_identity_permissions,
     NodeIdentityFileError,
