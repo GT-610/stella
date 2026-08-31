@@ -5,6 +5,7 @@
 mod active;
 mod config;
 mod control;
+mod data_plane;
 mod error;
 mod identity;
 mod state;
@@ -16,6 +17,7 @@ pub use config::{ClientConfig, ClientConfigError, ConfiguredNetwork, CONFIG_VERS
 pub use control::{
     authenticate_controller, AuthenticatedControl, BearerCredential, ControllerTrust, Enrollment,
 };
+pub use data_plane::{DataPlaneError, PeerDataSession};
 pub use error::ClientError;
 pub use identity::{
     create_node_identity, load_node_identity, verify_node_identity_permissions,
