@@ -22,6 +22,18 @@ The script installs the pinned Scapy version into its create-new artifact
 directory. It does not modify the repository, assign IP addresses, rename
 adapters, or delete artifacts.
 
+If the machine has only one TAP-Windows adapter, an elevated helper downloads
+the official OpenVPN `tap-windows6` release, verifies Microsoft Authenticode
+signatures on `devcon.exe` and the driver, creates one additional root device,
+and renames the two selected adapters:
+
+```powershell
+.\tests\two-node-lan\install-second-tap.ps1
+```
+
+The default names are `Stella Node A` and `Stella Node B`. The helper makes a
+system-level driver/device change and should be run only on a test machine.
+
 ## Run
 
 ```powershell
