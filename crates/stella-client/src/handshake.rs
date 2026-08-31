@@ -830,6 +830,12 @@ impl PeerHandshakeManager {
         self.clear_peer_exchange(peer_node_id);
     }
 
+    /// Returns whether this node already owns an in-progress initiator exchange.
+    #[must_use]
+    pub fn has_outgoing(&self, peer_node_id: NodeId) -> bool {
+        self.outgoing.contains_key(&peer_node_id)
+    }
+
     /// Starts a fresh initiation and returns its first exact datagram.
     ///
     /// Repeated calls while an exchange is active return its current cached

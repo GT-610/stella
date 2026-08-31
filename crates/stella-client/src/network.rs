@@ -18,6 +18,8 @@ use crate::{
 };
 
 const ROUTINE_REKEY_PACKET_LIMIT: u64 = u32::MAX as u64;
+const ROUTINE_REKEY_LEAD: u64 = 10;
+const OLD_SESSION_RECEIVE_GRACE: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_UNANSWERED_KEEPALIVES: usize = 3;
 
@@ -138,6 +140,13 @@ struct InstalledSession {
     outstanding_probes: BTreeSet<u64>,
     highest_peer_probe: u64,
     pending_echo_probe: Option<u64>,
+    rekeying: bool,
+}
+
+struct RetiredSession {
+    data: PeerDataSession,
+    endpoint: SocketAddr,
+    remove_at: Duration,
 }
 
 /// Active, isolated state for one TAP-backed virtual network.
@@ -148,6 +157,7 @@ pub struct NetworkDataPlane {
     switch: L2Switch,
     handshakes: PeerHandshakeManager,
     sessions: BTreeMap<NodeId, InstalledSession>,
+    retired_sessions: BTreeMap<(NodeId, u64), RetiredSession>,
 }
 
 impl NetworkDataPlane {
@@ -183,6 +193,7 @@ impl NetworkDataPlane {
             switch,
             handshakes,
             sessions: BTreeMap::new(),
+            retired_sessions: BTreeMap::new(),
         })
     }
 
@@ -195,7 +206,10 @@ impl NetworkDataPlane {
     /// Returns the established peers currently eligible for forwarding.
     #[must_use]
     pub fn established_peers(&self) -> BTreeSet<NodeId> {
-        self.sessions.keys().copied().collect()
+        self.sessions
+            .iter()
+            .filter_map(|(peer, session)| (!session.rekeying).then_some(*peer))
+            .collect()
     }
 
     /// Starts preferred-initiator handshakes for peers without a session.
@@ -215,7 +229,12 @@ impl NetworkDataPlane {
             .peers()
             .keys()
             .copied()
-            .filter(|peer| !self.sessions.contains_key(peer))
+            .filter(|peer| {
+                self.sessions
+                    .get(peer)
+                    .is_none_or(|session| session.rekeying)
+                    && !self.handshakes.has_outgoing(*peer)
+            })
             .collect();
         let mut output = NetworkOutput::default();
         for peer in peers {
@@ -248,24 +267,29 @@ impl NetworkDataPlane {
         wall_time: u64,
         monotonic_now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
-        let expired: Vec<NodeId> = self
+        let rekey: Vec<NodeId> = self
             .sessions
             .iter()
             .filter_map(|(peer, session)| {
-                (wall_time >= session.expires_at
-                    || session.data.sent_packet_count() >= ROUTINE_REKEY_PACKET_LIMIT)
+                (!session.rekeying
+                    && (wall_time.saturating_add(ROUTINE_REKEY_LEAD) >= session.expires_at
+                        || session.data.sent_packet_count() >= ROUTINE_REKEY_PACKET_LIMIT))
                     .then_some(*peer)
             })
             .collect();
-        for peer in expired {
-            self.remove_session(peer);
+        for peer in rekey {
+            if let Some(session) = self.sessions.get_mut(&peer) {
+                session.rekeying = true;
+            }
         }
+        self.expire_retired_sessions(monotonic_now);
         let mut output = NetworkOutput::default();
         let keepalive_due: Vec<NodeId> = self
             .sessions
             .iter()
             .filter_map(|(peer, session)| {
-                (monotonic_now.saturating_sub(session.last_activity_at) >= KEEPALIVE_INTERVAL)
+                (!session.rekeying
+                    && monotonic_now.saturating_sub(session.last_activity_at) >= KEEPALIVE_INTERVAL)
                     .then_some(*peer)
             })
             .collect();
@@ -402,6 +426,7 @@ impl NetworkDataPlane {
         let old_peers = self.state.peers().clone();
         if reset_all {
             self.sessions.clear();
+            self.retired_sessions.clear();
             self.switch = L2Switch::new(replacement.policy(), primary_mac, now)?;
             self.handshakes = PeerHandshakeManager::new(replacement.local_grant().node_id);
         }
@@ -443,25 +468,21 @@ impl NetworkDataPlane {
         let header = stella_proto::DataHeader::decode(datagram)?;
         let peer = header.sender_node_id;
         self.validate_source(peer, source)?;
-        let session = self
-            .sessions
-            .get_mut(&peer)
-            .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
-        if source != session.endpoint {
-            return Err(NetworkDataError::SessionEndpointMismatch {
-                peer_node_id: peer,
-                expected: session.endpoint,
-                actual: source,
-            });
-        }
-        if header.session_id != session.session_id {
-            return Err(NetworkDataError::NoPeerSession { peer_node_id: peer });
-        }
-        let Some(frame) = session.data.accept_datagram(datagram, now)? else {
-            session.last_activity_at = now;
+        let frame = if let Some(session) = self.sessions.get_mut(&peer) {
+            if header.session_id == session.session_id {
+                validate_pinned_endpoint(peer, session.endpoint, source)?;
+                let frame = session.data.accept_datagram(datagram, now)?;
+                session.last_activity_at = now;
+                frame
+            } else {
+                self.accept_retired_data(peer, header.session_id, source, datagram, now)?
+            }
+        } else {
+            self.accept_retired_data(peer, header.session_id, source, datagram, now)?
+        };
+        let Some(frame) = frame else {
             return Ok(NetworkOutput::default());
         };
-        session.last_activity_at = now;
         match self.switch.accept_peer_frame(peer, &frame, now)? {
             PeerIngress::DeliverToTap => Ok(NetworkOutput {
                 datagrams: Vec::new(),
@@ -469,6 +490,22 @@ impl NetworkDataPlane {
             }),
             PeerIngress::DropLocalMacConflict => Ok(NetworkOutput::default()),
         }
+    }
+
+    fn accept_retired_data(
+        &mut self,
+        peer: NodeId,
+        session_id: u64,
+        source: SocketAddr,
+        datagram: &[u8],
+        now: Duration,
+    ) -> Result<Option<Vec<u8>>, NetworkDataError> {
+        let retired = self
+            .retired_sessions
+            .get_mut(&(peer, session_id))
+            .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+        validate_pinned_endpoint(peer, retired.endpoint, source)?;
+        Ok(retired.data.accept_datagram(datagram, now)?)
     }
 
     fn apply_handshake_event(
@@ -495,6 +532,7 @@ impl NetworkDataPlane {
                         .push(route_handshake_to(transmission, source));
                 }
                 let session_id = session.session_id();
+                let established_at = session.established_at();
                 let expires_at = session.expires_at();
                 let data = session.into_data_session()?;
                 if let Some(previous) = self.sessions.insert(
@@ -508,10 +546,22 @@ impl NetworkDataPlane {
                         outstanding_probes: BTreeSet::new(),
                         highest_peer_probe: 0,
                         pending_echo_probe: None,
+                        rekeying: false,
                     },
                 ) {
-                    self.handshakes
-                        .retire_session(peer_node_id, previous.session_id);
+                    if previous.expires_at > established_at {
+                        self.retired_sessions.insert(
+                            (peer_node_id, previous.session_id),
+                            RetiredSession {
+                                data: previous.data,
+                                endpoint: previous.endpoint,
+                                remove_at: now.saturating_add(OLD_SESSION_RECEIVE_GRACE),
+                            },
+                        );
+                    } else {
+                        self.handshakes
+                            .retire_session(peer_node_id, previous.session_id);
+                    }
                 }
                 Ok(output)
             }
@@ -527,20 +577,13 @@ impl NetworkDataPlane {
         let header = stella_proto::KeepaliveHeader::decode(datagram)?;
         let peer = header.sender_node_id;
         self.validate_source(peer, source)?;
-        let session = self
-            .sessions
-            .get_mut(&peer)
-            .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
-        if source != session.endpoint {
-            return Err(NetworkDataError::SessionEndpointMismatch {
-                peer_node_id: peer,
-                expected: session.endpoint,
-                actual: source,
-            });
-        }
+        let Some(session) = self.sessions.get_mut(&peer) else {
+            return self.accept_retired_keepalive(peer, header.session_id, source, datagram);
+        };
         if header.session_id != session.session_id {
-            return Err(NetworkDataError::NoPeerSession { peer_node_id: peer });
+            return self.accept_retired_keepalive(peer, header.session_id, source, datagram);
         }
+        validate_pinned_endpoint(peer, session.endpoint, source)?;
         let keepalive = session.data.accept_keepalive(datagram)?;
         let echo_probe_id = keepalive.echo_probe_id();
         if echo_probe_id != 0 && session.outstanding_probes.contains(&echo_probe_id) {
@@ -553,6 +596,22 @@ impl NetworkDataPlane {
             session.pending_echo_probe = Some(keepalive.probe_id());
         }
         session.last_activity_at = now;
+        Ok(NetworkOutput::default())
+    }
+
+    fn accept_retired_keepalive(
+        &mut self,
+        peer: NodeId,
+        session_id: u64,
+        source: SocketAddr,
+        datagram: &[u8],
+    ) -> Result<NetworkOutput, NetworkDataError> {
+        let retired = self
+            .retired_sessions
+            .get_mut(&(peer, session_id))
+            .ok_or(NetworkDataError::NoPeerSession { peer_node_id: peer })?;
+        validate_pinned_endpoint(peer, retired.endpoint, source)?;
+        retired.data.accept_keepalive(datagram)?;
         Ok(NetworkOutput::default())
     }
 
@@ -612,7 +671,29 @@ impl NetworkDataPlane {
         if let Some(previous) = self.sessions.remove(&peer) {
             self.handshakes.retire_session(peer, previous.session_id);
         }
+        let retired: Vec<(NodeId, u64)> = self
+            .retired_sessions
+            .keys()
+            .filter(|(session_peer, _)| *session_peer == peer)
+            .copied()
+            .collect();
+        for key @ (_, session_id) in retired {
+            self.retired_sessions.remove(&key);
+            self.handshakes.retire_session(peer, session_id);
+        }
         self.switch.remove_peer(peer);
+    }
+
+    fn expire_retired_sessions(&mut self, now: Duration) {
+        let expired: Vec<(NodeId, u64)> = self
+            .retired_sessions
+            .iter()
+            .filter_map(|(key, session)| (now >= session.remove_at).then_some(*key))
+            .collect();
+        for key @ (peer, session_id) in expired {
+            self.retired_sessions.remove(&key);
+            self.handshakes.retire_session(peer, session_id);
+        }
     }
 }
 
@@ -677,6 +758,21 @@ fn route_handshake_to(transmission: HandshakeTransmission, endpoint: SocketAddr)
         endpoint,
         bytes,
     }
+}
+
+fn validate_pinned_endpoint(
+    peer_node_id: NodeId,
+    expected: SocketAddr,
+    actual: SocketAddr,
+) -> Result<(), NetworkDataError> {
+    if actual != expected {
+        return Err(NetworkDataError::SessionEndpointMismatch {
+            peer_node_id,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(all(test, windows))]
@@ -828,6 +924,65 @@ mod tests {
         frame
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn establish(
+        alice: &mut NetworkDataPlane,
+        bob: &mut NetworkDataPlane,
+        alice_key: &IdentitySigningKey,
+        bob_key: &IdentitySigningKey,
+        alice_address: SocketAddr,
+        bob_address: SocketAddr,
+        wall_time: u64,
+        now: Duration,
+    ) {
+        let mut pending = alice
+            .start_handshakes(alice_key, wall_time, now)
+            .expect("start alice")
+            .into_parts()
+            .0;
+        let mut from_alice = true;
+        if pending.is_empty() {
+            pending = bob
+                .start_handshakes(bob_key, wall_time, now)
+                .expect("start bob")
+                .into_parts()
+                .0;
+            from_alice = false;
+        }
+        for _ in 0..8 {
+            if pending.is_empty() {
+                return;
+            }
+            let mut next = Vec::new();
+            for datagram in pending {
+                let output = if from_alice {
+                    bob.accept_udp_datagram(
+                        alice_address,
+                        datagram.bytes(),
+                        bob_key,
+                        wall_time,
+                        now,
+                    )
+                    .expect("bob accepts handshake")
+                } else {
+                    alice
+                        .accept_udp_datagram(
+                            bob_address,
+                            datagram.bytes(),
+                            alice_key,
+                            wall_time,
+                            now,
+                        )
+                        .expect("alice accepts handshake")
+                };
+                next.extend(output.into_parts().0);
+            }
+            pending = next;
+            from_alice = !from_alice;
+        }
+        panic!("handshake did not converge within eight flights");
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn network_router_establishes_sessions_and_carries_broadcast_both_ways() {
@@ -855,85 +1010,16 @@ mod tests {
         )
         .expect("bob data plane");
 
-        let mut pending = alice
-            .start_handshakes(&alice_key, WALL_TIME, Duration::ZERO)
-            .expect("start alice")
-            .into_parts()
-            .0;
-        if pending.is_empty() {
-            pending = bob
-                .start_handshakes(&bob_key, WALL_TIME, Duration::ZERO)
-                .expect("start bob")
-                .into_parts()
-                .0;
-            while !pending.is_empty() {
-                let mut next = Vec::new();
-                for datagram in pending {
-                    let output = alice
-                        .accept_udp_datagram(
-                            bob_address,
-                            datagram.bytes(),
-                            &alice_key,
-                            WALL_TIME,
-                            Duration::ZERO,
-                        )
-                        .expect("alice accepts handshake");
-                    next.extend(output.into_parts().0);
-                }
-                pending = next;
-                if pending.is_empty() {
-                    break;
-                }
-                let mut next = Vec::new();
-                for datagram in pending {
-                    let output = bob
-                        .accept_udp_datagram(
-                            alice_address,
-                            datagram.bytes(),
-                            &bob_key,
-                            WALL_TIME,
-                            Duration::ZERO,
-                        )
-                        .expect("bob accepts handshake");
-                    next.extend(output.into_parts().0);
-                }
-                pending = next;
-            }
-        } else {
-            while !pending.is_empty() {
-                let mut next = Vec::new();
-                for datagram in pending {
-                    let output = bob
-                        .accept_udp_datagram(
-                            alice_address,
-                            datagram.bytes(),
-                            &bob_key,
-                            WALL_TIME,
-                            Duration::ZERO,
-                        )
-                        .expect("bob accepts handshake");
-                    next.extend(output.into_parts().0);
-                }
-                pending = next;
-                if pending.is_empty() {
-                    break;
-                }
-                let mut next = Vec::new();
-                for datagram in pending {
-                    let output = alice
-                        .accept_udp_datagram(
-                            bob_address,
-                            datagram.bytes(),
-                            &alice_key,
-                            WALL_TIME,
-                            Duration::ZERO,
-                        )
-                        .expect("alice accepts handshake");
-                    next.extend(output.into_parts().0);
-                }
-                pending = next;
-            }
-        }
+        establish(
+            &mut alice,
+            &mut bob,
+            &alice_key,
+            &bob_key,
+            alice_address,
+            bob_address,
+            WALL_TIME,
+            Duration::ZERO,
+        );
         assert_eq!(alice.established_peers().len(), 1);
         assert_eq!(bob.established_peers().len(), 1);
 
@@ -1052,6 +1138,139 @@ mod tests {
             .maintain(&alice_key, WALL_TIME, Duration::from_secs(93))
             .expect("keepalive timeout");
         assert!(alice.established_peers().is_empty());
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn routine_rekey_keeps_old_session_receive_only_for_thirty_seconds() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_address: SocketAddr = "127.0.0.1:46001".parse().expect("alice address");
+        let bob_address: SocketAddr = "127.0.0.1:46002".parse().expect("bob address");
+        let alice_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 2, 1]);
+        let bob_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 2, 2]);
+        let mut alice = NetworkDataPlane::new(
+            state(&store, &controller, &alice_key, network_id),
+            alice_mac,
+            alice_address,
+            1_200,
+            &alice_key,
+            Duration::ZERO,
+        )
+        .expect("alice data plane");
+        let mut bob = NetworkDataPlane::new(
+            state(&store, &controller, &bob_key, network_id),
+            bob_mac,
+            bob_address,
+            1_200,
+            &bob_key,
+            Duration::ZERO,
+        )
+        .expect("bob data plane");
+        establish(
+            &mut alice,
+            &mut bob,
+            &alice_key,
+            &bob_key,
+            alice_address,
+            bob_address,
+            WALL_TIME,
+            Duration::ZERO,
+        );
+
+        let first_old_frame = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xd1);
+        let first_old_packet = alice
+            .accept_tap_frame(&first_old_frame, Duration::from_secs(1))
+            .expect("first old packet")
+            .into_parts()
+            .0
+            .remove(0);
+        let second_old_frame = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xd2);
+        let second_old_packet = alice
+            .accept_tap_frame(&second_old_frame, Duration::from_secs(2))
+            .expect("second old packet")
+            .into_parts()
+            .0
+            .remove(0);
+
+        let rekey_wall_time = WALL_TIME + 890;
+        let rekey_now = Duration::from_secs(10);
+        let alice_start = alice
+            .maintain(&alice_key, rekey_wall_time, rekey_now)
+            .expect("alice starts rekey")
+            .into_parts()
+            .0;
+        let bob_start = bob
+            .maintain(&bob_key, rekey_wall_time, rekey_now)
+            .expect("bob starts rekey")
+            .into_parts()
+            .0;
+        let (mut pending, mut from_alice) = if alice_start.is_empty() {
+            (bob_start, false)
+        } else {
+            assert!(bob_start.is_empty());
+            (alice_start, true)
+        };
+        for _ in 0..8 {
+            if pending.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for datagram in pending {
+                let output = if from_alice {
+                    bob.accept_udp_datagram(
+                        alice_address,
+                        datagram.bytes(),
+                        &bob_key,
+                        rekey_wall_time,
+                        rekey_now,
+                    )
+                    .expect("bob advances rekey")
+                } else {
+                    alice
+                        .accept_udp_datagram(
+                            bob_address,
+                            datagram.bytes(),
+                            &alice_key,
+                            rekey_wall_time,
+                            rekey_now,
+                        )
+                        .expect("alice advances rekey")
+                };
+                next.extend(output.into_parts().0);
+            }
+            pending = next;
+            from_alice = !from_alice;
+        }
+        assert!(pending.is_empty());
+        assert_eq!(alice.established_peers().len(), 1);
+        assert_eq!(bob.established_peers().len(), 1);
+
+        let delayed = bob
+            .accept_udp_datagram(
+                alice_address,
+                first_old_packet.bytes(),
+                &bob_key,
+                rekey_wall_time,
+                Duration::from_secs(11),
+            )
+            .expect("accept reordered old-session packet");
+        assert_eq!(delayed.tap_frame(), Some(first_old_frame.as_slice()));
+
+        bob.maintain(&bob_key, rekey_wall_time + 31, Duration::from_secs(41))
+            .expect("expire old receive session");
+        assert!(matches!(
+            bob.accept_udp_datagram(
+                alice_address,
+                second_old_packet.bytes(),
+                &bob_key,
+                rekey_wall_time + 31,
+                Duration::from_secs(41),
+            ),
+            Err(NetworkDataError::NoPeerSession { .. })
+        ));
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
