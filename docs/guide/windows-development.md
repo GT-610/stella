@@ -4,7 +4,7 @@
 
 - Windows 10 or newer;
 - stable Rust toolchain with Cargo;
-- TAP-Windows installed for later platform tests;
+- TAP-Windows installed for the runtime and platform tests;
 - Bun for the VitePress documentation site;
 - Git with long-path support recommended.
 
@@ -62,7 +62,26 @@ Record the initialization output, network ID, and tokens before starting the
 daemon. The tokens are sensitive and printed only once. Press Ctrl+C to drain
 active sessions and shut down cleanly.
 
-The controller control plane is functional. `stella-client` does not yet form a
-usable virtual LAN; its Windows control-plane and data-plane integration are
-the next implementation milestone. For a persistent deployment, follow the
+The controller and Windows client now form an experimental virtual LAN. Generate
+separate enrollment and join tokens for every client, then initialize, join, and
+run each client as described in the [Windows client CLI guide](/api/client-cli).
+Each client needs a distinct installed TAP-Windows adapter, a reachable UDP
+endpoint published in its client configuration, and firewall or NAT rules that
+allow peer UDP traffic. Run the active client from an elevated PowerShell
+session so it can open the TAP adapter.
+
+The initial client configuration has an empty `advertised_endpoints` list. Before
+running a client, replace that list with an endpoint whose port matches
+`udp_bind`; for example:
+
+```toml
+[[transport.advertised_endpoints]]
+address = "192.168.1.20:45100"
+priority = 10
+max_datagram_size = 1200
+```
+
+Stella forwards Ethernet frames and does not assign IP addresses or run DHCP.
+Configure suitable addresses on the TAP adapters, or provide DHCP within the
+virtual LAN. For a persistent deployment, follow the
 [Windows controller deployment guide](./server-deployment.md).

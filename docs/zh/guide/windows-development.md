@@ -4,7 +4,7 @@
 
 - Windows 10 或更高版本；
 - 含 Cargo 的稳定版 Rust 工具链；
-- 为后续平台测试安装 TAP-Windows；
+- 为运行时和平台测试安装 TAP-Windows；
 - 用于 VitePress 文档站点的 Bun；
 - 建议使用已启用长路径支持的 Git。
 
@@ -58,6 +58,22 @@ cargo run -p stella-server -- --config $Config run
 启动守护进程前，请记录初始化输出、网络 ID 和令牌。令牌敏感且只输出一次。
 按 Ctrl+C 排空活动会话并正常关闭。
 
-控制器控制平面已经可用。`stella-client` 尚不能组成可用的虚拟局域网；其
-Windows 控制平面和数据平面集成是下一项实现里程碑。若要部署持久环境，请阅读
+控制器和 Windows 客户端现在可以组成实验性的虚拟局域网。请为每台客户端生成独立的
+注册和加入令牌，然后按 [Windows 客户端 CLI 指南](/zh/api/client-cli)初始化、加入并
+运行客户端。每台客户端需要一块独立、已安装的 TAP-Windows 适配器，一个在客户端配置中
+公布且可达的 UDP 端点，以及允许对等 UDP 流量通过的防火墙或 NAT 规则。活动客户端应在
+提升权限的 PowerShell 会话中运行，以便打开 TAP 适配器。
+
+初始客户端配置的 `advertised_endpoints` 列表为空。运行客户端前，请将该列表替换为端口
+与 `udp_bind` 一致的端点，例如：
+
+```toml
+[[transport.advertised_endpoints]]
+address = "192.168.1.20:45100"
+priority = 10
+max_datagram_size = 1200
+```
+
+Stella 转发以太网帧，不会分配 IP 地址或提供 DHCP。请在 TAP 适配器上配置合适的地址，
+或在虚拟局域网中提供 DHCP。若要部署持久环境，请阅读
 [Windows 控制器部署指南](./server-deployment.md)。

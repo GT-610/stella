@@ -4,6 +4,16 @@
 列表，以及 Windows TAP/数据平面运行时。除非另行指定路径，命令都使用
 `--config client.toml`。
 
+## 前置条件与可达性
+
+每台客户端都需要自己预先安装的 TAP-Windows Adapter V9。控制器必须能通过配置的
+TLS/TCP 地址访问。每台客户端必须公布至少一个对等节点可达的 UDP 端点，且主机防火墙
+和任何 NAT 都必须允许该对等 UDP 流量。请在提升权限的 PowerShell 会话中运行 `run`，
+以便进程打开 TAP 适配器。
+
+Stella 是二层覆盖网络：它不分配 IP 地址，也不提供 DHCP。请自行在 TAP 适配器上配置
+地址，或在虚拟局域网内提供 DHCP。
+
 ## 初始化
 
 ```powershell
@@ -20,8 +30,18 @@ stella-client --config C:\Stella\client.toml init `
 文件的继承权限，只允许当前账户和 `LocalSystem` 访问。已有目标不会被替换；初始化
 失败时只会删除本次调用创建的目标。
 
-成功输出包含小写节点 ID 和配置路径。初始配置没有网络条目。`init` 不接受注册或
-加入令牌，也不会将令牌写入磁盘。
+成功输出包含小写节点 ID 和配置路径。初始配置没有网络条目，且
+`transport.advertised_endpoints` 列表为空。运行客户端前，请将这个空列表替换为一个
+对等节点可达、端口与 `udp_bind` 一致的端点：
+
+```toml
+[[transport.advertised_endpoints]]
+address = "192.0.2.20:45100"
+priority = 10
+max_datagram_size = 1200
+```
+
+`init` 不接受注册或加入令牌，也不会将令牌写入磁盘。
 
 ## 加入网络
 

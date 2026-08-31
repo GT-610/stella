@@ -1,9 +1,8 @@
 # Deploy a controller on Windows
 
 This guide creates one self-hosted Stella controller deployment on Windows.
-The controller is functional, but the Windows client and Ethernet data plane
-are still under development; these steps prepare the control plane rather than
-forming a usable virtual LAN by themselves.
+Together with configured Windows clients, the controller forms an experimental
+Layer-2 virtual LAN. It is not a production networking release.
 
 ## Build the server
 
