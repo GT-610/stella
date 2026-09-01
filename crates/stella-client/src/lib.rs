@@ -16,6 +16,7 @@ mod runtime;
 mod state;
 mod switch;
 mod tls;
+mod turn;
 
 pub use active::{ActiveControl, ControlUpdate, HeartbeatReport};
 pub use config::{ClientConfig, ClientConfigError, ConfiguredNetwork, CONFIG_VERSION};
@@ -42,3 +43,4 @@ pub use state::{
 };
 pub use switch::{FloodClass, L2Switch, PeerIngress, SwitchError, TapForwarding};
 pub use tls::{SpkiPin, SpkiPinParseError};
+pub use turn::{TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError};

@@ -1,0 +1,1763 @@
+//! Authenticated TURN UDP allocation and relayed datagram client.
+
+use std::{
+    collections::BTreeMap,
+    fmt,
+    net::{IpAddr, SocketAddr},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+use stella_common::RelayId;
+use stella_crypto::sha256_segments;
+use stella_proto::{
+    decode_stun_xor_address, encode_stun_message, encode_stun_xor_address,
+    encode_turn_channel_data, CodecError, StunAttributeRef, StunAttributeType, StunClass,
+    StunErrorCodeView, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
+    StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
+};
+use stella_transport::{Endpoint as TransportEndpoint, ReceivedDatagram, TransportCapabilities};
+use thiserror::Error;
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot, Mutex},
+    task::JoinHandle,
+    time::{timeout_at, Instant},
+};
+use zeroize::Zeroizing;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const TURN_UDP_COMMAND_CAPACITY: usize = 64;
+const TURN_UDP_RECEIVE_CAPACITY: usize = 256;
+const TURN_UDP_RECEIVE_BUFFER_SIZE: usize = u16::MAX as usize;
+const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
+const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
+const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_TURN_UDP_DATAGRAM_SIZE: usize = 65_503;
+const REQUESTED_TRANSPORT_UDP: [u8; 4] = [17, 0, 0, 0];
+
+/// Configuration for one authenticated TURN allocation reached over UDP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurnUdpClientConfig {
+    /// Stable identity of the configured relay service.
+    pub relay_id: RelayId,
+    /// Numeric TURN UDP listener address.
+    pub server_address: SocketAddr,
+    /// Local client socket address; port zero requests an ephemeral port.
+    pub bind_address: SocketAddr,
+    /// Largest complete Stella datagram carried through this allocation.
+    pub max_datagram_size: usize,
+    /// Requested allocation lifetime, capped by the relay.
+    pub allocation_lifetime_seconds: u32,
+    /// Advertised allocation inactivity timeout.
+    pub idle_timeout_seconds: u32,
+    /// Complete retransmitting transaction deadline.
+    pub transaction_timeout: Duration,
+}
+
+impl TurnUdpClientConfig {
+    /// Creates a conservative TURN UDP client configuration.
+    #[must_use]
+    pub const fn new(
+        relay_id: RelayId,
+        server_address: SocketAddr,
+        bind_address: SocketAddr,
+    ) -> Self {
+        Self {
+            relay_id,
+            server_address,
+            bind_address,
+            max_datagram_size: 1_200,
+            allocation_lifetime_seconds: 600,
+            idle_timeout_seconds: 120,
+            transaction_timeout: DEFAULT_TRANSACTION_TIMEOUT,
+        }
+    }
+
+    fn validate(self) -> Result<(), TurnUdpError> {
+        if self.relay_id.is_zero() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "relay ID",
+                reason: "must be non-zero",
+            });
+        }
+        if self.server_address.port() == 0 || self.server_address.ip().is_unspecified() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "server address",
+                reason: "must use a specified address and non-zero port",
+            });
+        }
+        if self.server_address.is_ipv4() != self.bind_address.is_ipv4() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "bind address",
+                reason: "must use the TURN server address family",
+            });
+        }
+        if !(1_200..=MAX_TURN_UDP_DATAGRAM_SIZE).contains(&self.max_datagram_size) {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "maximum datagram size",
+                reason: "must be between 1200 and 65503 bytes",
+            });
+        }
+        if self.allocation_lifetime_seconds == 0 {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "allocation lifetime",
+                reason: "must be non-zero",
+            });
+        }
+        if self.idle_timeout_seconds == 0 {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "idle timeout",
+                reason: "must be non-zero",
+            });
+        }
+        if self.transaction_timeout < INITIAL_RETRANSMIT_TIMEOUT {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "transaction timeout",
+                reason: "must be at least 250 milliseconds",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Controller-issued TURN long-term credentials owned and redacted by the client.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TurnCredentials {
+    username: Zeroizing<Vec<u8>>,
+    password: Zeroizing<Vec<u8>>,
+    expires_at: u64,
+}
+
+impl TurnCredentials {
+    /// Creates credentials with an exclusive Unix expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] when either value is empty or expiry is zero.
+    pub fn new(
+        username: Vec<u8>,
+        password: Vec<u8>,
+        expires_at: u64,
+    ) -> Result<Self, TurnUdpError> {
+        if username.is_empty() || password.is_empty() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN credentials",
+                reason: "username and password must be non-empty",
+            });
+        }
+        if expires_at == 0 {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN credential expiry",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(Self {
+            username: Zeroizing::new(username),
+            password: Zeroizing::new(password),
+            expires_at,
+        })
+    }
+
+    /// Borrows the exact TURN `USERNAME` value.
+    #[must_use]
+    pub fn username(&self) -> &[u8] {
+        &self.username
+    }
+
+    /// Returns the exclusive credential expiry Unix time.
+    #[must_use]
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    fn validate_time(&self, now: u64) -> Result<(), TurnUdpError> {
+        if self.expires_at <= now {
+            return Err(TurnUdpError::CredentialExpired {
+                expires_at: self.expires_at,
+                now,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TurnCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnCredentials")
+            .field("username_length", &self.username.len())
+            .field("password_length", &self.password.len())
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Failure while creating or operating one TURN UDP allocation.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum TurnUdpError {
+    /// A stable client configuration bound is invalid.
+    #[error("invalid TURN UDP configuration for {field}: {reason}")]
+    InvalidConfig {
+        /// Stable field name.
+        field: &'static str,
+        /// Stable non-secret rule description.
+        reason: &'static str,
+    },
+    /// Controller-issued credentials are no longer valid.
+    #[error("TURN credentials expired at {expires_at}, evaluated at {now}")]
+    CredentialExpired {
+        /// Exclusive expiry Unix time.
+        expires_at: u64,
+        /// Current Unix time.
+        now: u64,
+    },
+    /// Operating-system randomness was unavailable.
+    #[error("operating-system randomness is unavailable for TURN transaction ID")]
+    RandomnessUnavailable,
+    /// A local socket operation failed.
+    #[error("TURN UDP {operation} failed")]
+    Io {
+        /// Stable operation name.
+        operation: &'static str,
+        /// Original operating-system error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A STUN or TURN record was structurally invalid.
+    #[error(transparent)]
+    Codec(#[from] CodecError),
+    /// A retransmitting request received no matching response before its deadline.
+    #[error("TURN {method:?} transaction timed out")]
+    TransactionTimeout {
+        /// Timed-out TURN method.
+        method: StunMethod,
+    },
+    /// A matching response had an unexpected class, method, or transaction context.
+    #[error("TURN {method:?} response is inconsistent with its request")]
+    UnexpectedResponse {
+        /// Requested method.
+        method: StunMethod,
+    },
+    /// The relay rejected an authenticated request.
+    #[error("TURN relay rejected {method:?} with status {code}")]
+    Rejected {
+        /// Rejected method.
+        method: StunMethod,
+        /// Registered STUN/TURN error code.
+        code: u16,
+    },
+    /// A required response attribute was absent or duplicated.
+    #[error("TURN response has invalid {attribute:?} cardinality")]
+    InvalidAttributeCardinality {
+        /// Affected attribute.
+        attribute: StunAttributeType,
+    },
+    /// A response attribute had invalid semantics.
+    #[error("TURN response attribute is invalid: {detail}")]
+    InvalidAttribute {
+        /// Stable non-secret rule description.
+        detail: &'static str,
+    },
+    /// An authenticated response failed HMAC verification.
+    #[error("TURN response MESSAGE-INTEGRITY-SHA256 verification failed")]
+    ResponseIntegrity,
+    /// A caller attempted to send a datagram larger than the allocation limit.
+    #[error("TURN datagram length {actual} exceeds configured maximum {maximum}")]
+    DatagramTooLarge {
+        /// Attempted datagram length.
+        actual: usize,
+        /// Configured maximum.
+        maximum: usize,
+    },
+    /// Caller storage cannot hold a complete relayed datagram.
+    #[error("receive output has {remaining} bytes but relayed datagram needs {needed}")]
+    ReceiveBufferTooSmall {
+        /// Complete relayed datagram length.
+        needed: usize,
+        /// Caller buffer capacity.
+        remaining: usize,
+    },
+    /// A concrete client method received an endpoint for another carrier.
+    #[error("endpoint is not a TURN UDP relay candidate")]
+    UnsupportedEndpoint,
+    /// The allocation actor stopped before completing an operation.
+    #[error("TURN UDP allocation actor stopped")]
+    ActorStopped,
+    /// The allocation actor task panicked or was cancelled unexpectedly.
+    #[error("TURN UDP allocation actor task failed")]
+    TaskFailed,
+    /// Time arithmetic overflowed a monotonic deadline.
+    #[error("TURN UDP deadline overflowed for {field}")]
+    DeadlineOverflow {
+        /// Stable deadline field name.
+        field: &'static str,
+    },
+    /// The dynamic TURN channel number space was exhausted.
+    #[error("TURN channel number space is exhausted")]
+    ChannelSpaceExhausted,
+}
+
+/// One live authenticated TURN UDP allocation with bounded command and receive queues.
+pub struct TurnUdpClient {
+    relay_id: RelayId,
+    relayed_address: SocketAddr,
+    mapped_address: SocketAddr,
+    local_address: SocketAddr,
+    capabilities: TransportCapabilities,
+    commands: mpsc::Sender<Command>,
+    inbound: Mutex<mpsc::Receiver<InboundEvent>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    shutdown: AtomicBool,
+}
+
+impl TurnUdpClient {
+    /// Authenticates, allocates a relayed UDP address, and starts the socket actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] for configuration, credentials, socket I/O,
+    /// authentication challenge, transaction, integrity, or allocation response failures.
+    pub async fn allocate(
+        config: TurnUdpClientConfig,
+        credentials: TurnCredentials,
+    ) -> Result<Self, TurnUdpError> {
+        config.validate()?;
+        credentials.validate_time(unix_time()?)?;
+        let socket = UdpSocket::bind(config.bind_address)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "bind",
+                source,
+            })?;
+        socket
+            .connect(config.server_address)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "connect",
+                source,
+            })?;
+        let local_address = socket.local_addr().map_err(|source| TurnUdpError::Io {
+            operation: "query local address",
+            source,
+        })?;
+        let expected_realm = format!("stella-relay:{}", config.relay_id).into_bytes();
+        let challenge = initial_challenge(&socket, config, &expected_realm).await?;
+        let mut actor = Actor::new(socket, config, credentials, challenge)?;
+        let allocation = actor.allocate().await?;
+        let relayed_address = allocation.relayed_address;
+        let mapped_address = allocation.mapped_address;
+        actor.schedule_allocation_refresh(allocation.lifetime)?;
+        let (commands, command_receiver) = mpsc::channel(TURN_UDP_COMMAND_CAPACITY);
+        let (inbound_sender, inbound) = mpsc::channel(TURN_UDP_RECEIVE_CAPACITY);
+        actor.commands = Some(command_receiver);
+        actor.inbound = Some(inbound_sender);
+        let task = tokio::spawn(actor.run());
+        Ok(Self {
+            relay_id: config.relay_id,
+            relayed_address,
+            mapped_address,
+            local_address,
+            capabilities: TransportCapabilities {
+                max_datagram_size: config.max_datagram_size,
+            },
+            commands,
+            inbound: Mutex::new(inbound),
+            task: Mutex::new(Some(task)),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
+    /// Returns the relay identity attached to this local allocation.
+    #[must_use]
+    pub const fn relay_id(&self) -> RelayId {
+        self.relay_id
+    }
+
+    /// Returns the public relayed candidate address.
+    #[must_use]
+    pub const fn relayed_address(&self) -> SocketAddr {
+        self.relayed_address
+    }
+
+    /// Returns the client address observed by the TURN server.
+    #[must_use]
+    pub const fn mapped_address(&self) -> SocketAddr {
+        self.mapped_address
+    }
+
+    /// Returns the local UDP socket address used for the allocation.
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.local_address
+    }
+
+    /// Returns the enforced complete Stella datagram limit.
+    #[must_use]
+    pub const fn capabilities(&self) -> TransportCapabilities {
+        self.capabilities
+    }
+
+    /// Returns the local relay candidate published to authorized peers.
+    #[must_use]
+    pub const fn local_endpoint(&self) -> TransportEndpoint {
+        TransportEndpoint::TurnUdp {
+            relay_id: self.relay_id,
+            address: self.relayed_address,
+        }
+    }
+
+    /// Creates or refreshes a peer permission and channel binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn prepare_peer(&self, endpoint: &TransportEndpoint) -> Result<(), TurnUdpError> {
+        let endpoint = endpoint.clone();
+        self.command(|response| Command::PreparePeer { endpoint, response })
+            .await
+    }
+
+    /// Creates or refreshes only the TURN permission for a peer candidate.
+    ///
+    /// This keeps the standard Send/Data indication path available before a
+    /// channel is selected or when a caller deliberately avoids `ChannelData`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn permit_peer(&self, endpoint: &TransportEndpoint) -> Result<(), TurnUdpError> {
+        let endpoint = endpoint.clone();
+        self.command(|response| Command::PermitPeer { endpoint, response })
+            .await
+    }
+
+    /// Sends one complete datagram through a prepared or automatically prepared relay path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] for endpoint mismatch, size, permission,
+    /// channel binding, actor, or socket failure.
+    pub async fn send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnUdpError> {
+        if datagram.len() > self.capabilities.max_datagram_size {
+            return Err(TurnUdpError::DatagramTooLarge {
+                actual: datagram.len(),
+                maximum: self.capabilities.max_datagram_size,
+            });
+        }
+        let endpoint = endpoint.clone();
+        let datagram = datagram.to_vec();
+        self.command(|response| Command::Send {
+            endpoint,
+            datagram,
+            response,
+        })
+        .await
+    }
+
+    /// Sends one complete datagram as a TURN Send indication.
+    ///
+    /// The actor automatically creates or refreshes the required permission;
+    /// the peer receives the datagram as a TURN Data indication when it has no
+    /// channel binding for this address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] for endpoint mismatch, size, permission,
+    /// actor, codec, or socket failure.
+    pub async fn send_indication_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnUdpError> {
+        if datagram.len() > self.capabilities.max_datagram_size {
+            return Err(TurnUdpError::DatagramTooLarge {
+                actual: datagram.len(),
+                maximum: self.capabilities.max_datagram_size,
+            });
+        }
+        let endpoint = endpoint.clone();
+        let datagram = datagram.to_vec();
+        self.command(|response| Command::SendIndication {
+            endpoint,
+            datagram,
+            response,
+        })
+        .await
+    }
+
+    /// Replaces short-lived controller credentials and verifies them with an allocation refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] when credentials are expired or the refresh fails.
+    pub async fn replace_credentials(
+        &self,
+        credentials: TurnCredentials,
+    ) -> Result<(), TurnUdpError> {
+        credentials.validate_time(unix_time()?)?;
+        self.command(|response| Command::ReplaceCredentials {
+            credentials,
+            response,
+        })
+        .await
+    }
+
+    /// Receives one complete relayed datagram without exposing partial data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] for insufficient output, actor failure, or shutdown.
+    pub async fn receive(&self, output: &mut [u8]) -> Result<ReceivedDatagram, TurnUdpError> {
+        let mut inbound = self.inbound.lock().await;
+        match inbound.recv().await.ok_or(TurnUdpError::ActorStopped)? {
+            InboundEvent::Datagram { endpoint, data } => {
+                if output.len() < data.len() {
+                    return Err(TurnUdpError::ReceiveBufferTooSmall {
+                        needed: data.len(),
+                        remaining: output.len(),
+                    });
+                }
+                let length = data.len();
+                output[..length].copy_from_slice(&data);
+                Ok(ReceivedDatagram {
+                    source: endpoint,
+                    length,
+                })
+            }
+            InboundEvent::Failed(error) => Err(error),
+        }
+    }
+
+    /// Deletes the allocation, stops the actor, and cancels pending receives.
+    ///
+    /// Shutdown is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] when deletion or actor joining fails.
+    pub async fn shutdown(&self) -> Result<(), TurnUdpError> {
+        if !self.shutdown.swap(true, Ordering::AcqRel) {
+            let result = self.command_allow_shutdown(Command::shutdown).await;
+            let join = self.join_task().await;
+            return result.and(join);
+        }
+        self.join_task().await
+    }
+
+    async fn command<F>(&self, create: F) -> Result<(), TurnUdpError>
+    where
+        F: FnOnce(oneshot::Sender<Result<(), TurnUdpError>>) -> Command,
+    {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(TurnUdpError::ActorStopped);
+        }
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(create(response))
+            .await
+            .map_err(|_| TurnUdpError::ActorStopped)?;
+        receiver.await.map_err(|_| TurnUdpError::ActorStopped)?
+    }
+
+    async fn command_allow_shutdown(
+        &self,
+        create: fn(oneshot::Sender<Result<(), TurnUdpError>>) -> Command,
+    ) -> Result<(), TurnUdpError> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(create(response))
+            .await
+            .map_err(|_| TurnUdpError::ActorStopped)?;
+        receiver.await.map_err(|_| TurnUdpError::ActorStopped)?
+    }
+
+    async fn join_task(&self) -> Result<(), TurnUdpError> {
+        let task = self.task.lock().await.take();
+        if let Some(task) = task {
+            task.await.map_err(|_| TurnUdpError::TaskFailed)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TurnUdpClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnUdpClient")
+            .field("relay_id", &self.relay_id)
+            .field("relayed_address", &self.relayed_address)
+            .field("mapped_address", &self.mapped_address)
+            .field("local_address", &self.local_address)
+            .field("capabilities", &self.capabilities)
+            .field("shutdown", &self.shutdown.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TurnUdpClient {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(task) = self.task.get_mut().take() {
+            task.abort();
+        }
+    }
+}
+
+enum Command {
+    PermitPeer {
+        endpoint: TransportEndpoint,
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+    PreparePeer {
+        endpoint: TransportEndpoint,
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+    Send {
+        endpoint: TransportEndpoint,
+        datagram: Vec<u8>,
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+    SendIndication {
+        endpoint: TransportEndpoint,
+        datagram: Vec<u8>,
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+    ReplaceCredentials {
+        credentials: TurnCredentials,
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+    Shutdown {
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+}
+
+impl Command {
+    fn shutdown(response: oneshot::Sender<Result<(), TurnUdpError>>) -> Self {
+        Self::Shutdown { response }
+    }
+}
+
+enum InboundEvent {
+    Datagram {
+        endpoint: TransportEndpoint,
+        data: Vec<u8>,
+    },
+    Failed(TurnUdpError),
+}
+
+struct AuthContext {
+    realm: Vec<u8>,
+    nonce: Zeroizing<Vec<u8>>,
+}
+
+struct AllocationResult {
+    relayed_address: SocketAddr,
+    mapped_address: SocketAddr,
+    lifetime: u32,
+}
+
+struct Permission {
+    expires_at: Instant,
+}
+
+struct ChannelBinding {
+    channel: TurnChannelNumber,
+    endpoint: TransportEndpoint,
+    expires_at: Instant,
+}
+
+struct Actor {
+    socket: UdpSocket,
+    config: TurnUdpClientConfig,
+    credentials: TurnCredentials,
+    auth: AuthContext,
+    receive_buffer: Vec<u8>,
+    commands: Option<mpsc::Receiver<Command>>,
+    inbound: Option<mpsc::Sender<InboundEvent>>,
+    allocation_refresh_at: Instant,
+    permissions: BTreeMap<IpAddr, Permission>,
+    peers: BTreeMap<SocketAddr, TransportEndpoint>,
+    channels: BTreeMap<SocketAddr, ChannelBinding>,
+    channel_peers: BTreeMap<TurnChannelNumber, SocketAddr>,
+    next_channel: u16,
+}
+
+impl Actor {
+    fn new(
+        socket: UdpSocket,
+        config: TurnUdpClientConfig,
+        credentials: TurnCredentials,
+        auth: AuthContext,
+    ) -> Result<Self, TurnUdpError> {
+        Ok(Self {
+            socket,
+            config,
+            credentials,
+            auth,
+            receive_buffer: vec![0_u8; TURN_UDP_RECEIVE_BUFFER_SIZE],
+            commands: None,
+            inbound: None,
+            allocation_refresh_at: deadline_after(MIN_REFRESH_INTERVAL, "initial refresh")?,
+            permissions: BTreeMap::new(),
+            peers: BTreeMap::new(),
+            channels: BTreeMap::new(),
+            channel_peers: BTreeMap::new(),
+            next_channel: 0x4000,
+        })
+    }
+
+    async fn allocate(&mut self) -> Result<AllocationResult, TurnUdpError> {
+        let lifetime = self.config.allocation_lifetime_seconds.to_be_bytes();
+        let response = self
+            .authenticated_request(
+                StunMethod::Allocate,
+                &[
+                    OwnedAttribute::new(
+                        StunAttributeType::REQUESTED_TRANSPORT,
+                        REQUESTED_TRANSPORT_UDP.to_vec(),
+                    ),
+                    OwnedAttribute::new(StunAttributeType::LIFETIME, lifetime.to_vec()),
+                ],
+            )
+            .await?;
+        let message = StunMessageView::decode(&response)?;
+        let relayed_address = decode_stun_xor_address(
+            required_attribute(&message, StunAttributeType::XOR_RELAYED_ADDRESS)?,
+            message.transaction_id(),
+        )?;
+        let mapped_address = decode_stun_xor_address(
+            required_attribute(&message, StunAttributeType::XOR_MAPPED_ADDRESS)?,
+            message.transaction_id(),
+        )?;
+        let lifetime = decode_lifetime(&message)?;
+        if lifetime == 0 {
+            return Err(TurnUdpError::InvalidAttribute {
+                detail: "Allocate response lifetime must be non-zero",
+            });
+        }
+        Ok(AllocationResult {
+            relayed_address,
+            mapped_address,
+            lifetime,
+        })
+    }
+
+    async fn run(mut self) {
+        let Some(mut commands) = self.commands.take() else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    if self.handle_command(command).await {
+                        break;
+                    }
+                }
+                received = self.socket.recv(&mut self.receive_buffer) => {
+                    match received {
+                        Ok(length) => self.handle_inbound_record(length),
+                        Err(source) => {
+                            self.fail(TurnUdpError::Io {
+                                operation: "receive",
+                                source,
+                            }).await;
+                            break;
+                        }
+                    }
+                }
+                () = tokio::time::sleep_until(self.allocation_refresh_at) => {
+                    if let Err(error) = self.refresh_allocation(self.config.allocation_lifetime_seconds).await {
+                        self.fail(error).await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, command: Command) -> bool {
+        match command {
+            Command::PermitPeer { endpoint, response } => {
+                let result = self.permit_peer(&endpoint).await;
+                let _result = response.send(result);
+                false
+            }
+            Command::PreparePeer { endpoint, response } => {
+                let result = self.prepare_peer(&endpoint).await;
+                let _result = response.send(result);
+                false
+            }
+            Command::SendIndication {
+                endpoint,
+                datagram,
+                response,
+            } => {
+                let result = self.send_indication_to_peer(&endpoint, &datagram).await;
+                let _result = response.send(result);
+                false
+            }
+            Command::Send {
+                endpoint,
+                datagram,
+                response,
+            } => {
+                let result = self.send_to_peer(&endpoint, &datagram).await;
+                let _result = response.send(result);
+                false
+            }
+            Command::ReplaceCredentials {
+                credentials,
+                response,
+            } => {
+                self.credentials = credentials;
+                let result = self
+                    .refresh_allocation(self.config.allocation_lifetime_seconds)
+                    .await;
+                let _result = response.send(result);
+                false
+            }
+            Command::Shutdown { response } => {
+                let result = self.refresh_allocation(0).await;
+                let _result = response.send(result);
+                true
+            }
+        }
+    }
+
+    async fn prepare_peer(&mut self, endpoint: &TransportEndpoint) -> Result<(), TurnUdpError> {
+        let (_relay_id, peer) = endpoint
+            .as_turn_udp()
+            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        self.ensure_permission(endpoint, peer).await?;
+        self.ensure_channel(endpoint, peer).await?;
+        Ok(())
+    }
+
+    async fn permit_peer(&mut self, endpoint: &TransportEndpoint) -> Result<(), TurnUdpError> {
+        let (_relay_id, peer) = endpoint
+            .as_turn_udp()
+            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        self.ensure_permission(endpoint, peer).await
+    }
+
+    async fn send_to_peer(
+        &mut self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnUdpError> {
+        if datagram.len() > self.config.max_datagram_size {
+            return Err(TurnUdpError::DatagramTooLarge {
+                actual: datagram.len(),
+                maximum: self.config.max_datagram_size,
+            });
+        }
+        let (_relay_id, peer) = endpoint
+            .as_turn_udp()
+            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        self.prepare_peer(endpoint).await?;
+        let channel = self
+            .channels
+            .get(&peer)
+            .map(|binding| binding.channel)
+            .ok_or(TurnUdpError::InvalidAttribute {
+                detail: "prepared peer has no channel binding",
+            })?;
+        let mut encoded = vec![0_u8; datagram.len().saturating_add(4)];
+        let length = encode_turn_channel_data(channel, datagram, &mut encoded)?;
+        self.socket
+            .send(&encoded[..length])
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "send ChannelData",
+                source,
+            })?;
+        Ok(())
+    }
+
+    async fn send_indication_to_peer(
+        &mut self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnUdpError> {
+        if datagram.len() > self.config.max_datagram_size {
+            return Err(TurnUdpError::DatagramTooLarge {
+                actual: datagram.len(),
+                maximum: self.config.max_datagram_size,
+            });
+        }
+        let (_relay_id, peer) = endpoint
+            .as_turn_udp()
+            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        self.ensure_permission(endpoint, peer).await?;
+        let transaction_id = random_transaction_id()?;
+        let encoded = encode_message(
+            StunMethod::Send,
+            StunClass::Indication,
+            transaction_id,
+            &[
+                OwnedAttribute::new(
+                    StunAttributeType::XOR_PEER_ADDRESS,
+                    xor_address_value(peer, transaction_id)?,
+                ),
+                OwnedAttribute::new(StunAttributeType::DATA, datagram.to_vec()),
+            ],
+        )?;
+        self.socket
+            .send(&encoded)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "send indication",
+                source,
+            })?;
+        Ok(())
+    }
+
+    async fn ensure_permission(
+        &mut self,
+        endpoint: &TransportEndpoint,
+        peer: SocketAddr,
+    ) -> Result<(), TurnUdpError> {
+        self.peers.insert(peer, endpoint.clone());
+        let now = Instant::now();
+        if self
+            .permissions
+            .get(&peer.ip())
+            .is_some_and(|permission| permission.expires_at > now + PERMISSION_LIFETIME / 2)
+        {
+            return Ok(());
+        }
+        let transaction_id = random_transaction_id()?;
+        let peer_value = xor_address_value(peer, transaction_id)?;
+        self.authenticated_request_with_transaction(
+            StunMethod::CreatePermission,
+            transaction_id,
+            &[OwnedAttribute::new(
+                StunAttributeType::XOR_PEER_ADDRESS,
+                peer_value,
+            )],
+        )
+        .await?;
+        self.permissions.insert(
+            peer.ip(),
+            Permission {
+                expires_at: deadline_after(PERMISSION_LIFETIME, "permission lifetime")?,
+            },
+        );
+        Ok(())
+    }
+
+    async fn ensure_channel(
+        &mut self,
+        endpoint: &TransportEndpoint,
+        peer: SocketAddr,
+    ) -> Result<(), TurnUdpError> {
+        let now = Instant::now();
+        if let Some(binding) = self.channels.get_mut(&peer) {
+            binding.endpoint = endpoint.clone();
+            if binding.expires_at > now + CHANNEL_LIFETIME / 2 {
+                return Ok(());
+            }
+        }
+        let channel = if let Some(binding) = self.channels.get(&peer) {
+            binding.channel
+        } else {
+            self.allocate_channel()?
+        };
+        let transaction_id = random_transaction_id()?;
+        let peer_value = xor_address_value(peer, transaction_id)?;
+        let mut channel_value = [0_u8; 4];
+        channel_value[..2].copy_from_slice(&channel.get().to_be_bytes());
+        self.authenticated_request_with_transaction(
+            StunMethod::ChannelBind,
+            transaction_id,
+            &[
+                OwnedAttribute::new(StunAttributeType::CHANNEL_NUMBER, channel_value.to_vec()),
+                OwnedAttribute::new(StunAttributeType::XOR_PEER_ADDRESS, peer_value),
+            ],
+        )
+        .await?;
+        self.channel_peers.insert(channel, peer);
+        self.channels.insert(
+            peer,
+            ChannelBinding {
+                channel,
+                endpoint: endpoint.clone(),
+                expires_at: deadline_after(CHANNEL_LIFETIME, "channel lifetime")?,
+            },
+        );
+        Ok(())
+    }
+
+    fn allocate_channel(&mut self) -> Result<TurnChannelNumber, TurnUdpError> {
+        for _attempt in 0..=0x3fff_u16 {
+            let candidate = self.next_channel;
+            self.next_channel = if candidate == 0x7fff {
+                0x4000
+            } else {
+                candidate + 1
+            };
+            let channel =
+                TurnChannelNumber::new(candidate).ok_or(TurnUdpError::ChannelSpaceExhausted)?;
+            if !self.channel_peers.contains_key(&channel) {
+                return Ok(channel);
+            }
+        }
+        Err(TurnUdpError::ChannelSpaceExhausted)
+    }
+
+    async fn refresh_allocation(&mut self, lifetime: u32) -> Result<(), TurnUdpError> {
+        let response = self
+            .authenticated_request(
+                StunMethod::Refresh,
+                &[OwnedAttribute::new(
+                    StunAttributeType::LIFETIME,
+                    lifetime.to_be_bytes().to_vec(),
+                )],
+            )
+            .await?;
+        let message = StunMessageView::decode(&response)?;
+        let granted = decode_lifetime(&message)?;
+        if lifetime == 0 {
+            if granted != 0 {
+                return Err(TurnUdpError::InvalidAttribute {
+                    detail: "Refresh deletion response lifetime must be zero",
+                });
+            }
+            return Ok(());
+        }
+        if granted == 0 {
+            return Err(TurnUdpError::InvalidAttribute {
+                detail: "Refresh response lifetime must be non-zero",
+            });
+        }
+        self.schedule_allocation_refresh(granted)
+    }
+
+    fn schedule_allocation_refresh(&mut self, lifetime: u32) -> Result<(), TurnUdpError> {
+        let allocation_half = Duration::from_secs(u64::from(lifetime)).div_f64(2.0);
+        let idle_half =
+            Duration::from_secs(u64::from(self.config.idle_timeout_seconds)).div_f64(2.0);
+        let interval = allocation_half
+            .max(MIN_REFRESH_INTERVAL)
+            .min(idle_half.max(MIN_REFRESH_INTERVAL));
+        self.allocation_refresh_at = deadline_after(interval, "allocation refresh")?;
+        Ok(())
+    }
+
+    async fn authenticated_request(
+        &mut self,
+        method: StunMethod,
+        method_attributes: &[OwnedAttribute],
+    ) -> Result<Vec<u8>, TurnUdpError> {
+        let transaction_id = random_transaction_id()?;
+        self.authenticated_request_with_transaction(method, transaction_id, method_attributes)
+            .await
+    }
+
+    async fn authenticated_request_with_transaction(
+        &mut self,
+        method: StunMethod,
+        transaction_id: StunTransactionId,
+        method_attributes: &[OwnedAttribute],
+    ) -> Result<Vec<u8>, TurnUdpError> {
+        self.credentials.validate_time(unix_time()?)?;
+        let request = signed_request(
+            method,
+            transaction_id,
+            &self.credentials,
+            &self.auth,
+            method_attributes,
+        )?;
+        let response = self.transact(method, transaction_id, &request).await?;
+        match classify_authenticated_response(
+            &response,
+            method,
+            transaction_id,
+            &self.credentials,
+            &self.auth.realm,
+        )? {
+            AuthenticatedResponse::Success => Ok(response),
+            AuthenticatedResponse::StaleNonce(challenge) => {
+                self.auth = challenge;
+                let retry_transaction = random_transaction_id()?;
+                let retry = signed_request(
+                    method,
+                    retry_transaction,
+                    &self.credentials,
+                    &self.auth,
+                    method_attributes,
+                )?;
+                let response = self.transact(method, retry_transaction, &retry).await?;
+                match classify_authenticated_response(
+                    &response,
+                    method,
+                    retry_transaction,
+                    &self.credentials,
+                    &self.auth.realm,
+                )? {
+                    AuthenticatedResponse::Success => Ok(response),
+                    AuthenticatedResponse::StaleNonce(_) => {
+                        Err(TurnUdpError::Rejected { method, code: 438 })
+                    }
+                }
+            }
+        }
+    }
+
+    async fn transact(
+        &mut self,
+        method: StunMethod,
+        transaction_id: StunTransactionId,
+        request: &[u8],
+    ) -> Result<Vec<u8>, TurnUdpError> {
+        let deadline = deadline_after(self.config.transaction_timeout, "transaction timeout")?;
+        let mut retransmit = INITIAL_RETRANSMIT_TIMEOUT;
+        loop {
+            self.socket
+                .send(request)
+                .await
+                .map_err(|source| TurnUdpError::Io {
+                    operation: "send request",
+                    source,
+                })?;
+            let attempt_deadline = deadline.min(Instant::now().checked_add(retransmit).ok_or(
+                TurnUdpError::DeadlineOverflow {
+                    field: "retransmission timeout",
+                },
+            )?);
+            loop {
+                match timeout_at(attempt_deadline, self.socket.recv(&mut self.receive_buffer)).await
+                {
+                    Ok(Ok(length)) => {
+                        if response_matches(&self.receive_buffer[..length], method, transaction_id)
+                        {
+                            return Ok(self.receive_buffer[..length].to_vec());
+                        }
+                        self.handle_inbound_record(length);
+                    }
+                    Ok(Err(source)) => {
+                        return Err(TurnUdpError::Io {
+                            operation: "receive response",
+                            source,
+                        });
+                    }
+                    Err(_elapsed) => break,
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(TurnUdpError::TransactionTimeout { method });
+            }
+            retransmit = retransmit.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
+        }
+    }
+
+    fn handle_inbound_record(&mut self, length: usize) {
+        let Some(record) = self.receive_buffer.get(..length) else {
+            return;
+        };
+        if record.first().is_some_and(|byte| byte & 0xc0 == 0x40) {
+            let Ok(channel_data) = TurnChannelDataView::decode_datagram(record) else {
+                return;
+            };
+            let Some(peer) = self.channel_peers.get(&channel_data.channel()).copied() else {
+                return;
+            };
+            let Some(binding) = self.channels.get(&peer) else {
+                return;
+            };
+            self.emit_datagram(binding.endpoint.clone(), channel_data.data().to_vec());
+            return;
+        }
+        let Ok(message) = StunMessageView::decode(record) else {
+            return;
+        };
+        if message.message_type() != StunMessageType::new(StunMethod::Data, StunClass::Indication) {
+            return;
+        }
+        let Ok(peer) =
+            required_attribute(&message, StunAttributeType::XOR_PEER_ADDRESS).and_then(|value| {
+                decode_stun_xor_address(value, message.transaction_id()).map_err(Into::into)
+            })
+        else {
+            return;
+        };
+        let Ok(data) = required_attribute(&message, StunAttributeType::DATA) else {
+            return;
+        };
+        if data.len() > self.config.max_datagram_size {
+            return;
+        }
+        let endpoint = self.peers.get(&peer).cloned();
+        if let Some(endpoint) = endpoint {
+            self.emit_datagram(endpoint, data.to_vec());
+        }
+    }
+
+    fn emit_datagram(&self, endpoint: TransportEndpoint, data: Vec<u8>) {
+        if let Some(inbound) = &self.inbound {
+            let _result = inbound.try_send(InboundEvent::Datagram { endpoint, data });
+        }
+    }
+
+    async fn fail(&self, error: TurnUdpError) {
+        if let Some(inbound) = &self.inbound {
+            let _result = inbound.send(InboundEvent::Failed(error)).await;
+        }
+    }
+}
+
+enum AuthenticatedResponse {
+    Success,
+    StaleNonce(AuthContext),
+}
+
+struct OwnedAttribute {
+    attribute_type: StunAttributeType,
+    value: Vec<u8>,
+}
+
+impl OwnedAttribute {
+    fn new(attribute_type: StunAttributeType, value: Vec<u8>) -> Self {
+        Self {
+            attribute_type,
+            value,
+        }
+    }
+}
+
+async fn initial_challenge(
+    socket: &UdpSocket,
+    config: TurnUdpClientConfig,
+    expected_realm: &[u8],
+) -> Result<AuthContext, TurnUdpError> {
+    let transaction_id = random_transaction_id()?;
+    let lifetime = config.allocation_lifetime_seconds.to_be_bytes();
+    let request = encode_message(
+        StunMethod::Allocate,
+        StunClass::Request,
+        transaction_id,
+        &[
+            OwnedAttribute::new(
+                StunAttributeType::REQUESTED_TRANSPORT,
+                REQUESTED_TRANSPORT_UDP.to_vec(),
+            ),
+            OwnedAttribute::new(StunAttributeType::LIFETIME, lifetime.to_vec()),
+        ],
+    )?;
+    let response = transact_initial(
+        socket,
+        StunMethod::Allocate,
+        transaction_id,
+        &request,
+        config.transaction_timeout,
+    )
+    .await?;
+    parse_challenge(
+        &response,
+        StunMethod::Allocate,
+        transaction_id,
+        401,
+        expected_realm,
+    )
+}
+
+async fn transact_initial(
+    socket: &UdpSocket,
+    method: StunMethod,
+    transaction_id: StunTransactionId,
+    request: &[u8],
+    transaction_timeout: Duration,
+) -> Result<Vec<u8>, TurnUdpError> {
+    let deadline = deadline_after(transaction_timeout, "initial transaction timeout")?;
+    let mut retransmit = INITIAL_RETRANSMIT_TIMEOUT;
+    let mut receive_buffer = vec![0_u8; TURN_UDP_RECEIVE_BUFFER_SIZE];
+    loop {
+        socket
+            .send(request)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "send initial Allocate",
+                source,
+            })?;
+        let attempt_deadline = deadline.min(Instant::now().checked_add(retransmit).ok_or(
+            TurnUdpError::DeadlineOverflow {
+                field: "initial retransmission timeout",
+            },
+        )?);
+        loop {
+            match timeout_at(attempt_deadline, socket.recv(&mut receive_buffer)).await {
+                Ok(Ok(length)) => {
+                    if response_matches(&receive_buffer[..length], method, transaction_id) {
+                        receive_buffer.truncate(length);
+                        return Ok(receive_buffer);
+                    }
+                }
+                Ok(Err(source)) => {
+                    return Err(TurnUdpError::Io {
+                        operation: "receive initial Allocate",
+                        source,
+                    });
+                }
+                Err(_elapsed) => break,
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(TurnUdpError::TransactionTimeout { method });
+        }
+        retransmit = retransmit.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
+    }
+}
+
+fn signed_request(
+    method: StunMethod,
+    transaction_id: StunTransactionId,
+    credentials: &TurnCredentials,
+    auth: &AuthContext,
+    method_attributes: &[OwnedAttribute],
+) -> Result<Vec<u8>, TurnUdpError> {
+    let mut algorithm = [0_u8; 4];
+    StunPasswordAlgorithm::Sha256.encode(&mut algorithm)?;
+    let zero_integrity = [0_u8; 32];
+    let mut attributes = vec![
+        OwnedAttribute::new(StunAttributeType::USERNAME, credentials.username.to_vec()),
+        OwnedAttribute::new(StunAttributeType::REALM, auth.realm.clone()),
+        OwnedAttribute::new(StunAttributeType::NONCE, auth.nonce.to_vec()),
+        OwnedAttribute::new(StunAttributeType::PASSWORD_ALGORITHM, algorithm.to_vec()),
+    ];
+    attributes.extend(
+        method_attributes.iter().map(|attribute| {
+            OwnedAttribute::new(attribute.attribute_type, attribute.value.clone())
+        }),
+    );
+    attributes.push(OwnedAttribute::new(
+        StunAttributeType::MESSAGE_INTEGRITY_SHA256,
+        zero_integrity.to_vec(),
+    ));
+    let mut encoded = encode_message(method, StunClass::Request, transaction_id, &attributes)?;
+    sign_message(&mut encoded, credentials, &auth.realm)?;
+    Ok(encoded)
+}
+
+fn encode_message(
+    method: StunMethod,
+    class: StunClass,
+    transaction_id: StunTransactionId,
+    attributes: &[OwnedAttribute],
+) -> Result<Vec<u8>, TurnUdpError> {
+    let references = attributes
+        .iter()
+        .map(|attribute| StunAttributeRef {
+            attribute_type: attribute.attribute_type,
+            value: &attribute.value,
+        })
+        .collect::<Vec<_>>();
+    let message = StunMessageRef {
+        message_type: StunMessageType::new(method, class),
+        transaction_id,
+        attributes: &references,
+    };
+    let mut encoded = vec![0_u8; message.encoded_len()?];
+    let length = encode_stun_message(message, &mut encoded)?;
+    encoded.truncate(length);
+    Ok(encoded)
+}
+
+fn sign_message(
+    encoded: &mut [u8],
+    credentials: &TurnCredentials,
+    realm: &[u8],
+) -> Result<(), TurnUdpError> {
+    let (offset, tag) = {
+        let message = StunMessageView::decode(encoded)?;
+        let integrity = message.message_integrity_sha256()?;
+        let key = long_term_key(credentials, realm);
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_ref())
+            .map_err(|_| TurnUdpError::ResponseIntegrity)?;
+        mac.update(integrity.message_type_bytes());
+        mac.update(&integrity.adjusted_body_length().to_be_bytes());
+        mac.update(integrity.bytes_after_length());
+        (integrity.value_offset(), mac.finalize().into_bytes())
+    };
+    let destination = encoded
+        .get_mut(offset..offset.saturating_add(tag.len()))
+        .ok_or(TurnUdpError::ResponseIntegrity)?;
+    destination.copy_from_slice(&tag);
+    Ok(())
+}
+
+fn verify_message_integrity(
+    message: &StunMessageView<'_>,
+    credentials: &TurnCredentials,
+    realm: &[u8],
+) -> Result<(), TurnUdpError> {
+    let integrity = message
+        .message_integrity_sha256()
+        .map_err(|_| TurnUdpError::ResponseIntegrity)?;
+    let key = long_term_key(credentials, realm);
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key.as_ref())
+        .map_err(|_| TurnUdpError::ResponseIntegrity)?;
+    mac.update(integrity.message_type_bytes());
+    mac.update(&integrity.adjusted_body_length().to_be_bytes());
+    mac.update(integrity.bytes_after_length());
+    mac.verify_slice(integrity.value())
+        .map_err(|_| TurnUdpError::ResponseIntegrity)
+}
+
+fn long_term_key(credentials: &TurnCredentials, realm: &[u8]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(sha256_segments(&[
+        &credentials.username,
+        b":",
+        realm,
+        b":",
+        &credentials.password,
+    ]))
+}
+
+fn classify_authenticated_response(
+    encoded: &[u8],
+    method: StunMethod,
+    transaction_id: StunTransactionId,
+    credentials: &TurnCredentials,
+    realm: &[u8],
+) -> Result<AuthenticatedResponse, TurnUdpError> {
+    let message = StunMessageView::decode(encoded)?;
+    if message.message_type().method != method || message.transaction_id() != transaction_id {
+        return Err(TurnUdpError::UnexpectedResponse { method });
+    }
+    verify_message_integrity(&message, credentials, realm)?;
+    match message.message_type().class {
+        StunClass::SuccessResponse => Ok(AuthenticatedResponse::Success),
+        StunClass::ErrorResponse => {
+            let code = response_error_code(&message)?;
+            if code == 438 {
+                let challenge = parse_challenge(encoded, method, transaction_id, 438, realm)?;
+                Ok(AuthenticatedResponse::StaleNonce(challenge))
+            } else {
+                Err(TurnUdpError::Rejected { method, code })
+            }
+        }
+        StunClass::Request | StunClass::Indication => {
+            Err(TurnUdpError::UnexpectedResponse { method })
+        }
+    }
+}
+
+fn parse_challenge(
+    encoded: &[u8],
+    method: StunMethod,
+    transaction_id: StunTransactionId,
+    expected_code: u16,
+    expected_realm: &[u8],
+) -> Result<AuthContext, TurnUdpError> {
+    let message = StunMessageView::decode(encoded)?;
+    if message.message_type() != StunMessageType::new(method, StunClass::ErrorResponse)
+        || message.transaction_id() != transaction_id
+        || response_error_code(&message)? != expected_code
+    {
+        return Err(TurnUdpError::UnexpectedResponse { method });
+    }
+    let realm = required_attribute(&message, StunAttributeType::REALM)?;
+    if realm != expected_realm {
+        return Err(TurnUdpError::InvalidAttribute {
+            detail: "challenge realm does not match configured relay",
+        });
+    }
+    let nonce = required_attribute(&message, StunAttributeType::NONCE)?;
+    if nonce.is_empty() {
+        return Err(TurnUdpError::InvalidAttribute {
+            detail: "challenge nonce must be non-empty",
+        });
+    }
+    let algorithm = required_attribute(&message, StunAttributeType::PASSWORD_ALGORITHM)?;
+    if StunPasswordAlgorithm::decode(algorithm)? != StunPasswordAlgorithm::Sha256 {
+        return Err(TurnUdpError::InvalidAttribute {
+            detail: "challenge password algorithm is unsupported",
+        });
+    }
+    Ok(AuthContext {
+        realm: realm.to_vec(),
+        nonce: Zeroizing::new(nonce.to_vec()),
+    })
+}
+
+fn response_matches(encoded: &[u8], method: StunMethod, transaction_id: StunTransactionId) -> bool {
+    if encoded.first().is_none_or(|byte| byte & 0xc0 != 0) {
+        return false;
+    }
+    let message = match StunMessageView::decode(encoded) {
+        Ok(message) => message,
+        Err(_error) => return false,
+    };
+    message.message_type().method == method
+        && message.transaction_id() == transaction_id
+        && matches!(
+            message.message_type().class,
+            StunClass::SuccessResponse | StunClass::ErrorResponse
+        )
+}
+
+fn response_error_code(message: &StunMessageView<'_>) -> Result<u16, TurnUdpError> {
+    Ok(
+        StunErrorCodeView::decode(required_attribute(message, StunAttributeType::ERROR_CODE)?)?
+            .code(),
+    )
+}
+
+fn decode_lifetime(message: &StunMessageView<'_>) -> Result<u32, TurnUdpError> {
+    let value = required_attribute(message, StunAttributeType::LIFETIME)?;
+    let bytes = <[u8; 4]>::try_from(value).map_err(|_| TurnUdpError::InvalidAttribute {
+        detail: "LIFETIME must contain four bytes",
+    })?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn required_attribute<'a>(
+    message: &StunMessageView<'a>,
+    requested: StunAttributeType,
+) -> Result<&'a [u8], TurnUdpError> {
+    let mut found = None;
+    for attribute in message.attributes() {
+        let attribute = attribute?;
+        if attribute.attribute_type() == requested && found.replace(attribute.value()).is_some() {
+            return Err(TurnUdpError::InvalidAttributeCardinality {
+                attribute: requested,
+            });
+        }
+    }
+    found.ok_or(TurnUdpError::InvalidAttributeCardinality {
+        attribute: requested,
+    })
+}
+
+fn xor_address_value(
+    address: SocketAddr,
+    transaction_id: StunTransactionId,
+) -> Result<Vec<u8>, TurnUdpError> {
+    let mut value = vec![0_u8; if address.is_ipv4() { 8 } else { 20 }];
+    let length = encode_stun_xor_address(address, transaction_id, &mut value)?;
+    value.truncate(length);
+    Ok(value)
+}
+
+fn random_transaction_id() -> Result<StunTransactionId, TurnUdpError> {
+    let mut bytes = [0_u8; 12];
+    getrandom::fill(&mut bytes).map_err(|_| TurnUdpError::RandomnessUnavailable)?;
+    Ok(StunTransactionId::from_bytes(bytes))
+}
+
+fn deadline_after(duration: Duration, field: &'static str) -> Result<Instant, TurnUdpError> {
+    Instant::now()
+        .checked_add(duration)
+        .ok_or(TurnUdpError::DeadlineOverflow { field })
+}
+
+fn unix_time() -> Result<u64, TurnUdpError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| TurnUdpError::InvalidConfig {
+            field: "system time",
+            reason: "must not predate the Unix epoch",
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use stella_common::{NodeId, RelayId};
+    use stella_server::{
+        relay_credentials::RelayCredentialAuthority,
+        turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
+    };
+    use stella_transport::Endpoint as TransportEndpoint;
+    use tokio::{sync::oneshot, time::timeout};
+
+    use super::{TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError};
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn allocations_authenticate_refresh_and_relay_channel_datagrams() {
+        let relay_id = RelayId::from_bytes([0x11; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x42; 32], 300).expect("credential authority");
+        let now = unix_time_for_test();
+        let credential_a = authority
+            .issue(relay_id, NodeId::from_bytes([0x21; 16]), now)
+            .expect("issue A credential");
+        let credential_b = authority
+            .issue(relay_id, NodeId::from_bytes([0x22; 16]), now)
+            .expect("issue B credential");
+        let replacement = authority
+            .issue(
+                relay_id,
+                NodeId::from_bytes([0x21; 16]),
+                now.saturating_add(1),
+            )
+            .expect("replacement credential");
+        let mut relay_config = TurnUdpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        relay_config.max_datagram_size = 1_200;
+        let relay = TurnUdpRelay::bind(relay_config, authority)
+            .await
+            .expect("bind relay");
+        let relay_address = relay.local_address().expect("relay address");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let relay_task = tokio::spawn(relay.run(async move {
+            let _result = shutdown_receiver.await;
+        }));
+
+        let client_config = TurnUdpClientConfig::new(
+            relay_id,
+            relay_address,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        );
+        let client_a = TurnUdpClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential_a.username().to_vec(),
+                credential_a.secret().to_vec(),
+                credential_a.expires_at(),
+            )
+            .expect("A credentials"),
+        )
+        .await
+        .expect("allocate A");
+        let client_b = TurnUdpClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential_b.username().to_vec(),
+                credential_b.secret().to_vec(),
+                credential_b.expires_at(),
+            )
+            .expect("B credentials"),
+        )
+        .await
+        .expect("allocate B");
+        let endpoint_a = TransportEndpoint::TurnUdp {
+            relay_id,
+            address: client_a.relayed_address(),
+        };
+        let endpoint_b = TransportEndpoint::TurnUdp {
+            relay_id,
+            address: client_b.relayed_address(),
+        };
+        client_a
+            .permit_peer(&endpoint_b)
+            .await
+            .expect("permit B from A");
+        client_b
+            .permit_peer(&endpoint_a)
+            .await
+            .expect("permit A from B");
+        client_a
+            .send_indication_to(&endpoint_b, b"A indication to B")
+            .await
+            .expect("send indication A to B");
+        let mut received = [0_u8; 64];
+        let metadata = timeout(Duration::from_secs(2), client_b.receive(&mut received))
+            .await
+            .expect("B indication timeout")
+            .expect("B indication receive");
+        assert_eq!(metadata.source, endpoint_a);
+        assert_eq!(&received[..metadata.length], b"A indication to B");
+
+        client_a
+            .prepare_peer(&endpoint_b)
+            .await
+            .expect("prepare B from A");
+        client_b
+            .prepare_peer(&endpoint_a)
+            .await
+            .expect("prepare A from B");
+
+        client_a
+            .send_to(&endpoint_b, b"A to B")
+            .await
+            .expect("relay A to B");
+        let metadata = timeout(Duration::from_secs(2), client_b.receive(&mut received))
+            .await
+            .expect("B receive timeout")
+            .expect("B receive");
+        assert_eq!(metadata.source, endpoint_a);
+        assert_eq!(&received[..metadata.length], b"A to B");
+
+        client_b
+            .send_to(&endpoint_a, b"B to A")
+            .await
+            .expect("relay B to A");
+        let metadata = timeout(Duration::from_secs(2), client_a.receive(&mut received))
+            .await
+            .expect("A receive timeout")
+            .expect("A receive");
+        assert_eq!(metadata.source, endpoint_b);
+        assert_eq!(&received[..metadata.length], b"B to A");
+
+        client_a
+            .replace_credentials(
+                TurnCredentials::new(
+                    replacement.username().to_vec(),
+                    replacement.secret().to_vec(),
+                    replacement.expires_at(),
+                )
+                .expect("replacement credentials"),
+            )
+            .await
+            .expect("refresh with replacement credential");
+
+        client_a.shutdown().await.expect("shutdown A");
+        client_b.shutdown().await.expect("shutdown B");
+        let _result = shutdown_sender.send(());
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect("relay shutdown timeout")
+            .expect("relay task join")
+            .expect("relay run");
+    }
+
+    #[test]
+    fn credentials_and_client_errors_do_not_expose_secrets() {
+        let credentials =
+            TurnCredentials::new(b"private-user".to_vec(), b"private-password".to_vec(), 100)
+                .expect("credentials");
+        let diagnostic = format!("{credentials:?}");
+        assert!(!diagnostic.contains("private-user"));
+        assert!(!diagnostic.contains("private-password"));
+        assert!(matches!(
+            TurnCredentials::new(Vec::new(), vec![1], 100),
+            Err(TurnUdpError::InvalidConfig {
+                field: "TURN credentials",
+                ..
+            })
+        ));
+    }
+
+    fn unix_time_for_test() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock")
+            .as_secs()
+    }
+}
