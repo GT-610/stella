@@ -9,6 +9,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod identity;
 pub mod network_state;
+pub mod relay_credentials;
 pub mod runtime;
 pub mod session;
 pub mod store;
