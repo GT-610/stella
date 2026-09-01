@@ -607,7 +607,7 @@ mod tests {
     use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
         encode_peer_record, ConfidentialityPolicy, Endpoint, NetworkPolicy, PeerListView,
-        PeerRecordRef, MEMBERSHIP_GRANT_LENGTH,
+        PeerRecordRef, ProtocolVersion, MEMBERSHIP_GRANT_LENGTH,
     };
     use stella_server::{
         network_state::encode_network_state,
@@ -693,7 +693,8 @@ mod tests {
         let view = store
             .network_session_view(derive_node_id(local.public_key()), network_id)
             .expect("read network view");
-        let encoded = encode_network_state(&controller, &view, 200).expect("encode state");
+        let encoded = encode_network_state(&controller, &view, 200, ProtocolVersion::V0_1)
+            .expect("encode state");
         let state = NetworkState::from_snapshot(&SnapshotInput {
             controller_id: derive_controller_id(controller.public_key()),
             controller_public_key: controller.public_key(),
@@ -727,7 +728,8 @@ mod tests {
         let view = store
             .network_session_view(derive_node_id(local.public_key()), network_id)
             .expect("read network view");
-        let encoded = encode_network_state(&controller, &view, 200).expect("encode state");
+        let encoded = encode_network_state(&controller, &view, 200, ProtocolVersion::V0_1)
+            .expect("encode state");
         let mut bad_grant = *encoded.local_grant();
         let last = bad_grant.len() - 1;
         bad_grant[last] ^= 1;
@@ -767,7 +769,8 @@ mod tests {
         let view = store
             .network_session_view(derive_node_id(local.public_key()), network_id)
             .expect("read network view");
-        let encoded = encode_network_state(&controller, &view, 200).expect("encode state");
+        let encoded = encode_network_state(&controller, &view, 200, ProtocolVersion::V0_1)
+            .expect("encode state");
         let mut state = NetworkState::from_snapshot(&SnapshotInput {
             controller_id: derive_controller_id(controller.public_key()),
             controller_public_key: controller.public_key(),

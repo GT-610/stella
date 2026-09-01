@@ -14,7 +14,8 @@ use stella_control::{
 };
 use stella_crypto::{validate_node_id, CryptoError, IdentityPublicKey, ED25519_SIGNATURE_LENGTH};
 use stella_proto::{
-    encode_version_list, CodecError, ControlFieldType, ControlMessageType, VersionEntry,
+    encode_version_list, CodecError, ControlFieldType, ControlHeader, ControlMessageType,
+    ProtocolVersion, VersionEntry,
 };
 use thiserror::Error;
 use tokio::{
@@ -41,6 +42,7 @@ pub struct AuthenticatedSession {
     peer_addr: SocketAddr,
     context: SessionContext,
     node: NodeRecord,
+    protocol_version: ProtocolVersion,
     inbound: InboundSequence,
     outbound: OutboundSequence,
 }
@@ -70,6 +72,12 @@ impl AuthenticatedSession {
         &self.context
     }
 
+    /// Returns the operational control version selected during authentication.
+    #[must_use]
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
     /// Splits the authenticated connection into active-loop state.
     #[must_use]
     pub fn into_parts(
@@ -79,6 +87,7 @@ impl AuthenticatedSession {
         SocketAddr,
         SessionContext,
         NodeRecord,
+        ProtocolVersion,
         InboundSequence,
         OutboundSequence,
     ) {
@@ -87,6 +96,7 @@ impl AuthenticatedSession {
             self.peer_addr,
             self.context,
             self.node,
+            self.protocol_version,
             self.inbound,
             self.outbound,
         )
@@ -113,6 +123,10 @@ pub async fn authenticate_session(
         .map_err(|_| AuthenticationError::Timeout)?
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping the negotiated authentication transcript linear makes version binding auditable"
+)]
 async fn authenticate_inner(
     session: AcceptedSession,
 ) -> Result<AuthenticatedSession, AuthenticationError> {
@@ -123,14 +137,20 @@ async fn authenticate_inner(
     let server_hello_id =
         send_server_hello(&mut stream, &mut outbound, &context, &server_nonce).await?;
 
-    let (client_hello_id, client_hello) = read_expected_message(
+    let (client_hello_header, client_hello) = read_expected_message(
         &mut stream,
         &mut inbound,
         ControlMessageType::ClientHello,
         server_hello_id,
+        None,
         parse_client_hello,
     )
     .await?;
+    let protocol_version = ProtocolVersion {
+        major: client_hello.selected.major,
+        minor: client_hello.selected.minor,
+    };
+    require_protocol_version(client_hello_header.version, protocol_version)?;
 
     let exporter = stream
         .get_ref()
@@ -148,14 +168,21 @@ async fn authenticate_inner(
         context.controller_id(),
     );
     let signature = sign_controller_proof(context.controller_identity(), proof_context);
-    let server_proof_id =
-        send_server_proof(&mut stream, &mut outbound, client_hello_id, &signature).await?;
+    let server_proof_id = send_server_proof(
+        &mut stream,
+        &mut outbound,
+        client_hello_header.message_id,
+        protocol_version,
+        &signature,
+    )
+    .await?;
 
-    let (node_auth_id, node_auth) = read_expected_message(
+    let (node_auth_header, node_auth) = read_expected_message(
         &mut stream,
         &mut inbound,
         ControlMessageType::NodeAuth,
         server_proof_id,
+        Some(protocol_version),
         parse_node_auth,
     )
     .await?;
@@ -175,7 +202,8 @@ async fn authenticate_inner(
         reject_authentication(
             &mut stream,
             &mut outbound,
-            node_auth_id,
+            node_auth_header.message_id,
+            protocol_version,
             AUTHENTICATION_FAILED,
         )
         .await?;
@@ -188,16 +216,25 @@ async fn authenticate_inner(
         &context,
         &client_hello,
         node_auth,
-        node_auth_id,
+        node_auth_header.message_id,
+        protocol_version,
     )
     .await?;
 
-    send_auth_result(&mut stream, &mut outbound, node_auth_id, 0).await?;
+    send_auth_result(
+        &mut stream,
+        &mut outbound,
+        node_auth_header.message_id,
+        protocol_version,
+        0,
+    )
+    .await?;
     Ok(AuthenticatedSession {
         stream,
         peer_addr,
         context,
         node,
+        protocol_version,
         inbound,
         outbound,
     })
@@ -209,8 +246,11 @@ async fn send_server_hello(
     context: &SessionContext,
     server_nonce: &[u8; CONTROL_NONCE_LENGTH],
 ) -> Result<u64, AuthenticationError> {
-    let mut versions = [0_u8; 8];
-    let version_length = encode_version_list(&[VersionEntry::V0_1_SUITE_1], &mut versions)?;
+    let mut versions = [0_u8; 12];
+    let version_length = encode_version_list(
+        &[VersionEntry::V0_2_SUITE_1, VersionEntry::V0_1_SUITE_1],
+        &mut versions,
+    )?;
     let server_time = unix_time()?.to_be_bytes();
     let public_key = context.controller_identity().public_key();
     let mut builder = MessageBuilder::new(ControlMessageType::ServerHello);
@@ -232,10 +272,12 @@ async fn send_server_proof(
     stream: &mut TlsStream<TcpStream>,
     outbound: &mut OutboundSequence,
     correlation_id: u64,
+    version: ProtocolVersion,
     signature: &[u8; ED25519_SIGNATURE_LENGTH],
 ) -> Result<u64, AuthenticationError> {
-    let mut builder =
-        MessageBuilder::new(ControlMessageType::ServerProof).with_correlation(correlation_id);
+    let mut builder = MessageBuilder::new(ControlMessageType::ServerProof)
+        .with_version(version)
+        .with_correlation(correlation_id);
     builder.push_field(ControlFieldType::ControllerSignature, signature)?;
     write_built_message(stream, outbound, builder).await
 }
@@ -244,12 +286,14 @@ async fn send_auth_result(
     stream: &mut TlsStream<TcpStream>,
     outbound: &mut OutboundSequence,
     correlation_id: u64,
+    version: ProtocolVersion,
     status: u16,
 ) -> Result<u64, AuthenticationError> {
     let status = status.to_be_bytes();
     let server_time = unix_time()?.to_be_bytes();
-    let mut builder =
-        MessageBuilder::new(ControlMessageType::AuthResult).with_correlation(correlation_id);
+    let mut builder = MessageBuilder::new(ControlMessageType::AuthResult)
+        .with_version(version)
+        .with_correlation(correlation_id);
     builder.push_field(ControlFieldType::StatusCode, &status)?;
     builder.push_field(ControlFieldType::ServerTime, &server_time)?;
     write_built_message(stream, outbound, builder).await
@@ -282,8 +326,9 @@ async fn read_expected_message<T>(
     inbound: &mut InboundSequence,
     expected_type: ControlMessageType,
     expected_correlation: u64,
+    expected_version: Option<ProtocolVersion>,
     parse: fn(&stella_control::OwnedControlMessage) -> Result<T, AuthenticationError>,
-) -> Result<(u64, T), AuthenticationError> {
+) -> Result<(ControlHeader, T), AuthenticationError> {
     let message = read_required_message(stream).await?;
     let header = message.header()?;
     inbound.accept(header.message_id)?;
@@ -299,16 +344,20 @@ async fn read_expected_message<T>(
             actual: header.correlation_id,
         });
     }
-    Ok((header.message_id, parse(&message)?))
+    if let Some(expected_version) = expected_version {
+        require_protocol_version(header.version, expected_version)?;
+    }
+    Ok((header, parse(&message)?))
 }
 
 async fn reject_authentication(
     stream: &mut TlsStream<TcpStream>,
     outbound: &mut OutboundSequence,
     correlation_id: u64,
+    version: ProtocolVersion,
     status: u16,
 ) -> Result<(), AuthenticationError> {
-    let _message_id = send_auth_result(stream, outbound, correlation_id, status).await?;
+    let _message_id = send_auth_result(stream, outbound, correlation_id, version, status).await?;
     sleep(random_failure_delay()?).await;
     let mut writer = RecordWriter::new(stream);
     writer.shutdown().await?;
@@ -322,23 +371,45 @@ async fn resolve_node_authorization(
     client_hello: &ClientHello,
     node_auth: NodeAuth,
     correlation_id: u64,
+    version: ProtocolVersion,
 ) -> Result<NodeRecord, AuthenticationError> {
     match authorize_node(context, client_hello, node_auth).await {
         Ok(node) => Ok(node),
         Err(AuthorizationFailure::EnrollmentRequired) => {
-            reject_authentication(stream, outbound, correlation_id, ENROLLMENT_REQUIRED).await?;
+            reject_authentication(
+                stream,
+                outbound,
+                correlation_id,
+                version,
+                ENROLLMENT_REQUIRED,
+            )
+            .await?;
             Err(AuthenticationError::Rejected {
                 status: ENROLLMENT_REQUIRED,
             })
         }
         Err(AuthorizationFailure::Rejected) => {
-            reject_authentication(stream, outbound, correlation_id, AUTHENTICATION_FAILED).await?;
+            reject_authentication(
+                stream,
+                outbound,
+                correlation_id,
+                version,
+                AUTHENTICATION_FAILED,
+            )
+            .await?;
             Err(AuthenticationError::Rejected {
                 status: AUTHENTICATION_FAILED,
             })
         }
         Err(AuthorizationFailure::Authority(source)) => {
-            reject_authentication(stream, outbound, correlation_id, AUTHENTICATION_FAILED).await?;
+            reject_authentication(
+                stream,
+                outbound,
+                correlation_id,
+                version,
+                AUTHENTICATION_FAILED,
+            )
+            .await?;
             Err(AuthenticationError::Authority(source))
         }
     }
@@ -382,7 +453,7 @@ fn parse_client_hello(
     let selected = selected.ok_or(AuthenticationError::ValidatedFieldMissing {
         field: ControlFieldType::SelectedVersion,
     })?;
-    if selected != VersionEntry::V0_1_SUITE_1 {
+    if selected != VersionEntry::V0_1_SUITE_1 && selected != VersionEntry::V0_2_SUITE_1 {
         return Err(AuthenticationError::UnsupportedVersion {
             major: selected.major,
             minor: selected.minor,
@@ -411,6 +482,16 @@ fn parse_client_hello(
         node_id,
         public_key,
     })
+}
+
+fn require_protocol_version(
+    actual: ProtocolVersion,
+    expected: ProtocolVersion,
+) -> Result<(), AuthenticationError> {
+    if actual != expected {
+        return Err(AuthenticationError::ProtocolVersionMismatch { expected, actual });
+    }
+    Ok(())
 }
 
 struct NodeAuth {
@@ -599,6 +680,14 @@ pub enum AuthenticationError {
         /// Selected suite registry value.
         suite_id: u16,
     },
+    /// A post-negotiation message did not use the selected header version.
+    #[error("expected control version {expected:?}, received {actual:?}")]
+    ProtocolVersionMismatch {
+        /// Version selected in `CLIENT_HELLO`.
+        expected: ProtocolVersion,
+        /// Version found in the message header.
+        actual: ProtocolVersion,
+    },
     /// The client nonce was all zero.
     #[error("client authentication nonce must be non-zero")]
     ZeroClientNonce,
@@ -666,7 +755,9 @@ mod tests {
         CONTROL_EXPORTER_LABEL, CONTROL_EXPORTER_LENGTH, CONTROL_NONCE_LENGTH,
     };
     use stella_crypto::{derive_node_id, IdentityPublicKey, IdentitySigningKey};
-    use stella_proto::{ControlFieldType, ControlMessageType, VersionEntry, VersionListView};
+    use stella_proto::{
+        ControlFieldType, ControlMessageType, ProtocolVersion, VersionEntry, VersionListView,
+    };
     use tokio::{
         io::AsyncReadExt,
         net::TcpStream,
@@ -772,7 +863,11 @@ mod tests {
             .expect("required server field")
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the loopback client exposes every authentication transcript input explicitly"
+    )]
     async fn authenticate_client(
         connector: &TlsConnector,
         address: SocketAddr,
@@ -781,6 +876,7 @@ mod tests {
         enrollment_token: Option<&BearerToken>,
         display_name: Option<&str>,
         corrupt_proof: bool,
+        selected_entry: VersionEntry,
     ) -> u16 {
         let tcp = connect_with_retry(address).await;
         let server_name = ServerName::try_from("localhost")
@@ -810,7 +906,7 @@ mod tests {
         .expect("decode supported versions");
         assert_eq!(
             versions.entries().collect::<Vec<_>>(),
-            vec![VersionEntry::V0_1_SUITE_1]
+            vec![VersionEntry::V0_2_SUITE_1, VersionEntry::V0_1_SUITE_1]
         );
         let server_nonce: [u8; CONTROL_NONCE_LENGTH] =
             field_value(&server_hello, ControlFieldType::ServerNonce)
@@ -836,11 +932,16 @@ mod tests {
             client_nonce[0] = 1;
         }
         let node_id = derive_node_id(node_key.public_key());
+        let protocol_version = ProtocolVersion {
+            major: selected_entry.major,
+            minor: selected_entry.minor,
+        };
         let mut selected = [0_u8; 4];
-        VersionEntry::V0_1_SUITE_1
+        selected_entry
             .encode(&mut selected)
             .expect("encode selected version");
         let mut client_hello = MessageBuilder::new(ControlMessageType::ClientHello)
+            .with_version(protocol_version)
             .with_correlation(server_hello_header.message_id);
         client_hello
             .push_field(ControlFieldType::SelectedVersion, &selected)
@@ -877,6 +978,7 @@ mod tests {
             server_proof_header.message_type,
             ControlMessageType::ServerProof
         );
+        assert_eq!(server_proof_header.version, protocol_version);
         assert_eq!(server_proof_header.correlation_id, client_hello_id);
         let controller_signature =
             field_value(&server_proof, ControlFieldType::ControllerSignature)
@@ -884,12 +986,7 @@ mod tests {
                 .expect("controller signature width");
         verify_controller_proof(
             controller_public_key,
-            ControllerProofContext::new(
-                &exporter,
-                &server_nonce,
-                VersionEntry::V0_1_SUITE_1,
-                controller_id,
-            ),
+            ControllerProofContext::new(&exporter, &server_nonce, selected_entry, controller_id),
             &controller_signature,
         )
         .expect("verify controller proof");
@@ -900,7 +997,7 @@ mod tests {
                 &exporter,
                 &server_nonce,
                 &client_nonce,
-                VersionEntry::V0_1_SUITE_1,
+                selected_entry,
                 controller_id,
                 node_id,
             ),
@@ -909,6 +1006,7 @@ mod tests {
             node_signature[0] ^= 0x80;
         }
         let mut node_auth = MessageBuilder::new(ControlMessageType::NodeAuth)
+            .with_version(protocol_version)
             .with_correlation(server_proof_header.message_id);
         node_auth
             .push_field(ControlFieldType::NodeSignature, &node_signature)
@@ -934,6 +1032,7 @@ mod tests {
             auth_result_header.message_type,
             ControlMessageType::AuthResult
         );
+        assert_eq!(auth_result_header.version, protocol_version);
         assert_eq!(auth_result_header.correlation_id, node_auth_id);
         let status = u16::from_be_bytes(
             field_value(&auth_result, ControlFieldType::StatusCode)
@@ -1011,6 +1110,7 @@ mod tests {
                 None,
                 None,
                 false,
+                VersionEntry::V0_1_SUITE_1,
             )
             .await,
             101
@@ -1025,6 +1125,7 @@ mod tests {
                 Some(&wrong_token),
                 Some("test node"),
                 false,
+                VersionEntry::V0_1_SUITE_1,
             )
             .await,
             100
@@ -1038,6 +1139,7 @@ mod tests {
                 Some(&enrollment_token),
                 Some("test node"),
                 false,
+                VersionEntry::V0_2_SUITE_1,
             )
             .await,
             0
@@ -1053,6 +1155,7 @@ mod tests {
                 None,
                 None,
                 false,
+                VersionEntry::V0_1_SUITE_1,
             )
             .await,
             0
@@ -1067,6 +1170,7 @@ mod tests {
                 Some(&enrollment_token),
                 Some("renamed node"),
                 false,
+                VersionEntry::V0_2_SUITE_1,
             )
             .await,
             100
@@ -1081,6 +1185,7 @@ mod tests {
                 None,
                 None,
                 true,
+                VersionEntry::V0_2_SUITE_1,
             )
             .await,
             100

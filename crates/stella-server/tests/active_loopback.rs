@@ -197,7 +197,7 @@ async fn authenticate_client(
     .expect("decode supported versions");
     assert_eq!(
         versions.entries().collect::<Vec<_>>(),
-        vec![VersionEntry::V0_1_SUITE_1]
+        vec![VersionEntry::V0_2_SUITE_1, VersionEntry::V0_1_SUITE_1]
     );
     let server_nonce: [u8; CONTROL_NONCE_LENGTH] =
         field_value(&server_hello, ControlFieldType::ServerNonce)

@@ -12,7 +12,9 @@ use stella_crypto::{
     derive_node_id, validate_controller_id, IdentityPublicKey, IdentitySigningKey,
     ED25519_PUBLIC_KEY_LENGTH, ED25519_SIGNATURE_LENGTH,
 };
-use stella_proto::{ControlFieldType, ControlMessageType, VersionEntry, VersionListView};
+use stella_proto::{
+    ControlFieldType, ControlMessageType, ProtocolVersion, VersionEntry, VersionListView,
+};
 use tokio::{
     io::{ReadHalf, WriteHalf},
     net::TcpStream,
@@ -139,6 +141,7 @@ pub struct AuthenticatedControl {
     controller_public_key: IdentityPublicKey,
     node_id: NodeId,
     node_public_key: IdentityPublicKey,
+    protocol_version: ProtocolVersion,
     server_time: u64,
 }
 
@@ -167,6 +170,12 @@ impl AuthenticatedControl {
         self.node_public_key
     }
 
+    /// Returns the operational control version selected during authentication.
+    #[must_use]
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
     /// Returns the controller Unix time from the successful authentication.
     #[must_use]
     pub const fn server_time(&self) -> u64 {
@@ -179,7 +188,9 @@ impl AuthenticatedControl {
     ///
     /// Returns [`ClientError`] when message construction or carrier I/O fails.
     pub async fn write_message(&mut self, builder: MessageBuilder) -> Result<u64, ClientError> {
-        let message = self.outbound.build(builder)?;
+        let message = self
+            .outbound
+            .build(builder.with_version(self.protocol_version))?;
         let message_id = message_id(&message)?;
         self.writer.write_message(&message).await?;
         self.writer.flush().await?;
@@ -212,6 +223,7 @@ impl fmt::Debug for AuthenticatedControl {
             .debug_struct("AuthenticatedControl")
             .field("controller_id", &self.controller_id)
             .field("node_id", &self.node_id)
+            .field("protocol_version", &self.protocol_version)
             .field("server_time", &self.server_time)
             .finish_non_exhaustive()
     }
@@ -258,12 +270,14 @@ pub async fn authenticate_controller(
         &server_hello,
         ControlFieldType::SupportedVersions,
     )?)?;
-    if !versions
+    let selected_entry = versions
         .entries()
-        .any(|entry| entry == VersionEntry::V0_1_SUITE_1)
-    {
-        return Err(ClientError::NoCompatibleVersion);
-    }
+        .find(|entry| *entry == VersionEntry::V0_2_SUITE_1 || *entry == VersionEntry::V0_1_SUITE_1)
+        .ok_or(ClientError::NoCompatibleVersion)?;
+    let protocol_version = ProtocolVersion {
+        major: selected_entry.major,
+        minor: selected_entry.minor,
+    };
     let server_nonce = fixed_array(
         field_value(&server_hello, ControlFieldType::ServerNonce)?,
         "server nonce",
@@ -288,11 +302,12 @@ pub async fn authenticate_controller(
 
     let client_nonce = random_nonzero_nonce()?;
     let node_id = derive_node_id(identity.public_key());
-    let mut selected = [0_u8; 4];
-    VersionEntry::V0_1_SUITE_1.encode(&mut selected)?;
+    let mut selected_bytes = [0_u8; 4];
+    selected_entry.encode(&mut selected_bytes)?;
     let mut client_hello = MessageBuilder::new(ControlMessageType::ClientHello)
+        .with_version(protocol_version)
         .with_correlation(message_id(&server_hello)?);
-    client_hello.push_field(ControlFieldType::SelectedVersion, &selected)?;
+    client_hello.push_field(ControlFieldType::SelectedVersion, &selected_bytes)?;
     client_hello.push_field(ControlFieldType::ClientNonce, &client_nonce)?;
     client_hello.push_field(ControlFieldType::NodeId, node_id.as_bytes())?;
     client_hello.push_field(
@@ -312,6 +327,7 @@ pub async fn authenticate_controller(
         .map_err(|source| ClientError::Tls(std::io::Error::other(source)))?;
     let server_proof =
         read_expected(&mut stream, &mut inbound, ControlMessageType::ServerProof).await?;
+    require_protocol_version(&server_proof, protocol_version)?;
     require_correlation(&server_proof, client_hello_id)?;
     let controller_signature = fixed_array::<ED25519_SIGNATURE_LENGTH>(
         field_value(&server_proof, ControlFieldType::ControllerSignature)?,
@@ -319,12 +335,7 @@ pub async fn authenticate_controller(
     )?;
     verify_controller_proof(
         controller_public_key,
-        ControllerProofContext::new(
-            &exporter,
-            &server_nonce,
-            VersionEntry::V0_1_SUITE_1,
-            controller_id,
-        ),
+        ControllerProofContext::new(&exporter, &server_nonce, selected_entry, controller_id),
         &controller_signature,
     )?;
 
@@ -334,12 +345,13 @@ pub async fn authenticate_controller(
             &exporter,
             &server_nonce,
             &client_nonce,
-            VersionEntry::V0_1_SUITE_1,
+            selected_entry,
             controller_id,
             node_id,
         ),
     );
     let mut node_auth = MessageBuilder::new(ControlMessageType::NodeAuth)
+        .with_version(protocol_version)
         .with_correlation(message_id(&server_proof)?);
     node_auth.push_field(ControlFieldType::NodeSignature, &node_signature)?;
     if let Some(enrollment) = enrollment {
@@ -356,6 +368,7 @@ pub async fn authenticate_controller(
 
     let auth_result =
         read_expected(&mut stream, &mut inbound, ControlMessageType::AuthResult).await?;
+    require_protocol_version(&auth_result, protocol_version)?;
     require_correlation(&auth_result, node_auth_id)?;
     let status = decode_u16(
         field_value(&auth_result, ControlFieldType::StatusCode)?,
@@ -371,7 +384,12 @@ pub async fn authenticate_controller(
 
     let (read_half, write_half) = tokio::io::split(stream);
     let (sender, inbox) = mpsc::channel(32);
-    let reader_task = tokio::spawn(read_authenticated_messages(read_half, inbound, sender));
+    let reader_task = tokio::spawn(read_authenticated_messages(
+        read_half,
+        inbound,
+        protocol_version,
+        sender,
+    ));
     Ok(AuthenticatedControl {
         writer: RecordWriter::new(write_half),
         inbox,
@@ -381,6 +399,7 @@ pub async fn authenticate_controller(
         controller_public_key,
         node_id,
         node_public_key: identity.public_key(),
+        protocol_version,
         server_time,
     })
 }
@@ -388,12 +407,19 @@ pub async fn authenticate_controller(
 async fn read_authenticated_messages(
     read_half: ReadHalf<TlsStream<TcpStream>>,
     mut inbound: InboundSequence,
+    protocol_version: ProtocolVersion,
     sender: mpsc::Sender<Result<OwnedControlMessage, ClientError>>,
 ) {
     let mut reader = RecordReader::new(read_half);
     loop {
         let result = match reader.read_message().await {
             Ok(Some(message)) => match message.header() {
+                Ok(header) if header.version != protocol_version => {
+                    Err(ClientError::ProtocolVersionMismatch {
+                        expected: protocol_version,
+                        actual: header.version,
+                    })
+                }
                 Ok(header) => inbound
                     .accept(header.message_id)
                     .map(|()| message)
@@ -467,6 +493,17 @@ fn require_correlation(message: &OwnedControlMessage, expected: u64) -> Result<(
     let actual = message.header()?.correlation_id;
     if actual != expected {
         return Err(ClientError::UnexpectedCorrelation { expected, actual });
+    }
+    Ok(())
+}
+
+fn require_protocol_version(
+    message: &OwnedControlMessage,
+    expected: ProtocolVersion,
+) -> Result<(), ClientError> {
+    let actual = message.header()?.version;
+    if actual != expected {
+        return Err(ClientError::ProtocolVersionMismatch { expected, actual });
     }
     Ok(())
 }

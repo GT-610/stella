@@ -61,13 +61,15 @@ pub async fn serve_control_session(session: AcceptedSession) -> Result<(), Contr
 pub async fn serve_authenticated_session(
     authenticated: AuthenticatedSession,
 ) -> Result<(), ActiveSessionError> {
-    let (stream, _peer_addr, context, node, inbound, outbound) = authenticated.into_parts();
+    let (stream, _peer_addr, context, node, protocol_version, inbound, outbound) =
+        authenticated.into_parts();
     let mut shutdown = context.shutdown();
     let request_timeout = Duration::from_secs(context.limits().request_timeout_seconds);
     let mut state = ActiveSessionState {
         stream,
         context,
         node_id: node.node_id(),
+        protocol_version,
         inbound,
         outbound,
         joined_networks: BTreeSet::new(),
@@ -128,6 +130,7 @@ struct ActiveSessionState {
     stream: TlsStream<TcpStream>,
     context: SessionContext,
     node_id: NodeId,
+    protocol_version: ProtocolVersion,
     inbound: InboundSequence,
     outbound: OutboundSequence,
     joined_networks: BTreeSet<NetworkId>,
@@ -141,6 +144,13 @@ async fn process_request(
 ) -> Result<(), ActiveSessionError> {
     let header = message.header()?;
     state.inbound.accept(header.message_id)?;
+    if header.version != state.protocol_version {
+        send_error(state, header.message_id, STATUS_INVALID_STATE).await?;
+        return Err(ActiveSessionError::ProtocolVersionMismatch {
+            expected: state.protocol_version,
+            actual: header.version,
+        });
+    }
     if header.correlation_id != 0 {
         send_error(state, header.message_id, STATUS_INVALID_STATE).await?;
         return Err(ActiveSessionError::NonzeroRequestCorrelation {
@@ -357,6 +367,7 @@ async fn handle_join(
         state.node_id,
         request,
         unix_time()?,
+        state.protocol_version,
     )
     .await?
     {
@@ -399,6 +410,7 @@ async fn resolve_join(
     node_id: NodeId,
     request: JoinRequest,
     now: u64,
+    version: ProtocolVersion,
 ) -> Result<JoinDecision, ActiveSessionError> {
     let Some(network) = authority.get_network(request.network_id).await? else {
         return Ok(JoinDecision::NetworkNotFound);
@@ -446,7 +458,7 @@ async fn resolve_join(
         controller_identity,
         &view,
         now,
-        ProtocolVersion::CURRENT,
+        version,
     )?)))
 }
 
@@ -637,7 +649,7 @@ async fn handle_snapshot_request(
         state.context.controller_identity(),
         &view,
         unix_time()?,
-        ProtocolVersion::CURRENT,
+        state.protocol_version,
     )?;
     send_peer_snapshot(state, correlation_id, &encoded).await
 }
@@ -710,7 +722,7 @@ async fn handle_heartbeat(
                 state.context.controller_identity(),
                 &view,
                 now,
-                ProtocolVersion::CURRENT,
+                state.protocol_version,
             )?);
         }
         revisions.push(revision);
@@ -747,7 +759,7 @@ async fn refresh_due_grants(state: &mut ActiveSessionState) -> Result<(), Active
             state.context.controller_identity(),
             &view,
             now,
-            ProtocolVersion::CURRENT,
+            state.protocol_version,
         )?;
         send_grant_refresh(state, &encoded).await?;
     }
@@ -868,6 +880,9 @@ async fn send_peer_snapshot(
         &encoded.snapshot_revision().to_be_bytes(),
     )?;
     builder.push_field(ControlFieldType::PeerList, encoded.peer_list())?;
+    if let Some(connectivity_list) = encoded.connectivity_list() {
+        builder.push_field(ControlFieldType::ConnectivityList, connectivity_list)?;
+    }
     write_message(state, builder).await?;
     schedule_grant_refresh(state, encoded)
 }
@@ -995,7 +1010,9 @@ async fn write_message(
     state: &mut ActiveSessionState,
     builder: MessageBuilder,
 ) -> Result<(), ActiveSessionError> {
-    let message = state.outbound.build(builder)?;
+    let message = state
+        .outbound
+        .build(builder.with_version(state.protocol_version))?;
     let mut writer = RecordWriter::new(&mut state.stream);
     writer.write_message(&message).await?;
     writer.flush().await?;
@@ -1068,6 +1085,14 @@ pub enum ActiveSessionError {
         /// Received message type.
         actual: ControlMessageType,
     },
+    /// An authenticated message changed version after negotiation.
+    #[error("expected control version {expected:?}, received {actual:?}")]
+    ProtocolVersionMismatch {
+        /// Version selected during authentication.
+        expected: ProtocolVersion,
+        /// Version found in the active message header.
+        actual: ProtocolVersion,
+    },
     /// A request referred to a network not joined on this TLS connection.
     #[error("network {network_id} is not joined on this authenticated connection")]
     NetworkNotJoined {
@@ -1130,7 +1155,7 @@ mod tests {
 
     use stella_common::{ControllerId, NetworkId};
     use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
+    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy, ProtocolVersion};
     use zeroize::Zeroizing;
 
     use super::{
@@ -1212,6 +1237,7 @@ mod tests {
                     token: None,
                 },
                 200,
+                ProtocolVersion::V0_1,
             )
             .await
             .expect("resolve missing token"),
@@ -1226,6 +1252,7 @@ mod tests {
                 token: Some(Zeroizing::new(token_bytes)),
             },
             200,
+            ProtocolVersion::V0_1,
         )
         .await
         .expect("resolve valid join");
@@ -1248,6 +1275,7 @@ mod tests {
                 token: Some(Zeroizing::new(token_bytes)),
             },
             201,
+            ProtocolVersion::V0_1,
         )
         .await
         .expect("resolve repeated join");
@@ -1295,6 +1323,7 @@ mod tests {
                     token: Some(Zeroizing::new(token_bytes)),
                 },
                 202,
+                ProtocolVersion::V0_1,
             )
             .await
             .expect("resolve suspended join"),

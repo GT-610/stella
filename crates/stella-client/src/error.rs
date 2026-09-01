@@ -3,7 +3,7 @@
 use std::{io, net::SocketAddr};
 
 use stella_common::NetworkId;
-use stella_proto::{ControlFieldType, ControlMessageType};
+use stella_proto::{ControlFieldType, ControlMessageType, ProtocolVersion};
 use thiserror::Error;
 
 /// Failure while configuring or operating a Stella client.
@@ -47,8 +47,16 @@ pub enum ClientError {
     #[error("operating-system randomness is unavailable")]
     RandomnessUnavailable,
     /// The controller selected or advertised no compatible secure protocol.
-    #[error("controller does not advertise Stella version 0.1 suite 1")]
+    #[error("controller does not advertise a supported Stella protocol and suite")]
     NoCompatibleVersion,
+    /// A message changed the operational protocol version after negotiation.
+    #[error("expected control version {expected:?}, received {actual:?}")]
+    ProtocolVersionMismatch {
+        /// Version selected during authentication.
+        expected: ProtocolVersion,
+        /// Version found in the message header.
+        actual: ProtocolVersion,
+    },
     /// The controller hello did not match the configured controller identity.
     #[error("controller hello identity does not match configured controller ID")]
     ControllerIdentityMismatch,

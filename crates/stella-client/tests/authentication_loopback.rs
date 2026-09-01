@@ -18,7 +18,7 @@ use stella_client::{
 };
 use stella_common::NetworkId;
 use stella_crypto::{derive_node_id, IdentitySigningKey};
-use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
+use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy, ProtocolVersion};
 use stella_server::{
     active::serve_control_session,
     bootstrap::{initialize_controller, BootstrapOptions},
@@ -171,6 +171,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     .await;
     assert_eq!(first_connection.controller_id(), initialized.controller_id);
     assert_eq!(first_connection.node_id(), node_id);
+    assert_eq!(first_connection.protocol_version(), ProtocolVersion::V0_2);
     assert!(first_connection.server_time() >= issued_at);
     let mut first = ActiveControl::new(first_connection);
     let first_epoch = first

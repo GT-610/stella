@@ -52,6 +52,13 @@ impl VersionEntry {
         suite_id: 1,
     };
 
+    /// Version 0.2 automatic-connectivity control extension with suite 1.
+    pub const V0_2_SUITE_1: Self = Self {
+        major: 0,
+        minor: 2,
+        suite_id: 1,
+    };
+
     /// Decodes exactly one four-byte version entry.
     ///
     /// # Errors

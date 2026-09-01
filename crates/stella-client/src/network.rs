@@ -917,7 +917,9 @@ mod tests {
 
     use stella_common::{MacAddress, NetworkId};
     use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
-    use stella_proto::{CommonHeader, ConfidentialityPolicy, Endpoint, NetworkPolicy, PacketType};
+    use stella_proto::{
+        CommonHeader, ConfidentialityPolicy, Endpoint, NetworkPolicy, PacketType, ProtocolVersion,
+    };
     use stella_server::{
         network_state::encode_network_state,
         store::{AuthorityStore, NetworkRecord, NodeRecord},
@@ -1031,7 +1033,8 @@ mod tests {
         let view = store
             .network_session_view(local_node_id, network_id)
             .expect("network session view");
-        let encoded = encode_network_state(controller, &view, WALL_TIME).expect("encode state");
+        let encoded = encode_network_state(controller, &view, WALL_TIME, ProtocolVersion::V0_1)
+            .expect("encode state");
         NetworkState::from_snapshot(&SnapshotInput {
             controller_id: derive_controller_id(controller.public_key()),
             controller_public_key: controller.public_key(),
