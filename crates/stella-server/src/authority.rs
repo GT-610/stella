@@ -459,10 +459,9 @@ impl AuthorityHandle {
         &self,
         node_id: NodeId,
         network_id: NetworkId,
-        generation: Vec<u8>,
+        generation: Zeroizing<Vec<u8>>,
         now: u64,
     ) -> Result<AuthorityRevision, AuthorityError> {
-        let generation = Zeroizing::new(generation);
         self.request(|reply| {
             Command::Connectivity(ConnectivityCommand::Publish {
                 node_id,
@@ -1006,6 +1005,7 @@ mod tests {
         encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
         ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
     };
+    use zeroize::Zeroizing;
 
     use super::{AuthorityError, AuthorityThread};
     use crate::store::{AuthorityStore, MembershipStatus, NetworkRecord, NodeRecord};
@@ -1280,7 +1280,7 @@ mod tests {
 
         let generation = connectivity_generation(42, 120);
         let published = authority
-            .publish_connectivity(node_id, network_id, generation.clone(), 120)
+            .publish_connectivity(node_id, network_id, Zeroizing::new(generation.clone()), 120)
             .await
             .expect("publish connectivity");
         assert_eq!(published.controller_epoch, 2);
@@ -1301,7 +1301,7 @@ mod tests {
         );
         assert_eq!(
             authority
-                .publish_connectivity(node_id, network_id, generation, 125)
+                .publish_connectivity(node_id, network_id, Zeroizing::new(generation), 125)
                 .await
                 .expect("refresh identical connectivity"),
             published

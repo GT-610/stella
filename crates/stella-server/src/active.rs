@@ -11,9 +11,9 @@ use stella_control::{
 };
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
-    encode_network_revision_list, CodecError, ControlFieldType, ControlMessageType, Endpoint,
-    EndpointSetView, MembershipGrantView, NetworkRevision, NetworkRevisionListView,
-    ProtocolVersion,
+    encode_network_revision_list, CodecError, ConnectivityGenerationView, ControlFieldType,
+    ControlMessageType, Endpoint, EndpointSetView, MembershipGrantView, NetworkRevision,
+    NetworkRevisionListView, ProtocolVersion,
 };
 use thiserror::Error;
 use tokio::{
@@ -39,6 +39,8 @@ const STATUS_JOIN_TOKEN_INVALID: u16 = 111;
 const STATUS_MEMBERSHIP_SUSPENDED: u16 = 112;
 const STATUS_NETWORK_NOT_FOUND: u16 = 200;
 const STATUS_NETWORK_FULL: u16 = 205;
+const STATUS_CONNECTIVITY_GENERATION_INVALID: u16 = 305;
+const STATUS_CONNECTIVITY_GENERATION_EXPIRED: u16 = 306;
 
 /// Authenticates and then serves one complete control connection.
 ///
@@ -174,6 +176,11 @@ async fn process_request(
             handle_endpoint_update(state, header.message_id, request).await?;
             Ok(())
         }
+        ControlMessageType::ConnectivityUpdate => {
+            let request = parse_connectivity_update(&message)?;
+            handle_connectivity_update(state, header.message_id, request).await?;
+            Ok(())
+        }
         ControlMessageType::SnapshotRequest => {
             let request = parse_snapshot_request(&message)?;
             handle_snapshot_request(state, header.message_id, request).await?;
@@ -199,6 +206,11 @@ struct JoinRequest {
 struct EndpointUpdate {
     network_id: NetworkId,
     endpoints: Vec<Endpoint>,
+}
+
+struct ConnectivityUpdate {
+    network_id: NetworkId,
+    generation: Option<Zeroizing<Vec<u8>>>,
 }
 
 struct SnapshotRequest {
@@ -286,6 +298,35 @@ fn parse_endpoint_update(
         endpoints: endpoints.ok_or(ActiveSessionError::ValidatedFieldMissing {
             field: ControlFieldType::EndpointSet,
         })?,
+    })
+}
+
+fn parse_connectivity_update(
+    message: &stella_control::OwnedControlMessage,
+) -> Result<ConnectivityUpdate, ActiveSessionError> {
+    let view = message.view()?;
+    let mut network_id = None;
+    let mut generation = None;
+    for field in view.fields() {
+        match field.field_type() {
+            Some(ControlFieldType::NetworkId) => {
+                network_id = Some(NetworkId::from_bytes(fixed_array(
+                    field.value(),
+                    "network ID",
+                )?));
+            }
+            Some(ControlFieldType::ConnectivityGeneration) => {
+                ConnectivityGenerationView::decode(field.value())?;
+                generation = Some(Zeroizing::new(field.value().to_vec()));
+            }
+            _ => {}
+        }
+    }
+    Ok(ConnectivityUpdate {
+        network_id: network_id.ok_or(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::NetworkId,
+        })?,
+        generation,
     })
 }
 
@@ -654,6 +695,119 @@ async fn handle_snapshot_request(
     send_peer_snapshot(state, correlation_id, &encoded).await
 }
 
+async fn handle_connectivity_update(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    request: ConnectivityUpdate,
+) -> Result<(), ActiveSessionError> {
+    require_joined(state, correlation_id, request.network_id).await?;
+    let network_id = request.network_id;
+    match resolve_connectivity_update(
+        state.context.authority(),
+        state.node_id,
+        request,
+        unix_time()?,
+    )
+    .await?
+    {
+        ConnectivityDecision::Accepted(revision) => {
+            send_connectivity_result(state, correlation_id, STATUS_OK, &revision).await?;
+        }
+        ConnectivityDecision::Rejected {
+            revision,
+            status,
+            forget,
+            close,
+        } => {
+            if forget {
+                forget_network(state, revision.network_id);
+            }
+            send_connectivity_result(state, correlation_id, status, &revision).await?;
+            if close {
+                shutdown_writer(&mut state.stream).await?;
+                return Err(ActiveSessionError::AuthorizationRevoked { status });
+            }
+        }
+        ConnectivityDecision::NetworkNotFound => {
+            forget_network(state, network_id);
+            send_error(state, correlation_id, STATUS_NETWORK_NOT_FOUND).await?;
+        }
+    }
+    Ok(())
+}
+
+enum ConnectivityDecision {
+    Accepted(AuthorityRevision),
+    Rejected {
+        revision: AuthorityRevision,
+        status: u16,
+        forget: bool,
+        close: bool,
+    },
+    NetworkNotFound,
+}
+
+async fn resolve_connectivity_update(
+    authority: &AuthorityHandle,
+    node_id: NodeId,
+    request: ConnectivityUpdate,
+    now: u64,
+) -> Result<ConnectivityDecision, ActiveSessionError> {
+    let Some(network) = authority.get_network(request.network_id).await? else {
+        return Ok(ConnectivityDecision::NetworkNotFound);
+    };
+    let result = match request.generation {
+        Some(generation) => {
+            authority
+                .publish_connectivity(node_id, request.network_id, generation, now)
+                .await
+        }
+        None => {
+            authority
+                .withdraw_connectivity(node_id, request.network_id, now)
+                .await
+        }
+    };
+    match result {
+        Ok(revision) => Ok(ConnectivityDecision::Accepted(revision)),
+        Err(error) => {
+            if matches!(
+                &error,
+                AuthorityError::Store(source)
+                    if matches!(source.as_ref(), StoreError::NetworkNotFound { .. })
+            ) {
+                return Ok(ConnectivityDecision::NetworkNotFound);
+            }
+            let classified = match &error {
+                AuthorityError::Store(source) => match source.as_ref() {
+                    StoreError::Codec(_) => {
+                        Some((STATUS_CONNECTIVITY_GENERATION_INVALID, false, false))
+                    }
+                    StoreError::ConnectivityGenerationExpired { .. } => {
+                        Some((STATUS_CONNECTIVITY_GENERATION_EXPIRED, false, false))
+                    }
+                    _ => classify_authorization_error(&error)
+                        .map(|(status, close)| (status, true, close)),
+                },
+                _ => None,
+            };
+            let Some((status, forget, close)) = classified else {
+                return Err(ActiveSessionError::Authority(error));
+            };
+            Ok(ConnectivityDecision::Rejected {
+                revision: AuthorityRevision {
+                    controller_epoch: network.controller_epoch(),
+                    network_id: network.network_id(),
+                    snapshot_revision: network.snapshot_revision(),
+                },
+                status,
+                forget,
+                close,
+            })
+        }
+    }
+}
+
 async fn handle_heartbeat(
     state: &mut ActiveSessionState,
     correlation_id: u64,
@@ -895,6 +1049,27 @@ async fn send_endpoint_result(
 ) -> Result<(), ActiveSessionError> {
     let mut builder =
         MessageBuilder::new(ControlMessageType::EndpointResult).with_correlation(correlation_id);
+    builder.push_field(ControlFieldType::StatusCode, &status.to_be_bytes())?;
+    builder.push_field(
+        ControlFieldType::ControllerEpoch,
+        &revision.controller_epoch.to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::NetworkId, revision.network_id.as_bytes())?;
+    builder.push_field(
+        ControlFieldType::SnapshotRevision,
+        &revision.snapshot_revision.to_be_bytes(),
+    )?;
+    write_message(state, builder).await
+}
+
+async fn send_connectivity_result(
+    state: &mut ActiveSessionState,
+    correlation_id: u64,
+    status: u16,
+    revision: &AuthorityRevision,
+) -> Result<(), ActiveSessionError> {
+    let mut builder = MessageBuilder::new(ControlMessageType::ConnectivityResult)
+        .with_correlation(correlation_id);
     builder.push_field(ControlFieldType::StatusCode, &status.to_be_bytes())?;
     builder.push_field(
         ControlFieldType::ControllerEpoch,
@@ -1155,12 +1330,17 @@ mod tests {
 
     use stella_common::{ControllerId, NetworkId};
     use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy, ProtocolVersion};
+    use stella_proto::{
+        encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
+        ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
+        ProtocolVersion,
+    };
     use zeroize::Zeroizing;
 
     use super::{
-        grant_refresh_delay, resolve_endpoint_update, resolve_join, resolve_leave,
-        EndpointDecision, EndpointUpdate, JoinDecision, JoinRequest, LeaveDecision,
+        grant_refresh_delay, resolve_connectivity_update, resolve_endpoint_update, resolve_join,
+        resolve_leave, ConnectivityDecision, ConnectivityUpdate, EndpointDecision, EndpointUpdate,
+        JoinDecision, JoinRequest, LeaveDecision,
     };
     use crate::{
         authority::AuthorityThread,
@@ -1188,6 +1368,32 @@ mod tests {
             network_id,
             policy_revision: 1,
         }
+    }
+
+    fn connectivity_generation(generation_id: u64, created_at: u64) -> Vec<u8> {
+        let candidates = [IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: u32::MAX - 1,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: "192.0.2.10:4242".parse().expect("candidate address"),
+            related_address: None,
+            relay_id: None,
+        }];
+        let generation = ConnectivityGenerationRef::new(
+            generation_id,
+            generation_id + 100,
+            created_at,
+            created_at + 600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &candidates,
+        )
+        .expect("valid connectivity generation");
+        let mut encoded = vec![0; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        encoded
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1308,6 +1514,70 @@ mod tests {
                 .endpoints(),
             &[endpoint]
         );
+
+        let connectivity = connectivity_generation(104, 201);
+        let connectivity_revision = resolve_connectivity_update(
+            &authority,
+            node_id,
+            ConnectivityUpdate {
+                network_id,
+                generation: Some(Zeroizing::new(connectivity.clone())),
+            },
+            201,
+        )
+        .await
+        .expect("publish connectivity");
+        assert!(matches!(
+            connectivity_revision,
+            ConnectivityDecision::Accepted(_)
+        ));
+        assert_eq!(
+            authority
+                .get_connectivity(node_id, network_id)
+                .await
+                .expect("read connectivity")
+                .expect("connectivity exists")
+                .encoded_generation(),
+            connectivity
+        );
+        assert!(matches!(
+            resolve_connectivity_update(
+                &authority,
+                node_id,
+                ConnectivityUpdate {
+                    network_id,
+                    generation: Some(Zeroizing::new(connectivity_generation(105, 100))),
+                },
+                701,
+            )
+            .await
+            .expect("reject expired connectivity"),
+            ConnectivityDecision::Rejected {
+                status: 306,
+                forget: false,
+                close: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            resolve_connectivity_update(
+                &authority,
+                node_id,
+                ConnectivityUpdate {
+                    network_id,
+                    generation: None,
+                },
+                202,
+            )
+            .await
+            .expect("withdraw connectivity"),
+            ConnectivityDecision::Accepted(_)
+        ));
+        assert!(authority
+            .get_connectivity(node_id, network_id)
+            .await
+            .expect("read withdrawn connectivity")
+            .is_none());
 
         authority
             .set_membership_status(node_id, network_id, MembershipStatus::Suspended)

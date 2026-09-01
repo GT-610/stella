@@ -18,7 +18,10 @@ use stella_client::{
 };
 use stella_common::NetworkId;
 use stella_crypto::{derive_node_id, IdentitySigningKey};
-use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy, ProtocolVersion};
+use stella_proto::{
+    ConfidentialityPolicy, ConnectivityCarrier, ConnectivityGenerationRef, Endpoint, IceCandidate,
+    IceCandidateClass, NetworkPolicy, ProtocolVersion,
+};
 use stella_server::{
     active::serve_control_session,
     bootstrap::{initialize_controller, BootstrapOptions},
@@ -205,6 +208,38 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .expect("publish endpoint and reconcile snapshot")
         .snapshot_revision();
     assert!(endpoint_revision >= initial_revision);
+    let candidates = [IceCandidate {
+        class: IceCandidateClass::Host,
+        carrier: ConnectivityCarrier::DirectUdp,
+        priority: u32::MAX - 1,
+        foundation: 1,
+        max_datagram_size: 1_200,
+        address: "192.0.2.10:45123".parse().expect("candidate address"),
+        related_address: None,
+        relay_id: None,
+    }];
+    let generation = ConnectivityGenerationRef::new(
+        1,
+        2,
+        issued_at,
+        issued_at + 600,
+        b"Abcd1234",
+        b"Abcdefghijklmnopqrstuv",
+        &candidates,
+    )
+    .expect("valid connectivity generation");
+    let connectivity_revision = first
+        .publish_connectivity(network_id, Some(generation))
+        .await
+        .expect("publish connectivity and reconcile snapshot")
+        .snapshot_revision();
+    assert!(connectivity_revision > endpoint_revision);
+    let withdrawn_revision = first
+        .publish_connectivity(network_id, None)
+        .await
+        .expect("withdraw connectivity and reconcile snapshot")
+        .snapshot_revision();
+    assert!(withdrawn_revision > connectivity_revision);
 
     let peer_key = IdentitySigningKey::generate().expect("generate peer identity");
     let peer_connection = authenticate_controller(

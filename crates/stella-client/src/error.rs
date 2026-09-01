@@ -57,6 +57,16 @@ pub enum ClientError {
         /// Version found in the message header.
         actual: ProtocolVersion,
     },
+    /// A requested feature is not registered in the negotiated version.
+    #[error("{feature} requires control version {required:?}, negotiated {negotiated:?}")]
+    ProtocolFeatureUnavailable {
+        /// Stable feature name.
+        feature: &'static str,
+        /// Minimum protocol version implementing the feature.
+        required: ProtocolVersion,
+        /// Version selected for this connection.
+        negotiated: ProtocolVersion,
+    },
     /// The controller hello did not match the configured controller identity.
     #[error("controller hello identity does not match configured controller ID")]
     ControllerIdentityMismatch,

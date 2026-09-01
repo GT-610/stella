@@ -8,10 +8,12 @@ use std::{
 use stella_common::{NetworkId, NodeId};
 use stella_control::{MessageBuilder, OwnedControlMessage};
 use stella_proto::{
-    encode_endpoint_set, encode_network_revision_list, ControlFieldType, ControlMessageType,
-    Endpoint, NetworkRevision, NetworkRevisionListView, PeerRecordView,
+    encode_connectivity_generation, encode_endpoint_set, encode_network_revision_list,
+    ConnectivityGenerationRef, ControlFieldType, ControlMessageType, Endpoint, NetworkRevision,
+    NetworkRevisionListView, PeerRecordView, ProtocolVersion,
 };
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 use crate::{
     AuthenticatedControl, BearerCredential, ClientError, GrantRefreshInput, NetworkState,
@@ -138,6 +140,82 @@ impl ActiveControl {
         ensure_control_field(
             result_epoch > previous_epoch || result_revision >= previous_revision,
             "ENDPOINT_RESULT",
+            "snapshot revision",
+        )?;
+        self.request_snapshot(network_id, previous_revision, result_epoch, result_revision)
+            .await
+    }
+
+    /// Publishes or withdraws the complete version 0.2 connectivity generation
+    /// and reconciles the resulting authoritative snapshot before returning.
+    ///
+    /// Passing `None` withdraws only automatic reachability; membership and
+    /// any version 0.1 endpoint set remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] for an inactive network, version mismatch,
+    /// invalid generation, request rejection, carrier failure, or inconsistent
+    /// response/snapshot.
+    pub async fn publish_connectivity(
+        &mut self,
+        network_id: NetworkId,
+        generation: Option<ConnectivityGenerationRef<'_>>,
+    ) -> Result<&NetworkState, ClientError> {
+        let current = self
+            .networks
+            .get(&network_id)
+            .ok_or(ClientError::NetworkNotActive { network_id })?;
+        let negotiated = self.connection.protocol_version();
+        if negotiated != ProtocolVersion::V0_2 {
+            return Err(ClientError::ProtocolFeatureUnavailable {
+                feature: "automatic connectivity publication",
+                required: ProtocolVersion::V0_2,
+                negotiated,
+            });
+        }
+        let previous_epoch = current.controller_epoch();
+        let previous_revision = current.snapshot_revision();
+        let mut encoded_generation = generation
+            .map(|generation| {
+                let length = generation.encoded_len()?;
+                let mut encoded = Zeroizing::new(vec![0; length]);
+                encode_connectivity_generation(generation, &mut encoded)?;
+                Ok::<_, ClientError>(encoded)
+            })
+            .transpose()?;
+        let mut request = MessageBuilder::new(ControlMessageType::ConnectivityUpdate);
+        request.push_field(ControlFieldType::NetworkId, network_id.as_bytes())?;
+        if let Some(encoded) = encoded_generation.as_deref_mut() {
+            request.push_field(ControlFieldType::ConnectivityGeneration, encoded)?;
+        }
+        let request_id = self.connection.write_message(request).await?;
+        let result = self
+            .read_response_while_applying_updates(request_id)
+            .await?;
+        require_network_response(
+            &result,
+            ControlMessageType::ConnectivityResult,
+            request_id,
+            "connectivity publication",
+            network_id,
+        )?;
+        let result_epoch = decode_u64(
+            field_value(&result, ControlFieldType::ControllerEpoch)?,
+            "controller epoch",
+        )?;
+        let result_revision = decode_u64(
+            field_value(&result, ControlFieldType::SnapshotRevision)?,
+            "snapshot revision",
+        )?;
+        ensure_control_field(
+            result_epoch >= previous_epoch,
+            "CONNECTIVITY_RESULT",
+            "controller epoch",
+        )?;
+        ensure_control_field(
+            result_epoch > previous_epoch || result_revision >= previous_revision,
+            "CONNECTIVITY_RESULT",
             "snapshot revision",
         )?;
         self.request_snapshot(network_id, previous_revision, result_epoch, result_revision)
