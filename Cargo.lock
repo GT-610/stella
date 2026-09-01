@@ -1215,6 +1215,7 @@ name = "stella-transport"
 version = "0.1.0"
 dependencies = [
  "socket2",
+ "stella-common",
  "thiserror",
  "tokio",
 ]

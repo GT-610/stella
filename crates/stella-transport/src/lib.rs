@@ -7,6 +7,8 @@ mod udp;
 
 use std::{future::Future, net::SocketAddr, num::NonZeroU64, pin::Pin};
 
+use stella_common::RelayId;
+
 pub use error::{IoErrorClass, IoOperation, TransportError};
 pub use udp::{
     UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
@@ -52,6 +54,13 @@ impl std::fmt::Display for PathId {
 pub enum Endpoint {
     /// UDP endpoint reachable over IPv4 or IPv6.
     Udp(SocketAddr),
+    /// Peer address reached through one of its TURN UDP relay candidates.
+    TurnUdp {
+        /// Stable relay identity attached to the peer candidate.
+        relay_id: RelayId,
+        /// Exact relayed peer address carried by the candidate.
+        address: SocketAddr,
+    },
 }
 
 impl Endpoint {
@@ -60,6 +69,16 @@ impl Endpoint {
     pub const fn as_udp(&self) -> Option<SocketAddr> {
         match self {
             Self::Udp(address) => Some(*address),
+            Self::TurnUdp { .. } => None,
+        }
+    }
+
+    /// Returns the relay identity and peer address for a TURN UDP endpoint.
+    #[must_use]
+    pub const fn as_turn_udp(&self) -> Option<(RelayId, SocketAddr)> {
+        match self {
+            Self::Udp(_) => None,
+            Self::TurnUdp { relay_id, address } => Some((*relay_id, *address)),
         }
     }
 }
@@ -68,6 +87,9 @@ impl std::fmt::Display for Endpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Udp(address) => write!(formatter, "udp://{address}"),
+            Self::TurnUdp { relay_id, address } => {
+                write!(formatter, "turn+udp://{relay_id}@{address}")
+            }
         }
     }
 }
@@ -128,6 +150,8 @@ pub trait DatagramTransport: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use stella_common::RelayId;
+
     use super::{Endpoint, PathId};
 
     #[test]
@@ -144,5 +168,21 @@ mod tests {
     fn transport_endpoints_include_their_carrier_in_diagnostics() {
         let endpoint = Endpoint::Udp("127.0.0.1:44900".parse().expect("UDP endpoint"));
         assert_eq!(endpoint.to_string(), "udp://127.0.0.1:44900");
+        let relay_id = RelayId::from_bytes([0x11; 16]);
+        let endpoint = Endpoint::TurnUdp {
+            relay_id,
+            address: "192.0.2.30:50000".parse().expect("TURN UDP endpoint"),
+        };
+        assert_eq!(
+            endpoint.to_string(),
+            "turn+udp://11111111111111111111111111111111@192.0.2.30:50000"
+        );
+        assert_eq!(
+            endpoint.as_turn_udp(),
+            Some((
+                relay_id,
+                "192.0.2.30:50000".parse().expect("TURN UDP endpoint")
+            ))
+        );
     }
 }
