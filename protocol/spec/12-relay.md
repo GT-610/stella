@@ -115,6 +115,31 @@ The client-to-server carrier may be a stream, but the TURN layer presents exact
 datagrams to ICE and Stella. Partial, oversized, truncated, or trailing bytes
 are rejected before Stella parsing.
 
+### 3.1 TURN record boundary
+
+The reference codec accepts the RFC 8489 20-byte STUN header with magic cookie
+`0x2112a442`, a 96-bit transaction ID, and a four-byte-aligned 16-bit body
+length. It registers Binding, Allocate, Refresh, Send, Data,
+CreatePermission, and ChannelBind methods and all four STUN classes. Other
+methods are rejected by the first profile rather than guessed.
+
+The initial attribute registry includes MAPPED-ADDRESS, USERNAME,
+MESSAGE-INTEGRITY, ERROR-CODE, UNKNOWN-ATTRIBUTES, CHANNEL-NUMBER, LIFETIME,
+XOR-PEER-ADDRESS, DATA, REALM, NONCE, XOR-RELAYED-ADDRESS,
+REQUESTED-TRANSPORT, DONT-FRAGMENT, MESSAGE-INTEGRITY-SHA256,
+PASSWORD-ALGORITHM, USERHASH, XOR-MAPPED-ADDRESS, SOFTWARE, ALTERNATE-SERVER,
+and FINGERPRINT. Extension attribute values remain length bounded. Unknown
+comprehension-required attributes are reported to TURN behavior code; unknown
+optional attributes may be ignored according to the relevant RFC. Attribute
+padding is ignored on receipt and emitted as zero.
+
+TURN ChannelData uses the standard channel range `0x4000` through `0x7fff`, a
+16-bit unpadded data length, and one complete relayed datagram per record. UDP
+records end immediately after the declared bytes. TCP and TLS records add only
+the standard four-byte alignment padding. Stream demultiplexing examines the
+two high bits and declared length before allocating or reading the complete
+record; prefixes `10` and `11` are invalid.
+
 ## 4. Secure WebSocket carrier
 
 An HTTPS deployment may expose `/stella/turn/v1` with WebSocket subprotocol

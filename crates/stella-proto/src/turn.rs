@@ -1,0 +1,1046 @@
+//! STUN/TURN message and `ChannelData` record framing used by Stella relays.
+
+use std::fmt;
+
+use crate::{
+    cursor::{ReadCursor, WriteCursor},
+    CodecError,
+};
+
+/// RFC 8489 magic cookie present in every STUN message.
+pub const STUN_MAGIC_COOKIE: u32 = 0x2112_a442;
+
+/// Exact fixed STUN message header length.
+pub const STUN_HEADER_LENGTH: usize = 20;
+
+/// Exact TURN `ChannelData` header length.
+pub const TURN_CHANNEL_DATA_HEADER_LENGTH: usize = 4;
+
+/// Largest aligned STUN message representable by its 16-bit body length.
+pub const MAX_STUN_MESSAGE_LENGTH: usize = STUN_HEADER_LENGTH + (u16::MAX as usize & !3);
+
+/// Minimum TURN channel number allocated by a client.
+pub const MIN_TURN_CHANNEL_NUMBER: u16 = 0x4000;
+
+/// Maximum TURN channel number allocated by a client.
+pub const MAX_TURN_CHANNEL_NUMBER: u16 = 0x7fff;
+
+const STUN_ATTRIBUTE_HEADER_LENGTH: usize = 4;
+
+/// STUN message class encoded across the two class bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum StunClass {
+    /// Client request expecting a success or error response.
+    Request = 0,
+    /// One-way indication without a transaction response.
+    Indication = 1,
+    /// Successful response to a request.
+    SuccessResponse = 2,
+    /// Error response to a request.
+    ErrorResponse = 3,
+}
+
+impl TryFrom<u8> for StunClass {
+    type Error = CodecError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Request),
+            1 => Ok(Self::Indication),
+            2 => Ok(Self::SuccessResponse),
+            3 => Ok(Self::ErrorResponse),
+            _ => Err(CodecError::InvalidEnumValue {
+                field: "STUN message class",
+                value: u64::from(value),
+            }),
+        }
+    }
+}
+
+/// STUN or TURN method required by the Stella relay profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum StunMethod {
+    /// STUN Binding discovery or consent check.
+    Binding = 0x001,
+    /// TURN allocation creation.
+    Allocate = 0x003,
+    /// TURN allocation refresh or deletion.
+    Refresh = 0x004,
+    /// TURN relayed datagram send indication.
+    Send = 0x006,
+    /// TURN relayed datagram receive indication.
+    Data = 0x007,
+    /// TURN peer permission creation.
+    CreatePermission = 0x008,
+    /// TURN channel binding creation or refresh.
+    ChannelBind = 0x009,
+}
+
+impl TryFrom<u16> for StunMethod {
+    type Error = CodecError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0x001 => Ok(Self::Binding),
+            0x003 => Ok(Self::Allocate),
+            0x004 => Ok(Self::Refresh),
+            0x006 => Ok(Self::Send),
+            0x007 => Ok(Self::Data),
+            0x008 => Ok(Self::CreatePermission),
+            0x009 => Ok(Self::ChannelBind),
+            _ => Err(CodecError::InvalidEnumValue {
+                field: "STUN method",
+                value: u64::from(value),
+            }),
+        }
+    }
+}
+
+/// Decoded STUN method and class pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StunMessageType {
+    /// Registered method.
+    pub method: StunMethod,
+    /// Transaction class.
+    pub class: StunClass,
+}
+
+impl StunMessageType {
+    /// Creates one method/class pair.
+    #[must_use]
+    pub const fn new(method: StunMethod, class: StunClass) -> Self {
+        Self { method, class }
+    }
+
+    /// Returns the RFC 8489 scattered-bit wire value.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        let method = self.method as u16;
+        let class = self.class as u16;
+        (method & 0x000f)
+            | ((method & 0x0070) << 1)
+            | ((method & 0x0f80) << 2)
+            | ((class & 0x0001) << 4)
+            | ((class & 0x0002) << 7)
+    }
+}
+
+impl TryFrom<u16> for StunMessageType {
+    type Error = CodecError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        if value & 0xc000 != 0 {
+            return Err(CodecError::ReservedBits {
+                field: "STUN message type",
+                bits: u64::from(value),
+                allowed: 0x3fff,
+            });
+        }
+        let method = (value & 0x000f) | ((value & 0x00e0) >> 1) | ((value & 0x3e00) >> 2);
+        let class = u8::try_from(((value >> 4) & 1) | ((value >> 7) & 2)).map_err(|_| {
+            CodecError::InvalidEnumValue {
+                field: "STUN message class",
+                value: u64::from(value),
+            }
+        })?;
+        Ok(Self {
+            method: StunMethod::try_from(method)?,
+            class: StunClass::try_from(class)?,
+        })
+    }
+}
+
+/// Opaque 96-bit STUN transaction identifier.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct StunTransactionId([u8; 12]);
+
+impl StunTransactionId {
+    /// Creates an identifier from its exact wire bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 12]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrows the exact wire bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 12] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for StunTransactionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StunTransactionId")
+            .finish_non_exhaustive()
+    }
+}
+
+/// STUN/TURN attribute type, including unrecognized extension values.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StunAttributeType(u16);
+
+impl StunAttributeType {
+    /// MAPPED-ADDRESS.
+    pub const MAPPED_ADDRESS: Self = Self(0x0001);
+    /// USERNAME.
+    pub const USERNAME: Self = Self(0x0006);
+    /// MESSAGE-INTEGRITY using HMAC-SHA-1.
+    pub const MESSAGE_INTEGRITY: Self = Self(0x0008);
+    /// ERROR-CODE.
+    pub const ERROR_CODE: Self = Self(0x0009);
+    /// UNKNOWN-ATTRIBUTES.
+    pub const UNKNOWN_ATTRIBUTES: Self = Self(0x000a);
+    /// CHANNEL-NUMBER.
+    pub const CHANNEL_NUMBER: Self = Self(0x000c);
+    /// LIFETIME.
+    pub const LIFETIME: Self = Self(0x000d);
+    /// XOR-PEER-ADDRESS.
+    pub const XOR_PEER_ADDRESS: Self = Self(0x0012);
+    /// DATA.
+    pub const DATA: Self = Self(0x0013);
+    /// REALM.
+    pub const REALM: Self = Self(0x0014);
+    /// NONCE.
+    pub const NONCE: Self = Self(0x0015);
+    /// XOR-RELAYED-ADDRESS.
+    pub const XOR_RELAYED_ADDRESS: Self = Self(0x0016);
+    /// REQUESTED-TRANSPORT.
+    pub const REQUESTED_TRANSPORT: Self = Self(0x0019);
+    /// DONT-FRAGMENT.
+    pub const DONT_FRAGMENT: Self = Self(0x001a);
+    /// MESSAGE-INTEGRITY-SHA256.
+    pub const MESSAGE_INTEGRITY_SHA256: Self = Self(0x001c);
+    /// PASSWORD-ALGORITHM.
+    pub const PASSWORD_ALGORITHM: Self = Self(0x001d);
+    /// USERHASH.
+    pub const USERHASH: Self = Self(0x001e);
+    /// XOR-MAPPED-ADDRESS.
+    pub const XOR_MAPPED_ADDRESS: Self = Self(0x0020);
+    /// SOFTWARE.
+    pub const SOFTWARE: Self = Self(0x8022);
+    /// ALTERNATE-SERVER.
+    pub const ALTERNATE_SERVER: Self = Self(0x8023);
+    /// FINGERPRINT.
+    pub const FINGERPRINT: Self = Self(0x8028);
+
+    /// Creates a non-zero extension attribute type.
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        if value == 0 {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    /// Returns the two-byte wire value.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Returns whether an unknown receiver must reject this attribute.
+    #[must_use]
+    pub const fn comprehension_required(self) -> bool {
+        self.0 < 0x8000
+    }
+}
+
+/// Borrowed STUN attribute supplied for encoding.
+#[derive(Clone, Copy)]
+pub struct StunAttributeRef<'a> {
+    /// Attribute type.
+    pub attribute_type: StunAttributeType,
+    /// Exact unpadded value bytes.
+    pub value: &'a [u8],
+}
+
+impl StunAttributeRef<'_> {
+    /// Returns the four-byte-aligned encoded length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when the value exceeds the 16-bit attribute
+    /// length or alignment arithmetic overflows.
+    pub fn encoded_len(&self) -> Result<usize, CodecError> {
+        let _length = u16::try_from(self.value.len()).map_err(|_| CodecError::ValueOutOfRange {
+            field: "STUN attribute length",
+            actual: self.value.len() as u64,
+            minimum: 0,
+            maximum: u64::from(u16::MAX),
+        })?;
+        align_to_four(
+            STUN_ATTRIBUTE_HEADER_LENGTH
+                .checked_add(self.value.len())
+                .ok_or(CodecError::IntegerOverflow {
+                    field: "STUN attribute encoded length",
+                })?,
+        )
+    }
+}
+
+impl fmt::Debug for StunAttributeRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StunAttributeRef")
+            .field("attribute_type", &self.attribute_type)
+            .field("value_length", &self.value.len())
+            .finish()
+    }
+}
+
+/// Borrowed complete STUN message supplied for encoding.
+#[derive(Clone, Copy, Debug)]
+pub struct StunMessageRef<'a> {
+    /// Method and class.
+    pub message_type: StunMessageType,
+    /// Transaction identifier.
+    pub transaction_id: StunTransactionId,
+    /// Ordered attributes.
+    pub attributes: &'a [StunAttributeRef<'a>],
+}
+
+impl StunMessageRef<'_> {
+    /// Returns the exact encoded message length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for oversized attributes, arithmetic overflow,
+    /// or a body that cannot fit the STUN 16-bit length.
+    pub fn encoded_len(&self) -> Result<usize, CodecError> {
+        let body_length = stun_attributes_encoded_len(self.attributes)?;
+        let _body_length = u16::try_from(body_length).map_err(|_| CodecError::ValueOutOfRange {
+            field: "STUN message body length",
+            actual: body_length as u64,
+            minimum: 0,
+            maximum: u64::from(u16::MAX),
+        })?;
+        STUN_HEADER_LENGTH
+            .checked_add(body_length)
+            .ok_or(CodecError::IntegerOverflow {
+                field: "STUN message encoded length",
+            })
+    }
+}
+
+/// Returns the aligned encoded length of an ordered attribute sequence.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for oversized values or checked arithmetic overflow.
+pub fn stun_attributes_encoded_len(
+    attributes: &[StunAttributeRef<'_>],
+) -> Result<usize, CodecError> {
+    attributes.iter().try_fold(0_usize, |length, attribute| {
+        length
+            .checked_add(attribute.encoded_len()?)
+            .ok_or(CodecError::IntegerOverflow {
+                field: "STUN attributes encoded length",
+            })
+    })
+}
+
+/// Encodes one complete STUN/TURN message and zeroes all attribute padding.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for invalid lengths, arithmetic overflow, or a
+/// caller-provided output slice that is too small.
+pub fn encode_stun_message(
+    message: StunMessageRef<'_>,
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    let encoded_length = message.encoded_len()?;
+    let body_length = encoded_length - STUN_HEADER_LENGTH;
+    let body_length = u16::try_from(body_length).map_err(|_| CodecError::ValueOutOfRange {
+        field: "STUN message body length",
+        actual: body_length as u64,
+        minimum: 0,
+        maximum: u64::from(u16::MAX),
+    })?;
+    let mut cursor = WriteCursor::new(output, 0);
+    cursor.write_u16(message.message_type.as_u16(), "STUN message type")?;
+    cursor.write_u16(body_length, "STUN message body length")?;
+    cursor.write_u32(STUN_MAGIC_COOKIE, "STUN magic cookie")?;
+    cursor.write_bytes(message.transaction_id.as_bytes(), "STUN transaction ID")?;
+    for attribute in message.attributes {
+        let value_length =
+            u16::try_from(attribute.value.len()).map_err(|_| CodecError::ValueOutOfRange {
+                field: "STUN attribute length",
+                actual: attribute.value.len() as u64,
+                minimum: 0,
+                maximum: u64::from(u16::MAX),
+            })?;
+        cursor.write_u16(attribute.attribute_type.as_u16(), "STUN attribute type")?;
+        cursor.write_u16(value_length, "STUN attribute length")?;
+        cursor.write_bytes(attribute.value, "STUN attribute value")?;
+        let padded = align_to_four(cursor.position())?;
+        while cursor.position() < padded {
+            cursor.write_u8(0, "STUN attribute padding")?;
+        }
+    }
+    Ok(cursor.position())
+}
+
+/// Borrowed validated STUN attribute.
+#[derive(Clone, Copy)]
+pub struct StunAttributeView<'a> {
+    attribute_type: StunAttributeType,
+    value: &'a [u8],
+}
+
+impl<'a> StunAttributeView<'a> {
+    /// Returns the attribute type.
+    #[must_use]
+    pub const fn attribute_type(&self) -> StunAttributeType {
+        self.attribute_type
+    }
+
+    /// Borrows the exact unpadded value bytes.
+    #[must_use]
+    pub const fn value(&self) -> &'a [u8] {
+        self.value
+    }
+}
+
+impl fmt::Debug for StunAttributeView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StunAttributeView")
+            .field("attribute_type", &self.attribute_type)
+            .field("value_length", &self.value.len())
+            .finish()
+    }
+}
+
+/// Iterator over bounded STUN attribute records.
+pub struct StunAttributeIter<'a> {
+    body: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Iterator for StunAttributeIter<'a> {
+    type Item = Result<StunAttributeView<'a>, CodecError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position == self.body.len() {
+            return None;
+        }
+        if self.position > self.body.len() {
+            return Some(Err(CodecError::TrailingBytes {
+                expected: self.body.len(),
+                actual: self.position,
+            }));
+        }
+        let base = STUN_HEADER_LENGTH.saturating_add(self.position);
+        let remaining = &self.body[self.position..];
+        let mut cursor = ReadCursor::new(remaining, base);
+        let raw_attribute_type = match cursor.read_u16("STUN attribute type") {
+            Ok(value) => value,
+            Err(error) => {
+                self.position = self.body.len();
+                return Some(Err(error));
+            }
+        };
+        let Some(attribute_type) = StunAttributeType::new(raw_attribute_type) else {
+            self.position = self.body.len();
+            return Some(Err(CodecError::InvalidEnumValue {
+                field: "STUN attribute type",
+                value: 0,
+            }));
+        };
+        let value_length = match cursor.read_u16("STUN attribute length") {
+            Ok(value) => usize::from(value),
+            Err(error) => {
+                self.position = self.body.len();
+                return Some(Err(error));
+            }
+        };
+        let value = match cursor.read_slice(value_length, "STUN attribute value") {
+            Ok(value) => value,
+            Err(error) => {
+                self.position = self.body.len();
+                return Some(Err(error));
+            }
+        };
+        let consumed = match align_to_four(cursor.position()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.position = self.body.len();
+                return Some(Err(error));
+            }
+        };
+        let Some(next) = self.position.checked_add(consumed) else {
+            self.position = self.body.len();
+            return Some(Err(CodecError::IntegerOverflow {
+                field: "STUN attribute iterator position",
+            }));
+        };
+        if next > self.body.len() {
+            self.position = self.body.len();
+            return Some(Err(CodecError::Truncated {
+                field: "STUN attribute padding",
+                offset: base.saturating_add(cursor.position()),
+                needed: consumed.saturating_sub(cursor.position()),
+                remaining: remaining.len().saturating_sub(cursor.position()),
+            }));
+        }
+        self.position = next;
+        Some(Ok(StunAttributeView {
+            attribute_type,
+            value,
+        }))
+    }
+}
+
+/// Borrowed validated complete STUN/TURN message.
+#[derive(Clone, Copy)]
+pub struct StunMessageView<'a> {
+    encoded: &'a [u8],
+    message_type: StunMessageType,
+    transaction_id: StunTransactionId,
+    body: &'a [u8],
+}
+
+impl<'a> StunMessageView<'a> {
+    /// Decodes one exact complete message and validates every attribute range.
+    ///
+    /// Attribute padding is ignored on input as required by STUN and is zeroed
+    /// by [`encode_stun_message`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for truncation, invalid type, cookie, alignment,
+    /// declared length, attribute ranges, zero attribute types, or trailing
+    /// bytes.
+    pub fn decode(input: &'a [u8]) -> Result<Self, CodecError> {
+        let mut cursor = ReadCursor::new(input, 0);
+        let message_type = StunMessageType::try_from(cursor.read_u16("STUN message type")?)?;
+        let body_length = usize::from(cursor.read_u16("STUN message body length")?);
+        if body_length % 4 != 0 {
+            return Err(CodecError::UnalignedHeaderLength {
+                actual: body_length,
+            });
+        }
+        if cursor.read_u32("STUN magic cookie")? != STUN_MAGIC_COOKIE {
+            return Err(CodecError::InvalidObjectMagic {
+                object: "STUN message",
+            });
+        }
+        let transaction_id =
+            StunTransactionId::from_bytes(cursor.read_array::<12>("STUN transaction ID")?);
+        let expected =
+            STUN_HEADER_LENGTH
+                .checked_add(body_length)
+                .ok_or(CodecError::IntegerOverflow {
+                    field: "STUN message length",
+                })?;
+        if input.len() != expected {
+            return Err(CodecError::TrailingBytes {
+                expected,
+                actual: input.len(),
+            });
+        }
+        let body = cursor.read_slice(body_length, "STUN message body")?;
+        let view = Self {
+            encoded: input,
+            message_type,
+            transaction_id,
+            body,
+        };
+        for attribute in view.attributes() {
+            let _attribute = attribute?;
+        }
+        Ok(view)
+    }
+
+    /// Returns the method and class.
+    #[must_use]
+    pub const fn message_type(&self) -> StunMessageType {
+        self.message_type
+    }
+
+    /// Returns the transaction identifier.
+    #[must_use]
+    pub const fn transaction_id(&self) -> StunTransactionId {
+        self.transaction_id
+    }
+
+    /// Borrows the exact complete encoded message.
+    #[must_use]
+    pub const fn encoded(&self) -> &'a [u8] {
+        self.encoded
+    }
+
+    /// Iterates over validated attributes in wire order.
+    #[must_use]
+    pub const fn attributes(&self) -> StunAttributeIter<'a> {
+        StunAttributeIter {
+            body: self.body,
+            position: 0,
+        }
+    }
+}
+
+impl fmt::Debug for StunMessageView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StunMessageView")
+            .field("message_type", &self.message_type)
+            .field("transaction_id", &self.transaction_id)
+            .field("body_length", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Validated TURN channel number in the dynamic allocation range.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TurnChannelNumber(u16);
+
+impl TurnChannelNumber {
+    /// Creates a channel number in `0x4000..=0x7fff`.
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        if value >= MIN_TURN_CHANNEL_NUMBER && value <= MAX_TURN_CHANNEL_NUMBER {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the two-byte wire value.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// Encodes one TURN `ChannelData` datagram without stream padding.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when data exceeds 65,535 bytes, length arithmetic
+/// overflows, or the output is too small.
+pub fn encode_turn_channel_data(
+    channel: TurnChannelNumber,
+    data: &[u8],
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    encode_turn_channel_data_inner(channel, data, output, false)
+}
+
+/// Encodes one TURN `ChannelData` stream record with zero alignment padding.
+///
+/// # Errors
+///
+/// Returns the same errors as [`encode_turn_channel_data`].
+pub fn encode_turn_channel_data_stream(
+    channel: TurnChannelNumber,
+    data: &[u8],
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    encode_turn_channel_data_inner(channel, data, output, true)
+}
+
+fn encode_turn_channel_data_inner(
+    channel: TurnChannelNumber,
+    data: &[u8],
+    output: &mut [u8],
+    stream_padding: bool,
+) -> Result<usize, CodecError> {
+    let data_length = u16::try_from(data.len()).map_err(|_| CodecError::ValueOutOfRange {
+        field: "TURN ChannelData length",
+        actual: data.len() as u64,
+        minimum: 0,
+        maximum: u64::from(u16::MAX),
+    })?;
+    let unpadded = TURN_CHANNEL_DATA_HEADER_LENGTH
+        .checked_add(data.len())
+        .ok_or(CodecError::IntegerOverflow {
+            field: "TURN ChannelData record length",
+        })?;
+    let encoded_length = if stream_padding {
+        align_to_four(unpadded)?
+    } else {
+        unpadded
+    };
+    let mut cursor = WriteCursor::new(output, 0);
+    cursor.write_u16(channel.get(), "TURN channel number")?;
+    cursor.write_u16(data_length, "TURN ChannelData length")?;
+    cursor.write_bytes(data, "TURN ChannelData payload")?;
+    while cursor.position() < encoded_length {
+        cursor.write_u8(0, "TURN ChannelData stream padding")?;
+    }
+    Ok(cursor.position())
+}
+
+/// Borrowed validated TURN `ChannelData` record.
+#[derive(Clone, Copy)]
+pub struct TurnChannelDataView<'a> {
+    channel: TurnChannelNumber,
+    data: &'a [u8],
+}
+
+impl<'a> TurnChannelDataView<'a> {
+    /// Decodes one exact UDP `ChannelData` datagram without alignment padding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for truncation, an out-of-range channel number,
+    /// or trailing bytes.
+    pub fn decode_datagram(input: &'a [u8]) -> Result<Self, CodecError> {
+        Self::decode(input, false)
+    }
+
+    /// Decodes one exact stream `ChannelData` record including alignment padding.
+    ///
+    /// Stream padding bytes are ignored as specified by TURN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for truncation, an out-of-range channel number,
+    /// or inconsistent padded length.
+    pub fn decode_stream(input: &'a [u8]) -> Result<Self, CodecError> {
+        Self::decode(input, true)
+    }
+
+    fn decode(input: &'a [u8], stream_padding: bool) -> Result<Self, CodecError> {
+        let mut cursor = ReadCursor::new(input, 0);
+        let raw_channel = cursor.read_u16("TURN channel number")?;
+        let channel = TurnChannelNumber::new(raw_channel).ok_or(CodecError::ValueOutOfRange {
+            field: "TURN channel number",
+            actual: u64::from(raw_channel),
+            minimum: u64::from(MIN_TURN_CHANNEL_NUMBER),
+            maximum: u64::from(MAX_TURN_CHANNEL_NUMBER),
+        })?;
+        let data_length = usize::from(cursor.read_u16("TURN ChannelData length")?);
+        let data = cursor.read_slice(data_length, "TURN ChannelData payload")?;
+        let unpadded = TURN_CHANNEL_DATA_HEADER_LENGTH
+            .checked_add(data_length)
+            .ok_or(CodecError::IntegerOverflow {
+                field: "TURN ChannelData record length",
+            })?;
+        let expected = if stream_padding {
+            align_to_four(unpadded)?
+        } else {
+            unpadded
+        };
+        if input.len() != expected {
+            return Err(CodecError::TrailingBytes {
+                expected,
+                actual: input.len(),
+            });
+        }
+        Ok(Self { channel, data })
+    }
+
+    /// Returns the bound channel number.
+    #[must_use]
+    pub const fn channel(&self) -> TurnChannelNumber {
+        self.channel
+    }
+
+    /// Borrows the exact relayed datagram bytes.
+    #[must_use]
+    pub const fn data(&self) -> &'a [u8] {
+        self.data
+    }
+}
+
+impl fmt::Debug for TurnChannelDataView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnChannelDataView")
+            .field("channel", &self.channel)
+            .field("data_length", &self.data.len())
+            .finish()
+    }
+}
+
+/// Returns the exact next record length for a TURN TCP/TLS byte stream.
+///
+/// `prefix` must contain the first four bytes. STUN records include their
+/// 20-byte header and already-aligned body. `ChannelData` records include
+/// four-byte stream padding.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for a short prefix, unsupported leading bits,
+/// invalid STUN method/class, unaligned STUN body, invalid channel number, or
+/// checked length overflow.
+pub fn decode_turn_stream_record_length(prefix: &[u8]) -> Result<usize, CodecError> {
+    let mut cursor = ReadCursor::new(prefix, 0);
+    let leading = cursor.read_u16("TURN stream record type")?;
+    let length = usize::from(cursor.read_u16("TURN stream record length")?);
+    match leading >> 14 {
+        0 => {
+            let _message_type = StunMessageType::try_from(leading)?;
+            if length % 4 != 0 {
+                return Err(CodecError::UnalignedHeaderLength { actual: length });
+            }
+            STUN_HEADER_LENGTH
+                .checked_add(length)
+                .ok_or(CodecError::IntegerOverflow {
+                    field: "TURN STUN stream record length",
+                })
+        }
+        1 => {
+            let _channel = TurnChannelNumber::new(leading).ok_or(CodecError::ValueOutOfRange {
+                field: "TURN channel number",
+                actual: u64::from(leading),
+                minimum: u64::from(MIN_TURN_CHANNEL_NUMBER),
+                maximum: u64::from(MAX_TURN_CHANNEL_NUMBER),
+            })?;
+            align_to_four(TURN_CHANNEL_DATA_HEADER_LENGTH.checked_add(length).ok_or(
+                CodecError::IntegerOverflow {
+                    field: "TURN ChannelData stream record length",
+                },
+            )?)
+        }
+        _ => Err(CodecError::ReservedBits {
+            field: "TURN stream record type",
+            bits: u64::from(leading),
+            allowed: 0x7fff,
+        }),
+    }
+}
+
+fn align_to_four(length: usize) -> Result<usize, CodecError> {
+    length
+        .checked_add(3)
+        .map(|value| value & !3)
+        .ok_or(CodecError::IntegerOverflow {
+            field: "four-byte alignment",
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decode_turn_stream_record_length, encode_stun_message, encode_turn_channel_data,
+        encode_turn_channel_data_stream, StunAttributeRef, StunAttributeType, StunClass,
+        StunMessageRef, StunMessageType, StunMessageView, StunMethod, StunTransactionId,
+        TurnChannelDataView, TurnChannelNumber, STUN_MAGIC_COOKIE,
+    };
+    use crate::CodecError;
+
+    const TRANSACTION_ID: StunTransactionId =
+        StunTransactionId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+    #[test]
+    fn registered_turn_message_types_match_rfc_values() {
+        assert_eq!(
+            StunMessageType::new(StunMethod::Allocate, StunClass::Request).as_u16(),
+            0x0003
+        );
+        assert_eq!(
+            StunMessageType::new(StunMethod::Allocate, StunClass::SuccessResponse).as_u16(),
+            0x0103
+        );
+        assert_eq!(
+            StunMessageType::new(StunMethod::Allocate, StunClass::ErrorResponse).as_u16(),
+            0x0113
+        );
+        assert_eq!(
+            StunMessageType::new(StunMethod::Send, StunClass::Indication).as_u16(),
+            0x0016
+        );
+        assert_eq!(
+            StunMessageType::new(StunMethod::Data, StunClass::Indication).as_u16(),
+            0x0017
+        );
+        for raw in [0x0001, 0x0003, 0x0103, 0x0113, 0x0016, 0x0017, 0x0008] {
+            assert_eq!(
+                StunMessageType::try_from(raw)
+                    .expect("registered type")
+                    .as_u16(),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn allocate_request_matches_canonical_bytes_and_round_trips() {
+        let transport = [17, 0, 0, 0];
+        let lifetime = 600_u32.to_be_bytes();
+        let attributes = [
+            StunAttributeRef {
+                attribute_type: StunAttributeType::REQUESTED_TRANSPORT,
+                value: &transport,
+            },
+            StunAttributeRef {
+                attribute_type: StunAttributeType::LIFETIME,
+                value: &lifetime,
+            },
+        ];
+        let message = StunMessageRef {
+            message_type: StunMessageType::new(StunMethod::Allocate, StunClass::Request),
+            transaction_id: TRANSACTION_ID,
+            attributes: &attributes,
+        };
+        let mut encoded = [0_u8; 36];
+        assert_eq!(
+            encode_stun_message(message, &mut encoded).expect("encode allocate request"),
+            encoded.len()
+        );
+        assert_eq!(
+            encoded,
+            [
+                0x00, 0x03, 0x00, 0x10, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                12, 0x00, 0x19, 0x00, 0x04, 17, 0, 0, 0, 0x00, 0x0d, 0x00, 0x04, 0x00, 0x00, 0x02,
+                0x58,
+            ]
+        );
+        let decoded = StunMessageView::decode(&encoded).expect("decode allocate request");
+        assert_eq!(decoded.message_type(), message.message_type);
+        assert_eq!(decoded.transaction_id(), TRANSACTION_ID);
+        let decoded_attributes = decoded
+            .attributes()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode attributes");
+        assert_eq!(decoded_attributes.len(), 2);
+        assert_eq!(
+            decoded_attributes[0].attribute_type(),
+            StunAttributeType::REQUESTED_TRANSPORT
+        );
+        assert_eq!(decoded_attributes[0].value(), &transport);
+        assert_eq!(decoded_attributes[1].value(), &lifetime);
+    }
+
+    #[test]
+    fn attribute_padding_is_zeroed_but_ignored_when_decoding() {
+        let attributes = [StunAttributeRef {
+            attribute_type: StunAttributeType::USERNAME,
+            value: b"abc",
+        }];
+        let message = StunMessageRef {
+            message_type: StunMessageType::new(StunMethod::Allocate, StunClass::Request),
+            transaction_id: TRANSACTION_ID,
+            attributes: &attributes,
+        };
+        let mut encoded = [0x5a; 28];
+        encode_stun_message(message, &mut encoded).expect("encode padded attribute");
+        assert_eq!(encoded[27], 0);
+        encoded[27] = 0x5a;
+        let decoded = StunMessageView::decode(&encoded).expect("padding is ignored");
+        let attribute = decoded
+            .attributes()
+            .next()
+            .expect("one attribute")
+            .expect("valid attribute");
+        assert_eq!(attribute.value(), b"abc");
+        let diagnostic = format!("{decoded:?} {attribute:?}");
+        assert!(!diagnostic.contains("abc"));
+    }
+
+    #[test]
+    fn malformed_stun_lengths_types_and_cookie_are_rejected() {
+        let mut header = [0_u8; 20];
+        header[..2].copy_from_slice(&0x0003_u16.to_be_bytes());
+        header[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        assert!(StunMessageView::decode(&header).is_ok());
+
+        let mut bad_cookie = header;
+        bad_cookie[4] ^= 1;
+        assert!(matches!(
+            StunMessageView::decode(&bad_cookie),
+            Err(CodecError::InvalidObjectMagic {
+                object: "STUN message"
+            })
+        ));
+        let mut unaligned = header;
+        unaligned[2..4].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(matches!(
+            StunMessageView::decode(&unaligned),
+            Err(CodecError::UnalignedHeaderLength { actual: 1 })
+        ));
+        let mut unknown_method = header;
+        unknown_method[..2].copy_from_slice(&0x0002_u16.to_be_bytes());
+        assert!(matches!(
+            StunMessageView::decode(&unknown_method),
+            Err(CodecError::InvalidEnumValue {
+                field: "STUN method",
+                ..
+            })
+        ));
+        let mut trailing = header.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            StunMessageView::decode(&trailing),
+            Err(CodecError::TrailingBytes {
+                expected: 20,
+                actual: 21
+            })
+        ));
+
+        let mut truncated_attribute = header.to_vec();
+        truncated_attribute[2..4].copy_from_slice(&4_u16.to_be_bytes());
+        truncated_attribute.extend_from_slice(&[0x00, 0x06, 0x00, 0x04]);
+        assert!(matches!(
+            StunMessageView::decode(&truncated_attribute),
+            Err(CodecError::Truncated {
+                field: "STUN attribute value",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn channel_data_preserves_datagram_and_stream_boundaries() {
+        let channel = TurnChannelNumber::new(0x4001).expect("valid channel");
+        let mut datagram = [0_u8; 7];
+        assert_eq!(
+            encode_turn_channel_data(channel, b"abc", &mut datagram)
+                .expect("encode datagram ChannelData"),
+            7
+        );
+        let decoded =
+            TurnChannelDataView::decode_datagram(&datagram).expect("decode datagram ChannelData");
+        assert_eq!(decoded.channel(), channel);
+        assert_eq!(decoded.data(), b"abc");
+
+        let mut stream = [0x5a; 8];
+        assert_eq!(
+            encode_turn_channel_data_stream(channel, b"abc", &mut stream)
+                .expect("encode stream ChannelData"),
+            8
+        );
+        assert_eq!(stream[7], 0);
+        assert_eq!(
+            decode_turn_stream_record_length(&stream[..4]).expect("channel record length"),
+            8
+        );
+        assert_eq!(
+            TurnChannelDataView::decode_stream(&stream)
+                .expect("decode stream ChannelData")
+                .data(),
+            b"abc"
+        );
+        assert!(TurnChannelDataView::decode_datagram(&stream).is_err());
+    }
+
+    #[test]
+    fn stream_framing_distinguishes_stun_channel_and_reserved_prefixes() {
+        assert_eq!(
+            decode_turn_stream_record_length(&[0x00, 0x03, 0x00, 0x10])
+                .expect("STUN record length"),
+            36
+        );
+        assert_eq!(
+            decode_turn_stream_record_length(&[0x40, 0x00, 0x00, 0x05])
+                .expect("ChannelData record length"),
+            12
+        );
+        assert!(matches!(
+            decode_turn_stream_record_length(&[0x80, 0x00, 0, 0]),
+            Err(CodecError::ReservedBits { .. })
+        ));
+        assert!(matches!(
+            decode_turn_stream_record_length(&[0x00, 0x03, 0x00]),
+            Err(CodecError::Truncated { .. })
+        ));
+    }
+}

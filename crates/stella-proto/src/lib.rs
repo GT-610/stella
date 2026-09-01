@@ -16,6 +16,7 @@ mod nested;
 mod peer;
 mod policy;
 mod relay;
+mod turn;
 
 pub use common::{
     CommonHeader, PacketType, ProtocolVersion, COMMON_HEADER_LENGTH, MAGIC, MAX_HEADER_LENGTH,
@@ -89,4 +90,12 @@ pub use relay::{
     MAX_RELAY_CREDENTIAL_LIFETIME_SECONDS, MAX_RELAY_DNS_NAME_LENGTH, MAX_RELAY_REGION_LENGTH,
     MAX_RELAY_SECRET_LENGTH, MAX_RELAY_SERVICES, MAX_RELAY_SPKI_PINS, MAX_RELAY_USERNAME_LENGTH,
     MIN_RELAY_SECRET_LENGTH, RELAY_ADDRESS_RECORD_LENGTH, RELAY_SERVICE_HEADER_LENGTH,
+};
+pub use turn::{
+    decode_turn_stream_record_length, encode_stun_message, encode_turn_channel_data,
+    encode_turn_channel_data_stream, stun_attributes_encoded_len, StunAttributeIter,
+    StunAttributeRef, StunAttributeType, StunAttributeView, StunClass, StunMessageRef,
+    StunMessageType, StunMessageView, StunMethod, StunTransactionId, TurnChannelDataView,
+    TurnChannelNumber, MAX_STUN_MESSAGE_LENGTH, MAX_TURN_CHANNEL_NUMBER, MIN_TURN_CHANNEL_NUMBER,
+    STUN_HEADER_LENGTH, STUN_MAGIC_COOKIE, TURN_CHANNEL_DATA_HEADER_LENGTH,
 };

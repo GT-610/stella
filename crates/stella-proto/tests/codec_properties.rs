@@ -3,14 +3,15 @@
 use proptest::prelude::*;
 use stella_common::{NetworkId, NodeId};
 use stella_proto::{
-    decode_control_record_length, encode_session_confirm, encode_session_reject, CommonHeader,
-    ConnectivityGenerationView, ConnectivityListView, ConnectivityRecordView, ControlFieldIter,
-    ControlHeader, ControlMessageView, DataHeader, DataPacketView, EndpointSetView,
-    HandshakeHeader, IceCandidate, KeepaliveHeader, KeepalivePacketView, MembershipGrantView,
-    NetworkPolicy, NetworkRevisionListView, PacketType, PeerListView, PeerRecordView,
-    ProtocolVersion, RelayServiceListView, RelayServiceView, SessionConfirmRef, SessionConfirmRole,
-    SessionConfirmView, SessionInitView, SessionRejectReason, SessionRejectRef, SessionRejectView,
-    SessionResponseView, StunServerListView, VersionListView, HANDSHAKE_FIXED_HEADER_LENGTH,
+    decode_control_record_length, decode_turn_stream_record_length, encode_session_confirm,
+    encode_session_reject, CommonHeader, ConnectivityGenerationView, ConnectivityListView,
+    ConnectivityRecordView, ControlFieldIter, ControlHeader, ControlMessageView, DataHeader,
+    DataPacketView, EndpointSetView, HandshakeHeader, IceCandidate, KeepaliveHeader,
+    KeepalivePacketView, MembershipGrantView, NetworkPolicy, NetworkRevisionListView, PacketType,
+    PeerListView, PeerRecordView, ProtocolVersion, RelayServiceListView, RelayServiceView,
+    SessionConfirmRef, SessionConfirmRole, SessionConfirmView, SessionInitView,
+    SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseView, StunMessageView,
+    StunServerListView, TurnChannelDataView, VersionListView, HANDSHAKE_FIXED_HEADER_LENGTH,
     SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG, SESSION_REJECT_PAYLOAD_LENGTH,
 };
 
@@ -83,6 +84,10 @@ proptest! {
         let _stun_servers = StunServerListView::decode(&input);
         let _relay_service = RelayServiceView::decode(&input);
         let _relay_services = RelayServiceListView::decode(&input);
+        let _stun_message = StunMessageView::decode(&input);
+        let _turn_channel_datagram = TurnChannelDataView::decode_datagram(&input);
+        let _turn_channel_stream = TurnChannelDataView::decode_stream(&input);
+        let _turn_stream_length = decode_turn_stream_record_length(&input);
     }
 
     #[test]
