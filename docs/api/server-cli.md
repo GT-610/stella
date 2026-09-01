@@ -1,11 +1,12 @@
 # Server administration CLI
 
 `stella-server` initializes a controller deployment, runs its TLS control-plane
-service, and provides authority administration commands. Every command loads
-the strict TOML configuration named by `--config` (default: `server.toml`).
-Commands that access authority state derive the controller ID from the
-protected controller identity, open the configured redb database, and perform
-database work on the serialized authority thread.
+service, creates protected relay credential keys, and provides authority
+administration commands. Commands that use deployment state load the strict
+TOML configuration named by `--config` (default: `server.toml`). Commands that
+access authority state derive the controller ID from the protected controller
+identity, open the configured redb database, and perform database work on the
+serialized authority thread.
 
 ## Common syntax
 
@@ -46,6 +47,21 @@ config=<configuration path>
 Transfer the controller ID and SPKI pin to clients over a trusted channel. The
 private keys are never printed, and `run` will not regenerate missing files.
 
+## Create a relay credential key
+
+```powershell
+stella-server relay-key create `
+  --output C:\Stella\secrets\relay-credential.key
+```
+
+`relay-key create` obtains a random non-zero 256-bit deployment key from the
+operating system, creates the destination with the same native protected-file
+policy as controller identities, writes and synchronizes it, and prints only
+`key=<path>`. It never overwrites an existing path and never emits key bytes.
+The parent directory must already exist. Keep the file with the controller and
+every separately deployed relay process that verifies its credentials; never
+copy it to clients.
+
 ## Run the controller
 
 ```powershell
@@ -57,7 +73,10 @@ certificate and private key, controller-bound database, and persisted
 invariants before binding the configured TCP address. It then serves TLS 1.3
 control sessions for registration, authentication, network membership,
 endpoint publication, snapshots, heartbeats, and proactive membership-grant
-refreshes.
+refreshes. When `[connectivity]` is configured, version 0.2 authentication also
+delivers the deployment STUN and relay service list with node-scoped,
+short-lived credentials. The controller proactively replaces the complete
+configuration halfway through the remaining credential lifetime.
 
 The `[logging].filter` value uses `tracing-subscriber` filter syntax. The
 generated value `info,stella_server=info` writes human-readable operational

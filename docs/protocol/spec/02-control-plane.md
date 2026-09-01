@@ -373,7 +373,7 @@ optional field.
 | `0x0002` | `CLIENT_HELLO` | C to S | selected version, client nonce, node ID, node public key |
 | `0x0003` | `SERVER_PROOF` | S to C | controller signature |
 | `0x0004` | `NODE_AUTH` | C to S | node signature, (enrollment token), (display name) |
-| `0x0005` | `AUTH_RESULT` | S to C | status code, (status message), server time |
+| `0x0005` | `AUTH_RESULT` | S to C | status code, (status message), server time, (connectivity-config revision in version 0.2) |
 | `0x0010` | `JOIN_REQUEST` | C to S | network ID, (join token) |
 | `0x0011` | `JOIN_RESULT` | S to C | status code, (status message), controller epoch, network ID, (grant), (policy), (revision) |
 | `0x0012` | `LEAVE_REQUEST` | C to S | network ID |
@@ -430,6 +430,12 @@ epochs are sent only in network-scoped results and state. On authentication
 failure, the controller sends a generic status and closes TLS after a small
 randomized delay. It does not distinguish unknown key, bad token, disabled
 node, or bad signature to an unauthenticated peer.
+
+A successful version 0.2 `AUTH_RESULT` includes
+`CONNECTIVITY_CONFIG_REVISION` exactly when an initial `CONNECTIVITY_CONFIG`
+immediately follows it. That configuration has correlation zero and the same
+revision, so a client does not need a timeout or speculative read to discover
+whether deployment services are configured.
 
 ## 10. Join and leave
 
@@ -522,8 +528,10 @@ After version 0.2 authentication, and whenever service information or relay
 credentials change, the controller sends `CONNECTIVITY_CONFIG`. Its revision is
 deployment-scoped and monotonic. The relay service list contains credentials
 only for the receiving node. A client replaces the complete configuration
-atomically and renews it before credential expiry. It never republishes relay
-allocation credentials to peers.
+atomically. The controller sends a replacement halfway through the remaining
+credential lifetime; a client that has no unexpired replacement stops creating
+new Relay allocations. It never republishes Relay allocation credentials to
+peers.
 
 ## 13. Grant refresh
 

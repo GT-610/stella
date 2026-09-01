@@ -41,6 +41,54 @@ certificate, and key paths resolve from the configuration file's directory.
 Allow inbound TCP port 44900, or the custom port in `listen`, through the host
 and upstream firewalls.
 
+## Configure connectivity services
+
+This optional version 0.2 section lets the controller distribute STUN servers,
+Relay locations, TLS trust, and short-lived node-scoped Relay credentials. It
+does not itself start a STUN or Relay daemon; the addresses and ports must name
+services that you deploy separately.
+
+Create the shared credential authority key without exposing it on stdout:
+
+```powershell
+& C:\Stella\stella-server.exe relay-key create `
+  --output C:\Stella\secrets\relay-credential.key
+```
+
+Then add a deployment revision and at least one STUN server and Relay service:
+
+```toml
+[connectivity]
+revision = 1
+credential_key = "secrets/relay-credential.key"
+credential_lifetime_seconds = 300
+stun_servers = ["192.0.2.20:3478"]
+
+[[connectivity.relays]]
+id = "01010101010101010101010101010101"
+priority = 0
+region = "primary"
+hostname = "relay.example.net"
+tls_server_name = "relay.example.net"
+require_web_pki = true
+turn_udp = 3478
+turn_tls = 443
+addresses = ["192.0.2.30", "2001:db8::30"]
+```
+
+The Relay ID must be a unique non-zero 16-byte hexadecimal value. A non-zero
+carrier port enables that carrier. `credential_lifetime_seconds` defaults to
+300 and accepts 60 through 600 seconds. Address and STUN list order is
+preference order; Relay services are canonicalized by `priority` and ID. For a
+private TLS authority, omit `require_web_pki` and configure one or more
+canonical `sha256/<standard-base64>` values in `spki_pins`. Increase `revision`
+whenever the deployment service definition changes.
+
+Keep the credential key readable only by the controller account and trusted
+Relay processes. Clients receive only short-lived credentials bound to their
+node identity and a specific Relay ID. The controller refreshes them halfway
+through their remaining lifetime over the authenticated control channel.
+
 ## Create a network and enrollment material
 
 ```powershell
@@ -85,7 +133,9 @@ New-Item -ItemType Directory -Force C:\Stella\backups | Out-Null
 
 The destination must not already exist. Store the verified database backup
 together with protected copies of the controller and TLS identities; the
-database alone cannot recreate the same controller trust identity.
+database alone cannot recreate the same controller trust identity. If
+connectivity services are enabled, also back up the Relay credential key; a
+replacement invalidates credentials issued under the prior key.
 
 For every administration command and policy default, see the
 [server CLI reference](/api/server-cli).

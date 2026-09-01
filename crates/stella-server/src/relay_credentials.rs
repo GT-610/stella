@@ -1,6 +1,11 @@
 //! Stateless short-lived relay credential issuance and verification.
 
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    io::Write,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use hmac::{Hmac, KeyInit, Mac};
@@ -11,6 +16,8 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::identity::{create_protected_secret_file, IdentityFileError};
+
 const CREDENTIAL_DOMAIN: &[u8] = b"stella relay credential v1\0";
 /// Exact length of one deployment relay credential HMAC key.
 pub const RELAY_CREDENTIAL_KEY_LENGTH: usize = 32;
@@ -18,6 +25,69 @@ pub const RELAY_CREDENTIAL_KEY_LENGTH: usize = 32;
 pub const MIN_RELAY_CREDENTIAL_LIFETIME_SECONDS: u64 = 60;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Creates one protected deployment key for relay credential issuance.
+///
+/// The target is created with native create-new semantics, hardened before
+/// secret bytes are written, durably synchronized, and never printed. A
+/// partial file is removed when writing or synchronization fails.
+///
+/// # Errors
+///
+/// Returns [`RelayCredentialKeyFileError`] when operating-system randomness,
+/// protected file creation, writing, synchronization, or partial-file cleanup
+/// fails.
+pub fn create_relay_credential_key(path: &Path) -> Result<(), RelayCredentialKeyFileError> {
+    let mut key = Zeroizing::new([0_u8; RELAY_CREDENTIAL_KEY_LENGTH]);
+    loop {
+        getrandom::fill(key.as_mut())
+            .map_err(|_| RelayCredentialKeyFileError::RandomnessUnavailable)?;
+        if key.iter().any(|byte| *byte != 0) {
+            break;
+        }
+    }
+    let mut file = create_protected_secret_file(path).map_err(|source| {
+        RelayCredentialKeyFileError::Create {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    if let Err(source) = file.write_all(key.as_ref()) {
+        drop(file);
+        return Err(cleanup_partial_key(
+            path,
+            RelayCredentialKeyFileError::Write {
+                path: path.to_path_buf(),
+                source,
+            },
+        ));
+    }
+    if let Err(source) = file.sync_all() {
+        drop(file);
+        return Err(cleanup_partial_key(
+            path,
+            RelayCredentialKeyFileError::Sync {
+                path: path.to_path_buf(),
+                source,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_partial_key(
+    path: &Path,
+    cause: RelayCredentialKeyFileError,
+) -> RelayCredentialKeyFileError {
+    match std::fs::remove_file(path) {
+        Ok(()) => cause,
+        Err(source) => RelayCredentialKeyFileError::CleanupFailed {
+            path: path.to_path_buf(),
+            cause: Box::new(cause),
+            source,
+        },
+    }
+}
 
 /// Stateless deployment authority for node-scoped short-lived relay credentials.
 pub struct RelayCredentialAuthority {
@@ -225,11 +295,100 @@ pub enum RelayCredentialError {
     InvalidKey,
 }
 
+/// Failure while creating a protected relay credential key file.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RelayCredentialKeyFileError {
+    /// The operating system could not provide secret randomness.
+    #[error("operating-system randomness is unavailable")]
+    RandomnessUnavailable,
+    /// The protected create-new file operation failed.
+    #[error("unable to create protected relay credential key file {path}")]
+    Create {
+        /// Requested output path.
+        path: PathBuf,
+        /// Native protected-file failure.
+        #[source]
+        source: IdentityFileError,
+    },
+    /// Secret bytes could not be written completely.
+    #[error("unable to write relay credential key file {path}")]
+    Write {
+        /// Newly created key path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Secret bytes could not be durably synchronized.
+    #[error("unable to sync relay credential key file {path}")]
+    Sync {
+        /// Newly created key path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Removing a partial new key failed after another error.
+    #[error("unable to remove partial relay credential key file {path} after {cause}")]
+    CleanupFailed {
+        /// Partial key path.
+        path: PathBuf,
+        /// Failure that triggered cleanup.
+        cause: Box<RelayCredentialKeyFileError>,
+        /// Cleanup filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::{
+        io::Read,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use stella_common::{NodeId, RelayId};
 
+    #[cfg(windows)]
+    use super::{
+        create_relay_credential_key, RelayCredentialKeyFileError, RELAY_CREDENTIAL_KEY_LENGTH,
+    };
     use super::{RelayCredentialAuthority, RelayCredentialError};
+    #[cfg(windows)]
+    use crate::identity::open_protected_secret_file;
+
+    #[cfg(windows)]
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_relay_key_is_random_fixed_width_and_create_new() {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "stella-relay-key-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("relay-credential.key");
+        create_relay_credential_key(&path).expect("create protected relay key");
+
+        let mut bytes = Vec::new();
+        open_protected_secret_file(&path)
+            .expect("verify protected relay key")
+            .read_to_end(&mut bytes)
+            .expect("read relay key");
+        assert_eq!(bytes.len(), RELAY_CREDENTIAL_KEY_LENGTH);
+        assert!(bytes.iter().any(|byte| *byte != 0));
+        assert!(matches!(
+            create_relay_credential_key(&path),
+            Err(RelayCredentialKeyFileError::Create { .. })
+        ));
+
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
 
     #[test]
     fn credentials_are_scoped_expiring_and_redacted() {

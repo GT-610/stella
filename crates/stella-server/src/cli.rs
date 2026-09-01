@@ -19,6 +19,7 @@ use stella_server::{
     bootstrap::{initialize_controller, BootstrapOptions},
     config::ServerConfig,
     identity::load_controller_identity,
+    relay_credentials::create_relay_credential_key,
     runtime::{run_controller, SessionError, SessionHandler},
     store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
 };
@@ -65,6 +66,11 @@ enum Command {
     JoinToken {
         #[command(subcommand)]
         command: JoinTokenCommand,
+    },
+    /// Creates protected deployment keys for relay credential issuance.
+    RelayKey {
+        #[command(subcommand)]
+        command: RelayKeyCommand,
     },
     /// Lists and administratively enables or disables nodes.
     Node {
@@ -166,6 +172,15 @@ enum JoinTokenCommand {
     Create(JoinTokenCreateArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum RelayKeyCommand {
+    /// Creates one random protected 256-bit key without overwriting a target.
+    Create {
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Args)]
 struct TokenLifetimeArgs {
     #[arg(long, default_value_t = DEFAULT_TOKEN_TTL_SECONDS)]
@@ -242,10 +257,18 @@ async fn execute(cli: Cli, output: &mut dyn Write) -> Result<()> {
             execute_enrollment_token(&cli.config, command, output).await
         }
         Command::JoinToken { command } => execute_join_token(&cli.config, command, output).await,
+        Command::RelayKey { command } => execute_relay_key(command, output),
         Command::Node { command } => execute_node(&cli.config, command, output).await,
         Command::Member { command } => execute_member(&cli.config, command, output).await,
         Command::State { command } => execute_state(&cli.config, command, output).await,
     }
+}
+
+fn execute_relay_key(command: RelayKeyCommand, output: &mut dyn Write) -> Result<()> {
+    let RelayKeyCommand::Create { output: path } = command;
+    create_relay_credential_key(&path)
+        .with_context(|| format!("could not create relay credential key {}", path.display()))?;
+    writeln!(output, "key={}", path.display()).context("could not write relay key path")
 }
 
 async fn execute_run(config_path: &Path) -> Result<()> {
@@ -736,6 +759,62 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["stella-server", "run"]).is_ok());
         assert!(Cli::try_parse_from(["stella-server", "state", "verify"]).is_ok());
+        assert!(Cli::try_parse_from(["stella-server", "relay-key", "create"]).is_err());
+        assert!(Cli::try_parse_from([
+            "stella-server",
+            "relay-key",
+            "create",
+            "--output",
+            "relay.key"
+        ])
+        .is_ok());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn relay_key_command_creates_once_without_printing_secret() {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "stella-server-cli-relay-key-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create relay key test directory");
+        let path = directory.join("relay-credential.key");
+        let argv = [
+            OsString::from("stella-server"),
+            OsString::from("relay-key"),
+            OsString::from("create"),
+            OsString::from("--output"),
+            path.as_os_str().to_owned(),
+        ];
+        let mut output = Vec::new();
+        execute(
+            Cli::try_parse_from(argv.clone()).expect("parse relay key command"),
+            &mut output,
+        )
+        .await
+        .expect("create relay key");
+        let key = std::fs::read(&path).expect("read generated relay key");
+        assert_eq!(
+            key.len(),
+            stella_server::relay_credentials::RELAY_CREDENTIAL_KEY_LENGTH
+        );
+        assert!(key.iter().any(|byte| *byte != 0));
+        let text = String::from_utf8(output).expect("UTF-8 relay key output");
+        assert_eq!(text.trim(), format!("key={}", path.display()));
+        assert!(!text.contains(&base64::engine::general_purpose::STANDARD.encode(&key)));
+
+        let mut repeated_output = Vec::new();
+        assert!(execute(
+            Cli::try_parse_from(argv).expect("parse repeated relay key command"),
+            &mut repeated_output,
+        )
+        .await
+        .is_err());
+        assert!(repeated_output.is_empty());
+        assert_eq!(std::fs::read(&path).expect("reread relay key"), key);
+
+        std::fs::remove_dir_all(directory).expect("remove relay key test directory");
     }
 
     #[tokio::test(flavor = "current_thread")]
