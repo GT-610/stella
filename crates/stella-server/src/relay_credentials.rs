@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -19,7 +19,9 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::identity::{create_protected_secret_file, IdentityFileError};
+use crate::identity::{
+    create_protected_secret_file, open_protected_secret_file, IdentityFileError,
+};
 
 const CREDENTIAL_DOMAIN: &[u8] = b"stella relay credential v1\0";
 const TURN_NONCE_DOMAIN: &[u8] = b"stella turn nonce v1\0";
@@ -80,6 +82,40 @@ pub fn create_relay_credential_key(path: &Path) -> Result<(), RelayCredentialKey
         ));
     }
     Ok(())
+}
+
+/// Loads a protected deployment key into a relay credential authority.
+///
+/// # Errors
+///
+/// Returns [`RelayCredentialAuthorityFileError`] when ACL verification,
+/// metadata, exact-length reading, or authority validation fails.
+pub fn load_relay_credential_authority(
+    path: &Path,
+    lifetime_seconds: u64,
+) -> Result<RelayCredentialAuthority, RelayCredentialAuthorityFileError> {
+    let mut file = open_protected_secret_file(path)?;
+    let actual = file
+        .metadata()
+        .map_err(|source| RelayCredentialAuthorityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if actual != RELAY_CREDENTIAL_KEY_LENGTH as u64 {
+        return Err(RelayCredentialAuthorityFileError::Length {
+            path: path.to_path_buf(),
+            actual,
+        });
+    }
+    let mut key = Zeroizing::new([0_u8; RELAY_CREDENTIAL_KEY_LENGTH]);
+    file.read_exact(key.as_mut())
+        .map_err(|source| RelayCredentialAuthorityFileError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    RelayCredentialAuthority::new(*key, lifetime_seconds)
+        .map_err(RelayCredentialAuthorityFileError::Credential)
 }
 
 fn cleanup_partial_key(
@@ -453,6 +489,44 @@ pub enum RelayCredentialKeyFileError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Failure while loading a protected relay credential authority key.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RelayCredentialAuthorityFileError {
+    /// Native protected-file opening or ACL validation failed.
+    #[error(transparent)]
+    KeyFile(#[from] IdentityFileError),
+    /// Key file metadata could not be read.
+    #[error("unable to read relay credential key metadata for {path}")]
+    Metadata {
+        /// Configured key path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Key file does not contain exactly 32 bytes.
+    #[error("relay credential key {path} contains {actual} bytes instead of 32")]
+    Length {
+        /// Configured key path.
+        path: PathBuf,
+        /// Observed file length.
+        actual: u64,
+    },
+    /// Exact key bytes could not be read.
+    #[error("unable to read relay credential key {path}")]
+    Read {
+        /// Configured key path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Key bytes or configured credential lifetime are invalid.
+    #[error(transparent)]
+    Credential(#[from] RelayCredentialError),
 }
 
 #[cfg(test)]

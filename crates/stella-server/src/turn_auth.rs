@@ -5,7 +5,10 @@ use std::fmt;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use stella_common::{NodeId, RelayId};
-use stella_proto::{StunAttributeType, StunClass, StunMessageView, StunPasswordAlgorithm};
+use stella_proto::{
+    CodecError, StunAttributeType, StunClass, StunMessageView, StunPasswordAlgorithm,
+    STUN_MESSAGE_INTEGRITY_SHA256_LENGTH,
+};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -89,7 +92,19 @@ impl TurnAuthenticator {
         &self,
         message: &StunMessageView<'_>,
         now: u64,
-    ) -> Result<NodeId, TurnAuthenticationError> {
+    ) -> Result<AuthenticatedTurnRequest, TurnAuthenticationError> {
+        let (authenticated, nonce_status) = self.authenticate_including_stale(message, now)?;
+        if nonce_status == TurnNonceStatus::Expired {
+            return Err(TurnAuthenticationError::StaleNonce);
+        }
+        Ok(authenticated)
+    }
+
+    pub(crate) fn authenticate_including_stale(
+        &self,
+        message: &StunMessageView<'_>,
+        now: u64,
+    ) -> Result<(AuthenticatedTurnRequest, TurnNonceStatus), TurnAuthenticationError> {
         if message.message_type().class != StunClass::Request {
             return Err(TurnAuthenticationError::Malformed {
                 detail: "authentication is defined only for request messages",
@@ -129,10 +144,13 @@ impl TurnAuthenticator {
         if !bool::from(actual.as_slice().ct_eq(integrity.value())) {
             return Err(TurnAuthenticationError::Unauthorized);
         }
-        if nonce_status == TurnNonceStatus::Expired {
-            return Err(TurnAuthenticationError::StaleNonce);
-        }
-        Ok(resolved.node_id)
+        Ok((
+            AuthenticatedTurnRequest {
+                node_id: resolved.node_id,
+                key,
+            },
+            nonce_status,
+        ))
     }
 }
 
@@ -145,6 +163,66 @@ impl fmt::Debug for TurnAuthenticator {
             .field("realm", &String::from_utf8_lossy(&self.realm))
             .finish()
     }
+}
+
+/// Authenticated TURN request identity and response-integrity context.
+pub struct AuthenticatedTurnRequest {
+    node_id: NodeId,
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl AuthenticatedTurnRequest {
+    /// Returns the node identity bound to the controller-issued credential.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub(crate) fn sign_encoded_message(
+        &self,
+        encoded: &mut [u8],
+    ) -> Result<(), TurnResponseIntegrityError> {
+        let (value_offset, tag) = {
+            let message = StunMessageView::decode(encoded)?;
+            let integrity = message.message_integrity_sha256()?;
+            let mut mac = <HmacSha256 as KeyInit>::new_from_slice(self.key.as_ref())
+                .map_err(|_| TurnResponseIntegrityError::InvalidKey)?;
+            mac.update(integrity.message_type_bytes());
+            mac.update(&integrity.adjusted_body_length().to_be_bytes());
+            mac.update(integrity.bytes_after_length());
+            (integrity.value_offset(), mac.finalize().into_bytes())
+        };
+        let end = value_offset
+            .checked_add(STUN_MESSAGE_INTEGRITY_SHA256_LENGTH)
+            .ok_or(TurnResponseIntegrityError::RangeOverflow)?;
+        let Some(destination) = encoded.get_mut(value_offset..end) else {
+            return Err(TurnResponseIntegrityError::RangeOutsideMessage);
+        };
+        destination.copy_from_slice(&tag);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AuthenticatedTurnRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedTurnRequest")
+            .field("node_id", &self.node_id)
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum TurnResponseIntegrityError {
+    #[error(transparent)]
+    Codec(#[from] CodecError),
+    #[error("TURN response integrity key is invalid")]
+    InvalidKey,
+    #[error("TURN response integrity range overflowed")]
+    RangeOverflow,
+    #[error("TURN response integrity range is outside the encoded message")]
+    RangeOutsideMessage,
 }
 
 /// Public values required in a TURN 401 or 438 authentication challenge.
@@ -316,8 +394,11 @@ mod tests {
             credential.secret(),
         );
         let message = StunMessageView::decode(&encoded).expect("decode signed request");
-        assert_eq!(authenticator.authenticate(&message, 1_001), Ok(node_id));
-        let diagnostic = format!("{authenticator:?} {challenge:?}");
+        let authenticated = authenticator
+            .authenticate(&message, 1_001)
+            .expect("authenticate request");
+        assert_eq!(authenticated.node_id(), node_id);
+        let diagnostic = format!("{authenticator:?} {challenge:?} {authenticated:?}");
         assert!(!diagnostic
             .contains(std::str::from_utf8(challenge.nonce()).expect("nonce is printable ASCII")));
         assert!(!diagnostic.contains(
@@ -345,20 +426,20 @@ mod tests {
             credential.secret(),
         );
         let message = StunMessageView::decode(&encoded).expect("decode signed request");
-        assert_eq!(
+        assert!(matches!(
             authenticator.authenticate(&message, 1_120),
             Err(TurnAuthenticationError::StaleNonce)
-        );
+        ));
         let integrity_offset = message
             .message_integrity_sha256()
             .expect("integrity range")
             .value_offset();
         encoded[integrity_offset] ^= 1;
         let tampered = StunMessageView::decode(&encoded).expect("decode tampered request");
-        assert_eq!(
+        assert!(matches!(
             authenticator.authenticate(&tampered, 1_120),
             Err(TurnAuthenticationError::Unauthorized)
-        );
+        ));
     }
 
     #[test]
@@ -380,13 +461,13 @@ mod tests {
             challenge.nonce(),
             credential.secret(),
         );
-        assert_eq!(
+        assert!(matches!(
             authenticator.authenticate(
                 &StunMessageView::decode(&wrong_realm).expect("decode wrong realm request"),
                 2_001
             ),
             Err(TurnAuthenticationError::Unauthorized)
-        );
+        ));
 
         let zero_integrity = [0_u8; 32];
         let duplicate = [

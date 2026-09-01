@@ -212,6 +212,45 @@ phrase is printable UTF-8 without control characters and is at most 127 bytes.
 The reference relay uses stable standard reason phrases and never includes
 credentials, packet bytes, or internal error details.
 
+### 3.4 Initial UDP method behavior
+
+The first executable relay implements TURN over UDP. Binding requests do not
+require authentication and receive XOR-MAPPED-ADDRESS. Allocate supports only
+UDP requested transport value `17,0,0,0`. A successful authenticated Allocate
+creates one allocation for the client transport address and returns
+XOR-RELAYED-ADDRESS, XOR-MAPPED-ADDRESS, LIFETIME, SOFTWARE, and
+MESSAGE-INTEGRITY-SHA256. The granted lifetime is the smaller of the requested
+non-zero lifetime and the deployment limit; omitting LIFETIME requests the
+deployment limit. A second non-retransmitted Allocate on the same client
+transport receives 437.
+
+Refresh requires the allocation owner and the normal authenticated request
+attributes. A zero LIFETIME deletes the allocation; any other value renews it
+up to the deployment limit. CreatePermission accepts one or more unique
+XOR-PEER-ADDRESS values, refreshes those peer-IP permissions for 300 seconds,
+and is bounded by the per-allocation peer limit. ChannelBind requires exactly
+one CHANNEL-NUMBER and one XOR-PEER-ADDRESS, creates the corresponding
+permission, and binds the exact peer socket address for 600 seconds. Channel
+numbers and peer addresses are one-to-one within an allocation.
+
+Send indications and client ChannelData records are accepted only from an
+active allocation. Their peer IP must have an unexpired permission, and their
+datagram must not exceed the deployment's advertised maximum. ChannelData also
+requires a live matching channel binding. Peer datagrams received on an
+allocation socket are returned as ChannelData when an exact live binding
+exists, otherwise as a Data indication containing XOR-PEER-ADDRESS and DATA.
+Datagrams from peer IPs without a live permission are dropped.
+
+UDP request responses are cached by client transport address and transaction
+ID for 40 seconds so a retransmission does not create a second allocation or
+repeat a mutation. The cache is bounded and never stores indications or packet
+payload diagnostics. Authenticated success and error responses include
+MESSAGE-INTEGRITY-SHA256; an initial 401 challenge cannot include integrity.
+Malformed requests receive 400, unknown comprehension-required attributes 420,
+missing allocations 437, wrong credential ownership 441, unsupported
+transport 442, and exhausted capacity 486. Indications and ChannelData that
+cannot be accepted are silently dropped as required by their one-way nature.
+
 ## 4. Secure WebSocket carrier
 
 An HTTPS deployment may expose `/stella/turn/v1` with WebSocket subprotocol
