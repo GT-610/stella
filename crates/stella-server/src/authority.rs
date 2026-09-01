@@ -6,10 +6,12 @@ use stella_common::{NetworkId, NodeId};
 use stella_crypto::IdentityPublicKey;
 use stella_proto::Endpoint;
 use tokio::sync::{mpsc, oneshot};
+use zeroize::Zeroizing;
 
 use crate::store::{
-    AuthorityRevision, AuthorityStore, BearerToken, EndpointLeaseRecord, MembershipRecord,
-    MembershipStatus, NetworkRecord, NetworkSessionView, NodeRecord, StoreError,
+    AuthorityRevision, AuthorityStore, BearerToken, ConnectivityAuthorityRecord,
+    EndpointLeaseRecord, MembershipRecord, MembershipStatus, NetworkRecord, NetworkSessionView,
+    NodeRecord, StoreError,
 };
 
 type StoreReply<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -444,6 +446,91 @@ impl AuthorityHandle {
             .await
     }
 
+    /// Publishes one member's complete version 0.2 connectivity generation.
+    ///
+    /// The queued command owns and zeroizes the generation bytes, so
+    /// cancellation never leaves ICE credentials in an ordinary allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, authorization, generation,
+    /// counter, or store failure.
+    pub async fn publish_connectivity(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+        generation: Vec<u8>,
+        now: u64,
+    ) -> Result<AuthorityRevision, AuthorityError> {
+        let generation = Zeroizing::new(generation);
+        self.request(|reply| {
+            Command::Connectivity(ConnectivityCommand::Publish {
+                node_id,
+                network_id,
+                generation,
+                now,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Withdraws one member's version 0.2 connectivity generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, authorization, counter, or
+    /// store failure.
+    pub async fn withdraw_connectivity(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+        now: u64,
+    ) -> Result<AuthorityRevision, AuthorityError> {
+        self.request(|reply| {
+            Command::Connectivity(ConnectivityCommand::Withdraw {
+                node_id,
+                network_id,
+                now,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Returns one member's latest version 0.2 connectivity generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, or store failure.
+    pub async fn get_connectivity(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+    ) -> Result<Option<ConnectivityAuthorityRecord>, AuthorityError> {
+        self.request(|reply| {
+            Command::Connectivity(ConnectivityCommand::Get {
+                node_id,
+                network_id,
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Lists all published connectivity generations in node-ID order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for queue, reply, or store failure.
+    pub async fn list_connectivity(
+        &self,
+        network_id: NetworkId,
+    ) -> Result<Vec<ConnectivityAuthorityRecord>, AuthorityError> {
+        self.request(|reply| Command::Connectivity(ConnectivityCommand::List { network_id, reply }))
+            .await
+    }
+
     async fn request<T>(
         &self,
         build: impl FnOnce(StoreReply<T>) -> Command,
@@ -657,6 +744,7 @@ enum Command {
         reply: StoreReply<NetworkSessionView>,
     },
     Endpoint(EndpointCommand),
+    Connectivity(ConnectivityCommand),
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -688,6 +776,31 @@ enum EndpointCommand {
     Expire {
         now: u64,
         reply: StoreReply<Vec<AuthorityRevision>>,
+    },
+}
+
+enum ConnectivityCommand {
+    Publish {
+        node_id: NodeId,
+        network_id: NetworkId,
+        generation: Zeroizing<Vec<u8>>,
+        now: u64,
+        reply: StoreReply<AuthorityRevision>,
+    },
+    Withdraw {
+        node_id: NodeId,
+        network_id: NetworkId,
+        now: u64,
+        reply: StoreReply<AuthorityRevision>,
+    },
+    Get {
+        node_id: NodeId,
+        network_id: NetworkId,
+        reply: StoreReply<Option<ConnectivityAuthorityRecord>>,
+    },
+    List {
+        network_id: NetworkId,
+        reply: StoreReply<Vec<ConnectivityAuthorityRecord>>,
     },
 }
 
@@ -786,6 +899,7 @@ impl Command {
                 respond(reply, store.network_session_view(node_id, network_id));
             }
             Self::Endpoint(command) => command.execute(store),
+            Self::Connectivity(command) => command.execute(store),
             Self::Shutdown { reply } => {
                 let _reply_result = reply.send(());
                 return false;
@@ -830,6 +944,40 @@ impl EndpointCommand {
     }
 }
 
+impl ConnectivityCommand {
+    fn execute(self, store: &AuthorityStore) {
+        match self {
+            Self::Publish {
+                node_id,
+                network_id,
+                generation,
+                now,
+                reply,
+            } => respond(
+                reply,
+                store.publish_connectivity(node_id, network_id, Some(generation.as_slice()), now),
+            ),
+            Self::Withdraw {
+                node_id,
+                network_id,
+                now,
+                reply,
+            } => respond(
+                reply,
+                store.publish_connectivity(node_id, network_id, None, now),
+            ),
+            Self::Get {
+                node_id,
+                network_id,
+                reply,
+            } => respond(reply, store.get_connectivity(node_id, network_id)),
+            Self::List { network_id, reply } => {
+                respond(reply, store.list_connectivity(network_id));
+            }
+        }
+    }
+}
+
 fn run_authority(store: &AuthorityStore, mut receiver: mpsc::Receiver<Command>) {
     while let Some(command) = receiver.blocking_recv() {
         if !command.execute(store) {
@@ -854,7 +1002,10 @@ mod tests {
 
     use stella_common::{ControllerId, NetworkId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
+    use stella_proto::{
+        encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
+        ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
+    };
 
     use super::{AuthorityError, AuthorityThread};
     use crate::store::{AuthorityStore, MembershipStatus, NetworkRecord, NodeRecord};
@@ -888,6 +1039,34 @@ mod tests {
             network_id,
             policy_revision: 1,
         }
+    }
+
+    fn connectivity_generation(generation_id: u64, created_at: u64) -> Vec<u8> {
+        let candidates = [IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: u32::MAX - 1,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: format!("192.0.2.{}:45000", generation_id % 200 + 1)
+                .parse()
+                .expect("valid candidate address"),
+            related_address: None,
+            relay_id: None,
+        }];
+        let generation = ConnectivityGenerationRef::new(
+            generation_id,
+            generation_id + 100,
+            created_at,
+            created_at + 600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &candidates,
+        )
+        .expect("valid connectivity generation");
+        let mut encoded = vec![0; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        encoded
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1066,6 +1245,85 @@ mod tests {
             .expect("list expired endpoints")
             .is_empty());
         worker.shutdown().await.expect("shutdown worker");
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connectivity_commands_publish_list_and_withdraw_secret_generations() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([39; 16]))
+            .expect("initialize store");
+        let worker = AuthorityThread::spawn(
+            store,
+            NonZeroUsize::new(2).expect("non-zero queue capacity"),
+        )
+        .expect("spawn authority thread");
+        let authority = worker.handle();
+        let node = NodeRecord::new(signing_key(40).public_key(), "Connectivity node", 100)
+            .expect("valid node");
+        let node_id = node.node_id();
+        authority.create_node(node).await.expect("create node");
+        let network_id = NetworkId::from_bytes([41; 16]);
+        authority
+            .create_network(
+                NetworkRecord::new(policy(network_id), "Connectivity LAN", 100)
+                    .expect("valid network"),
+            )
+            .await
+            .expect("create network");
+        authority
+            .add_member(node_id, network_id, 110)
+            .await
+            .expect("add member");
+
+        let generation = connectivity_generation(42, 120);
+        let published = authority
+            .publish_connectivity(node_id, network_id, generation.clone(), 120)
+            .await
+            .expect("publish connectivity");
+        assert_eq!(published.controller_epoch, 2);
+        assert_eq!(published.snapshot_revision, 3);
+        let stored = authority
+            .get_connectivity(node_id, network_id)
+            .await
+            .expect("get connectivity")
+            .expect("connectivity exists");
+        assert_eq!(stored.generation_id(), 42);
+        assert_eq!(stored.encoded_generation(), generation);
+        assert_eq!(
+            authority
+                .list_connectivity(network_id)
+                .await
+                .expect("list connectivity"),
+            vec![stored]
+        );
+        assert_eq!(
+            authority
+                .publish_connectivity(node_id, network_id, generation, 125)
+                .await
+                .expect("refresh identical connectivity"),
+            published
+        );
+
+        let withdrawn = authority
+            .withdraw_connectivity(node_id, network_id, 130)
+            .await
+            .expect("withdraw connectivity");
+        assert_eq!(withdrawn.snapshot_revision, 4);
+        assert!(authority
+            .get_connectivity(node_id, network_id)
+            .await
+            .expect("get withdrawn connectivity")
+            .is_none());
+        assert!(authority
+            .list_connectivity(network_id)
+            .await
+            .expect("list withdrawn connectivity")
+            .is_empty());
+
+        worker.shutdown().await.expect("shutdown authority worker");
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
