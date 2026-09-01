@@ -1,6 +1,9 @@
 //! STUN/TURN message and `ChannelData` record framing used by Stella relays.
 
-use std::fmt;
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use crate::{
     cursor::{ReadCursor, WriteCursor},
@@ -25,7 +28,21 @@ pub const MIN_TURN_CHANNEL_NUMBER: u16 = 0x4000;
 /// Maximum TURN channel number allocated by a client.
 pub const MAX_TURN_CHANNEL_NUMBER: u16 = 0x7fff;
 
+/// Exact value length of `MESSAGE-INTEGRITY-SHA256`.
+pub const STUN_MESSAGE_INTEGRITY_SHA256_LENGTH: usize = 32;
+
+/// Exact value length of an IPv4 XOR address attribute.
+pub const STUN_XOR_IPV4_ADDRESS_LENGTH: usize = 8;
+
+/// Exact value length of an IPv6 XOR address attribute.
+pub const STUN_XOR_IPV6_ADDRESS_LENGTH: usize = 20;
+
+/// Largest error reason phrase accepted by the Stella TURN profile.
+pub const MAX_STUN_ERROR_REASON_LENGTH: usize = 127;
+
 const STUN_ATTRIBUTE_HEADER_LENGTH: usize = 4;
+const STUN_IPV4_FAMILY: u8 = 0x01;
+const STUN_IPV6_FAMILY: u8 = 0x02;
 
 /// STUN message class encoded across the two class bits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +193,350 @@ impl fmt::Debug for StunTransactionId {
             .debug_struct("StunTransactionId")
             .finish_non_exhaustive()
     }
+}
+
+/// Password derivation algorithm accepted by the Stella TURN profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum StunPasswordAlgorithm {
+    /// SHA-256 long-term credential key derivation from RFC 8489.
+    Sha256 = 0x0002,
+}
+
+impl StunPasswordAlgorithm {
+    /// Returns the registered two-byte algorithm number.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+
+    /// Encodes the algorithm and its empty parameter block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when `output` is shorter than four bytes.
+    pub fn encode(self, output: &mut [u8]) -> Result<usize, CodecError> {
+        let mut cursor = WriteCursor::new(output, 0);
+        cursor.write_u16(self.as_u16(), "STUN password algorithm")?;
+        cursor.write_u16(0, "STUN password algorithm parameter length")?;
+        Ok(cursor.position())
+    }
+
+    /// Decodes the exact Stella SHA-256 password-algorithm value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for an unsupported algorithm, non-empty
+    /// parameters, truncation, or trailing bytes.
+    pub fn decode(input: &[u8]) -> Result<Self, CodecError> {
+        let mut cursor = ReadCursor::new(input, 0);
+        let algorithm = cursor.read_u16("STUN password algorithm")?;
+        if algorithm != Self::Sha256.as_u16() {
+            return Err(CodecError::InvalidEnumValue {
+                field: "STUN password algorithm",
+                value: u64::from(algorithm),
+            });
+        }
+        let parameter_length =
+            usize::from(cursor.read_u16("STUN password algorithm parameter length")?);
+        if parameter_length != 0 {
+            return Err(CodecError::LengthMismatch {
+                field: "STUN password algorithm parameters",
+                expected: 0,
+                actual: parameter_length,
+            });
+        }
+        if input.len() != cursor.position() {
+            return Err(CodecError::TrailingBytes {
+                expected: cursor.position(),
+                actual: input.len(),
+            });
+        }
+        Ok(Self::Sha256)
+    }
+}
+
+/// Encodes one STUN XOR address attribute value.
+///
+/// The output contains only the attribute value, not its four-byte attribute
+/// header. Stella accepts non-zero unicast IPv4 and IPv6 socket addresses.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for a zero port, unusable address, or an output
+/// buffer shorter than 8 bytes for IPv4 or 20 bytes for IPv6.
+pub fn encode_stun_xor_address(
+    address: SocketAddr,
+    transaction_id: StunTransactionId,
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    validate_stun_socket_address(address)?;
+    let mut cursor = WriteCursor::new(output, 0);
+    cursor.write_u8(0, "STUN address reserved")?;
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            cursor.write_u8(STUN_IPV4_FAMILY, "STUN address family")?;
+            cursor.write_u16(
+                address.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16),
+                "STUN XOR port",
+            )?;
+            let address_bytes = ip.octets();
+            let mask = STUN_MAGIC_COOKIE.to_be_bytes();
+            let xored: [u8; 4] = std::array::from_fn(|index| address_bytes[index] ^ mask[index]);
+            cursor.write_bytes(&xored, "STUN XOR IPv4 address")?;
+        }
+        IpAddr::V6(ip) => {
+            cursor.write_u8(STUN_IPV6_FAMILY, "STUN address family")?;
+            cursor.write_u16(
+                address.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16),
+                "STUN XOR port",
+            )?;
+            let address_bytes = ip.octets();
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            let xored: [u8; 16] = std::array::from_fn(|index| {
+                let mask = if index < cookie.len() {
+                    cookie[index]
+                } else {
+                    transaction_id.as_bytes()[index - cookie.len()]
+                };
+                address_bytes[index] ^ mask
+            });
+            cursor.write_bytes(&xored, "STUN XOR IPv6 address")?;
+        }
+    }
+    Ok(cursor.position())
+}
+
+/// Decodes one exact STUN XOR address attribute value.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for malformed length, reserved bytes, unsupported
+/// family, a zero port, or a non-unicast address.
+pub fn decode_stun_xor_address(
+    input: &[u8],
+    transaction_id: StunTransactionId,
+) -> Result<SocketAddr, CodecError> {
+    let mut cursor = ReadCursor::new(input, 0);
+    if cursor.read_u8("STUN address reserved")? != 0 {
+        return Err(CodecError::NonZeroReserved {
+            field: "STUN address reserved",
+            offset: 0,
+        });
+    }
+    let family = cursor.read_u8("STUN address family")?;
+    let port = cursor.read_u16("STUN XOR port")? ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+    if port == 0 {
+        return Err(CodecError::ZeroField {
+            field: "STUN address port",
+        });
+    }
+    let ip = match family {
+        STUN_IPV4_FAMILY => {
+            if input.len() != STUN_XOR_IPV4_ADDRESS_LENGTH {
+                return Err(CodecError::LengthMismatch {
+                    field: "STUN XOR IPv4 address",
+                    expected: STUN_XOR_IPV4_ADDRESS_LENGTH,
+                    actual: input.len(),
+                });
+            }
+            let xored = cursor.read_array::<4>("STUN XOR IPv4 address")?;
+            let mask = STUN_MAGIC_COOKIE.to_be_bytes();
+            IpAddr::V4(Ipv4Addr::from(std::array::from_fn(|index| {
+                xored[index] ^ mask[index]
+            })))
+        }
+        STUN_IPV6_FAMILY => {
+            if input.len() != STUN_XOR_IPV6_ADDRESS_LENGTH {
+                return Err(CodecError::LengthMismatch {
+                    field: "STUN XOR IPv6 address",
+                    expected: STUN_XOR_IPV6_ADDRESS_LENGTH,
+                    actual: input.len(),
+                });
+            }
+            let xored = cursor.read_array::<16>("STUN XOR IPv6 address")?;
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            IpAddr::V6(Ipv6Addr::from(std::array::from_fn(|index| {
+                let mask = if index < cookie.len() {
+                    cookie[index]
+                } else {
+                    transaction_id.as_bytes()[index - cookie.len()]
+                };
+                xored[index] ^ mask
+            })))
+        }
+        _ => {
+            return Err(CodecError::InvalidEnumValue {
+                field: "STUN address family",
+                value: u64::from(family),
+            });
+        }
+    };
+    let address = SocketAddr::new(ip, port);
+    validate_stun_socket_address(address)?;
+    Ok(address)
+}
+
+fn validate_stun_socket_address(address: SocketAddr) -> Result<(), CodecError> {
+    if address.port() == 0 {
+        return Err(CodecError::ZeroField {
+            field: "STUN address port",
+        });
+    }
+    let ip = address.ip();
+    let invalid = ip.is_unspecified()
+        || ip.is_multicast()
+        || matches!(ip, IpAddr::V4(value) if value == Ipv4Addr::BROADCAST);
+    if invalid {
+        return Err(CodecError::InvalidEndpointAddress {
+            family: if ip.is_ipv4() { "IPv4" } else { "IPv6" },
+        });
+    }
+    Ok(())
+}
+
+/// Borrowed validated STUN `ERROR-CODE` attribute value.
+#[derive(Clone, Copy)]
+pub struct StunErrorCodeView<'a> {
+    code: u16,
+    reason: &'a str,
+}
+
+impl<'a> StunErrorCodeView<'a> {
+    /// Decodes one exact `ERROR-CODE` attribute value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] for truncation, reserved bits, a status outside
+    /// 300 through 699, invalid UTF-8, control characters, or an oversized
+    /// reason phrase.
+    pub fn decode(input: &'a [u8]) -> Result<Self, CodecError> {
+        let mut cursor = ReadCursor::new(input, 0);
+        let reserved = cursor.read_u16("STUN error code reserved")?;
+        if reserved != 0 {
+            return Err(CodecError::NonZeroReserved {
+                field: "STUN error code reserved",
+                offset: 0,
+            });
+        }
+        let class = cursor.read_u8("STUN error class")?;
+        if class & 0xf8 != 0 {
+            return Err(CodecError::ReservedBits {
+                field: "STUN error class",
+                bits: u64::from(class),
+                allowed: 0x07,
+            });
+        }
+        let number = cursor.read_u8("STUN error number")?;
+        if number > 99 {
+            return Err(CodecError::ValueOutOfRange {
+                field: "STUN error number",
+                actual: u64::from(number),
+                minimum: 0,
+                maximum: 99,
+            });
+        }
+        let code = u16::from(class) * 100 + u16::from(number);
+        validate_stun_error_code(code)?;
+        let reason_bytes =
+            cursor.read_slice(input.len() - cursor.position(), "STUN error reason")?;
+        let reason =
+            std::str::from_utf8(reason_bytes).map_err(|error| CodecError::InvalidUtf8 {
+                field: "STUN error reason",
+                offset: error.valid_up_to(),
+            })?;
+        validate_stun_error_reason(reason)?;
+        Ok(Self { code, reason })
+    }
+
+    /// Returns the represented three-digit status code.
+    #[must_use]
+    pub const fn code(&self) -> u16 {
+        self.code
+    }
+
+    /// Borrows the validated reason phrase.
+    #[must_use]
+    pub const fn reason(&self) -> &'a str {
+        self.reason
+    }
+}
+
+impl fmt::Debug for StunErrorCodeView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StunErrorCodeView")
+            .field("code", &self.code)
+            .field("reason_length", &self.reason.len())
+            .finish()
+    }
+}
+
+/// Encodes one STUN `ERROR-CODE` attribute value.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] when the code is outside 300 through 699, the reason
+/// is longer than 127 bytes or contains a control character, or `output` is too
+/// small.
+pub fn encode_stun_error_code(
+    code: u16,
+    reason: &str,
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    validate_stun_error_code(code)?;
+    validate_stun_error_reason(reason)?;
+    let class = u8::try_from(code / 100).map_err(|_| CodecError::ValueOutOfRange {
+        field: "STUN error class",
+        actual: u64::from(code / 100),
+        minimum: 3,
+        maximum: 6,
+    })?;
+    let number = u8::try_from(code % 100).map_err(|_| CodecError::ValueOutOfRange {
+        field: "STUN error number",
+        actual: u64::from(code % 100),
+        minimum: 0,
+        maximum: 99,
+    })?;
+    let mut cursor = WriteCursor::new(output, 0);
+    cursor.write_u16(0, "STUN error code reserved")?;
+    cursor.write_u8(class, "STUN error class")?;
+    cursor.write_u8(number, "STUN error number")?;
+    cursor.write_bytes(reason.as_bytes(), "STUN error reason")?;
+    Ok(cursor.position())
+}
+
+fn validate_stun_error_code(code: u16) -> Result<(), CodecError> {
+    if !(300..=699).contains(&code) {
+        return Err(CodecError::ValueOutOfRange {
+            field: "STUN error code",
+            actual: u64::from(code),
+            minimum: 300,
+            maximum: 699,
+        });
+    }
+    Ok(())
+}
+
+fn validate_stun_error_reason(reason: &str) -> Result<(), CodecError> {
+    if reason.len() > MAX_STUN_ERROR_REASON_LENGTH {
+        return Err(CodecError::ValueOutOfRange {
+            field: "STUN error reason length",
+            actual: reason.len() as u64,
+            minimum: 0,
+            maximum: MAX_STUN_ERROR_REASON_LENGTH as u64,
+        });
+    }
+    if let Some((offset, _character)) = reason
+        .char_indices()
+        .find(|(_offset, character)| character.is_control())
+    {
+        return Err(CodecError::InvalidTextCharacter {
+            field: "STUN error reason",
+            offset,
+        });
+    }
+    Ok(())
 }
 
 /// STUN/TURN attribute type, including unrecognized extension values.
@@ -390,6 +751,8 @@ pub fn encode_stun_message(
 pub struct StunAttributeView<'a> {
     attribute_type: StunAttributeType,
     value: &'a [u8],
+    encoded_offset: usize,
+    encoded_length: usize,
 }
 
 impl<'a> StunAttributeView<'a> {
@@ -404,6 +767,24 @@ impl<'a> StunAttributeView<'a> {
     pub const fn value(&self) -> &'a [u8] {
         self.value
     }
+
+    /// Returns the absolute offset of the attribute header in its message.
+    #[must_use]
+    pub const fn encoded_offset(&self) -> usize {
+        self.encoded_offset
+    }
+
+    /// Returns the absolute offset of the unpadded value in its message.
+    #[must_use]
+    pub const fn value_offset(&self) -> usize {
+        self.encoded_offset + STUN_ATTRIBUTE_HEADER_LENGTH
+    }
+
+    /// Returns the aligned encoded attribute length including its header.
+    #[must_use]
+    pub const fn encoded_len(&self) -> usize {
+        self.encoded_length
+    }
 }
 
 impl fmt::Debug for StunAttributeView<'_> {
@@ -412,6 +793,8 @@ impl fmt::Debug for StunAttributeView<'_> {
             .debug_struct("StunAttributeView")
             .field("attribute_type", &self.attribute_type)
             .field("value_length", &self.value.len())
+            .field("encoded_offset", &self.encoded_offset)
+            .field("encoded_length", &self.encoded_length)
             .finish()
     }
 }
@@ -492,7 +875,63 @@ impl<'a> Iterator for StunAttributeIter<'a> {
         Some(Ok(StunAttributeView {
             attribute_type,
             value,
+            encoded_offset: base,
+            encoded_length: consumed,
         }))
+    }
+}
+
+/// Validated `MESSAGE-INTEGRITY-SHA256` calculation ranges.
+#[derive(Clone, Copy)]
+pub struct StunMessageIntegritySha256<'a> {
+    encoded: &'a [u8],
+    integrity_offset: usize,
+    value_offset: usize,
+    adjusted_body_length: u16,
+    value: &'a [u8; STUN_MESSAGE_INTEGRITY_SHA256_LENGTH],
+}
+
+impl<'a> StunMessageIntegritySha256<'a> {
+    /// Borrows the original two-byte message type before the length field.
+    #[must_use]
+    pub fn message_type_bytes(&self) -> &'a [u8] {
+        &self.encoded[..2]
+    }
+
+    /// Returns the temporary body length used by the integrity calculation.
+    #[must_use]
+    pub const fn adjusted_body_length(&self) -> u16 {
+        self.adjusted_body_length
+    }
+
+    /// Borrows bytes after the header length through the attribute before
+    /// `MESSAGE-INTEGRITY-SHA256`.
+    #[must_use]
+    pub fn bytes_after_length(&self) -> &'a [u8] {
+        &self.encoded[4..self.integrity_offset]
+    }
+
+    /// Borrows the received complete 32-byte HMAC value.
+    #[must_use]
+    pub const fn value(&self) -> &'a [u8; STUN_MESSAGE_INTEGRITY_SHA256_LENGTH] {
+        self.value
+    }
+
+    /// Returns the absolute offset at which the HMAC value begins.
+    #[must_use]
+    pub const fn value_offset(&self) -> usize {
+        self.value_offset
+    }
+}
+
+impl fmt::Debug for StunMessageIntegritySha256<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StunMessageIntegritySha256")
+            .field("integrity_offset", &self.integrity_offset)
+            .field("value_offset", &self.value_offset)
+            .field("adjusted_body_length", &self.adjusted_body_length)
+            .finish_non_exhaustive()
     }
 }
 
@@ -582,6 +1021,108 @@ impl<'a> StunMessageView<'a> {
             body: self.body,
             position: 0,
         }
+    }
+
+    /// Locates and validates the SHA-256 message-integrity boundary.
+    ///
+    /// The returned ranges let a cryptographic caller feed the message type,
+    /// the adjusted two-byte body length, and `bytes_after_length()` to
+    /// HMAC-SHA-256 without copying or mutating the received message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] when the integrity attribute is missing,
+    /// duplicated, not exactly 32 bytes, or followed by anything except one
+    /// exact four-byte `FINGERPRINT` attribute.
+    pub fn message_integrity_sha256(&self) -> Result<StunMessageIntegritySha256<'a>, CodecError> {
+        let mut integrity = None;
+        let mut fingerprint_seen = false;
+        for attribute in self.attributes() {
+            let attribute = attribute?;
+            let attribute_type = attribute.attribute_type();
+            if attribute_type == StunAttributeType::MESSAGE_INTEGRITY_SHA256 {
+                if integrity.is_some() {
+                    return Err(CodecError::DuplicateStunAttribute {
+                        attribute_type: attribute_type.as_u16(),
+                    });
+                }
+                if fingerprint_seen {
+                    return Err(CodecError::InvalidStunAttributeOrder {
+                        attribute_type: attribute_type.as_u16(),
+                    });
+                }
+                if attribute.value().len() != STUN_MESSAGE_INTEGRITY_SHA256_LENGTH {
+                    return Err(CodecError::InvalidStunAttributeLength {
+                        attribute_type: attribute_type.as_u16(),
+                        expected: STUN_MESSAGE_INTEGRITY_SHA256_LENGTH,
+                        actual: attribute.value().len(),
+                    });
+                }
+                integrity = Some(attribute);
+                continue;
+            }
+            if attribute_type == StunAttributeType::FINGERPRINT {
+                if fingerprint_seen {
+                    return Err(CodecError::DuplicateStunAttribute {
+                        attribute_type: attribute_type.as_u16(),
+                    });
+                }
+                if integrity.is_none() {
+                    return Err(CodecError::InvalidStunAttributeOrder {
+                        attribute_type: attribute_type.as_u16(),
+                    });
+                }
+                if attribute.value().len() != 4 {
+                    return Err(CodecError::InvalidStunAttributeLength {
+                        attribute_type: attribute_type.as_u16(),
+                        expected: 4,
+                        actual: attribute.value().len(),
+                    });
+                }
+                fingerprint_seen = true;
+                continue;
+            }
+            if integrity.is_some() {
+                return Err(CodecError::InvalidStunAttributeOrder {
+                    attribute_type: attribute_type.as_u16(),
+                });
+            }
+        }
+        let attribute = integrity.ok_or(CodecError::MissingStunAttribute {
+            attribute_type: StunAttributeType::MESSAGE_INTEGRITY_SHA256.as_u16(),
+        })?;
+        let integrity_end = attribute
+            .encoded_offset()
+            .checked_add(attribute.encoded_len())
+            .ok_or(CodecError::IntegerOverflow {
+                field: "STUN message integrity boundary",
+            })?;
+        let adjusted_body_length =
+            integrity_end
+                .checked_sub(STUN_HEADER_LENGTH)
+                .ok_or(CodecError::IntegerOverflow {
+                    field: "STUN message integrity body length",
+                })?;
+        let adjusted_body_length =
+            u16::try_from(adjusted_body_length).map_err(|_| CodecError::ValueOutOfRange {
+                field: "STUN message integrity body length",
+                actual: adjusted_body_length as u64,
+                minimum: 0,
+                maximum: u64::from(u16::MAX),
+            })?;
+        let value = <&[u8; STUN_MESSAGE_INTEGRITY_SHA256_LENGTH]>::try_from(attribute.value())
+            .map_err(|_| CodecError::InvalidStunAttributeLength {
+                attribute_type: attribute.attribute_type().as_u16(),
+                expected: STUN_MESSAGE_INTEGRITY_SHA256_LENGTH,
+                actual: attribute.value().len(),
+            })?;
+        Ok(StunMessageIntegritySha256 {
+            encoded: self.encoded,
+            integrity_offset: attribute.encoded_offset(),
+            value_offset: attribute.value_offset(),
+            adjusted_body_length,
+            value,
+        })
     }
 }
 
@@ -819,11 +1360,15 @@ fn align_to_four(length: usize) -> Result<usize, CodecError> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
     use super::{
-        decode_turn_stream_record_length, encode_stun_message, encode_turn_channel_data,
+        decode_stun_xor_address, decode_turn_stream_record_length, encode_stun_error_code,
+        encode_stun_message, encode_stun_xor_address, encode_turn_channel_data,
         encode_turn_channel_data_stream, StunAttributeRef, StunAttributeType, StunClass,
-        StunMessageRef, StunMessageType, StunMessageView, StunMethod, StunTransactionId,
-        TurnChannelDataView, TurnChannelNumber, STUN_MAGIC_COOKIE,
+        StunErrorCodeView, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
+        StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
+        STUN_MAGIC_COOKIE,
     };
     use crate::CodecError;
 
@@ -934,6 +1479,201 @@ mod tests {
         assert_eq!(attribute.value(), b"abc");
         let diagnostic = format!("{decoded:?} {attribute:?}");
         assert!(!diagnostic.contains("abc"));
+    }
+
+    #[test]
+    fn xor_addresses_match_ipv4_wire_example_and_round_trip_ipv6() {
+        let ipv4 = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 32_853);
+        let mut encoded_ipv4 = [0_u8; 8];
+        assert_eq!(
+            encode_stun_xor_address(ipv4, TRANSACTION_ID, &mut encoded_ipv4)
+                .expect("encode IPv4 XOR address"),
+            encoded_ipv4.len()
+        );
+        assert_eq!(
+            encoded_ipv4,
+            [0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43]
+        );
+        assert_eq!(
+            decode_stun_xor_address(&encoded_ipv4, TRANSACTION_ID)
+                .expect("decode IPv4 XOR address"),
+            ipv4
+        );
+
+        let ipv6 = SocketAddr::new(
+            "2001:db8:1234:5678:90ab:cdef:1234:5678"
+                .parse::<Ipv6Addr>()
+                .expect("IPv6 address")
+                .into(),
+            44_300,
+        );
+        let mut encoded_ipv6 = [0_u8; 20];
+        encode_stun_xor_address(ipv6, TRANSACTION_ID, &mut encoded_ipv6)
+            .expect("encode IPv6 XOR address");
+        assert_eq!(
+            decode_stun_xor_address(&encoded_ipv6, TRANSACTION_ID)
+                .expect("decode IPv6 XOR address"),
+            ipv6
+        );
+    }
+
+    #[test]
+    fn xor_addresses_reject_reserved_family_length_and_non_unicast_values() {
+        let mut address = [0_u8; 8];
+        address[1] = 1;
+        address[2..4].copy_from_slice(&(9_u16 ^ 0x2112).to_be_bytes());
+        address[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        assert!(matches!(
+            decode_stun_xor_address(&address, TRANSACTION_ID),
+            Err(CodecError::InvalidEndpointAddress { family: "IPv4" })
+        ));
+        address[0] = 1;
+        assert!(matches!(
+            decode_stun_xor_address(&address, TRANSACTION_ID),
+            Err(CodecError::NonZeroReserved { .. })
+        ));
+        address[0] = 0;
+        address[1] = 3;
+        assert!(matches!(
+            decode_stun_xor_address(&address, TRANSACTION_ID),
+            Err(CodecError::InvalidEnumValue {
+                field: "STUN address family",
+                ..
+            })
+        ));
+        address[1] = 1;
+        assert!(matches!(
+            decode_stun_xor_address(&address[..7], TRANSACTION_ID),
+            Err(CodecError::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn error_code_and_password_algorithm_values_are_strict() {
+        let mut error = [0_u8; 16];
+        let length =
+            encode_stun_error_code(401, "Unauthorized", &mut error).expect("encode error code");
+        assert_eq!(&error[..length], b"\0\0\x04\x01Unauthorized");
+        let decoded = StunErrorCodeView::decode(&error[..length]).expect("decode error code");
+        assert_eq!(decoded.code(), 401);
+        assert_eq!(decoded.reason(), "Unauthorized");
+        assert!(encode_stun_error_code(299, "invalid", &mut error).is_err());
+        assert!(encode_stun_error_code(400, "bad\nrequest", &mut error).is_err());
+
+        let mut algorithm = [0_u8; 4];
+        assert_eq!(
+            StunPasswordAlgorithm::Sha256
+                .encode(&mut algorithm)
+                .expect("encode password algorithm"),
+            4
+        );
+        assert_eq!(algorithm, [0, 2, 0, 0]);
+        assert_eq!(
+            StunPasswordAlgorithm::decode(&algorithm).expect("decode password algorithm"),
+            StunPasswordAlgorithm::Sha256
+        );
+        assert!(StunPasswordAlgorithm::decode(&[0, 1, 0, 0]).is_err());
+        assert!(StunPasswordAlgorithm::decode(&[0, 2, 0, 1]).is_err());
+    }
+
+    #[test]
+    fn sha256_integrity_ranges_adjust_header_and_exclude_integrity_value() {
+        let zero_integrity = [0_u8; 32];
+        let fingerprint = [0_u8; 4];
+        let attributes = [
+            StunAttributeRef {
+                attribute_type: StunAttributeType::USERNAME,
+                value: b"abc",
+            },
+            StunAttributeRef {
+                attribute_type: StunAttributeType::MESSAGE_INTEGRITY_SHA256,
+                value: &zero_integrity,
+            },
+            StunAttributeRef {
+                attribute_type: StunAttributeType::FINGERPRINT,
+                value: &fingerprint,
+            },
+        ];
+        let message = StunMessageRef {
+            message_type: StunMessageType::new(StunMethod::Allocate, StunClass::Request),
+            transaction_id: TRANSACTION_ID,
+            attributes: &attributes,
+        };
+        let mut encoded = vec![0_u8; message.encoded_len().expect("encoded length")];
+        encode_stun_message(message, &mut encoded).expect("encode authenticated request");
+        let view = StunMessageView::decode(&encoded).expect("decode authenticated request");
+        let integrity = view
+            .message_integrity_sha256()
+            .expect("locate integrity range");
+        assert_eq!(integrity.adjusted_body_length(), 44);
+        assert_eq!(integrity.value(), &zero_integrity);
+        assert_eq!(integrity.value_offset(), 32);
+
+        let mut hmac_input = Vec::new();
+        hmac_input.extend_from_slice(integrity.message_type_bytes());
+        hmac_input.extend_from_slice(&integrity.adjusted_body_length().to_be_bytes());
+        hmac_input.extend_from_slice(integrity.bytes_after_length());
+        let mut expected = encoded[..28].to_vec();
+        expected[2..4].copy_from_slice(&44_u16.to_be_bytes());
+        assert_eq!(hmac_input, expected);
+    }
+
+    #[test]
+    fn sha256_integrity_rejects_missing_duplicate_and_trailing_attributes() {
+        let integrity = [0_u8; 32];
+        let duplicate = [
+            StunAttributeRef {
+                attribute_type: StunAttributeType::MESSAGE_INTEGRITY_SHA256,
+                value: &integrity,
+            },
+            StunAttributeRef {
+                attribute_type: StunAttributeType::MESSAGE_INTEGRITY_SHA256,
+                value: &integrity,
+            },
+        ];
+        let trailing_lifetime = 300_u32.to_be_bytes();
+        let trailing = [
+            duplicate[0],
+            StunAttributeRef {
+                attribute_type: StunAttributeType::LIFETIME,
+                value: &trailing_lifetime,
+            },
+        ];
+        for (attributes, expected_duplicate) in
+            [(duplicate.as_slice(), true), (trailing.as_slice(), false)]
+        {
+            let message = StunMessageRef {
+                message_type: StunMessageType::new(StunMethod::Allocate, StunClass::Request),
+                transaction_id: TRANSACTION_ID,
+                attributes,
+            };
+            let mut encoded = vec![0_u8; message.encoded_len().expect("encoded length")];
+            encode_stun_message(message, &mut encoded).expect("encode integrity case");
+            let result = StunMessageView::decode(&encoded)
+                .expect("decode integrity case")
+                .message_integrity_sha256();
+            assert_eq!(
+                matches!(result, Err(CodecError::DuplicateStunAttribute { .. })),
+                expected_duplicate
+            );
+            assert_eq!(
+                matches!(result, Err(CodecError::InvalidStunAttributeOrder { .. })),
+                !expected_duplicate
+            );
+        }
+        let empty = StunMessageRef {
+            message_type: StunMessageType::new(StunMethod::Allocate, StunClass::Request),
+            transaction_id: TRANSACTION_ID,
+            attributes: &[],
+        };
+        let mut encoded = [0_u8; 20];
+        encode_stun_message(empty, &mut encoded).expect("encode empty request");
+        assert!(matches!(
+            StunMessageView::decode(&encoded)
+                .expect("decode empty request")
+                .message_integrity_sha256(),
+            Err(CodecError::MissingStunAttribute { .. })
+        ));
     }
 
     #[test]

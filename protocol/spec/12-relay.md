@@ -140,6 +140,78 @@ the standard four-byte alignment padding. Stream demultiplexing examines the
 two high bits and declared length before allocating or reading the complete
 record; prefixes `10` and `11` are invalid.
 
+### 3.2 TURN authentication profile
+
+The first Stella relay profile uses the TURN long-term credential mechanism
+with `MESSAGE-INTEGRITY-SHA256` only. It does not emit or accept the legacy
+SHA-1 `MESSAGE-INTEGRITY` attribute. `PASSWORD-ALGORITHM` is present in every
+authentication challenge and authenticated request, names algorithm `0x0002`
+(SHA-256), and has an empty parameter block. `USERHASH` is not used by version
+0.2 because the controller-issued username already contains only an expiry and
+an opaque node identifier.
+
+The canonical realm is the printable ASCII string
+`stella-relay:<relay-id>`, where `<relay-id>` is the lower-case canonical
+32-hex-digit relay identifier. A controller-issued credential uses the
+USERNAME value `<expires-at>:<node-id>` and its opaque credential secret as the
+long-term password. The 32-byte integrity key is:
+
+```text
+SHA-256(USERNAME || ":" || REALM || ":" || PASSWORD)
+```
+
+All concatenated values are their exact attribute or credential bytes. The
+password never appears in a TURN record. The HMAC is HMAC-SHA-256 and the
+`MESSAGE-INTEGRITY-SHA256` value is the complete 32-byte output.
+
+An unauthenticated Allocate request receives error 401 with exactly one REALM,
+NONCE, and PASSWORD-ALGORITHM attribute. The reference relay uses a 120-second
+stateless nonce encoded as unpadded base64url of:
+
+```text
+expires-at-be64 || HMAC-SHA-256(
+    relay-credential-key,
+    "stella turn nonce v1\0" || relay-id || expires-at-be64
+)
+```
+
+Expiry is exclusive. A missing or invalid nonce receives 401; an otherwise
+authenticated request carrying an expired nonce receives 438 and a replacement
+NONCE. Nonces are relay-scoped but deliberately not bound to an observed IP
+address or port, so a NAT rebinding does not invalidate an allocation request.
+
+Authenticated requests contain exactly one USERNAME, REALM, NONCE,
+PASSWORD-ALGORITHM, and MESSAGE-INTEGRITY-SHA256. Duplicate authentication
+attributes, a mismatched realm, an unsupported password algorithm, malformed
+credential username, expired credential, or invalid HMAC are rejected without
+logging credential bytes or distinguishing forged passwords from unknown
+users. All method attributes protected by the request occur before
+MESSAGE-INTEGRITY-SHA256. Only a single four-byte FINGERPRINT may follow it.
+
+For integrity calculation, the STUN header length is temporarily the body
+length through the end of the MESSAGE-INTEGRITY-SHA256 attribute. HMAC input is
+the message from byte zero through the attribute immediately before
+MESSAGE-INTEGRITY-SHA256; the integrity attribute header and value are not HMAC
+input. A following FINGERPRINT is therefore outside the integrity calculation.
+
+### 3.3 Address and error attributes
+
+XOR-PEER-ADDRESS, XOR-RELAYED-ADDRESS, and XOR-MAPPED-ADDRESS use the standard
+STUN address value. Byte 0 is zero, byte 1 is family `0x01` for IPv4 or `0x02`
+for IPv6, and bytes 2 through 3 are the port XOR the most-significant 16 bits of
+the magic cookie. IPv4 addresses are XORed with the 32-bit magic cookie. IPv6
+addresses are XORed with the concatenation of the magic cookie and the 96-bit
+transaction ID. Other families, non-zero reserved bytes, zero ports,
+unspecified addresses, multicast addresses, and trailing bytes are rejected by
+the Stella profile.
+
+ERROR-CODE begins with two zero bytes, then a class byte whose upper five bits
+are zero, then a decimal number byte. The represented status is
+`class * 100 + number` and is limited to 300 through 699. The remaining reason
+phrase is printable UTF-8 without control characters and is at most 127 bytes.
+The reference relay uses stable standard reason phrases and never includes
+credentials, packet bytes, or internal error details.
+
 ## 4. Secure WebSocket carrier
 
 An HTTPS deployment may expose `/stella/turn/v1` with WebSocket subprotocol

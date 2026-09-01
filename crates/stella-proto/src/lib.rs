@@ -92,10 +92,14 @@ pub use relay::{
     MIN_RELAY_SECRET_LENGTH, RELAY_ADDRESS_RECORD_LENGTH, RELAY_SERVICE_HEADER_LENGTH,
 };
 pub use turn::{
-    decode_turn_stream_record_length, encode_stun_message, encode_turn_channel_data,
+    decode_stun_xor_address, decode_turn_stream_record_length, encode_stun_error_code,
+    encode_stun_message, encode_stun_xor_address, encode_turn_channel_data,
     encode_turn_channel_data_stream, stun_attributes_encoded_len, StunAttributeIter,
-    StunAttributeRef, StunAttributeType, StunAttributeView, StunClass, StunMessageRef,
-    StunMessageType, StunMessageView, StunMethod, StunTransactionId, TurnChannelDataView,
-    TurnChannelNumber, MAX_STUN_MESSAGE_LENGTH, MAX_TURN_CHANNEL_NUMBER, MIN_TURN_CHANNEL_NUMBER,
-    STUN_HEADER_LENGTH, STUN_MAGIC_COOKIE, TURN_CHANNEL_DATA_HEADER_LENGTH,
+    StunAttributeRef, StunAttributeType, StunAttributeView, StunClass, StunErrorCodeView,
+    StunMessageIntegritySha256, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
+    StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
+    MAX_STUN_ERROR_REASON_LENGTH, MAX_STUN_MESSAGE_LENGTH, MAX_TURN_CHANNEL_NUMBER,
+    MIN_TURN_CHANNEL_NUMBER, STUN_HEADER_LENGTH, STUN_MAGIC_COOKIE,
+    STUN_MESSAGE_INTEGRITY_SHA256_LENGTH, STUN_XOR_IPV4_ADDRESS_LENGTH,
+    STUN_XOR_IPV6_ADDRESS_LENGTH, TURN_CHANNEL_DATA_HEADER_LENGTH,
 };

@@ -359,4 +359,34 @@ pub enum CodecError {
         /// Offset within the field value.
         offset: usize,
     },
+    /// A required STUN attribute is absent.
+    #[error("STUN message is missing required attribute 0x{attribute_type:04x}")]
+    MissingStunAttribute {
+        /// Missing attribute type.
+        attribute_type: u16,
+    },
+    /// A STUN attribute that must be unique occurs more than once.
+    #[error("duplicate STUN attribute 0x{attribute_type:04x}")]
+    DuplicateStunAttribute {
+        /// Duplicated attribute type.
+        attribute_type: u16,
+    },
+    /// A registered STUN attribute has an invalid value length.
+    #[error(
+        "invalid STUN attribute 0x{attribute_type:04x} length: expected {expected}, got {actual}"
+    )]
+    InvalidStunAttributeLength {
+        /// Attribute type whose value length is invalid.
+        attribute_type: u16,
+        /// Required exact value length.
+        expected: usize,
+        /// Supplied value length.
+        actual: usize,
+    },
+    /// A STUN attribute appears after an integrity attribute that must cover it.
+    #[error("STUN attribute 0x{attribute_type:04x} is invalid after message integrity")]
+    InvalidStunAttributeOrder {
+        /// Attribute type found in the invalid position.
+        attribute_type: u16,
+    },
 }
