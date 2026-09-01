@@ -7,7 +7,10 @@ use std::{
     str::FromStr,
 };
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use stella_common::{NodeId, RelayId};
@@ -19,10 +22,14 @@ use zeroize::Zeroizing;
 use crate::identity::{create_protected_secret_file, IdentityFileError};
 
 const CREDENTIAL_DOMAIN: &[u8] = b"stella relay credential v1\0";
+const TURN_NONCE_DOMAIN: &[u8] = b"stella turn nonce v1\0";
+const TURN_NONCE_RAW_LENGTH: usize = 8 + 32;
 /// Exact length of one deployment relay credential HMAC key.
 pub const RELAY_CREDENTIAL_KEY_LENGTH: usize = 32;
 /// Minimum supported relay credential lifetime.
 pub const MIN_RELAY_CREDENTIAL_LIFETIME_SECONDS: u64 = 60;
+/// Lifetime of one stateless TURN authentication nonce.
+pub const TURN_NONCE_LIFETIME_SECONDS: u64 = 120;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -168,12 +175,83 @@ impl RelayCredentialAuthority {
         if relay_id.is_zero() {
             return None;
         }
+        let resolved = self.resolve(relay_id, username, now)?;
+        bool::from(resolved.password.as_slice().ct_eq(secret)).then_some(resolved.node_id)
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        relay_id: RelayId,
+        username: &[u8],
+        now: u64,
+    ) -> Option<ResolvedRelayCredential> {
+        if relay_id.is_zero() {
+            return None;
+        }
         let (expires_at, node_id) = parse_username(username)?;
         if expires_at <= now {
             return None;
         }
-        let expected = self.secret(relay_id, username).ok()?;
-        bool::from(expected.as_slice().ct_eq(secret)).then_some(node_id)
+        Some(ResolvedRelayCredential {
+            node_id,
+            password: self.secret(relay_id, username).ok()?,
+        })
+    }
+
+    pub(crate) fn issue_turn_nonce(
+        &self,
+        relay_id: RelayId,
+        now: u64,
+    ) -> Result<Zeroizing<Vec<u8>>, RelayCredentialError> {
+        if relay_id.is_zero() {
+            return Err(RelayCredentialError::ZeroRelayId);
+        }
+        let expires_at = now
+            .checked_add(TURN_NONCE_LIFETIME_SECONDS)
+            .ok_or(RelayCredentialError::ExpiryOverflow)?;
+        let expiry = expires_at.to_be_bytes();
+        let tag = self.turn_nonce_tag(relay_id, expiry)?;
+        let mut raw = [0_u8; TURN_NONCE_RAW_LENGTH];
+        raw[..expiry.len()].copy_from_slice(&expiry);
+        raw[expiry.len()..].copy_from_slice(&tag);
+        Ok(Zeroizing::new(URL_SAFE_NO_PAD.encode(raw).into_bytes()))
+    }
+
+    pub(crate) fn verify_turn_nonce(
+        &self,
+        relay_id: RelayId,
+        nonce: &[u8],
+        now: u64,
+    ) -> TurnNonceStatus {
+        if relay_id.is_zero() {
+            return TurnNonceStatus::Invalid;
+        }
+        let Ok(raw) = URL_SAFE_NO_PAD.decode(nonce) else {
+            return TurnNonceStatus::Invalid;
+        };
+        if raw.len() != TURN_NONCE_RAW_LENGTH || URL_SAFE_NO_PAD.encode(&raw).as_bytes() != nonce {
+            return TurnNonceStatus::Invalid;
+        }
+        let Some(expiry_bytes) = raw
+            .get(..8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        else {
+            return TurnNonceStatus::Invalid;
+        };
+        let Some(received_tag) = raw.get(8..) else {
+            return TurnNonceStatus::Invalid;
+        };
+        let Ok(expected_tag) = self.turn_nonce_tag(relay_id, expiry_bytes) else {
+            return TurnNonceStatus::Invalid;
+        };
+        if !bool::from(expected_tag.as_slice().ct_eq(received_tag)) {
+            return TurnNonceStatus::Invalid;
+        }
+        if u64::from_be_bytes(expiry_bytes) <= now {
+            TurnNonceStatus::Expired
+        } else {
+            TurnNonceStatus::Valid
+        }
     }
 
     fn secret(
@@ -190,6 +268,41 @@ impl RelayCredentialAuthority {
             STANDARD.encode(mac.finalize().into_bytes()).into_bytes(),
         ))
     }
+
+    fn turn_nonce_tag(
+        &self,
+        relay_id: RelayId,
+        expiry: [u8; 8],
+    ) -> Result<[u8; 32], RelayCredentialError> {
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(self.key.as_ref())
+            .map_err(|_| RelayCredentialError::InvalidKey)?;
+        mac.update(TURN_NONCE_DOMAIN);
+        mac.update(relay_id.as_bytes());
+        mac.update(&expiry);
+        Ok(mac.finalize().into_bytes().into())
+    }
+}
+
+pub(crate) struct ResolvedRelayCredential {
+    pub(crate) node_id: NodeId,
+    pub(crate) password: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for ResolvedRelayCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedRelayCredential")
+            .field("node_id", &self.node_id)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnNonceStatus {
+    Valid,
+    Expired,
+    Invalid,
 }
 
 impl fmt::Debug for RelayCredentialAuthority {
@@ -356,7 +469,7 @@ mod tests {
     use super::{
         create_relay_credential_key, RelayCredentialKeyFileError, RELAY_CREDENTIAL_KEY_LENGTH,
     };
-    use super::{RelayCredentialAuthority, RelayCredentialError};
+    use super::{RelayCredentialAuthority, RelayCredentialError, TurnNonceStatus};
     #[cfg(windows)]
     use crate::identity::open_protected_secret_file;
 
@@ -477,5 +590,44 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn turn_nonces_are_relay_scoped_canonical_and_expiring() {
+        let authority =
+            RelayCredentialAuthority::new([0x45; 32], 300).expect("valid credential authority");
+        let relay_id = RelayId::from_bytes([0x21; 16]);
+        let other_relay = RelayId::from_bytes([0x22; 16]);
+        let nonce = authority
+            .issue_turn_nonce(relay_id, 1_000)
+            .expect("issue TURN nonce");
+        assert_eq!(
+            authority.verify_turn_nonce(relay_id, &nonce, 1_119),
+            TurnNonceStatus::Valid
+        );
+        assert_eq!(
+            authority.verify_turn_nonce(relay_id, &nonce, 1_120),
+            TurnNonceStatus::Expired
+        );
+        assert_eq!(
+            authority.verify_turn_nonce(other_relay, &nonce, 1_001),
+            TurnNonceStatus::Invalid
+        );
+        let mut tampered = nonce.to_vec();
+        tampered[0] ^= 1;
+        assert_eq!(
+            authority.verify_turn_nonce(relay_id, &tampered, 1_001),
+            TurnNonceStatus::Invalid
+        );
+        let mut padded = nonce.to_vec();
+        padded.push(b'=');
+        assert_eq!(
+            authority.verify_turn_nonce(relay_id, &padded, 1_001),
+            TurnNonceStatus::Invalid
+        );
+        assert!(matches!(
+            authority.issue_turn_nonce(relay_id, u64::MAX),
+            Err(RelayCredentialError::ExpiryOverflow)
+        ));
     }
 }
