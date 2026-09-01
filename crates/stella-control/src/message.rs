@@ -7,19 +7,20 @@ use stella_proto::{
     ControlHeader, ControlMessageType, ControlMessageView, ProtocolVersion, CONTROL_HEADER_LENGTH,
     MAX_CONTROL_RECORD_LENGTH,
 };
+use zeroize::Zeroizing;
 
 use crate::ControlError;
 
 #[derive(Eq, PartialEq)]
 struct OwnedControlField {
     field_type: ControlFieldType,
-    value: Vec<u8>,
+    value: Zeroizing<Vec<u8>>,
 }
 
 impl OwnedControlField {
     fn new(field_type: ControlFieldType, value: &[u8]) -> Result<Self, ControlError> {
         ControlFieldRef::new(field_type, value)?;
-        let mut owned = Vec::new();
+        let mut owned = Zeroizing::new(Vec::new());
         owned
             .try_reserve_exact(value.len())
             .map_err(|_| ControlError::AllocationFailed {
@@ -171,7 +172,7 @@ impl MessageBuilder {
 /// Owned and fully validated control message without its four-byte prefix.
 #[derive(Clone, Eq, PartialEq)]
 pub struct OwnedControlMessage {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
 }
 
 impl OwnedControlMessage {
@@ -183,7 +184,9 @@ impl OwnedControlMessage {
     /// invariant.
     pub fn new(bytes: Vec<u8>) -> Result<Self, ControlError> {
         ControlMessageView::decode(&bytes)?;
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes: Zeroizing::new(bytes),
+        })
     }
 
     /// Borrows the exact encoded message bytes without the outer prefix.
@@ -227,7 +230,9 @@ impl OwnedControlMessage {
     }
 
     pub(crate) fn from_validated_bytes(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self {
+            bytes: Zeroizing::new(bytes),
+        }
     }
 }
 

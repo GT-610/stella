@@ -1142,6 +1142,7 @@ dependencies = [
  "stella-proto",
  "thiserror",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

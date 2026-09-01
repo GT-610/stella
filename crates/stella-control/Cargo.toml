@@ -13,6 +13,7 @@ stella-crypto = { path = "../stella-crypto" }
 stella-proto = { path = "../stella-proto" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
