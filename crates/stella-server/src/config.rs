@@ -140,6 +140,63 @@ impl ServerConfig {
             connectivity,
         })
     }
+
+    /// Resolves one configured TURN UDP relay into executable service settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when connectivity services are absent, the
+    /// relay ID is unknown, TURN UDP is not advertised, or a numeric bound
+    /// cannot be represented by this platform.
+    pub fn turn_udp_relay_settings(
+        &self,
+        relay_id: RelayId,
+    ) -> Result<TurnUdpRelaySettings, ConfigError> {
+        let connectivity = self
+            .connectivity
+            .as_ref()
+            .ok_or_else(|| invalid_connectivity("connectivity services are not configured"))?;
+        let relay = connectivity
+            .relay_services
+            .iter()
+            .find(|relay| relay.relay_id == relay_id)
+            .ok_or_else(|| invalid_connectivity("requested relay ID is not configured"))?;
+        if !relay.carriers.contains(RelayCarrierMask::TURN_UDP) || relay.ports.turn_udp == 0 {
+            return Err(invalid_connectivity(
+                "requested relay does not advertise TURN UDP",
+            ));
+        }
+        let max_datagram_size =
+            usize::try_from(relay.max_datagram_size).map_err(|_| ConfigError::LengthOverflow)?;
+        Ok(TurnUdpRelaySettings {
+            relay_id,
+            credential_key_path: connectivity.credential_key_path.clone(),
+            credential_lifetime_seconds: connectivity.credential_lifetime_seconds,
+            port: relay.ports.turn_udp,
+            max_datagram_size,
+            allocation_lifetime_seconds: relay.allocation_lifetime_seconds,
+            idle_timeout_seconds: relay.idle_timeout_seconds,
+        })
+    }
+}
+
+/// Executable settings derived from one advertised TURN UDP relay service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnUdpRelaySettings {
+    /// Stable configured relay identity.
+    pub relay_id: RelayId,
+    /// Protected shared credential authority key path.
+    pub credential_key_path: PathBuf,
+    /// Controller-issued credential lifetime used by the shared authority.
+    pub credential_lifetime_seconds: u64,
+    /// Advertised TURN UDP port.
+    pub port: u16,
+    /// Advertised relayed Stella datagram ceiling.
+    pub max_datagram_size: usize,
+    /// Maximum granted allocation lifetime.
+    pub allocation_lifetime_seconds: u32,
+    /// Allocation inactivity deadline.
+    pub idle_timeout_seconds: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -731,6 +788,23 @@ private_key = "secrets/tls-key.pem"
         );
         let parsed = ServerConfig::parse(&document, Path::new("C:/stella"))
             .expect("valid connectivity services");
+        let relay_id = "01010101010101010101010101010101"
+            .parse()
+            .expect("valid relay ID");
+        let settings = parsed
+            .turn_udp_relay_settings(relay_id)
+            .expect("resolve TURN UDP settings");
+        assert_eq!(settings.relay_id, relay_id);
+        assert_eq!(
+            settings.credential_key_path,
+            Path::new("C:/stella/secrets/relay-credential.key")
+        );
+        assert_eq!(settings.credential_lifetime_seconds, 300);
+        assert_eq!(settings.port, 3478);
+        assert_eq!(settings.max_datagram_size, 1_200);
+        assert_eq!(settings.allocation_lifetime_seconds, 600);
+        assert_eq!(settings.idle_timeout_seconds, 120);
+
         let connectivity = parsed.connectivity.expect("connectivity configured");
         assert_eq!(connectivity.revision, 7);
         assert_eq!(

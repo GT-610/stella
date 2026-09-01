@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     io::Write,
+    net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,7 +11,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use stella_common::{NetworkId, NodeId};
+use stella_common::{NetworkId, NodeId, RelayId};
 use stella_crypto::derive_controller_id;
 use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 use stella_server::{
@@ -19,9 +20,10 @@ use stella_server::{
     bootstrap::{initialize_controller, BootstrapOptions},
     config::ServerConfig,
     identity::load_controller_identity,
-    relay_credentials::create_relay_credential_key,
+    relay_credentials::{create_relay_credential_key, load_relay_credential_authority},
     runtime::{run_controller, SessionError, SessionHandler},
     store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
+    turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zeroize::Zeroizing;
@@ -71,6 +73,11 @@ enum Command {
     RelayKey {
         #[command(subcommand)]
         command: RelayKeyCommand,
+    },
+    /// Runs self-hosted relay data services.
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
     },
     /// Lists and administratively enables or disables nodes.
     Node {
@@ -181,6 +188,32 @@ enum RelayKeyCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RelayCommand {
+    /// Runs the configured TURN UDP relay until Ctrl+C.
+    Run(RelayRunArgs),
+}
+
+#[derive(Clone, Copy, Debug, Args)]
+struct RelayRunArgs {
+    #[arg(long)]
+    id: RelayId,
+    #[arg(long)]
+    listen: SocketAddr,
+    #[arg(long)]
+    advertise: IpAddr,
+    #[arg(long)]
+    allocation_bind: Option<IpAddr>,
+    #[arg(long, default_value_t = 1_024)]
+    max_allocations: usize,
+    #[arg(long, default_value_t = 4)]
+    max_allocations_per_node: usize,
+    #[arg(long, default_value_t = 128)]
+    max_permissions_per_allocation: usize,
+    #[arg(long, default_value_t = 128)]
+    max_channels_per_allocation: usize,
+}
+
 #[derive(Clone, Copy, Debug, Args)]
 struct TokenLifetimeArgs {
     #[arg(long, default_value_t = DEFAULT_TOKEN_TTL_SECONDS)]
@@ -258,6 +291,7 @@ async fn execute(cli: Cli, output: &mut dyn Write) -> Result<()> {
         }
         Command::JoinToken { command } => execute_join_token(&cli.config, command, output).await,
         Command::RelayKey { command } => execute_relay_key(command, output),
+        Command::Relay { command } => execute_relay(&cli.config, command).await,
         Command::Node { command } => execute_node(&cli.config, command, output).await,
         Command::Member { command } => execute_member(&cli.config, command, output).await,
         Command::State { command } => execute_state(&cli.config, command, output).await,
@@ -269,6 +303,65 @@ fn execute_relay_key(command: RelayKeyCommand, output: &mut dyn Write) -> Result
     create_relay_credential_key(&path)
         .with_context(|| format!("could not create relay credential key {}", path.display()))?;
     writeln!(output, "key={}", path.display()).context("could not write relay key path")
+}
+
+async fn execute_relay(config_path: &Path, command: RelayCommand) -> Result<()> {
+    let RelayCommand::Run(args) = command;
+    let config = ServerConfig::load(config_path)
+        .with_context(|| format!("could not load {}", config_path.display()))?;
+    let settings = config
+        .turn_udp_relay_settings(args.id)
+        .context("could not resolve configured TURN UDP relay")?;
+    if args.listen.port() != settings.port {
+        return Err(anyhow!(
+            "TURN UDP listen port {} does not match configured advertised port {}",
+            args.listen.port(),
+            settings.port
+        ));
+    }
+    let filter = tracing_subscriber::EnvFilter::try_new(&config.logging.filter)
+        .context("invalid configured tracing filter")?;
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .try_init()
+        .context("could not initialize relay logging")?;
+    let credentials = load_relay_credential_authority(
+        &settings.credential_key_path,
+        settings.credential_lifetime_seconds,
+    )
+    .with_context(|| {
+        format!(
+            "could not load relay credential authority {}",
+            settings.credential_key_path.display()
+        )
+    })?;
+    let mut relay_config = TurnUdpRelayConfig::new(
+        settings.relay_id,
+        args.listen,
+        args.allocation_bind.unwrap_or(args.listen.ip()),
+        args.advertise,
+    );
+    relay_config.max_datagram_size = settings.max_datagram_size;
+    relay_config.allocation_lifetime_seconds = settings.allocation_lifetime_seconds;
+    relay_config.idle_timeout_seconds = settings.idle_timeout_seconds;
+    relay_config.max_allocations = args.max_allocations;
+    relay_config.max_allocations_per_node = args.max_allocations_per_node;
+    relay_config.max_permissions_per_allocation = args.max_permissions_per_allocation;
+    relay_config.max_channels_per_allocation = args.max_channels_per_allocation;
+    let relay = TurnUdpRelay::bind(relay_config, credentials)
+        .await
+        .context("could not bind TURN UDP relay")?;
+    tracing::info!(
+        relay_id = %settings.relay_id,
+        listen = %relay.local_address().context("could not query TURN UDP listener")?,
+        advertise = %args.advertise,
+        "starting TURN UDP relay"
+    );
+    relay
+        .run(ctrl_c_shutdown())
+        .await
+        .context("TURN UDP relay runtime failed")
 }
 
 async fn execute_run(config_path: &Path) -> Result<()> {
@@ -688,7 +781,7 @@ mod tests {
         store::{AuthorityStore, NodeRecord},
     };
 
-    use super::{execute, Cli};
+    use super::{execute, Cli, Command, RelayCommand};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -768,6 +861,35 @@ mod tests {
             "relay.key"
         ])
         .is_ok());
+        assert!(Cli::try_parse_from(["stella-server", "relay", "run"]).is_err());
+        let relay = Cli::try_parse_from([
+            "stella-server",
+            "relay",
+            "run",
+            "--id",
+            "01010101010101010101010101010101",
+            "--listen",
+            "0.0.0.0:3478",
+            "--advertise",
+            "192.0.2.30",
+            "--allocation-bind",
+            "0.0.0.0",
+        ])
+        .expect("parse TURN UDP relay command");
+        let Command::Relay {
+            command: RelayCommand::Run(args),
+        } = relay.command
+        else {
+            panic!("expected relay run command");
+        };
+        assert_eq!(args.listen.to_string(), "0.0.0.0:3478");
+        assert_eq!(args.advertise.to_string(), "192.0.2.30");
+        assert_eq!(
+            args.allocation_bind.expect("allocation bind").to_string(),
+            "0.0.0.0"
+        );
+        assert_eq!(args.max_allocations, 1_024);
+        assert_eq!(args.max_allocations_per_node, 4);
     }
 
     #[cfg(windows)]
