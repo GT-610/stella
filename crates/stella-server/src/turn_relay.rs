@@ -5,17 +5,24 @@ use std::{
     fmt,
     future::Future,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use stella_common::{NodeId, RelayId};
 use stella_proto::{
-    encode_stun_error_code, encode_stun_message, encode_stun_xor_address, CodecError,
-    StunAttributeRef, StunAttributeType, StunClass, StunMessageRef, StunMessageType,
-    StunMessageView, StunMethod, StunTransactionId,
+    decode_stun_xor_address, encode_stun_error_code, encode_stun_message, encode_stun_xor_address,
+    encode_turn_channel_data, CodecError, StunAttributeRef, StunAttributeType, StunClass,
+    StunMessageRef, StunMessageType, StunMessageView, StunMethod, StunTransactionId,
+    TurnChannelDataView, TurnChannelNumber,
 };
 use thiserror::Error;
-use tokio::{net::UdpSocket, time::MissedTickBehavior};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, oneshot},
+    task::JoinSet,
+    time::MissedTickBehavior,
+};
 
 use crate::{
     relay_credentials::{RelayCredentialAuthority, TurnNonceStatus},
@@ -27,6 +34,9 @@ const REQUESTED_TRANSPORT_UDP: [u8; 4] = [17, 0, 0, 0];
 const RESPONSE_CACHE_LIFETIME: Duration = Duration::from_secs(40);
 const RESPONSE_CACHE_CAPACITY: usize = 4_096;
 const RECEIVE_BUFFER_LENGTH: usize = u16::MAX as usize;
+const ALLOCATION_COMMAND_CAPACITY: usize = 256;
+const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
+const CHANNEL_BINDING_LIFETIME: Duration = Duration::from_secs(600);
 
 /// Runtime limits and addresses for one TURN UDP listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +59,10 @@ pub struct TurnUdpRelayConfig {
     pub max_allocations: usize,
     /// Active allocation limit for one authenticated node.
     pub max_allocations_per_node: usize,
+    /// Maximum simultaneously permitted peer IPs per allocation.
+    pub max_permissions_per_allocation: usize,
+    /// Maximum live channel bindings per allocation.
+    pub max_channels_per_allocation: usize,
 }
 
 impl TurnUdpRelayConfig {
@@ -70,6 +84,8 @@ impl TurnUdpRelayConfig {
             idle_timeout_seconds: 120,
             max_allocations: 1_024,
             max_allocations_per_node: 4,
+            max_permissions_per_allocation: 128,
+            max_channels_per_allocation: 128,
         }
     }
 
@@ -111,6 +127,13 @@ impl TurnUdpRelayConfig {
         {
             return Err(invalid_config("allocation count limits are invalid"));
         }
+        if self.max_permissions_per_allocation == 0
+            || self.max_permissions_per_allocation > 128
+            || self.max_channels_per_allocation == 0
+            || self.max_channels_per_allocation > self.max_permissions_per_allocation
+        {
+            return Err(invalid_config("permission or channel limits are invalid"));
+        }
         Ok(())
     }
 }
@@ -119,8 +142,9 @@ impl TurnUdpRelayConfig {
 pub struct TurnUdpRelay {
     config: TurnUdpRelayConfig,
     authenticator: TurnAuthenticator,
-    control: UdpSocket,
+    control: Arc<UdpSocket>,
     allocations: HashMap<SocketAddr, Allocation>,
+    allocation_tasks: JoinSet<()>,
     response_cache: HashMap<ResponseCacheKey, CachedResponse>,
     response_cache_order: VecDeque<ResponseCacheKey>,
 }
@@ -147,8 +171,9 @@ impl TurnUdpRelay {
         Ok(Self {
             config,
             authenticator,
-            control,
+            control: Arc::new(control),
             allocations: HashMap::new(),
+            allocation_tasks: JoinSet::new(),
             response_cache: HashMap::new(),
             response_cache_order: VecDeque::new(),
         })
@@ -185,8 +210,13 @@ impl TurnUdpRelay {
         let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_LENGTH];
         loop {
             tokio::select! {
-                () = &mut shutdown => return Ok(()),
+                () = &mut shutdown => break,
                 _ = cleanup.tick() => self.remove_expired(Instant::now()),
+                joined = self.allocation_tasks.join_next(), if !self.allocation_tasks.is_empty() => {
+                    if let Some(result) = joined {
+                        result.map_err(|source| TurnRelayError::AllocationTaskJoin { source })?;
+                    }
+                }
                 received = self.control.recv_from(&mut receive_buffer) => {
                     let (length, client) = received.map_err(|source| TurnRelayError::ReceiveControl {
                         source,
@@ -205,6 +235,11 @@ impl TurnUdpRelay {
                 }
             }
         }
+        self.allocations.clear();
+        while let Some(result) = self.allocation_tasks.join_next().await {
+            result.map_err(|source| TurnRelayError::AllocationTaskJoin { source })?;
+        }
+        Ok(())
     }
 
     async fn handle_client_record(
@@ -214,12 +249,28 @@ impl TurnUdpRelay {
         now_unix: u64,
         now: Instant,
     ) -> Result<Option<Vec<u8>>, TurnRelayError> {
-        if input.len() < 2 || input[0] & 0xc0 != 0 {
+        if input.len() < 2 {
+            return Ok(None);
+        }
+        if input[0] & 0xc0 == 0x40 {
+            let Ok(channel_data) = TurnChannelDataView::decode_datagram(input) else {
+                return Ok(None);
+            };
+            self.handle_channel_data(client, channel_data, now).await;
+            return Ok(None);
+        }
+        if input[0] & 0xc0 != 0 {
             return Ok(None);
         }
         let Ok(message) = StunMessageView::decode(input) else {
             return Ok(None);
         };
+        if message.message_type().class == StunClass::Indication
+            && message.message_type().method == StunMethod::Send
+        {
+            self.handle_send_indication(&message, client, now).await;
+            return Ok(None);
+        }
         if message.message_type().class != StunClass::Request {
             return Ok(None);
         }
@@ -240,6 +291,14 @@ impl TurnUdpRelay {
                     .await?
             }
             StunMethod::Refresh => self.handle_refresh(&message, client, now_unix, now)?,
+            StunMethod::CreatePermission => {
+                self.handle_create_permission(&message, client, now_unix, now)
+                    .await?
+            }
+            StunMethod::ChannelBind => {
+                self.handle_channel_bind(&message, client, now_unix, now)
+                    .await?
+            }
             _ => Self::error_response(&message, 400, "Bad Request", None, None)?,
         };
         self.cache_response(cache_key, response.clone(), now)?;
@@ -350,7 +409,7 @@ impl TurnUdpRelay {
     }
 
     async fn create_allocation(
-        &self,
+        &mut self,
         message: &StunMessageView<'_>,
         client: SocketAddr,
         node_id: NodeId,
@@ -368,9 +427,19 @@ impl TurnUdpRelay {
             .local_addr()
             .map_err(|source| TurnRelayError::AllocationLocalAddress { source })?;
         let relayed_address = SocketAddr::new(self.config.advertised_address, local.port());
+        let (command_sender, command_receiver) = mpsc::channel(ALLOCATION_COMMAND_CAPACITY);
+        self.allocation_tasks.spawn(run_allocation_actor(
+            socket,
+            Arc::clone(&self.control),
+            client,
+            self.config.max_datagram_size,
+            self.config.max_permissions_per_allocation,
+            self.config.max_channels_per_allocation,
+            command_receiver,
+        ));
         let allocation = Allocation {
             node_id,
-            _socket: socket,
+            command_sender,
             relayed_address,
             expires_at: checked_deadline(now, lifetime, "allocation lifetime")?,
             idle_deadline: checked_deadline(
@@ -467,6 +536,327 @@ impl TurnUdpRelay {
             ],
             Some(&authenticated),
         )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_create_permission(
+        &mut self,
+        message: &StunMessageView<'_>,
+        client: SocketAddr,
+        now_unix: u64,
+        now: Instant,
+    ) -> Result<Vec<u8>, TurnRelayError> {
+        let authenticated = match self.authenticate(message, now_unix)? {
+            AuthenticationDecision::Authenticated(value) => value,
+            AuthenticationDecision::Response(response) => return Ok(response),
+        };
+        let unknown = unknown_required_attributes(message)?;
+        if !unknown.is_empty() {
+            return Self::error_response(
+                message,
+                420,
+                "Unknown Attribute",
+                Some(&authenticated),
+                Some(&unknown),
+            );
+        }
+        let peers =
+            match Self::validated_method_value(peer_addresses(message), message, &authenticated)? {
+                Ok(peers) => peers,
+                Err(response) => return Ok(response),
+            };
+        if peers.is_empty() || peers.len() > self.config.max_permissions_per_allocation {
+            return Self::error_response(
+                message,
+                508,
+                "Insufficient Capacity",
+                Some(&authenticated),
+                None,
+            );
+        }
+        let Some(allocation) = self.allocations.get_mut(&client) else {
+            return Self::error_response(
+                message,
+                437,
+                "Allocation Mismatch",
+                Some(&authenticated),
+                None,
+            );
+        };
+        if allocation.node_id != authenticated.node_id() {
+            return Self::error_response(
+                message,
+                441,
+                "Wrong Credentials",
+                Some(&authenticated),
+                None,
+            );
+        }
+        allocation.idle_deadline = checked_deadline(
+            now,
+            self.config.idle_timeout_seconds,
+            "allocation idle timeout",
+        )?;
+        let sender = allocation.command_sender.clone();
+        let (response_sender, response_receiver) = oneshot::channel();
+        if sender
+            .send(AllocationCommand::CreatePermissions {
+                peers,
+                now,
+                response: response_sender,
+            })
+            .await
+            .is_err()
+        {
+            self.allocations.remove(&client);
+            return Self::error_response(
+                message,
+                437,
+                "Allocation Mismatch",
+                Some(&authenticated),
+                None,
+            );
+        }
+        match response_receiver.await {
+            Ok(Ok(())) => encode_response(
+                message.message_type().method,
+                StunClass::SuccessResponse,
+                message.transaction_id(),
+                vec![OwnedAttribute::new(
+                    StunAttributeType::SOFTWARE,
+                    SOFTWARE.to_vec(),
+                )],
+                Some(&authenticated),
+            ),
+            Ok(Err(AllocationMutationError::Capacity)) => Self::error_response(
+                message,
+                508,
+                "Insufficient Capacity",
+                Some(&authenticated),
+                None,
+            ),
+            Ok(Err(AllocationMutationError::Conflict)) => {
+                Self::error_response(message, 400, "Bad Request", Some(&authenticated), None)
+            }
+            Ok(Err(AllocationMutationError::DeadlineOverflow)) => {
+                Err(TurnRelayError::DeadlineOverflow {
+                    field: "permission lifetime",
+                })
+            }
+            Err(_closed) => {
+                self.allocations.remove(&client);
+                Self::error_response(
+                    message,
+                    437,
+                    "Allocation Mismatch",
+                    Some(&authenticated),
+                    None,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_channel_bind(
+        &mut self,
+        message: &StunMessageView<'_>,
+        client: SocketAddr,
+        now_unix: u64,
+        now: Instant,
+    ) -> Result<Vec<u8>, TurnRelayError> {
+        let authenticated = match self.authenticate(message, now_unix)? {
+            AuthenticationDecision::Authenticated(value) => value,
+            AuthenticationDecision::Response(response) => return Ok(response),
+        };
+        let unknown = unknown_required_attributes(message)?;
+        if !unknown.is_empty() {
+            return Self::error_response(
+                message,
+                420,
+                "Unknown Attribute",
+                Some(&authenticated),
+                Some(&unknown),
+            );
+        }
+        let channel =
+            match Self::validated_method_value(channel_number(message), message, &authenticated)? {
+                Ok(channel) => channel,
+                Err(response) => return Ok(response),
+            };
+        let peers =
+            match Self::validated_method_value(peer_addresses(message), message, &authenticated)? {
+                Ok(peers) => peers,
+                Err(response) => return Ok(response),
+            };
+        let Some(peer) = peers
+            .as_slice()
+            .first()
+            .copied()
+            .filter(|_| peers.len() == 1)
+        else {
+            return Self::error_response(message, 400, "Bad Request", Some(&authenticated), None);
+        };
+        let Some(allocation) = self.allocations.get_mut(&client) else {
+            return Self::error_response(
+                message,
+                437,
+                "Allocation Mismatch",
+                Some(&authenticated),
+                None,
+            );
+        };
+        if allocation.node_id != authenticated.node_id() {
+            return Self::error_response(
+                message,
+                441,
+                "Wrong Credentials",
+                Some(&authenticated),
+                None,
+            );
+        }
+        allocation.idle_deadline = checked_deadline(
+            now,
+            self.config.idle_timeout_seconds,
+            "allocation idle timeout",
+        )?;
+        let sender = allocation.command_sender.clone();
+        let (response_sender, response_receiver) = oneshot::channel();
+        if sender
+            .send(AllocationCommand::BindChannel {
+                channel,
+                peer,
+                now,
+                response: response_sender,
+            })
+            .await
+            .is_err()
+        {
+            self.allocations.remove(&client);
+            return Self::error_response(
+                message,
+                437,
+                "Allocation Mismatch",
+                Some(&authenticated),
+                None,
+            );
+        }
+        match response_receiver.await {
+            Ok(Ok(())) => encode_response(
+                message.message_type().method,
+                StunClass::SuccessResponse,
+                message.transaction_id(),
+                vec![OwnedAttribute::new(
+                    StunAttributeType::SOFTWARE,
+                    SOFTWARE.to_vec(),
+                )],
+                Some(&authenticated),
+            ),
+            Ok(Err(AllocationMutationError::Capacity)) => Self::error_response(
+                message,
+                508,
+                "Insufficient Capacity",
+                Some(&authenticated),
+                None,
+            ),
+            Ok(Err(AllocationMutationError::Conflict)) => {
+                Self::error_response(message, 400, "Bad Request", Some(&authenticated), None)
+            }
+            Ok(Err(AllocationMutationError::DeadlineOverflow)) => {
+                Err(TurnRelayError::DeadlineOverflow {
+                    field: "channel binding lifetime",
+                })
+            }
+            Err(_closed) => {
+                self.allocations.remove(&client);
+                Self::error_response(
+                    message,
+                    437,
+                    "Allocation Mismatch",
+                    Some(&authenticated),
+                    None,
+                )
+            }
+        }
+    }
+
+    async fn handle_send_indication(
+        &mut self,
+        message: &StunMessageView<'_>,
+        client: SocketAddr,
+        now: Instant,
+    ) {
+        let Ok(unknown) = unknown_required_attributes(message) else {
+            return;
+        };
+        if !unknown.is_empty() {
+            return;
+        }
+        let Ok(peers) = peer_addresses(message) else {
+            return;
+        };
+        let Some(peer) = peers
+            .as_slice()
+            .first()
+            .copied()
+            .filter(|_| peers.len() == 1)
+        else {
+            return;
+        };
+        let Ok(Some(data)) = unique_attribute(message, StunAttributeType::DATA) else {
+            return;
+        };
+        if data.len() > self.config.max_datagram_size {
+            return;
+        }
+        let Some(allocation) = self.allocations.get_mut(&client) else {
+            return;
+        };
+        let Ok(idle_deadline) = checked_deadline(
+            now,
+            self.config.idle_timeout_seconds,
+            "allocation idle timeout",
+        ) else {
+            return;
+        };
+        allocation.idle_deadline = idle_deadline;
+        let _result = allocation
+            .command_sender
+            .send(AllocationCommand::SendToPeer {
+                peer,
+                data: data.to_vec(),
+                now,
+            })
+            .await;
+    }
+
+    async fn handle_channel_data(
+        &mut self,
+        client: SocketAddr,
+        channel_data: TurnChannelDataView<'_>,
+        now: Instant,
+    ) {
+        if channel_data.data().len() > self.config.max_datagram_size {
+            return;
+        }
+        let Some(allocation) = self.allocations.get_mut(&client) else {
+            return;
+        };
+        let Ok(idle_deadline) = checked_deadline(
+            now,
+            self.config.idle_timeout_seconds,
+            "allocation idle timeout",
+        ) else {
+            return;
+        };
+        allocation.idle_deadline = idle_deadline;
+        let _result = allocation
+            .command_sender
+            .send(AllocationCommand::SendChannelData {
+                channel: channel_data.channel(),
+                data: channel_data.data().to_vec(),
+                now,
+            })
+            .await;
     }
 
     fn authenticate(
@@ -642,7 +1032,7 @@ impl fmt::Debug for TurnUdpRelay {
 
 struct Allocation {
     node_id: NodeId,
-    _socket: UdpSocket,
+    command_sender: mpsc::Sender<AllocationCommand>,
     relayed_address: SocketAddr,
     expires_at: Instant,
     idle_deadline: Instant,
@@ -657,6 +1047,262 @@ impl fmt::Debug for Allocation {
             .field("expires_at", &self.expires_at)
             .field("idle_deadline", &self.idle_deadline)
             .finish_non_exhaustive()
+    }
+}
+
+enum AllocationCommand {
+    CreatePermissions {
+        peers: Vec<SocketAddr>,
+        now: Instant,
+        response: oneshot::Sender<Result<(), AllocationMutationError>>,
+    },
+    BindChannel {
+        channel: TurnChannelNumber,
+        peer: SocketAddr,
+        now: Instant,
+        response: oneshot::Sender<Result<(), AllocationMutationError>>,
+    },
+    SendToPeer {
+        peer: SocketAddr,
+        data: Vec<u8>,
+        now: Instant,
+    },
+    SendChannelData {
+        channel: TurnChannelNumber,
+        data: Vec<u8>,
+        now: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AllocationMutationError {
+    Capacity,
+    Conflict,
+    DeadlineOverflow,
+}
+
+struct ChannelBinding {
+    peer: SocketAddr,
+    expires_at: Instant,
+}
+
+struct AllocationActor {
+    socket: UdpSocket,
+    control: Arc<UdpSocket>,
+    client: SocketAddr,
+    max_datagram_size: usize,
+    max_permissions: usize,
+    max_channels: usize,
+    permissions: HashMap<IpAddr, Instant>,
+    channels: HashMap<TurnChannelNumber, ChannelBinding>,
+}
+
+async fn run_allocation_actor(
+    socket: UdpSocket,
+    control: Arc<UdpSocket>,
+    client: SocketAddr,
+    max_datagram_size: usize,
+    max_permissions: usize,
+    max_channels: usize,
+    mut commands: mpsc::Receiver<AllocationCommand>,
+) {
+    let mut actor = AllocationActor {
+        socket,
+        control,
+        client,
+        max_datagram_size,
+        max_permissions,
+        max_channels,
+        permissions: HashMap::new(),
+        channels: HashMap::new(),
+    };
+    let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_LENGTH];
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    return;
+                };
+                actor.handle_command(command).await;
+            }
+            received = actor.socket.recv_from(&mut receive_buffer) => {
+                let Ok((length, peer)) = received else {
+                    return;
+                };
+                actor.handle_peer_datagram(peer, &receive_buffer[..length]).await;
+            }
+        }
+    }
+}
+
+impl AllocationActor {
+    async fn handle_command(&mut self, command: AllocationCommand) {
+        match command {
+            AllocationCommand::CreatePermissions {
+                peers,
+                now,
+                response,
+            } => {
+                let result = self.create_permissions(&peers, now);
+                let _result = response.send(result);
+            }
+            AllocationCommand::BindChannel {
+                channel,
+                peer,
+                now,
+                response,
+            } => {
+                let result = self.bind_channel(channel, peer, now);
+                let _result = response.send(result);
+            }
+            AllocationCommand::SendToPeer { peer, data, now } => {
+                self.send_to_peer(peer, &data, None, now).await;
+            }
+            AllocationCommand::SendChannelData { channel, data, now } => {
+                self.cleanup(now);
+                let Some(peer) = self.channels.get(&channel).map(|binding| binding.peer) else {
+                    return;
+                };
+                self.send_to_peer(peer, &data, Some(channel), now).await;
+            }
+        }
+    }
+
+    fn create_permissions(
+        &mut self,
+        peers: &[SocketAddr],
+        now: Instant,
+    ) -> Result<(), AllocationMutationError> {
+        self.cleanup(now);
+        let expires_at = now
+            .checked_add(PERMISSION_LIFETIME)
+            .ok_or(AllocationMutationError::DeadlineOverflow)?;
+        let mut new_ips = peers
+            .iter()
+            .map(SocketAddr::ip)
+            .filter(|ip| !self.permissions.contains_key(ip))
+            .collect::<Vec<_>>();
+        new_ips.sort_unstable();
+        new_ips.dedup();
+        if self.permissions.len().saturating_add(new_ips.len()) > self.max_permissions {
+            return Err(AllocationMutationError::Capacity);
+        }
+        for peer in peers {
+            self.permissions.insert(peer.ip(), expires_at);
+        }
+        Ok(())
+    }
+
+    fn bind_channel(
+        &mut self,
+        channel: TurnChannelNumber,
+        peer: SocketAddr,
+        now: Instant,
+    ) -> Result<(), AllocationMutationError> {
+        self.cleanup(now);
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|binding| binding.peer != peer)
+            || self
+                .channels
+                .iter()
+                .any(|(bound_channel, binding)| *bound_channel != channel && binding.peer == peer)
+        {
+            return Err(AllocationMutationError::Conflict);
+        }
+        let new_permission = !self.permissions.contains_key(&peer.ip());
+        let new_channel = !self.channels.contains_key(&channel);
+        if (new_permission && self.permissions.len() >= self.max_permissions)
+            || (new_channel && self.channels.len() >= self.max_channels)
+        {
+            return Err(AllocationMutationError::Capacity);
+        }
+        let permission_expires = now
+            .checked_add(PERMISSION_LIFETIME)
+            .ok_or(AllocationMutationError::DeadlineOverflow)?;
+        let channel_expires = now
+            .checked_add(CHANNEL_BINDING_LIFETIME)
+            .ok_or(AllocationMutationError::DeadlineOverflow)?;
+        self.permissions.insert(peer.ip(), permission_expires);
+        self.channels.insert(
+            channel,
+            ChannelBinding {
+                peer,
+                expires_at: channel_expires,
+            },
+        );
+        Ok(())
+    }
+
+    async fn send_to_peer(
+        &mut self,
+        peer: SocketAddr,
+        data: &[u8],
+        required_channel: Option<TurnChannelNumber>,
+        now: Instant,
+    ) {
+        self.cleanup(now);
+        if data.len() > self.max_datagram_size
+            || !self.permissions.contains_key(&peer.ip())
+            || required_channel.is_some_and(|channel| {
+                self.channels
+                    .get(&channel)
+                    .is_none_or(|binding| binding.peer != peer)
+            })
+        {
+            return;
+        }
+        let _result = self.socket.send_to(data, peer).await;
+    }
+
+    async fn handle_peer_datagram(&mut self, peer: SocketAddr, data: &[u8]) {
+        let now = Instant::now();
+        self.cleanup(now);
+        if data.len() > self.max_datagram_size || !self.permissions.contains_key(&peer.ip()) {
+            return;
+        }
+        let channel = self
+            .channels
+            .iter()
+            .find_map(|(channel, binding)| (binding.peer == peer).then_some(*channel));
+        let encoded = if let Some(channel) = channel {
+            let mut encoded = vec![0_u8; data.len().saturating_add(4)];
+            let Ok(length) = encode_turn_channel_data(channel, data, &mut encoded) else {
+                return;
+            };
+            encoded.truncate(length);
+            encoded
+        } else {
+            let Some(transaction_id) = random_transaction_id() else {
+                return;
+            };
+            let Ok(peer_value) = xor_address_value(peer, transaction_id) else {
+                return;
+            };
+            let Ok(encoded) = encode_response(
+                StunMethod::Data,
+                StunClass::Indication,
+                transaction_id,
+                vec![
+                    OwnedAttribute::new(StunAttributeType::XOR_PEER_ADDRESS, peer_value),
+                    OwnedAttribute::new(StunAttributeType::DATA, data.to_vec()),
+                ],
+                None,
+            ) else {
+                return;
+            };
+            encoded
+        };
+        let _result = self.control.send_to(&encoded, self.client).await;
+    }
+
+    fn cleanup(&mut self, now: Instant) {
+        self.permissions
+            .retain(|_peer_ip, expires_at| *expires_at > now);
+        self.channels.retain(|_channel, binding| {
+            binding.expires_at > now && self.permissions.contains_key(&binding.peer.ip())
+        });
     }
 }
 
@@ -751,6 +1397,51 @@ fn unique_attribute<'a>(
         }
     }
     Ok(found)
+}
+
+fn peer_addresses(message: &StunMessageView<'_>) -> Result<Vec<SocketAddr>, TurnRelayError> {
+    let mut peers = Vec::new();
+    for attribute in message.attributes() {
+        let attribute = attribute?;
+        if attribute.attribute_type() != StunAttributeType::XOR_PEER_ADDRESS {
+            continue;
+        }
+        let peer = decode_stun_xor_address(attribute.value(), message.transaction_id())?;
+        if peers.contains(&peer) {
+            return Err(TurnRelayError::MalformedRequest {
+                detail: "duplicate XOR-PEER-ADDRESS",
+            });
+        }
+        peers.push(peer);
+    }
+    Ok(peers)
+}
+
+fn channel_number(message: &StunMessageView<'_>) -> Result<TurnChannelNumber, TurnRelayError> {
+    let Some(value) = unique_attribute(message, StunAttributeType::CHANNEL_NUMBER)? else {
+        return Err(TurnRelayError::MalformedRequest {
+            detail: "missing CHANNEL-NUMBER",
+        });
+    };
+    let bytes = <[u8; 4]>::try_from(value).map_err(|_| TurnRelayError::MalformedRequest {
+        detail: "CHANNEL-NUMBER must contain four bytes",
+    })?;
+    if bytes[2..] != [0, 0] {
+        return Err(TurnRelayError::MalformedRequest {
+            detail: "CHANNEL-NUMBER reserved bytes must be zero",
+        });
+    }
+    TurnChannelNumber::new(u16::from_be_bytes([bytes[0], bytes[1]])).ok_or(
+        TurnRelayError::MalformedRequest {
+            detail: "CHANNEL-NUMBER is outside the dynamic range",
+        },
+    )
+}
+
+fn random_transaction_id() -> Option<StunTransactionId> {
+    let mut bytes = [0_u8; 12];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(StunTransactionId::from_bytes(bytes))
 }
 
 fn requested_lifetime(
@@ -891,6 +1582,13 @@ pub enum TurnRelayError {
         #[source]
         source: std::io::Error,
     },
+    /// A per-allocation actor panicked or was cancelled unexpectedly.
+    #[error("TURN allocation task failed")]
+    AllocationTaskJoin {
+        /// Tokio task join failure.
+        #[source]
+        source: tokio::task::JoinError,
+    },
     /// System wall clock precedes the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     ClockBeforeUnixEpoch,
@@ -931,9 +1629,10 @@ mod tests {
     use sha2::{Digest, Sha256};
     use stella_common::{NodeId, RelayId};
     use stella_proto::{
-        decode_stun_xor_address, encode_stun_message, StunAttributeRef, StunAttributeType,
-        StunClass, StunErrorCodeView, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
-        StunPasswordAlgorithm, StunTransactionId,
+        decode_stun_xor_address, encode_stun_message, encode_stun_xor_address,
+        encode_turn_channel_data, StunAttributeRef, StunAttributeType, StunClass,
+        StunErrorCodeView, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
+        StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
     };
     use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
     use zeroize::Zeroizing;
@@ -942,6 +1641,12 @@ mod tests {
     use crate::relay_credentials::RelayCredentialAuthority;
 
     type HmacSha256 = Hmac<Sha256>;
+
+    struct TestAllocation {
+        realm: Vec<u8>,
+        nonce: Vec<u8>,
+        relayed_address: SocketAddr,
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -1068,6 +1773,322 @@ mod tests {
             .expect("relay runtime");
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn permissions_send_data_and_channel_data_preserve_datagrams() {
+        let relay_id = RelayId::from_bytes([0x71; 16]);
+        let node_a = NodeId::from_bytes([0x72; 16]);
+        let node_b = NodeId::from_bytes([0x73; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x74; 32], 300).expect("credential authority");
+        let now = unix_time_for_test();
+        let credential_a = authority
+            .issue(relay_id, node_a, now)
+            .expect("issue credential A");
+        let credential_b = authority
+            .issue(relay_id, node_b, now)
+            .expect("issue credential B");
+        let config = TurnUdpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let relay = TurnUdpRelay::bind(config, authority)
+            .await
+            .expect("bind TURN relay");
+        let relay_address = relay.local_address().expect("relay address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(relay.run(async move {
+            let _result = shutdown_rx.await;
+        }));
+        let client_a = bind_test_client().await;
+        let client_b = bind_test_client().await;
+        let allocation_a = allocate_test_client(
+            &client_a,
+            relay_address,
+            credential_a.username(),
+            credential_a.secret(),
+            10,
+        )
+        .await;
+        let allocation_b = allocate_test_client(
+            &client_b,
+            relay_address,
+            credential_b.username(),
+            credential_b.secret(),
+            20,
+        )
+        .await;
+
+        create_permission(
+            &client_a,
+            relay_address,
+            credential_a.username(),
+            credential_a.secret(),
+            &allocation_a,
+            allocation_b.relayed_address,
+            30,
+        )
+        .await;
+        create_permission(
+            &client_b,
+            relay_address,
+            credential_b.username(),
+            credential_b.secret(),
+            &allocation_b,
+            allocation_a.relayed_address,
+            31,
+        )
+        .await;
+
+        send_indication(
+            &client_a,
+            relay_address,
+            allocation_b.relayed_address,
+            b"first datagram",
+            40,
+        )
+        .await;
+        let first = receive_owned_message(&client_b).await;
+        let first = StunMessageView::decode(&first).expect("decode Data indication");
+        assert_eq!(first.message_type().method, StunMethod::Data);
+        assert_eq!(first.message_type().class, StunClass::Indication);
+        assert_eq!(
+            required_attribute(&first, StunAttributeType::DATA),
+            b"first datagram"
+        );
+        assert_eq!(
+            decode_stun_xor_address(
+                required_attribute(&first, StunAttributeType::XOR_PEER_ADDRESS),
+                first.transaction_id(),
+            )
+            .expect("decode peer address"),
+            allocation_a.relayed_address
+        );
+
+        let channel = TurnChannelNumber::new(0x4001).expect("channel number");
+        bind_channel(
+            &client_b,
+            relay_address,
+            credential_b.username(),
+            credential_b.secret(),
+            &allocation_b,
+            channel,
+            allocation_a.relayed_address,
+            50,
+        )
+        .await;
+        send_indication(
+            &client_a,
+            relay_address,
+            allocation_b.relayed_address,
+            b"channel receive",
+            51,
+        )
+        .await;
+        let channel_record = receive_owned_message(&client_b).await;
+        let channel_record =
+            TurnChannelDataView::decode_datagram(&channel_record).expect("decode ChannelData");
+        assert_eq!(channel_record.channel(), channel);
+        assert_eq!(channel_record.data(), b"channel receive");
+
+        let mut outbound_channel = vec![0_u8; 64];
+        let length = encode_turn_channel_data(channel, b"channel send", &mut outbound_channel)
+            .expect("encode client ChannelData");
+        client_b
+            .send_to(&outbound_channel[..length], relay_address)
+            .await
+            .expect("send client ChannelData");
+        let received_by_a = receive_owned_message(&client_a).await;
+        let received_by_a =
+            StunMessageView::decode(&received_by_a).expect("decode peer Data indication");
+        assert_eq!(
+            required_attribute(&received_by_a, StunAttributeType::DATA),
+            b"channel send"
+        );
+
+        let _result = shutdown_tx.send(());
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("relay shutdown deadline")
+            .expect("relay task join")
+            .expect("relay runtime");
+    }
+
+    async fn bind_test_client() -> UdpSocket {
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind test client")
+    }
+
+    async fn allocate_test_client(
+        client: &UdpSocket,
+        relay: SocketAddr,
+        username: &[u8],
+        password: &[u8],
+        seed: u8,
+    ) -> TestAllocation {
+        let requested_transport = [17, 0, 0, 0];
+        send_message(
+            client,
+            relay,
+            StunMethod::Allocate,
+            StunTransactionId::from_bytes([seed; 12]),
+            &[StunAttributeRef {
+                attribute_type: StunAttributeType::REQUESTED_TRANSPORT,
+                value: &requested_transport,
+            }],
+        )
+        .await;
+        let challenge = receive_owned_message(client).await;
+        let challenge = StunMessageView::decode(&challenge).expect("decode Allocate challenge");
+        assert_error(&challenge, 401);
+        let realm = required_attribute(&challenge, StunAttributeType::REALM).to_vec();
+        let nonce = required_attribute(&challenge, StunAttributeType::NONCE).to_vec();
+        let transaction_id = StunTransactionId::from_bytes([seed.saturating_add(1); 12]);
+        let request = signed_request(
+            StunMethod::Allocate,
+            transaction_id,
+            username,
+            &realm,
+            &nonce,
+            password,
+            &[StunAttributeRef {
+                attribute_type: StunAttributeType::REQUESTED_TRANSPORT,
+                value: &requested_transport,
+            }],
+        );
+        client
+            .send_to(&request, relay)
+            .await
+            .expect("send authenticated Allocate");
+        let response = receive_owned_message(client).await;
+        let response = StunMessageView::decode(&response).expect("decode Allocate response");
+        assert_eq!(response.message_type().class, StunClass::SuccessResponse);
+        let relayed_address = decode_stun_xor_address(
+            required_attribute(&response, StunAttributeType::XOR_RELAYED_ADDRESS),
+            transaction_id,
+        )
+        .expect("decode relayed address");
+        TestAllocation {
+            realm,
+            nonce,
+            relayed_address,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_permission(
+        client: &UdpSocket,
+        relay: SocketAddr,
+        username: &[u8],
+        password: &[u8],
+        allocation: &TestAllocation,
+        peer: SocketAddr,
+        seed: u8,
+    ) {
+        let transaction_id = StunTransactionId::from_bytes([seed; 12]);
+        let peer_value = encoded_xor_address(peer, transaction_id);
+        let request = signed_request(
+            StunMethod::CreatePermission,
+            transaction_id,
+            username,
+            &allocation.realm,
+            &allocation.nonce,
+            password,
+            &[StunAttributeRef {
+                attribute_type: StunAttributeType::XOR_PEER_ADDRESS,
+                value: &peer_value,
+            }],
+        );
+        client
+            .send_to(&request, relay)
+            .await
+            .expect("send CreatePermission");
+        let response = receive_message(client).await;
+        assert_eq!(response.message_type().class, StunClass::SuccessResponse);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bind_channel(
+        client: &UdpSocket,
+        relay: SocketAddr,
+        username: &[u8],
+        password: &[u8],
+        allocation: &TestAllocation,
+        channel: TurnChannelNumber,
+        peer: SocketAddr,
+        seed: u8,
+    ) {
+        let transaction_id = StunTransactionId::from_bytes([seed; 12]);
+        let peer_value = encoded_xor_address(peer, transaction_id);
+        let mut channel_value = [0_u8; 4];
+        channel_value[..2].copy_from_slice(&channel.get().to_be_bytes());
+        let request = signed_request(
+            StunMethod::ChannelBind,
+            transaction_id,
+            username,
+            &allocation.realm,
+            &allocation.nonce,
+            password,
+            &[
+                StunAttributeRef {
+                    attribute_type: StunAttributeType::CHANNEL_NUMBER,
+                    value: &channel_value,
+                },
+                StunAttributeRef {
+                    attribute_type: StunAttributeType::XOR_PEER_ADDRESS,
+                    value: &peer_value,
+                },
+            ],
+        );
+        client
+            .send_to(&request, relay)
+            .await
+            .expect("send ChannelBind");
+        let response = receive_message(client).await;
+        assert_eq!(response.message_type().class, StunClass::SuccessResponse);
+    }
+
+    async fn send_indication(
+        client: &UdpSocket,
+        relay: SocketAddr,
+        peer: SocketAddr,
+        data: &[u8],
+        seed: u8,
+    ) {
+        let transaction_id = StunTransactionId::from_bytes([seed; 12]);
+        let peer_value = encoded_xor_address(peer, transaction_id);
+        let encoded = encode_message_with_class(
+            StunMethod::Send,
+            StunClass::Indication,
+            transaction_id,
+            &[
+                StunAttributeRef {
+                    attribute_type: StunAttributeType::XOR_PEER_ADDRESS,
+                    value: &peer_value,
+                },
+                StunAttributeRef {
+                    attribute_type: StunAttributeType::DATA,
+                    value: data,
+                },
+            ],
+        );
+        client
+            .send_to(&encoded, relay)
+            .await
+            .expect("send Send indication");
+    }
+
+    fn encoded_xor_address(address: SocketAddr, transaction_id: StunTransactionId) -> Vec<u8> {
+        let mut value = vec![0_u8; if address.is_ipv4() { 8 } else { 20 }];
+        let length = encode_stun_xor_address(address, transaction_id, &mut value)
+            .expect("encode XOR peer address");
+        value.truncate(length);
+        value
+    }
+
     fn signed_request(
         method: StunMethod,
         transaction_id: StunTransactionId,
@@ -1140,8 +2161,17 @@ mod tests {
         transaction_id: StunTransactionId,
         attributes: &[StunAttributeRef<'_>],
     ) -> Vec<u8> {
+        encode_message_with_class(method, StunClass::Request, transaction_id, attributes)
+    }
+
+    fn encode_message_with_class(
+        method: StunMethod,
+        class: StunClass,
+        transaction_id: StunTransactionId,
+        attributes: &[StunAttributeRef<'_>],
+    ) -> Vec<u8> {
         let message = StunMessageRef {
-            message_type: StunMessageType::new(method, StunClass::Request),
+            message_type: StunMessageType::new(method, class),
             transaction_id,
             attributes,
         };
