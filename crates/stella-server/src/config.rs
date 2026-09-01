@@ -1,14 +1,24 @@
 //! Strict versioned controller configuration.
 
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
+use stella_common::RelayId;
+use stella_proto::{
+    RelayAddress, RelayCarrierMask, RelayPorts, RelayServiceRef, RelayTrustRequirements,
+    StunServer, MAX_RELAY_SERVICES, MAX_STUN_SERVERS,
+};
 use thiserror::Error;
+
+use crate::relay_credentials::RelayCredential;
 
 /// Supported controller configuration schema version.
 pub const CONFIG_VERSION: u32 = 1;
@@ -44,6 +54,7 @@ pub struct ServerConfig {
     pub limits: LimitsConfig,
     /// Structured logging configuration.
     pub logging: LoggingConfig,
+    pub(crate) connectivity: Option<ConnectivityServicesConfig>,
 }
 
 impl ServerConfig {
@@ -113,6 +124,10 @@ impl ServerConfig {
         raw.limits.validate()?;
         raw.logging.validate()?;
 
+        let connectivity = raw
+            .connectivity
+            .map(|connectivity| ConnectivityServicesConfig::from_raw(connectivity, base_directory))
+            .transpose()?;
         Ok(Self {
             version: raw.version,
             listen: raw.listen,
@@ -122,7 +137,240 @@ impl ServerConfig {
             tls_private_key_path: resolve_path(base_directory, &raw.tls.private_key),
             limits: raw.limits,
             logging: raw.logging,
+            connectivity,
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectivityServicesConfig {
+    pub(crate) revision: u64,
+    pub(crate) credential_key_path: PathBuf,
+    pub(crate) credential_lifetime_seconds: u64,
+    pub(crate) stun_servers: Vec<StunServer>,
+    pub(crate) relay_services: Vec<RelayServiceConfig>,
+}
+
+impl ConnectivityServicesConfig {
+    fn from_raw(raw: RawConnectivityConfig, base: &Path) -> Result<Self, ConfigError> {
+        if raw.revision == 0 {
+            return Err(invalid_connectivity(
+                "configuration revision must be non-zero",
+            ));
+        }
+        validate_nonempty_path(&raw.credential_key, "connectivity.credential_key")?;
+        let _ = crate::relay_credentials::RelayCredentialAuthority::new(
+            [1; crate::relay_credentials::RELAY_CREDENTIAL_KEY_LENGTH],
+            raw.credential_lifetime_seconds,
+        )
+        .map_err(|_| invalid_connectivity("credential lifetime is outside protocol bounds"))?;
+        if !(1..=usize::from(MAX_STUN_SERVERS)).contains(&raw.stun_servers.len()) {
+            return Err(invalid_connectivity(
+                "STUN server count is outside protocol bounds",
+            ));
+        }
+        if !(1..=usize::from(MAX_RELAY_SERVICES)).contains(&raw.relays.len()) {
+            return Err(invalid_connectivity(
+                "relay service count is outside protocol bounds",
+            ));
+        }
+        let stun_servers = priority_stun_servers(&raw.stun_servers)?;
+        let mut relay_services = raw
+            .relays
+            .into_iter()
+            .map(RelayServiceConfig::from_raw)
+            .collect::<Result<Vec<_>, _>>()?;
+        relay_services.sort_by_key(|service| (service.priority, service.relay_id));
+        let mut relay_ids = BTreeSet::new();
+        if relay_services
+            .iter()
+            .any(|service| !relay_ids.insert(service.relay_id))
+        {
+            return Err(invalid_connectivity("relay IDs must be unique"));
+        }
+        Ok(Self {
+            revision: raw.revision,
+            credential_key_path: resolve_path(base, &raw.credential_key),
+            credential_lifetime_seconds: raw.credential_lifetime_seconds,
+            stun_servers,
+            relay_services,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RelayServiceConfig {
+    pub(crate) relay_id: RelayId,
+    pub(crate) carriers: RelayCarrierMask,
+    pub(crate) priority: u16,
+    pub(crate) max_datagram_size: u32,
+    pub(crate) allocation_lifetime_seconds: u32,
+    pub(crate) idle_timeout_seconds: u32,
+    pub(crate) hostname: String,
+    pub(crate) tls_server_name: String,
+    pub(crate) region: String,
+    pub(crate) trust: RelayTrustRequirements,
+    pub(crate) ports: RelayPorts,
+    pub(crate) addresses: Vec<RelayAddress>,
+    pub(crate) spki_pins: Vec<[u8; 32]>,
+}
+
+impl RelayServiceConfig {
+    fn from_raw(raw: RawRelayServiceConfig) -> Result<Self, ConfigError> {
+        let relay_id = RelayId::from_str(&raw.id)
+            .map_err(|_| invalid_connectivity("relay ID must be canonical hexadecimal"))?;
+        let ports = RelayPorts {
+            turn_udp: raw.turn_udp,
+            turn_tcp: raw.turn_tcp,
+            turn_tls: raw.turn_tls,
+            secure_websocket: raw.secure_websocket,
+        };
+        let carriers = relay_carriers(ports)?;
+        let addresses = priority_relay_addresses(&raw.addresses)?;
+        let mut spki_pins = raw
+            .spki_pins
+            .iter()
+            .map(|pin| decode_spki_pin(pin))
+            .collect::<Result<Vec<_>, _>>()?;
+        spki_pins.sort_unstable();
+        if spki_pins.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid_connectivity("relay SPKI pins must be unique"));
+        }
+        let trust_bits =
+            u8::from(raw.require_web_pki) | if spki_pins.is_empty() { 0 } else { 1 << 1 };
+        let trust = RelayTrustRequirements::from_bits(trust_bits)
+            .map_err(|_| invalid_connectivity("relay TLS trust is invalid"))?;
+        let service = Self {
+            relay_id,
+            carriers,
+            priority: raw.priority,
+            max_datagram_size: raw.max_datagram_size,
+            allocation_lifetime_seconds: raw.allocation_lifetime_seconds,
+            idle_timeout_seconds: raw.idle_timeout_seconds,
+            hostname: raw.hostname,
+            tls_server_name: raw.tls_server_name,
+            region: raw.region,
+            trust,
+            ports,
+            addresses,
+            spki_pins,
+        };
+        service
+            .as_ref(1, 301, b"placeholder", &[0; 32])
+            .validate()
+            .map_err(|_| invalid_connectivity("relay service violates protocol bounds"))?;
+        Ok(service)
+    }
+
+    pub(crate) fn with_credential<'a>(
+        &'a self,
+        credential: &'a RelayCredential,
+    ) -> RelayServiceRef<'a> {
+        self.as_ref(
+            credential.issued_at(),
+            credential.expires_at(),
+            credential.username(),
+            credential.secret(),
+        )
+    }
+
+    fn as_ref<'a>(
+        &'a self,
+        issued_at: u64,
+        expires_at: u64,
+        username: &'a [u8],
+        secret: &'a [u8],
+    ) -> RelayServiceRef<'a> {
+        RelayServiceRef {
+            relay_id: self.relay_id,
+            carriers: self.carriers,
+            priority: self.priority,
+            max_datagram_size: self.max_datagram_size,
+            allocation_lifetime_seconds: self.allocation_lifetime_seconds,
+            idle_timeout_seconds: self.idle_timeout_seconds,
+            credential_issued_at: issued_at,
+            credential_expires_at: expires_at,
+            hostname: &self.hostname,
+            tls_server_name: &self.tls_server_name,
+            credential_username: username,
+            credential_secret: secret,
+            region: &self.region,
+            trust: self.trust,
+            ports: self.ports,
+            addresses: &self.addresses,
+            spki_pins: &self.spki_pins,
+        }
+    }
+}
+
+fn priority_stun_servers(addresses: &[SocketAddr]) -> Result<Vec<StunServer>, ConfigError> {
+    addresses
+        .iter()
+        .enumerate()
+        .map(|(priority, address)| {
+            let priority = u8::try_from(priority)
+                .map_err(|_| invalid_connectivity("too many STUN servers"))?;
+            let server = StunServer {
+                priority,
+                address: *address,
+            };
+            server
+                .validate()
+                .map_err(|_| invalid_connectivity("STUN address is not usable"))?;
+            Ok(server)
+        })
+        .collect()
+}
+
+fn priority_relay_addresses(addresses: &[IpAddr]) -> Result<Vec<RelayAddress>, ConfigError> {
+    addresses
+        .iter()
+        .enumerate()
+        .map(|(priority, address)| {
+            let priority = u8::try_from(priority)
+                .map_err(|_| invalid_connectivity("too many relay addresses"))?;
+            let address = RelayAddress {
+                priority,
+                address: *address,
+            };
+            address
+                .validate()
+                .map_err(|_| invalid_connectivity("relay address is not usable"))?;
+            Ok(address)
+        })
+        .collect()
+}
+
+fn relay_carriers(ports: RelayPorts) -> Result<RelayCarrierMask, ConfigError> {
+    let bits = u16::from(ports.turn_udp != 0)
+        | (u16::from(ports.turn_tcp != 0) << 1)
+        | (u16::from(ports.turn_tls != 0) << 2)
+        | (u16::from(ports.secure_websocket != 0) << 3);
+    RelayCarrierMask::from_bits(bits)
+        .map_err(|_| invalid_connectivity("relay must enable at least one carrier"))
+}
+
+fn decode_spki_pin(text: &str) -> Result<[u8; 32], ConfigError> {
+    let encoded = text
+        .strip_prefix("sha256/")
+        .ok_or_else(|| invalid_connectivity("relay SPKI pin must start with sha256/"))?;
+    let decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid_connectivity("relay SPKI pin is not standard base64"))?;
+    if STANDARD.encode(&decoded) != encoded {
+        return Err(invalid_connectivity(
+            "relay SPKI pin is not canonical base64",
+        ));
+    }
+    decoded
+        .try_into()
+        .map_err(|_| invalid_connectivity("relay SPKI pin must contain 32 bytes"))
+}
+
+fn invalid_connectivity(reason: &'static str) -> ConfigError {
+    ConfigError::InvalidValue {
+        field: "connectivity",
+        reason,
     }
 }
 
@@ -302,6 +550,67 @@ struct RawServerConfig {
     limits: LimitsConfig,
     #[serde(default)]
     logging: LoggingConfig,
+    connectivity: Option<RawConnectivityConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConnectivityConfig {
+    revision: u64,
+    credential_key: PathBuf,
+    #[serde(default = "default_relay_credential_lifetime")]
+    credential_lifetime_seconds: u64,
+    stun_servers: Vec<SocketAddr>,
+    relays: Vec<RawRelayServiceConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelayServiceConfig {
+    id: String,
+    priority: u16,
+    #[serde(default = "default_relay_datagram_size")]
+    max_datagram_size: u32,
+    #[serde(default = "default_relay_allocation_lifetime")]
+    allocation_lifetime_seconds: u32,
+    #[serde(default = "default_relay_idle_timeout")]
+    idle_timeout_seconds: u32,
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    tls_server_name: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    require_web_pki: bool,
+    #[serde(default)]
+    turn_udp: u16,
+    #[serde(default)]
+    turn_tcp: u16,
+    #[serde(default)]
+    turn_tls: u16,
+    #[serde(default)]
+    secure_websocket: u16,
+    #[serde(default)]
+    addresses: Vec<IpAddr>,
+    #[serde(default)]
+    spki_pins: Vec<String>,
+}
+
+const fn default_relay_credential_lifetime() -> u64 {
+    300
+}
+
+const fn default_relay_datagram_size() -> u32 {
+    1_200
+}
+
+const fn default_relay_allocation_lifetime() -> u32 {
+    600
+}
+
+const fn default_relay_idle_timeout() -> u32 {
+    120
 }
 
 #[derive(Deserialize)]
@@ -366,6 +675,9 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use stella_proto::{RelayCarrierMask, RelayTrustRequirements};
+
     use super::{
         ConfigError, LimitsConfig, LoggingConfig, ServerConfig, CONFIG_VERSION, MAX_CONFIG_BYTES,
     };
@@ -408,6 +720,35 @@ private_key = "secrets/tls-key.pem"
         );
         assert_eq!(config.limits, LimitsConfig::default());
         assert_eq!(config.logging, LoggingConfig::default());
+        assert!(config.connectivity.is_none());
+    }
+
+    #[test]
+    fn connectivity_services_are_protocol_validated_and_canonicalized() {
+        let pin = format!("sha256/{}", STANDARD.encode([1_u8; 32]));
+        let document = format!(
+            "{VALID_CONFIG}\n[connectivity]\nrevision = 7\ncredential_key = \"secrets/relay-credential.key\"\ncredential_lifetime_seconds = 300\nstun_servers = [\"192.0.2.20:3478\", \"[2001:db8::20]:3478\"]\n\n[[connectivity.relays]]\nid = \"02020202020202020202020202020202\"\npriority = 20\nhostname = \"relay-b.example.com\"\ntls_server_name = \"relay-b.example.com\"\nregion = \"backup\"\nrequire_web_pki = true\nturn_tls = 443\naddresses = [\"192.0.2.31\"]\n\n[[connectivity.relays]]\nid = \"01010101010101010101010101010101\"\npriority = 10\nhostname = \"relay-a.example.com\"\ntls_server_name = \"relay-a.example.com\"\nregion = \"primary\"\nturn_udp = 3478\nturn_tls = 443\naddresses = [\"192.0.2.30\", \"2001:db8::30\"]\nspki_pins = [\"{pin}\"]\n"
+        );
+        let parsed = ServerConfig::parse(&document, Path::new("C:/stella"))
+            .expect("valid connectivity services");
+        let connectivity = parsed.connectivity.expect("connectivity configured");
+        assert_eq!(connectivity.revision, 7);
+        assert_eq!(
+            connectivity.credential_key_path,
+            Path::new("C:/stella/secrets/relay-credential.key")
+        );
+        assert_eq!(connectivity.stun_servers.len(), 2);
+        assert_eq!(connectivity.stun_servers[0].priority, 0);
+        assert_eq!(connectivity.stun_servers[1].priority, 1);
+        assert_eq!(connectivity.relay_services.len(), 2);
+        let primary = &connectivity.relay_services[0];
+        assert_eq!(primary.priority, 10);
+        assert!(primary.carriers.contains(RelayCarrierMask::TURN_UDP));
+        assert!(primary.carriers.contains(RelayCarrierMask::TURN_TLS));
+        assert!(primary.trust.contains(RelayTrustRequirements::SPKI_PIN));
+        assert_eq!(primary.addresses[0].priority, 0);
+        assert_eq!(primary.addresses[1].priority, 1);
+        assert_eq!(primary.spki_pins, vec![[1; 32]]);
     }
 
     #[test]
@@ -462,6 +803,28 @@ private_key = "secrets/tls-key.pem"
             ServerConfig::parse(&invalid_filter, Path::new(".")),
             Err(ConfigError::InvalidValue {
                 field: "logging.filter",
+                ..
+            })
+        ));
+
+        let no_carrier = format!(
+            "{VALID_CONFIG}\n[connectivity]\nrevision = 1\ncredential_key = \"relay.key\"\nstun_servers = [\"192.0.2.20:3478\"]\n\n[[connectivity.relays]]\nid = \"01010101010101010101010101010101\"\npriority = 0\naddresses = [\"192.0.2.30\"]\n"
+        );
+        assert!(matches!(
+            ServerConfig::parse(&no_carrier, Path::new(".")),
+            Err(ConfigError::InvalidValue {
+                field: "connectivity",
+                ..
+            })
+        ));
+
+        let invalid_stun = format!(
+            "{VALID_CONFIG}\n[connectivity]\nrevision = 1\ncredential_key = \"relay.key\"\nstun_servers = [\"127.0.0.1:3478\"]\nrelays = []\n"
+        );
+        assert!(matches!(
+            ServerConfig::parse(&invalid_stun, Path::new(".")),
+            Err(ConfigError::InvalidValue {
+                field: "connectivity",
                 ..
             })
         ));

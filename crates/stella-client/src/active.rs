@@ -34,11 +34,12 @@ pub struct ActiveControl {
 impl ActiveControl {
     /// Starts with an authenticated connection and no active forwarding state.
     #[must_use]
-    pub const fn new(connection: AuthenticatedControl) -> Self {
+    pub fn new(mut connection: AuthenticatedControl) -> Self {
+        let connectivity_config = connection.take_connectivity_config();
         Self {
             connection,
             networks: BTreeMap::new(),
-            connectivity_config: None,
+            connectivity_config,
             heartbeat_counter: 0,
         }
     }

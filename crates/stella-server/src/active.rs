@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     authority::{AuthorityError, AuthorityHandle},
+    connectivity_config::EncodedConnectivityConfig,
     network_state::{encode_network_state, EncodedNetworkState, NetworkStateError},
     runtime::{AcceptedSession, SessionContext},
     session::{authenticate_session, AuthenticatedSession, AuthenticationError},
@@ -63,10 +64,21 @@ pub async fn serve_control_session(session: AcceptedSession) -> Result<(), Contr
 pub async fn serve_authenticated_session(
     authenticated: AuthenticatedSession,
 ) -> Result<(), ActiveSessionError> {
-    let (stream, _peer_addr, context, node, protocol_version, inbound, outbound) =
-        authenticated.into_parts();
+    let (
+        stream,
+        _peer_addr,
+        context,
+        node,
+        protocol_version,
+        inbound,
+        outbound,
+        connectivity_expires_at,
+    ) = authenticated.into_parts();
     let mut shutdown = context.shutdown();
     let request_timeout = Duration::from_secs(context.limits().request_timeout_seconds);
+    let connectivity_refresh = connectivity_expires_at
+        .map(|expires_at| connectivity_refresh_deadline(expires_at, unix_time()?))
+        .transpose()?;
     let mut state = ActiveSessionState {
         stream,
         context,
@@ -77,17 +89,18 @@ pub async fn serve_authenticated_session(
         joined_networks: BTreeSet::new(),
         last_heartbeat: None,
         grant_refreshes: BTreeMap::new(),
+        connectivity_refresh,
     };
 
     loop {
-        let refresh_deadline = state.grant_refreshes.values().min().copied();
+        let refresh_deadline = next_refresh_deadline(&state);
         let wake = {
             let mut reader = RecordReader::new(&mut state.stream);
             if let Some(deadline) = refresh_deadline {
                 tokio::select! {
                     _ = shutdown.changed() => SessionWake::Shutdown,
                     result = reader.read_message() => SessionWake::Message(result),
-                    () = sleep_until(deadline) => SessionWake::GrantRefresh,
+                    () = sleep_until(deadline) => SessionWake::Refresh,
                 }
             } else {
                 tokio::select! {
@@ -111,8 +124,8 @@ pub async fn serve_authenticated_session(
                     Ok(Err(error)) => return Err(error),
                 }
             }
-            SessionWake::GrantRefresh => {
-                match timeout(request_timeout, refresh_due_grants(&mut state)).await {
+            SessionWake::Refresh => {
+                match timeout(request_timeout, refresh_due_state(&mut state)).await {
                     Err(_) => return Err(ActiveSessionError::RequestTimeout),
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => return Err(error),
@@ -125,7 +138,7 @@ pub async fn serve_authenticated_session(
 enum SessionWake {
     Shutdown,
     Message(Result<Option<stella_control::OwnedControlMessage>, ControlError>),
-    GrantRefresh,
+    Refresh,
 }
 
 struct ActiveSessionState {
@@ -138,6 +151,7 @@ struct ActiveSessionState {
     joined_networks: BTreeSet<NetworkId>,
     last_heartbeat: Option<u64>,
     grant_refreshes: BTreeMap<NetworkId, Instant>,
+    connectivity_refresh: Option<Instant>,
 }
 
 async fn process_request(
@@ -889,6 +903,42 @@ async fn handle_heartbeat(
     Ok(())
 }
 
+fn next_refresh_deadline(state: &ActiveSessionState) -> Option<Instant> {
+    state
+        .grant_refreshes
+        .values()
+        .copied()
+        .chain(state.connectivity_refresh)
+        .min()
+}
+
+async fn refresh_due_state(state: &mut ActiveSessionState) -> Result<(), ActiveSessionError> {
+    refresh_due_connectivity_config(state).await?;
+    refresh_due_grants(state).await
+}
+
+async fn refresh_due_connectivity_config(
+    state: &mut ActiveSessionState,
+) -> Result<(), ActiveSessionError> {
+    let Some(deadline) = state.connectivity_refresh else {
+        return Ok(());
+    };
+    if deadline > Instant::now() {
+        return Ok(());
+    }
+    let now = unix_time()?;
+    let config = state
+        .context
+        .connectivity()
+        .ok_or(ActiveSessionError::ConnectivityConfigUnavailable)?
+        .issue(state.node_id, now)
+        .map_err(|_| ActiveSessionError::ConnectivityConfigIssue)?;
+    let next_deadline = connectivity_refresh_deadline(config.credential_expires_at(), now)?;
+    send_connectivity_config(state, &config).await?;
+    state.connectivity_refresh = Some(next_deadline);
+    Ok(())
+}
+
 async fn refresh_due_grants(state: &mut ActiveSessionState) -> Result<(), ActiveSessionError> {
     let current = Instant::now();
     let due_networks = state
@@ -1083,6 +1133,23 @@ async fn send_connectivity_result(
     write_message(state, builder).await
 }
 
+async fn send_connectivity_config(
+    state: &mut ActiveSessionState,
+    config: &EncodedConnectivityConfig,
+) -> Result<(), ActiveSessionError> {
+    let mut builder = MessageBuilder::new(ControlMessageType::ConnectivityConfig);
+    builder.push_field(
+        ControlFieldType::ConnectivityConfigRevision,
+        &config.revision().to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::StunServerList, config.stun_server_list())?;
+    builder.push_field(
+        ControlFieldType::RelayServiceList,
+        config.relay_service_list(),
+    )?;
+    write_message(state, builder).await
+}
+
 async fn send_heartbeat_ack(
     state: &mut ActiveSessionState,
     correlation_id: u64,
@@ -1142,6 +1209,16 @@ fn grant_refresh_delay(encoded: &EncodedNetworkState) -> Result<Duration, Active
         .checked_sub(grant.not_before)
         .ok_or(ActiveSessionError::GrantLifetimeInvalid)?;
     Ok(Duration::from_secs(lifetime / 2))
+}
+
+fn connectivity_refresh_deadline(expires_at: u64, now: u64) -> Result<Instant, ActiveSessionError> {
+    Instant::now()
+        .checked_add(connectivity_refresh_delay(expires_at, now))
+        .ok_or(ActiveSessionError::ConnectivityRefreshDeadlineOverflow)
+}
+
+fn connectivity_refresh_delay(expires_at: u64, now: u64) -> Duration {
+    Duration::from_secs(expires_at.saturating_sub(now) / 2)
 }
 
 async fn send_leave_result(
@@ -1288,6 +1365,15 @@ pub enum ActiveSessionError {
     /// The monotonic clock could not represent the next refresh deadline.
     #[error("membership grant refresh deadline overflows monotonic time")]
     GrantRefreshDeadlineOverflow,
+    /// Authentication advertised connectivity services that are no longer present.
+    #[error("deployment connectivity configuration is unavailable during refresh")]
+    ConnectivityConfigUnavailable,
+    /// Fresh node-scoped relay credentials could not be issued.
+    #[error("unable to refresh deployment connectivity configuration")]
+    ConnectivityConfigIssue,
+    /// The monotonic clock could not represent the next credential refresh.
+    #[error("connectivity configuration refresh deadline overflows monotonic time")]
+    ConnectivityRefreshDeadlineOverflow,
     /// A codec-validated message unexpectedly lacked a required field.
     #[error("validated control message is missing required field {field:?}")]
     ValidatedFieldMissing {
@@ -1338,9 +1424,10 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        grant_refresh_delay, resolve_connectivity_update, resolve_endpoint_update, resolve_join,
-        resolve_leave, ConnectivityDecision, ConnectivityUpdate, EndpointDecision, EndpointUpdate,
-        JoinDecision, JoinRequest, LeaveDecision,
+        connectivity_refresh_delay, grant_refresh_delay, resolve_connectivity_update,
+        resolve_endpoint_update, resolve_join, resolve_leave, ConnectivityDecision,
+        ConnectivityUpdate, EndpointDecision, EndpointUpdate, JoinDecision, JoinRequest,
+        LeaveDecision,
     };
     use crate::{
         authority::AuthorityThread,
@@ -1394,6 +1481,16 @@ mod tests {
         let mut encoded = vec![0; generation.encoded_len().expect("generation length")];
         encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
         encoded
+    }
+
+    #[test]
+    fn connectivity_credentials_refresh_halfway_through_remaining_lifetime() {
+        assert_eq!(
+            connectivity_refresh_delay(1_300, 1_000),
+            Duration::from_secs(150)
+        );
+        assert_eq!(connectivity_refresh_delay(1_001, 1_000), Duration::ZERO);
+        assert_eq!(connectivity_refresh_delay(999, 1_000), Duration::ZERO);
     }
 
     #[allow(clippy::too_many_lines)]

@@ -7,6 +7,7 @@ pub mod authority;
 pub mod authorization;
 pub mod bootstrap;
 pub mod config;
+mod connectivity_config;
 pub mod identity;
 pub mod network_state;
 pub mod relay_credentials;

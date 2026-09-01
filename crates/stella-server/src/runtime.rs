@@ -25,6 +25,7 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use crate::{
     authority::{AuthorityError, AuthorityHandle, AuthorityThread},
     config::{ConfigError, LimitsConfig, ServerConfig},
+    connectivity_config::{ConnectivityConfigError, ConnectivityConfigIssuer},
     identity::{load_controller_identity, IdentityFileError},
     store::{AuthorityStore, StoreError},
     tls::{load_tls_server_config, TlsIdentityError},
@@ -51,6 +52,7 @@ pub struct SessionContext {
     controller_identity: Arc<IdentitySigningKey>,
     controller_id: ControllerId,
     limits: LimitsConfig,
+    connectivity: Option<Arc<ConnectivityConfigIssuer>>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -77,6 +79,10 @@ impl SessionContext {
     #[must_use]
     pub const fn limits(&self) -> LimitsConfig {
         self.limits
+    }
+
+    pub(crate) fn connectivity(&self) -> Option<&ConnectivityConfigIssuer> {
+        self.connectivity.as_deref()
     }
 
     /// Returns a receiver that changes to `true` when shutdown begins.
@@ -141,6 +147,7 @@ pub async fn run_controller(
         controller_id,
         tls_acceptor,
         store,
+        connectivity,
     } = prepared;
     let authority = AuthorityThread::spawn(
         store,
@@ -153,6 +160,7 @@ pub async fn run_controller(
         tls_acceptor,
         authority: authority.handle(),
         handler,
+        connectivity,
     };
     let result = serve_listener(listener, resources, shutdown).await;
     let shutdown_result = authority.shutdown().await;
@@ -169,6 +177,7 @@ struct PreparedController {
     controller_id: ControllerId,
     tls_acceptor: TlsAcceptor,
     store: AuthorityStore,
+    connectivity: Option<Arc<ConnectivityConfigIssuer>>,
 }
 
 struct ListenerResources {
@@ -178,6 +187,7 @@ struct ListenerResources {
     tls_acceptor: TlsAcceptor,
     authority: AuthorityHandle,
     handler: SessionHandler,
+    connectivity: Option<Arc<ConnectivityConfigIssuer>>,
 }
 
 impl PreparedController {
@@ -189,12 +199,19 @@ impl PreparedController {
         let tls_config =
             load_tls_server_config(&config.tls_certificate_path, &config.tls_private_key_path)?;
         let store = AuthorityStore::open(&config.database_path, controller_id)?;
+        let connectivity = config
+            .connectivity
+            .as_ref()
+            .map(ConnectivityConfigIssuer::load)
+            .transpose()?
+            .map(Arc::new);
         Ok(Self {
             config,
             controller_identity,
             controller_id,
             tls_acceptor: TlsAcceptor::from(tls_config),
             store,
+            connectivity,
         })
     }
 }
@@ -211,6 +228,7 @@ async fn serve_listener(
         tls_acceptor,
         authority,
         handler,
+        connectivity,
     } = resources;
     let limits = config.limits;
     let semaphore = Arc::new(Semaphore::new(limits.max_connections));
@@ -220,6 +238,7 @@ async fn serve_listener(
         controller_identity,
         controller_id,
         limits,
+        connectivity,
         shutdown: shutdown_receiver,
     };
     let mut tasks = JoinSet::new();
@@ -368,6 +387,13 @@ pub enum RuntimeError {
     /// Authority command or worker lifecycle failed.
     #[error(transparent)]
     Authority(#[from] AuthorityError),
+    /// Deployment connectivity service or credential-key loading failed.
+    #[error("deployment connectivity configuration failed: {source}")]
+    Connectivity {
+        /// Redacted configuration or protected-key failure.
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
+    },
     /// A validated queue size unexpectedly became zero.
     #[error("authority queue capacity unexpectedly became zero")]
     ZeroAuthorityQueue,
@@ -393,6 +419,14 @@ pub enum RuntimeError {
     /// The host clock is earlier than the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     ClockBeforeUnixEpoch,
+}
+
+impl From<ConnectivityConfigError> for RuntimeError {
+    fn from(source: ConnectivityConfigError) -> Self {
+        Self::Connectivity {
+            source: Box::new(source),
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

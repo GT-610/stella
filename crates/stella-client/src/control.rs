@@ -24,7 +24,7 @@ use tokio::{
 use tokio_rustls::{client::TlsStream, rustls::pki_types::ServerName};
 use zeroize::Zeroizing;
 
-use crate::{tls, ClientError, SpkiPin};
+use crate::{tls, ClientError, ConnectivityConfigState, SpkiPin};
 
 /// One redacted fixed-width enrollment or join bearer credential.
 #[derive(Clone)]
@@ -143,6 +143,7 @@ pub struct AuthenticatedControl {
     node_public_key: IdentityPublicKey,
     protocol_version: ProtocolVersion,
     server_time: u64,
+    connectivity_config: Option<ConnectivityConfigState>,
 }
 
 impl AuthenticatedControl {
@@ -180,6 +181,16 @@ impl AuthenticatedControl {
     #[must_use]
     pub const fn server_time(&self) -> u64 {
         self.server_time
+    }
+
+    /// Returns the initial deployment STUN and relay configuration, when advertised.
+    #[must_use]
+    pub const fn connectivity_config(&self) -> Option<&ConnectivityConfigState> {
+        self.connectivity_config.as_ref()
+    }
+
+    pub(crate) fn take_connectivity_config(&mut self) -> Option<ConnectivityConfigState> {
+        self.connectivity_config.take()
     }
 
     /// Builds and writes one ordered control message, returning its message ID.
@@ -225,6 +236,13 @@ impl fmt::Debug for AuthenticatedControl {
             .field("node_id", &self.node_id)
             .field("protocol_version", &self.protocol_version)
             .field("server_time", &self.server_time)
+            .field(
+                "connectivity_config_revision",
+                &self
+                    .connectivity_config
+                    .as_ref()
+                    .map(ConnectivityConfigState::revision),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -381,6 +399,39 @@ pub async fn authenticate_controller(
         field_value(&auth_result, ControlFieldType::ServerTime)?,
         "server time",
     )?;
+    let connectivity_revision = optional_u64(
+        &auth_result,
+        ControlFieldType::ConnectivityConfigRevision,
+        "connectivity configuration revision",
+    )?;
+    let connectivity_config = if let Some(revision) = connectivity_revision {
+        let message = read_expected(
+            &mut stream,
+            &mut inbound,
+            ControlMessageType::ConnectivityConfig,
+        )
+        .await?;
+        require_protocol_version(&message, protocol_version)?;
+        require_correlation(&message, 0)?;
+        let received_revision = decode_u64(
+            field_value(&message, ControlFieldType::ConnectivityConfigRevision)?,
+            "connectivity configuration revision",
+        )?;
+        if received_revision != revision {
+            return Err(ClientError::InconsistentControlField {
+                context: "AUTH_RESULT connectivity configuration",
+                field: "configuration revision",
+            });
+        }
+        Some(ConnectivityConfigState::from_wire(
+            received_revision,
+            field_value(&message, ControlFieldType::StunServerList)?,
+            field_value(&message, ControlFieldType::RelayServiceList)?,
+            server_time,
+        )?)
+    } else {
+        None
+    };
 
     let (read_half, write_half) = tokio::io::split(stream);
     let (sender, inbox) = mpsc::channel(32);
@@ -401,6 +452,7 @@ pub async fn authenticate_controller(
         node_public_key: identity.public_key(),
         protocol_version,
         server_time,
+        connectivity_config,
     })
 }
 
@@ -520,6 +572,19 @@ fn decode_u16(value: &[u8], field: &'static str) -> Result<u16, ClientError> {
 
 fn decode_u64(value: &[u8], field: &'static str) -> Result<u64, ClientError> {
     Ok(u64::from_be_bytes(fixed_array(value, field)?))
+}
+
+fn optional_u64(
+    message: &OwnedControlMessage,
+    field: ControlFieldType,
+    name: &'static str,
+) -> Result<Option<u64>, ClientError> {
+    for candidate in message.view()?.fields() {
+        if candidate.field_type() == Some(field) {
+            return decode_u64(candidate.value(), name).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn random_nonzero_nonce() -> Result<[u8; CONTROL_NONCE_LENGTH], ClientError> {

@@ -1280,6 +1280,10 @@ fn field_allowed(
                     ControlMessageType::ConnectivityUpdate,
                     ControlFieldType::ConnectivityGeneration
                 )
+                | (
+                    ControlMessageType::AuthResult,
+                    ControlFieldType::ConnectivityConfigRevision
+                )
                 | (ControlMessageType::Error, ControlFieldType::RetryAfterMs)
         )
 }

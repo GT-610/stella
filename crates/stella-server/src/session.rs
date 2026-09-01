@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     authority::AuthorityError,
+    connectivity_config::EncodedConnectivityConfig,
     runtime::{AcceptedSession, SessionContext},
     store::{BearerToken, NodeRecord},
 };
@@ -45,6 +46,7 @@ pub struct AuthenticatedSession {
     protocol_version: ProtocolVersion,
     inbound: InboundSequence,
     outbound: OutboundSequence,
+    connectivity_expires_at: Option<u64>,
 }
 
 impl AuthenticatedSession {
@@ -90,6 +92,7 @@ impl AuthenticatedSession {
         ProtocolVersion,
         InboundSequence,
         OutboundSequence,
+        Option<u64>,
     ) {
         (
             self.stream,
@@ -99,6 +102,7 @@ impl AuthenticatedSession {
             self.protocol_version,
             self.inbound,
             self.outbound,
+            self.connectivity_expires_at,
         )
     }
 }
@@ -221,14 +225,31 @@ async fn authenticate_inner(
     )
     .await?;
 
+    let now = unix_time()?;
+    let connectivity = if protocol_version == ProtocolVersion::V0_2 {
+        context
+            .connectivity()
+            .map(|issuer| issuer.issue(node.node_id(), now))
+            .transpose()
+            .map_err(|_| AuthenticationError::ConnectivityConfig)?
+    } else {
+        None
+    };
     send_auth_result(
         &mut stream,
         &mut outbound,
         node_auth_header.message_id,
         protocol_version,
         0,
+        now,
+        connectivity
+            .as_ref()
+            .map(EncodedConnectivityConfig::revision),
     )
     .await?;
+    if let Some(connectivity) = &connectivity {
+        send_connectivity_config(&mut stream, &mut outbound, connectivity).await?;
+    }
     Ok(AuthenticatedSession {
         stream,
         peer_addr,
@@ -237,6 +258,9 @@ async fn authenticate_inner(
         protocol_version,
         inbound,
         outbound,
+        connectivity_expires_at: connectivity
+            .as_ref()
+            .map(EncodedConnectivityConfig::credential_expires_at),
     })
 }
 
@@ -288,14 +312,41 @@ async fn send_auth_result(
     correlation_id: u64,
     version: ProtocolVersion,
     status: u16,
+    server_time: u64,
+    connectivity_revision: Option<u64>,
 ) -> Result<u64, AuthenticationError> {
     let status = status.to_be_bytes();
-    let server_time = unix_time()?.to_be_bytes();
+    let server_time = server_time.to_be_bytes();
     let mut builder = MessageBuilder::new(ControlMessageType::AuthResult)
         .with_version(version)
         .with_correlation(correlation_id);
     builder.push_field(ControlFieldType::StatusCode, &status)?;
     builder.push_field(ControlFieldType::ServerTime, &server_time)?;
+    if let Some(revision) = connectivity_revision {
+        builder.push_field(
+            ControlFieldType::ConnectivityConfigRevision,
+            &revision.to_be_bytes(),
+        )?;
+    }
+    write_built_message(stream, outbound, builder).await
+}
+
+async fn send_connectivity_config(
+    stream: &mut TlsStream<TcpStream>,
+    outbound: &mut OutboundSequence,
+    config: &EncodedConnectivityConfig,
+) -> Result<u64, AuthenticationError> {
+    let mut builder = MessageBuilder::new(ControlMessageType::ConnectivityConfig)
+        .with_version(ProtocolVersion::V0_2);
+    builder.push_field(
+        ControlFieldType::ConnectivityConfigRevision,
+        &config.revision().to_be_bytes(),
+    )?;
+    builder.push_field(ControlFieldType::StunServerList, config.stun_server_list())?;
+    builder.push_field(
+        ControlFieldType::RelayServiceList,
+        config.relay_service_list(),
+    )?;
     write_built_message(stream, outbound, builder).await
 }
 
@@ -357,7 +408,16 @@ async fn reject_authentication(
     version: ProtocolVersion,
     status: u16,
 ) -> Result<(), AuthenticationError> {
-    let _message_id = send_auth_result(stream, outbound, correlation_id, version, status).await?;
+    let _message_id = send_auth_result(
+        stream,
+        outbound,
+        correlation_id,
+        version,
+        status,
+        unix_time()?,
+        None,
+    )
+    .await?;
     sleep(random_failure_delay()?).await;
     let mut writer = RecordWriter::new(stream);
     writer.shutdown().await?;
@@ -651,6 +711,9 @@ pub enum AuthenticationError {
     /// Operating-system cryptographic randomness was unavailable.
     #[error("operating-system cryptographic randomness is unavailable")]
     RandomnessUnavailable,
+    /// Per-node STUN and relay configuration could not be issued.
+    #[error("unable to issue deployment connectivity configuration")]
+    ConnectivityConfig,
     /// The host wall clock is earlier than the Unix epoch.
     #[error("system clock is before the Unix epoch")]
     ClockBeforeUnixEpoch,
@@ -737,8 +800,8 @@ pub enum AuthenticationError {
 #[cfg(all(test, windows))]
 mod tests {
     use std::{
-        fs::File,
-        io::BufReader,
+        fs::{File, OpenOptions},
+        io::{BufReader, Write},
         net::SocketAddr,
         path::{Path, PathBuf},
         sync::{
@@ -756,7 +819,8 @@ mod tests {
     };
     use stella_crypto::{derive_node_id, IdentityPublicKey, IdentitySigningKey};
     use stella_proto::{
-        ControlFieldType, ControlMessageType, ProtocolVersion, VersionEntry, VersionListView,
+        ControlFieldType, ControlMessageType, ProtocolVersion, RelayServiceListView,
+        StunServerListView, VersionEntry, VersionListView,
     };
     use tokio::{
         io::AsyncReadExt,
@@ -774,6 +838,7 @@ mod tests {
     use crate::{
         bootstrap::{initialize_controller, BootstrapOptions},
         config::ServerConfig,
+        identity::create_protected_secret_file,
         runtime::{run_controller, SessionError, SessionHandler},
         store::{AuthorityStore, BearerToken},
     };
@@ -1039,6 +1104,55 @@ mod tests {
                 .try_into()
                 .expect("status width"),
         );
+        let connectivity_revision = auth_result
+            .view()
+            .expect("validated auth result")
+            .fields()
+            .find_map(|field| {
+                (field.field_type() == Some(ControlFieldType::ConnectivityConfigRevision)).then(
+                    || {
+                        u64::from_be_bytes(
+                            field
+                                .value()
+                                .try_into()
+                                .expect("connectivity revision width"),
+                        )
+                    },
+                )
+            });
+        if let Some(revision) = connectivity_revision {
+            let config = read_message(&mut tls).await;
+            let header = config.header().expect("connectivity config header");
+            inbound
+                .accept(header.message_id)
+                .expect("connectivity config sequence");
+            assert_eq!(header.message_type, ControlMessageType::ConnectivityConfig);
+            assert_eq!(header.version, protocol_version);
+            assert_eq!(header.correlation_id, 0);
+            assert_eq!(
+                u64::from_be_bytes(
+                    field_value(&config, ControlFieldType::ConnectivityConfigRevision)
+                        .try_into()
+                        .expect("connectivity revision width")
+                ),
+                revision
+            );
+            assert_eq!(
+                StunServerListView::decode(field_value(&config, ControlFieldType::StunServerList))
+                    .expect("decode STUN services")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                RelayServiceListView::decode(field_value(
+                    &config,
+                    ControlFieldType::RelayServiceList
+                ))
+                .expect("decode relay services")
+                .len(),
+                1
+            );
+        }
         if status != 0 {
             let mut trailing = [0_u8; 1];
             assert_eq!(tls.read(&mut trailing).await.expect("read TLS close"), 0);
@@ -1067,6 +1181,23 @@ mod tests {
             },
         )
         .expect("initialize controller deployment");
+        let key_path = directory.join("secrets/relay-credential.key");
+        let mut key_file =
+            create_protected_secret_file(&key_path).expect("create relay credential key");
+        key_file.write_all(&[0x42; 32]).expect("write relay key");
+        key_file.sync_all().expect("sync relay key");
+        drop(key_file);
+        let mut config_file = OpenOptions::new()
+            .append(true)
+            .open(&config_path)
+            .expect("open generated configuration");
+        config_file
+            .write_all(
+                b"\n[connectivity]\nrevision = 1\ncredential_key = \"secrets/relay-credential.key\"\ncredential_lifetime_seconds = 300\nstun_servers = [\"192.0.2.20:3478\"]\n\n[[connectivity.relays]]\nid = \"01010101010101010101010101010101\"\npriority = 0\nturn_udp = 3478\naddresses = [\"192.0.2.30\"]\n",
+            )
+            .expect("append connectivity configuration");
+        config_file.sync_all().expect("sync configuration");
+        drop(config_file);
         let config = ServerConfig::load(&config_path).expect("load test configuration");
         let store = AuthorityStore::open(&config.database_path, initialized.controller_id)
             .expect("open authority before server");
