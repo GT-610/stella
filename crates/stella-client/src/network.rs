@@ -1046,6 +1046,7 @@ mod tests {
             local_grant_bytes: encoded.local_grant(),
             policy_bytes: encoded.policy(),
             peer_list_bytes: encoded.peer_list(),
+            connectivity_list_bytes: None,
             now: WALL_TIME,
         })
         .expect("validate state")

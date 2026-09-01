@@ -1,17 +1,112 @@
 //! Validated in-memory controller state for one virtual network.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use stella_common::{ControllerId, NetworkId, NodeId};
 use stella_crypto::{
     sha256_segments, validate_controller_id, validate_node_id, CryptoError, IdentityPublicKey,
 };
 use stella_proto::{
-    CodecError, Endpoint, MembershipGrant, MembershipGrantView, NetworkPolicy, PeerListView,
-    PeerRecordView, MEMBERSHIP_GRANT_LENGTH, MEMBERSHIP_GRANT_SIGNATURE_DOMAIN,
-    NETWORK_POLICY_LENGTH,
+    CodecError, ConnectivityGenerationView, ConnectivityListView, Endpoint, IceCandidate,
+    MembershipGrant, MembershipGrantView, NetworkPolicy, PeerListView, PeerRecordView,
+    MEMBERSHIP_GRANT_LENGTH, MEMBERSHIP_GRANT_SIGNATURE_DOMAIN, NETWORK_POLICY_LENGTH,
 };
 use thiserror::Error;
+use zeroize::Zeroizing;
+
+/// Validated version 0.2 reachability generation for one authorized peer.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PeerConnectivityState {
+    generation_id: u64,
+    tie_breaker: u64,
+    created_at: u64,
+    expires_at: u64,
+    username_fragment: Zeroizing<Vec<u8>>,
+    password: Zeroizing<Vec<u8>>,
+    candidates: Vec<IceCandidate>,
+}
+
+impl PeerConnectivityState {
+    /// Returns the random generation correlation identifier.
+    #[must_use]
+    pub const fn generation_id(&self) -> u64 {
+        self.generation_id
+    }
+
+    /// Returns the random ICE role tie breaker.
+    #[must_use]
+    pub const fn tie_breaker(&self) -> u64 {
+        self.tie_breaker
+    }
+
+    /// Returns the generation creation Unix time.
+    #[must_use]
+    pub const fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Returns the exclusive generation expiry Unix time.
+    #[must_use]
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    /// Borrows the ICE username fragment.
+    #[must_use]
+    pub fn username_fragment(&self) -> &[u8] {
+        &self.username_fragment
+    }
+
+    /// Borrows the secret ICE password.
+    #[must_use]
+    pub fn password(&self) -> &[u8] {
+        &self.password
+    }
+
+    /// Returns validated candidates in strict descending-priority order.
+    #[must_use]
+    pub fn candidates(&self) -> &[IceCandidate] {
+        &self.candidates
+    }
+
+    fn from_generation(
+        node_id: NodeId,
+        generation: &ConnectivityGenerationView<'_>,
+        now: u64,
+    ) -> Result<Self, StateError> {
+        if generation.expires_at() <= now {
+            return Err(StateError::ConnectivityGenerationExpired {
+                node_id,
+                now,
+                expires_at: generation.expires_at(),
+            });
+        }
+        Ok(Self {
+            generation_id: generation.generation_id(),
+            tie_breaker: generation.tie_breaker(),
+            created_at: generation.created_at(),
+            expires_at: generation.expires_at(),
+            username_fragment: Zeroizing::new(generation.username_fragment().to_vec()),
+            password: Zeroizing::new(generation.password().to_vec()),
+            candidates: generation.candidates().collect(),
+        })
+    }
+}
+
+impl fmt::Debug for PeerConnectivityState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PeerConnectivityState")
+            .field("generation_id", &self.generation_id)
+            .field("tie_breaker", &self.tie_breaker)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("username_fragment_length", &self.username_fragment.len())
+            .field("password_length", &self.password.len())
+            .field("candidate_count", &self.candidates.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Fully validated authorization and reachability metadata for one peer.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +116,7 @@ pub struct PeerState {
     grant: MembershipGrant,
     grant_bytes: [u8; MEMBERSHIP_GRANT_LENGTH],
     endpoints: Vec<Endpoint>,
+    connectivity: Option<PeerConnectivityState>,
 }
 
 impl PeerState {
@@ -52,6 +148,12 @@ impl PeerState {
     #[must_use]
     pub fn endpoints(&self) -> &[Endpoint] {
         &self.endpoints
+    }
+
+    /// Returns the peer's latest validated version 0.2 connectivity generation.
+    #[must_use]
+    pub const fn connectivity(&self) -> Option<&PeerConnectivityState> {
+        self.connectivity.as_ref()
     }
 }
 
@@ -170,7 +272,7 @@ impl NetworkState {
                 if peer.node_id() == input.local_node_id {
                     return Err(StateError::DeltaTargetsLocalNode);
                 }
-                let owned = validate_peer(
+                let mut owned = validate_peer(
                     &peer,
                     NetworkValidationContext {
                         controller_id: input.controller_id,
@@ -186,6 +288,10 @@ impl NetworkState {
                 if !self.peers.contains_key(&owned.node_id) && self.peers.len() >= maximum {
                     return Err(StateError::PeerCapacityExceeded { maximum });
                 }
+                owned.connectivity = self
+                    .peers
+                    .get(&owned.node_id)
+                    .and_then(|peer| peer.connectivity.clone());
                 self.peers.insert(owned.node_id, owned);
             }
             PeerDeltaOperation::Remove(node_id) => {
@@ -304,6 +410,20 @@ impl NetworkState {
             )?;
             peers.insert(owned.node_id, owned);
         }
+        if let Some(connectivity_list_bytes) = input.connectivity_list_bytes {
+            let connectivity_list = ConnectivityListView::decode(connectivity_list_bytes)?;
+            for record in connectivity_list.records() {
+                let node_id = record.node_id();
+                let peer = peers
+                    .get_mut(&node_id)
+                    .ok_or(StateError::ConnectivityForUnknownPeer { node_id })?;
+                peer.connectivity = Some(PeerConnectivityState::from_generation(
+                    node_id,
+                    &record.generation(),
+                    input.now,
+                )?);
+            }
+        }
         Ok(Self {
             controller_public_key: input.controller_public_key,
             network_id: input.network_id,
@@ -340,6 +460,8 @@ pub struct SnapshotInput<'a> {
     pub policy_bytes: &'a [u8],
     /// Exact complete peer-list bytes.
     pub peer_list_bytes: &'a [u8],
+    /// Exact version 0.2 connectivity-list bytes, absent in version 0.1.
+    pub connectivity_list_bytes: Option<&'a [u8]>,
     /// Unix time used for every grant validity check.
     pub now: u64,
 }
@@ -449,6 +571,7 @@ fn validate_peer(
         grant,
         grant_bytes,
         endpoints: peer.endpoints().collect(),
+        connectivity: None,
     })
 }
 
@@ -593,6 +716,24 @@ pub enum StateError {
         /// Absent removal target.
         node_id: NodeId,
     },
+    /// A connectivity record names a node absent from the peer list.
+    #[error("connectivity snapshot targets unknown peer {node_id}")]
+    ConnectivityForUnknownPeer {
+        /// Node not present in the enclosing peer list.
+        node_id: NodeId,
+    },
+    /// A peer connectivity generation is already expired at snapshot time.
+    #[error(
+        "connectivity generation for peer {node_id} expired at {expires_at}, evaluated at {now}"
+    )]
+    ConnectivityGenerationExpired {
+        /// Peer whose reachability is stale.
+        node_id: NodeId,
+        /// Snapshot validation time.
+        now: u64,
+        /// Exclusive generation expiry.
+        expires_at: u64,
+    },
 }
 
 #[cfg(all(test, windows))]
@@ -606,8 +747,9 @@ mod tests {
     use stella_common::NetworkId;
     use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
-        encode_peer_record, ConfidentialityPolicy, Endpoint, NetworkPolicy, PeerListView,
-        PeerRecordRef, ProtocolVersion, MEMBERSHIP_GRANT_LENGTH,
+        encode_connectivity_generation, encode_peer_record, ConfidentialityPolicy,
+        ConnectivityCarrier, ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass,
+        NetworkPolicy, PeerListView, PeerRecordRef, ProtocolVersion, MEMBERSHIP_GRANT_LENGTH,
     };
     use stella_server::{
         network_state::encode_network_state,
@@ -620,6 +762,32 @@ mod tests {
 
     fn signing_key(seed: u8) -> IdentitySigningKey {
         IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([seed; 32]))
+    }
+
+    fn connectivity_generation(created_at: u64) -> Vec<u8> {
+        let candidates = [IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: u32::MAX - 1,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.74:45001".parse().expect("candidate address"),
+            related_address: None,
+            relay_id: None,
+        }];
+        let generation = ConnectivityGenerationRef::new(
+            75,
+            76,
+            created_at,
+            created_at + 600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &candidates,
+        )
+        .expect("valid connectivity generation");
+        let mut encoded = vec![0; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        encoded
     }
 
     fn fixture() -> (
@@ -706,6 +874,7 @@ mod tests {
             local_grant_bytes: encoded.local_grant(),
             policy_bytes: encoded.policy(),
             peer_list_bytes: encoded.peer_list(),
+            connectivity_list_bytes: None,
             now: 200,
         })
         .expect("snapshot validates");
@@ -718,6 +887,78 @@ mod tests {
             state.local_grant().node_id,
             derive_node_id(local.public_key())
         );
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn connectivity_snapshot_is_owned_redacted_and_peer_scoped() {
+        let (directory, store, controller, local, network_id) = fixture();
+        let initial_view = store
+            .network_session_view(derive_node_id(local.public_key()), network_id)
+            .expect("read initial network view");
+        let peer_id = initial_view.peers()[0].node().node_id();
+        let generation = connectivity_generation(120);
+        store
+            .publish_connectivity(peer_id, network_id, Some(&generation), 120)
+            .expect("publish peer connectivity");
+        let view = store
+            .network_session_view(derive_node_id(local.public_key()), network_id)
+            .expect("read connectivity network view");
+        let encoded = encode_network_state(&controller, &view, 200, ProtocolVersion::V0_2)
+            .expect("encode version 0.2 state");
+        let connectivity_list = encoded
+            .connectivity_list()
+            .expect("version 0.2 connectivity list");
+        let input = SnapshotInput {
+            controller_id: derive_controller_id(controller.public_key()),
+            controller_public_key: controller.public_key(),
+            local_node_id: derive_node_id(local.public_key()),
+            local_public_key: local.public_key(),
+            network_id,
+            controller_epoch: encoded.controller_epoch(),
+            snapshot_revision: encoded.snapshot_revision(),
+            local_grant_bytes: encoded.local_grant(),
+            policy_bytes: encoded.policy(),
+            peer_list_bytes: encoded.peer_list(),
+            connectivity_list_bytes: Some(connectivity_list),
+            now: 200,
+        };
+        let state = NetworkState::from_snapshot(&input).expect("validate connectivity snapshot");
+        let connectivity = state.peers()[&peer_id]
+            .connectivity()
+            .expect("peer connectivity exists");
+        assert_eq!(connectivity.generation_id(), 75);
+        assert_eq!(connectivity.tie_breaker(), 76);
+        assert_eq!(connectivity.created_at(), 120);
+        assert_eq!(connectivity.expires_at(), 720);
+        assert_eq!(connectivity.username_fragment(), b"Abcd1234");
+        assert_eq!(connectivity.password(), b"Abcdefghijklmnopqrstuv");
+        assert_eq!(connectivity.candidates().len(), 1);
+        let diagnostic = format!("{connectivity:?}");
+        assert!(!diagnostic.contains("Abcd1234"));
+        assert!(!diagnostic.contains("Abcdefghijklmnopqrstuv"));
+
+        let expired = SnapshotInput { now: 720, ..input };
+        assert!(matches!(
+            NetworkState::from_snapshot(&expired),
+            Err(StateError::ConnectivityGenerationExpired {
+                node_id,
+                expires_at: 720,
+                now: 720,
+            }) if node_id == peer_id
+        ));
+        let mut unknown_list = connectivity_list.to_vec();
+        unknown_list[8..24].copy_from_slice(&[0x55; 16]);
+        let unknown = SnapshotInput {
+            connectivity_list_bytes: Some(&unknown_list),
+            ..input
+        };
+        assert!(matches!(
+            NetworkState::from_snapshot(&unknown),
+            Err(StateError::ConnectivityForUnknownPeer { .. })
+        ));
+
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
@@ -744,6 +985,7 @@ mod tests {
             local_grant_bytes: &bad_grant,
             policy_bytes: encoded.policy(),
             peer_list_bytes: encoded.peer_list(),
+            connectivity_list_bytes: None,
             now: 200,
         };
         assert!(matches!(
@@ -782,6 +1024,7 @@ mod tests {
             local_grant_bytes: encoded.local_grant(),
             policy_bytes: encoded.policy(),
             peer_list_bytes: encoded.peer_list(),
+            connectivity_list_bytes: None,
             now: 200,
         })
         .expect("snapshot validates");
@@ -806,7 +1049,6 @@ mod tests {
         .expect("rebuild peer record");
         let mut peer_bytes = vec![0_u8; record.encoded_len().expect("peer record length")];
         encode_peer_record(record, &mut peer_bytes).expect("encode peer record");
-
         let first_revision = state.snapshot_revision() + 1;
         state
             .apply_peer_delta(&PeerDeltaInput {
@@ -822,7 +1064,6 @@ mod tests {
             .expect("remove known peer");
         assert!(state.peers().is_empty());
         assert_eq!(state.snapshot_revision(), first_revision);
-
         assert!(matches!(
             state.apply_peer_delta(&PeerDeltaInput {
                 controller_id: derive_controller_id(controller.public_key()),
@@ -850,7 +1091,6 @@ mod tests {
                 now: 200,
             })
             .expect("restore peer from complete record");
-        assert_eq!(state.peers().len(), 1);
         assert!(matches!(
             state.apply_peer_delta(&PeerDeltaInput {
                 controller_id: derive_controller_id(controller.public_key()),

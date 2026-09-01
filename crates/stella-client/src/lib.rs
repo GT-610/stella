@@ -35,8 +35,8 @@ pub use network::{NetworkDataError, NetworkDataPlane, NetworkOutput, RoutedDatag
 #[cfg(target_os = "windows")]
 pub use runtime::{ClientDataRuntime, RuntimeError};
 pub use state::{
-    GrantRefreshInput, NetworkState, PeerDeltaInput, PeerDeltaOperation, PeerState, SnapshotInput,
-    StateError,
+    GrantRefreshInput, NetworkState, PeerConnectivityState, PeerDeltaInput, PeerDeltaOperation,
+    PeerState, SnapshotInput, StateError,
 };
 pub use switch::{FloodClass, L2Switch, PeerIngress, SwitchError, TapForwarding};
 pub use tls::{SpkiPin, SpkiPinParseError};

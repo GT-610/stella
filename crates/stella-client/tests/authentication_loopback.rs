@@ -264,6 +264,29 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     )
     .await
     .expect("peer publishes endpoint");
+    let peer_candidates = [IceCandidate {
+        class: IceCandidateClass::Host,
+        carrier: ConnectivityCarrier::DirectUdp,
+        priority: u32::MAX - 2,
+        foundation: 2,
+        max_datagram_size: 1_200,
+        address: "192.0.2.11:45124".parse().expect("peer candidate address"),
+        related_address: None,
+        relay_id: None,
+    }];
+    let peer_generation = ConnectivityGenerationRef::new(
+        3,
+        4,
+        issued_at,
+        issued_at + 600,
+        b"Efgh5678",
+        b"Zyxwvutsrqponmlkjihgfe",
+        &peer_candidates,
+    )
+    .expect("valid peer connectivity generation");
+    peer.publish_connectivity(network_id, Some(peer_generation))
+        .await
+        .expect("peer publishes connectivity");
 
     let heartbeat = first.heartbeat().await.expect("heartbeat is acknowledged");
     assert_eq!(heartbeat.counter(), 1);
@@ -277,6 +300,17 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
             .len(),
         1
     );
+    let peer_id = derive_node_id(peer_key.public_key());
+    let peer_connectivity = first
+        .network(network_id)
+        .expect("heartbeat restored active network")
+        .peers()
+        .get(&peer_id)
+        .expect("peer exists")
+        .connectivity()
+        .expect("peer connectivity exists");
+    assert_eq!(peer_connectivity.generation_id(), 3);
+    assert_eq!(peer_connectivity.password(), b"Zyxwvutsrqponmlkjihgfe");
     let reconciled_epoch = first
         .network(network_id)
         .expect("heartbeat restored active network")

@@ -857,6 +857,10 @@ impl PendingJoin {
             local_grant_bytes: local_grant,
             policy_bytes: policy,
             peer_list_bytes: field_value(snapshot, ControlFieldType::PeerList)?,
+            connectivity_list_bytes: optional_field_value(
+                snapshot,
+                ControlFieldType::ConnectivityList,
+            )?,
             now: unix_time()?,
         })?)
     }
@@ -981,6 +985,7 @@ fn decode_snapshot(
         local_grant_bytes: field_value(message, ControlFieldType::MembershipGrant)?,
         policy_bytes: field_value(message, ControlFieldType::NetworkPolicy)?,
         peer_list_bytes: field_value(message, ControlFieldType::PeerList)?,
+        connectivity_list_bytes: optional_field_value(message, ControlFieldType::ConnectivityList)?,
         now: unix_time()?,
     })?)
 }
@@ -1051,6 +1056,16 @@ fn field_value(
         message_type: view.header().message_type,
         field,
     })
+}
+
+fn optional_field_value(
+    message: &OwnedControlMessage,
+    field: ControlFieldType,
+) -> Result<Option<&[u8]>, ClientError> {
+    let view = message.view()?;
+    Ok(view
+        .fields()
+        .find_map(|candidate| (candidate.field_type() == Some(field)).then(|| candidate.value())))
 }
 
 fn decode_network_id(message: &OwnedControlMessage) -> Result<NetworkId, ClientError> {
