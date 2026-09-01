@@ -13,6 +13,7 @@ use stella_crypto::IdentitySigningKey;
 use stella_proto::{
     encode_network_revision_list, CodecError, ControlFieldType, ControlMessageType, Endpoint,
     EndpointSetView, MembershipGrantView, NetworkRevision, NetworkRevisionListView,
+    ProtocolVersion,
 };
 use thiserror::Error;
 use tokio::{
@@ -445,6 +446,7 @@ async fn resolve_join(
         controller_identity,
         &view,
         now,
+        ProtocolVersion::CURRENT,
     )?)))
 }
 
@@ -631,7 +633,12 @@ async fn handle_snapshot_request(
             return Ok(());
         }
     };
-    let encoded = encode_network_state(state.context.controller_identity(), &view, unix_time()?)?;
+    let encoded = encode_network_state(
+        state.context.controller_identity(),
+        &view,
+        unix_time()?,
+        ProtocolVersion::CURRENT,
+    )?;
     send_peer_snapshot(state, correlation_id, &encoded).await
 }
 
@@ -703,6 +710,7 @@ async fn handle_heartbeat(
                 state.context.controller_identity(),
                 &view,
                 now,
+                ProtocolVersion::CURRENT,
             )?);
         }
         revisions.push(revision);
@@ -735,7 +743,12 @@ async fn refresh_due_grants(state: &mut ActiveSessionState) -> Result<(), Active
                 continue;
             }
         };
-        let encoded = encode_network_state(state.context.controller_identity(), &view, now)?;
+        let encoded = encode_network_state(
+            state.context.controller_identity(),
+            &view,
+            now,
+            ProtocolVersion::CURRENT,
+        )?;
         send_grant_refresh(state, &encoded).await?;
     }
     Ok(())

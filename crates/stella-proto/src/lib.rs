@@ -22,7 +22,8 @@ pub use common::{
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 pub use connectivity::{
-    encode_connectivity_generation, encode_connectivity_list, encode_connectivity_record,
+    encode_connectivity_generation, encode_connectivity_list,
+    encode_connectivity_list_from_encoded_records, encode_connectivity_record,
     encode_stun_server_list, ConnectivityCarrier, ConnectivityGenerationRef,
     ConnectivityGenerationView, ConnectivityListView, ConnectivityRecordIter,
     ConnectivityRecordRef, ConnectivityRecordView, IceCandidate, IceCandidateClass,

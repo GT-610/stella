@@ -5,10 +5,12 @@ use std::fmt;
 use stella_common::NetworkId;
 use stella_crypto::{derive_controller_id, IdentitySigningKey};
 use stella_proto::{
-    encode_peer_list, CodecError, PeerListView, PeerRecordRef, MEMBERSHIP_GRANT_LENGTH,
+    encode_connectivity_list_from_encoded_records, encode_peer_list, CodecError,
+    ConnectivityListView, PeerListView, PeerRecordRef, ProtocolVersion, MEMBERSHIP_GRANT_LENGTH,
     NETWORK_POLICY_LENGTH,
 };
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{
     authorization::{issue_membership_grant, AuthorizationError},
@@ -23,6 +25,7 @@ pub struct EncodedNetworkState {
     local_grant: [u8; MEMBERSHIP_GRANT_LENGTH],
     policy: [u8; NETWORK_POLICY_LENGTH],
     peer_list: Vec<u8>,
+    connectivity_list: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl EncodedNetworkState {
@@ -61,6 +64,16 @@ impl EncodedNetworkState {
     pub fn peer_list(&self) -> &[u8] {
         &self.peer_list
     }
+
+    /// Borrows the complete node-ID-sorted version 0.2 connectivity list.
+    ///
+    /// Version 0.1 state has no connectivity list.
+    #[must_use]
+    pub fn connectivity_list(&self) -> Option<&[u8]> {
+        self.connectivity_list
+            .as_ref()
+            .map(|encoded| encoded.as_slice())
+    }
 }
 
 impl fmt::Debug for EncodedNetworkState {
@@ -71,6 +84,10 @@ impl fmt::Debug for EncodedNetworkState {
             .field("controller_epoch", &self.controller_epoch)
             .field("snapshot_revision", &self.snapshot_revision)
             .field("peer_list_length", &self.peer_list.len())
+            .field(
+                "connectivity_list_length",
+                &self.connectivity_list.as_ref().map(|encoded| encoded.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -89,6 +106,7 @@ pub fn encode_network_state(
     controller_identity: &IdentitySigningKey,
     view: &NetworkSessionView,
     now: u64,
+    version: ProtocolVersion,
 ) -> Result<EncodedNetworkState, NetworkStateError> {
     let network = view.network();
     let local_grant = issue_membership_grant(
@@ -154,6 +172,17 @@ pub fn encode_network_state(
         network.controller_epoch(),
     )?;
 
+    let connectivity_list = match version {
+        ProtocolVersion::V0_1 => None,
+        ProtocolVersion::V0_2 => Some(encode_connectivity_list(view)?),
+        unsupported => {
+            return Err(NetworkStateError::UnsupportedProtocolVersion {
+                major: unsupported.major,
+                minor: unsupported.minor,
+            });
+        }
+    };
+
     Ok(EncodedNetworkState {
         network_id: network.network_id(),
         controller_epoch: network.controller_epoch(),
@@ -161,7 +190,47 @@ pub fn encode_network_state(
         local_grant,
         policy,
         peer_list,
+        connectivity_list,
     })
+}
+
+fn encode_connectivity_list(
+    view: &NetworkSessionView,
+) -> Result<Zeroizing<Vec<u8>>, NetworkStateError> {
+    let record_count = view
+        .peers()
+        .iter()
+        .filter(|peer| peer.connectivity().is_some())
+        .count();
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(record_count)
+        .map_err(|_| NetworkStateError::AllocationFailed {
+            requested: record_count,
+        })?;
+    let mut encoded_length = 4_usize;
+    for peer in view.peers() {
+        let Some(connectivity) = peer.connectivity() else {
+            continue;
+        };
+        let encoded_record = connectivity.encoded_record();
+        encoded_length = encoded_length
+            .checked_add(encoded_record.len())
+            .ok_or(NetworkStateError::LengthOverflow)?;
+        records.push(encoded_record);
+    }
+
+    let mut encoded = Zeroizing::new(Vec::new());
+    encoded
+        .try_reserve_exact(encoded_length)
+        .map_err(|_| NetworkStateError::AllocationFailed {
+            requested: encoded_length,
+        })?;
+    encoded.resize(encoded_length, 0);
+    let actual_length = encode_connectivity_list_from_encoded_records(&records, &mut encoded)?;
+    encoded.truncate(actual_length);
+    ConnectivityListView::decode(&encoded)?;
+    Ok(encoded)
 }
 
 /// Failure while signing or encoding one coherent network state view.
@@ -179,9 +248,17 @@ pub enum NetworkStateError {
         /// Requested byte or entry count.
         requested: usize,
     },
-    /// Checked peer-list length arithmetic overflowed.
-    #[error("peer-list length arithmetic overflowed")]
+    /// Checked peer or connectivity-list length arithmetic overflowed.
+    #[error("network-state list length arithmetic overflowed")]
     LengthOverflow,
+    /// The caller requested an operational version this encoder does not know.
+    #[error("network-state encoding does not support protocol version {major}.{minor}")]
+    UnsupportedProtocolVersion {
+        /// Unsupported major version.
+        major: u8,
+        /// Unsupported minor version.
+        minor: u8,
+    },
 }
 
 #[cfg(all(test, windows))]
@@ -195,8 +272,9 @@ mod tests {
     use stella_common::NetworkId;
     use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
-        ConfidentialityPolicy, Endpoint, MembershipGrantView, NetworkPolicy, PeerListView,
-        NETWORK_POLICY_LENGTH,
+        encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
+        ConnectivityGenerationRef, ConnectivityListView, Endpoint, IceCandidate, IceCandidateClass,
+        MembershipGrantView, NetworkPolicy, PeerListView, ProtocolVersion, NETWORK_POLICY_LENGTH,
     };
 
     use super::encode_network_state;
@@ -242,6 +320,32 @@ mod tests {
         (directory, store, controller, network_id)
     }
 
+    fn connectivity_generation(created_at: u64) -> Vec<u8> {
+        let candidates = [IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: u32::MAX - 1,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: "192.0.2.94:4242".parse().expect("candidate address"),
+            related_address: None,
+            relay_id: None,
+        }];
+        let generation = ConnectivityGenerationRef::new(
+            95,
+            96,
+            created_at,
+            created_at + 600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &candidates,
+        )
+        .expect("valid generation");
+        let mut encoded = vec![0; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        encoded
+    }
+
     #[test]
     fn coherent_view_encodes_local_and_online_peer_grants() {
         let (directory, store, controller, network_id) = test_store();
@@ -266,11 +370,18 @@ mod tests {
         store
             .publish_endpoints(peer.node_id(), network_id, &[endpoint], 120)
             .expect("publish peer endpoint");
+        let generation = connectivity_generation(120);
+        store
+            .publish_connectivity(peer.node_id(), network_id, Some(&generation), 120)
+            .expect("publish peer connectivity");
         let view = store
             .network_session_view(local.node_id(), network_id)
             .expect("read coherent view");
 
-        let encoded = encode_network_state(&controller, &view, 200).expect("encode state");
+        let encoded = encode_network_state(&controller, &view, 200, ProtocolVersion::V0_1)
+            .expect("encode version 0.1 state");
+        let encoded_v0_2 = encode_network_state(&controller, &view, 200, ProtocolVersion::V0_2)
+            .expect("encode version 0.2 state");
         assert_eq!(encoded.network_id(), network_id);
         assert_eq!(
             encoded.controller_epoch(),
@@ -290,6 +401,22 @@ mod tests {
         let mut policy_bytes = [0_u8; NETWORK_POLICY_LENGTH];
         policy.encode(&mut policy_bytes).expect("re-encode policy");
         assert_eq!(&policy_bytes, encoded.policy());
+        assert!(encoded.connectivity_list().is_none());
+        assert_eq!(encoded_v0_2.peer_list(), encoded.peer_list());
+        assert_eq!(
+            encoded_v0_2.snapshot_revision(),
+            encoded.snapshot_revision()
+        );
+        let connectivity = ConnectivityListView::decode(
+            encoded_v0_2
+                .connectivity_list()
+                .expect("version 0.2 connectivity list"),
+        )
+        .expect("decode connectivity list");
+        assert_eq!(connectivity.len(), 1);
+        let connectivity_record = connectivity.records().next().expect("connectivity record");
+        assert_eq!(connectivity_record.node_id(), peer.node_id());
+        assert_eq!(connectivity_record.generation().generation_id(), 95);
         let peers = PeerListView::decode(encoded.peer_list()).expect("decode peer list");
         assert_eq!(peers.len(), 1);
         let encoded_peer = peers.peers().next().expect("peer exists");

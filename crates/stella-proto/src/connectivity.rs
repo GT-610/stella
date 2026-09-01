@@ -1133,6 +1133,88 @@ pub fn encode_connectivity_list(
     Ok(encoded_length)
 }
 
+/// Encodes a node-ID-sorted connectivity list from canonical record bytes.
+///
+/// Every input record is fully decoded before any output is written. This is
+/// useful when a controller persists already canonical records and must not
+/// reconstruct or expose their embedded credentials merely to build a list.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] for excessive count, malformed records, invalid
+/// ordering, length overflow, or insufficient output capacity.
+pub fn encode_connectivity_list_from_encoded_records(
+    records: &[&[u8]],
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    let count = u16::try_from(records.len()).map_err(|_| CodecError::ValueOutOfRange {
+        field: "connectivity record count",
+        actual: u64::try_from(records.len()).unwrap_or(u64::MAX),
+        minimum: 0,
+        maximum: u64::from(MAX_CONNECTIVITY_RECORDS),
+    })?;
+    if count > MAX_CONNECTIVITY_RECORDS {
+        return Err(CodecError::ValueOutOfRange {
+            field: "connectivity record count",
+            actual: u64::from(count),
+            minimum: 0,
+            maximum: u64::from(MAX_CONNECTIVITY_RECORDS),
+        });
+    }
+
+    let mut encoded_length = 4_usize;
+    let mut previous = None;
+    for (index, encoded_record) in records.iter().copied().enumerate() {
+        let record = ConnectivityRecordView::decode(encoded_record)?;
+        if previous.is_some_and(|previous_id| previous_id >= record.node_id()) {
+            return Err(CodecError::NestedRecordsOutOfOrder {
+                context: "connectivity list",
+                index,
+            });
+        }
+        previous = Some(record.node_id());
+        encoded_length = encoded_length.checked_add(encoded_record.len()).ok_or(
+            CodecError::IntegerOverflow {
+                field: "connectivity list length",
+            },
+        )?;
+    }
+    if output.len() < encoded_length {
+        return Err(CodecError::OutputTooSmall {
+            field: "connectivity list",
+            offset: 0,
+            needed: encoded_length,
+            remaining: output.len(),
+        });
+    }
+    {
+        let mut cursor = WriteCursor::new(output, 0);
+        cursor.write_u16(count, "connectivity record count")?;
+        cursor.write_u16(0, "connectivity list reserved")?;
+    }
+    let mut position = 4_usize;
+    for encoded_record in records {
+        let end =
+            position
+                .checked_add(encoded_record.len())
+                .ok_or(CodecError::IntegerOverflow {
+                    field: "connectivity record end",
+                })?;
+        let remaining = output.len().saturating_sub(position);
+        let record_output = output
+            .get_mut(position..end)
+            .ok_or(CodecError::OutputTooSmall {
+                field: "connectivity record",
+                offset: position,
+                needed: encoded_record.len(),
+                remaining,
+            })?;
+        record_output.copy_from_slice(encoded_record);
+        position = end;
+    }
+    Ok(encoded_length)
+}
+
 /// One numeric STUN service used for server-reflexive candidate gathering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StunServer {
@@ -1713,7 +1795,8 @@ mod tests {
     use stella_common::{NodeId, RelayId};
 
     use super::{
-        encode_connectivity_generation, encode_connectivity_list, encode_connectivity_record,
+        encode_connectivity_generation, encode_connectivity_list,
+        encode_connectivity_list_from_encoded_records, encode_connectivity_record,
         encode_stun_server_list, ConnectivityCarrier, ConnectivityGenerationRef,
         ConnectivityGenerationView, ConnectivityListView, ConnectivityRecordRef,
         ConnectivityRecordView, IceCandidate, IceCandidateClass, StunServer, StunServerListView,
@@ -1889,6 +1972,8 @@ mod tests {
         let decoded = ConnectivityRecordView::decode(&record_bytes).expect("decode record");
         assert_eq!(decoded.node_id(), first.node_id());
         assert_eq!(decoded.generation().generation_id(), 7);
+        let mut second_record_bytes = vec![0; second.encoded_len().expect("record length")];
+        encode_connectivity_record(second, &mut second_record_bytes).expect("encode second record");
 
         let length = 4
             + first.encoded_len().expect("first length")
@@ -1898,6 +1983,15 @@ mod tests {
             encode_connectivity_list(&[first, second], &mut list_bytes),
             Ok(length)
         );
+        let mut stored_list_bytes = vec![0; length];
+        assert_eq!(
+            encode_connectivity_list_from_encoded_records(
+                &[&record_bytes, &second_record_bytes],
+                &mut stored_list_bytes
+            ),
+            Ok(length)
+        );
+        assert_eq!(stored_list_bytes, list_bytes);
         let list = ConnectivityListView::decode(&list_bytes).expect("decode list");
         assert_eq!(list.len(), 2);
         assert_eq!(
@@ -1908,6 +2002,16 @@ mod tests {
         );
         assert!(matches!(
             encode_connectivity_list(&[second, first], &mut list_bytes),
+            Err(CodecError::NestedRecordsOutOfOrder {
+                context: "connectivity list",
+                index: 1,
+            })
+        ));
+        assert!(matches!(
+            encode_connectivity_list_from_encoded_records(
+                &[&second_record_bytes, &record_bytes],
+                &mut stored_list_bytes
+            ),
             Err(CodecError::NestedRecordsOutOfOrder {
                 context: "connectivity list",
                 index: 1,
