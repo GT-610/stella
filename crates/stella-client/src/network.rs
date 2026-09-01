@@ -8,7 +8,9 @@ use std::{
 
 use stella_common::{MacAddress, NetworkId, NodeId};
 use stella_crypto::IdentitySigningKey;
-use stella_proto::{CommonHeader, Endpoint, HandshakeHeader, PacketType};
+use stella_proto::{
+    CommonHeader, ConnectivityCarrier, Endpoint, HandshakeHeader, IceCandidateClass, PacketType,
+};
 use stella_transport::{Endpoint as TransportEndpoint, PathId};
 use thiserror::Error;
 
@@ -499,15 +501,16 @@ impl NetworkDataPlane {
         for peer in current_peers {
             let endpoints_changed = reset_all
                 || old_peers.get(&peer).is_none_or(|old| {
-                    self.state
-                        .peers()
-                        .get(&peer)
-                        .is_none_or(|current| old.endpoints() != current.endpoints())
+                    self.state.peers().get(&peer).is_none_or(|current| {
+                        old.endpoints() != current.endpoints()
+                            || old.connectivity() != current.connectivity()
+                    })
                 });
             let changed = old_peers.get(&peer).is_none_or(|old| {
                 self.state.peers().get(&peer).is_none_or(|current| {
                     old.grant().grant_serial != current.grant().grant_serial
                         || old.endpoints() != current.endpoints()
+                        || old.connectivity() != current.connectivity()
                 })
             });
             if changed {
@@ -714,6 +717,20 @@ impl NetworkDataPlane {
             .ok_or(NetworkDataError::UnknownPath { path_id })
     }
 
+    /// Returns distinct remote TURN UDP candidates currently installed as paths.
+    #[must_use]
+    pub fn relay_endpoints(&self) -> Vec<TransportEndpoint> {
+        let mut endpoints = self
+            .paths
+            .values()
+            .filter(|path| matches!(path.endpoint, TransportEndpoint::TurnUdp { .. }))
+            .map(|path| path.endpoint.clone())
+            .collect::<Vec<_>>();
+        endpoints.sort_by_key(ToString::to_string);
+        endpoints.dedup();
+        endpoints
+    }
+
     fn peer_path(&self, peer: NodeId) -> Result<PathId, NetworkDataError> {
         self.select_peer_path(peer)
             .ok_or(NetworkDataError::NoPeerPath { peer_node_id: peer })
@@ -747,6 +764,26 @@ impl NetworkDataPlane {
     }
 
     fn install_peer_paths(&mut self, peer: NodeId) -> Result<(), NetworkDataError> {
+        let relay_endpoints = self
+            .state
+            .peers()
+            .get(&peer)
+            .and_then(|state| state.connectivity())
+            .into_iter()
+            .flat_map(|connectivity| connectivity.candidates().iter().copied())
+            .filter(|candidate| {
+                candidate.class == IceCandidateClass::Relay
+                    && candidate.carrier == ConnectivityCarrier::TurnUdp
+            })
+            .filter_map(|candidate| {
+                candidate
+                    .relay_id
+                    .map(|relay_id| TransportEndpoint::TurnUdp {
+                        relay_id,
+                        address: candidate.address,
+                    })
+            })
+            .collect::<Vec<_>>();
         let mut endpoints = self
             .state
             .peers()
@@ -767,7 +804,19 @@ impl NetworkDataPlane {
                 endpoint.port(),
             )
         });
-        let mut path_ids = Vec::with_capacity(endpoints.len());
+        let mut path_ids =
+            Vec::with_capacity(relay_endpoints.len().saturating_add(endpoints.len()));
+        for endpoint in relay_endpoints {
+            let path_id = self.allocate_path_id()?;
+            self.paths.insert(
+                path_id,
+                PeerPath {
+                    peer_node_id: peer,
+                    endpoint,
+                },
+            );
+            path_ids.push(path_id);
+        }
         for endpoint in endpoints {
             let path_id = self.allocate_path_id()?;
             self.paths.insert(
@@ -915,10 +964,12 @@ mod tests {
         time::Duration,
     };
 
-    use stella_common::{MacAddress, NetworkId};
+    use stella_common::{MacAddress, NetworkId, RelayId};
     use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
-        CommonHeader, ConfidentialityPolicy, Endpoint, NetworkPolicy, PacketType, ProtocolVersion,
+        encode_connectivity_generation, CommonHeader, ConfidentialityPolicy, ConnectivityCarrier,
+        ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
+        PacketType, ProtocolVersion,
     };
     use stella_server::{
         network_state::encode_network_state,
@@ -1029,12 +1080,22 @@ mod tests {
         local: &IdentitySigningKey,
         network_id: NetworkId,
     ) -> NetworkState {
+        state_for_version(store, controller, local, network_id, ProtocolVersion::V0_1)
+    }
+
+    fn state_for_version(
+        store: &AuthorityStore,
+        controller: &IdentitySigningKey,
+        local: &IdentitySigningKey,
+        network_id: NetworkId,
+        version: ProtocolVersion,
+    ) -> NetworkState {
         let local_node_id = derive_node_id(local.public_key());
         let view = store
             .network_session_view(local_node_id, network_id)
             .expect("network session view");
-        let encoded = encode_network_state(controller, &view, WALL_TIME, ProtocolVersion::V0_1)
-            .expect("encode state");
+        let encoded =
+            encode_network_state(controller, &view, WALL_TIME, version).expect("encode state");
         NetworkState::from_snapshot(&SnapshotInput {
             controller_id: derive_controller_id(controller.public_key()),
             controller_public_key: controller.public_key(),
@@ -1046,7 +1107,7 @@ mod tests {
             local_grant_bytes: encoded.local_grant(),
             policy_bytes: encoded.policy(),
             peer_list_bytes: encoded.peer_list(),
-            connectivity_list_bytes: None,
+            connectivity_list_bytes: encoded.connectivity_list(),
             now: WALL_TIME,
         })
         .expect("validate state")
@@ -1134,6 +1195,68 @@ mod tests {
                 .expect("resolve alternate path"),
             &alternate
         );
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn relay_candidates_install_distinct_preferred_transport_paths() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_id = derive_node_id(alice_key.public_key());
+        let relay_id = RelayId::from_bytes([0x55; 16]);
+        let relay_address: SocketAddr = "192.0.2.44:50000".parse().expect("relay address");
+        let candidate = IceCandidate {
+            class: IceCandidateClass::Relay,
+            carrier: ConnectivityCarrier::TurnUdp,
+            priority: 100,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: relay_address,
+            related_address: Some("192.0.2.45:45000".parse().expect("related address")),
+            relay_id: Some(relay_id),
+        };
+        let candidates = [candidate];
+        let generation = ConnectivityGenerationRef::new(
+            10,
+            11,
+            130,
+            600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &candidates,
+        )
+        .expect("relay connectivity generation");
+        let mut encoded = vec![0_u8; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        store
+            .publish_connectivity(alice_id, network_id, Some(&encoded), 130)
+            .expect("publish relay connectivity");
+
+        let plane = NetworkDataPlane::new(
+            state_for_version(
+                &store,
+                &controller,
+                &bob_key,
+                network_id,
+                ProtocolVersion::V0_2,
+            ),
+            MacAddress::from_bytes([0x02, 0, 0, 0, 1, 8]),
+            "127.0.0.1:46002".parse().expect("bob address"),
+            1_200,
+            &bob_key,
+            Duration::ZERO,
+        )
+        .expect("relay-aware data plane");
+        let relay_endpoint = TransportEndpoint::TurnUdp {
+            relay_id,
+            address: relay_address,
+        };
+        let relay_path = plane
+            .resolve_peer_path(alice_id, &relay_endpoint)
+            .expect("relay path");
+        assert_eq!(plane.select_peer_path(alice_id), Some(relay_path));
+        assert_eq!(plane.relay_endpoints(), vec![relay_endpoint]);
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
