@@ -4,6 +4,7 @@
 
 mod active;
 mod config;
+mod connectivity;
 mod control;
 mod data_plane;
 mod error;
@@ -18,6 +19,7 @@ mod tls;
 
 pub use active::{ActiveControl, ControlUpdate, HeartbeatReport};
 pub use config::{ClientConfig, ClientConfigError, ConfiguredNetwork, CONFIG_VERSION};
+pub use connectivity::{ConnectivityConfigState, RelayServiceState};
 pub use control::{
     authenticate_controller, AuthenticatedControl, BearerCredential, ControllerTrust, Enrollment,
 };

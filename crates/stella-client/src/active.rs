@@ -16,8 +16,8 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthenticatedControl, BearerCredential, ClientError, GrantRefreshInput, NetworkState,
-    PeerDeltaInput, PeerDeltaOperation, SnapshotInput,
+    AuthenticatedControl, BearerCredential, ClientError, ConnectivityConfigState,
+    GrantRefreshInput, NetworkState, PeerDeltaInput, PeerDeltaOperation, SnapshotInput,
 };
 
 const MAX_ENDPOINT_SET_LENGTH: usize = 4 + 8 * 28;
@@ -27,6 +27,7 @@ const MAX_NETWORK_REVISION_LIST_LENGTH: usize = 4 + 256 * 32;
 pub struct ActiveControl {
     connection: AuthenticatedControl,
     networks: BTreeMap<NetworkId, NetworkState>,
+    connectivity_config: Option<ConnectivityConfigState>,
     heartbeat_counter: u64,
 }
 
@@ -37,6 +38,7 @@ impl ActiveControl {
         Self {
             connection,
             networks: BTreeMap::new(),
+            connectivity_config: None,
             heartbeat_counter: 0,
         }
     }
@@ -57,6 +59,12 @@ impl ActiveControl {
     #[must_use]
     pub fn network(&self, network_id: NetworkId) -> Option<&NetworkState> {
         self.networks.get(&network_id)
+    }
+
+    /// Returns the latest atomically validated deployment connectivity configuration.
+    #[must_use]
+    pub const fn connectivity_config(&self) -> Option<&ConnectivityConfigState> {
+        self.connectivity_config.as_ref()
     }
 
     /// Joins and activates one network, replacing any prior view only after
@@ -332,6 +340,7 @@ impl ActiveControl {
             ControlMessageType::PeerSnapshot => self.apply_unsolicited_snapshot(message),
             ControlMessageType::PeerDelta => self.apply_peer_delta(message).await,
             ControlMessageType::GrantRefresh => self.apply_grant_refresh(message),
+            ControlMessageType::ConnectivityConfig => self.apply_connectivity_config(message),
             ControlMessageType::ServerShutdown => Ok(ControlUpdate::ServerShutdown {
                 deadline: decode_u64(
                     field_value(message, ControlFieldType::ShutdownDeadline)?,
@@ -347,6 +356,32 @@ impl ActiveControl {
             }),
             actual => Err(ClientError::UnexpectedActiveMessage { actual }),
         }
+    }
+
+    fn apply_connectivity_config(
+        &mut self,
+        message: &OwnedControlMessage,
+    ) -> Result<ControlUpdate, ClientError> {
+        let received = ConnectivityConfigState::from_wire(
+            decode_u64(
+                field_value(message, ControlFieldType::ConnectivityConfigRevision)?,
+                "connectivity configuration revision",
+            )?,
+            field_value(message, ControlFieldType::StunServerList)?,
+            field_value(message, ControlFieldType::RelayServiceList)?,
+            unix_time()?,
+        )?;
+        if let Some(current) = &self.connectivity_config {
+            if received.revision() <= current.revision() {
+                return Err(ClientError::ConnectivityConfigRevisionNotAdvanced {
+                    current: current.revision(),
+                    received: received.revision(),
+                });
+            }
+        }
+        let revision = received.revision();
+        self.connectivity_config = Some(received);
+        Ok(ControlUpdate::ConnectivityConfigReplaced { revision })
     }
 
     async fn read_response_while_applying_updates(
@@ -614,6 +649,13 @@ impl std::fmt::Debug for ActiveControl {
             .debug_struct("ActiveControl")
             .field("connection", &self.connection)
             .field("active_networks", &self.networks.len())
+            .field(
+                "connectivity_config_revision",
+                &self
+                    .connectivity_config
+                    .as_ref()
+                    .map(ConnectivityConfigState::revision),
+            )
             .field("heartbeat_counter", &self.heartbeat_counter)
             .finish_non_exhaustive()
     }
@@ -651,6 +693,11 @@ impl HeartbeatReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ControlUpdate {
+    /// The complete deployment STUN and relay configuration was replaced.
+    ConnectivityConfigReplaced {
+        /// New deployment-scoped configuration revision.
+        revision: u64,
+    },
     /// A complete unsolicited snapshot replaced one network.
     SnapshotReplaced {
         /// Replaced network.

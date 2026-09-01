@@ -2,7 +2,7 @@
 
 use std::{io, net::SocketAddr};
 
-use stella_common::NetworkId;
+use stella_common::{NetworkId, RelayId};
 use stella_proto::{ControlFieldType, ControlMessageType, ProtocolVersion};
 use thiserror::Error;
 
@@ -144,5 +144,28 @@ pub enum ClientError {
     InvalidFieldWidth {
         /// Stable non-secret field name.
         field: &'static str,
+    },
+    /// A decoded deployment connectivity configuration used revision zero.
+    #[error("connectivity configuration revision must be non-zero")]
+    InvalidConnectivityConfigRevision,
+    /// A controller tried to replace connectivity configuration with an older revision.
+    #[error(
+        "connectivity configuration revision {received} does not advance current revision {current}"
+    )]
+    ConnectivityConfigRevisionNotAdvanced {
+        /// Currently active deployment configuration revision.
+        current: u64,
+        /// Received non-advancing revision.
+        received: u64,
+    },
+    /// A relay credential was already expired when the configuration arrived.
+    #[error("relay {relay_id} credential expired at {expires_at}, evaluated at {now}")]
+    RelayCredentialExpired {
+        /// Relay service whose credential is stale.
+        relay_id: RelayId,
+        /// Client validation Unix time.
+        now: u64,
+        /// Exclusive credential expiry Unix time.
+        expires_at: u64,
     },
 }
