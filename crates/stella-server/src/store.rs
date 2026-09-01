@@ -1,7 +1,7 @@
 //! Transactional redb controller authority store.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     path::{Path, PathBuf},
     str,
@@ -11,13 +11,15 @@ use redb::{Database, ReadableTable, TableDefinition};
 use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
 use stella_crypto::{derive_node_id, sha256_segments, CryptoError, IdentityPublicKey};
 use stella_proto::{
-    encode_endpoint_set, CodecError, Endpoint, EndpointSetView, MembershipPermissions,
-    NetworkPolicy, MAX_ENDPOINTS, NETWORK_POLICY_LENGTH,
+    encode_endpoint_set, CodecError, ConnectivityGenerationView, ConnectivityRecordView, Endpoint,
+    EndpointSetView, MembershipPermissions, NetworkPolicy, CONNECTIVITY_RECORD_FIXED_LENGTH,
+    MAX_ENDPOINTS, NETWORK_POLICY_LENGTH,
 };
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-const STORE_SCHEMA_VERSION: u32 = 1;
+const LEGACY_STORE_SCHEMA_VERSION: u32 = 1;
+const STORE_SCHEMA_VERSION: u32 = 2;
 const RECORD_VERSION: u8 = 1;
 const MAX_DISPLAY_NAME_BYTES: usize = 64;
 const NODE_RECORD_FIXED_LENGTH: usize = 48;
@@ -26,11 +28,13 @@ const NODE_RECORD_MAGIC: [u8; 4] = *b"SNOD";
 const NETWORK_RECORD_MAGIC: [u8; 4] = *b"SNET";
 const MEMBERSHIP_RECORD_MAGIC: [u8; 4] = *b"SMEM";
 const ENDPOINT_RECORD_MAGIC: [u8; 4] = *b"SEPT";
+const CONNECTIVITY_AUTHORITY_RECORD_MAGIC: [u8; 4] = *b"SCON";
 const ENROLLMENT_TOKEN_RECORD_MAGIC: [u8; 4] = *b"SENT";
 const JOIN_TOKEN_RECORD_MAGIC: [u8; 4] = *b"SJTK";
 const NODE_ENABLED_FLAG: u8 = 0x01;
 const MEMBERSHIP_RECORD_LENGTH: usize = 64;
 const ENDPOINT_RECORD_FIXED_LENGTH: usize = 48;
+const CONNECTIVITY_AUTHORITY_RECORD_FIXED_LENGTH: usize = 24;
 const MAX_ENDPOINT_SET_LENGTH: usize = 4 + (MAX_ENDPOINTS as usize) * 28;
 const MAX_ENDPOINT_RECORD_LENGTH: usize = ENDPOINT_RECORD_FIXED_LENGTH + MAX_ENDPOINT_SET_LENGTH;
 const TOKEN_RECORD_LENGTH: usize = 24;
@@ -52,6 +56,7 @@ const NODES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("nodes");
 const NETWORKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("networks");
 const MEMBERSHIPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("memberships");
 const ENDPOINTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("endpoints");
+const CONNECTIVITY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("connectivity");
 const ENROLLMENT_TOKENS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("enrollment_tokens");
 const JOIN_TOKENS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("join_tokens");
 
@@ -114,13 +119,14 @@ impl AuthorityStore {
             return Err(StoreError::InvalidControllerId);
         }
         let database = Database::open(path)?;
-        let controller_id = read_metadata(&database)?;
+        let (schema_version, controller_id) = read_metadata_unchecked(&database)?;
         if controller_id != expected_controller_id {
             return Err(StoreError::ControllerMismatch {
                 expected: expected_controller_id,
                 actual: controller_id,
             });
         }
+        migrate_authority_schema(&database, schema_version)?;
         let store = Self {
             database,
             controller_id,
@@ -210,6 +216,7 @@ impl AuthorityStore {
             }
         }
         verify_endpoint_records(&read)?;
+        verify_connectivity_records(&read)?;
         {
             let tokens = read.open_table(ENROLLMENT_TOKENS)?;
             for entry in tokens.iter()? {
@@ -370,6 +377,11 @@ impl AuthorityStore {
             for (key, _, _, _) in &authority_updates {
                 endpoints.remove(key.as_slice())?;
             }
+            drop(endpoints);
+            let mut connectivity = write.open_table(CONNECTIVITY)?;
+            for (key, _, _, _) in &authority_updates {
+                connectivity.remove(key.as_slice())?;
+            }
         }
         write.commit()?;
         Ok(true)
@@ -482,6 +494,19 @@ impl AuthorityStore {
                 }
             }
         }
+        let mut connectivity_keys = Vec::new();
+        {
+            let connectivity = write.open_table(CONNECTIVITY)?;
+            for entry in connectivity.iter()? {
+                let (key, value) = entry?;
+                let key = decode_identifier::<32>(key.value(), "connectivity", "connectivity key")?;
+                let record = ConnectivityAuthorityRecord::decode(value.value())?;
+                validate_connectivity_key(&record, &key)?;
+                if record.network_id == network_id {
+                    connectivity_keys.push(key);
+                }
+            }
+        }
         let mut join_token_keys = Vec::new();
         {
             let tokens = write.open_table(JOIN_TOKENS)?;
@@ -505,6 +530,12 @@ impl AuthorityStore {
             let mut endpoints = write.open_table(ENDPOINTS)?;
             for key in endpoint_keys {
                 endpoints.remove(key.as_slice())?;
+            }
+        }
+        {
+            let mut connectivity = write.open_table(CONNECTIVITY)?;
+            for key in connectivity_keys {
+                connectivity.remove(key.as_slice())?;
             }
         }
         {
@@ -693,7 +724,7 @@ impl AuthorityStore {
         self.add_membership_transaction(node_id, network_id, now, None)
     }
 
-    /// Removes membership and endpoint state in one authority transaction.
+    /// Removes membership, endpoint, and connectivity state in one transaction.
     ///
     /// Repeating an absent leave is idempotent and returns current counters.
     ///
@@ -726,6 +757,10 @@ impl AuthorityStore {
         {
             let mut endpoints = write.open_table(ENDPOINTS)?;
             endpoints.remove(key.as_slice())?;
+        }
+        {
+            let mut connectivity = write.open_table(CONNECTIVITY)?;
+            connectivity.remove(key.as_slice())?;
         }
         {
             let mut networks = write.open_table(NETWORKS)?;
@@ -782,6 +817,9 @@ impl AuthorityStore {
         if status == MembershipStatus::Suspended {
             let mut endpoints = write.open_table(ENDPOINTS)?;
             endpoints.remove(key.as_slice())?;
+            drop(endpoints);
+            let mut connectivity = write.open_table(CONNECTIVITY)?;
+            connectivity.remove(key.as_slice())?;
         }
         write.commit()?;
         Ok(revision)
@@ -989,6 +1027,164 @@ impl AuthorityStore {
         Ok(records)
     }
 
+    /// Publishes or withdraws one complete version 0.2 connectivity generation.
+    ///
+    /// Publication creates or refreshes the member's existing online lease
+    /// without replacing any version 0.1 endpoints. A new lease, a changed
+    /// generation, or an effective withdrawal advances the shared network
+    /// snapshot revision exactly once. Republishing identical content only
+    /// refreshes the lease activity time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for an unknown, disabled, or suspended member, a
+    /// malformed or expired generation, inconsistent persisted state, an
+    /// exhausted revision, or transaction failure.
+    pub fn publish_connectivity(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+        generation: Option<&[u8]>,
+        now: u64,
+    ) -> Result<AuthorityRevision, StoreError> {
+        let candidate = generation
+            .map(|bytes| ConnectivityAuthorityRecord::new(network_id, node_id, bytes))
+            .transpose()?;
+        if candidate
+            .as_ref()
+            .is_some_and(|record| record.expires_at <= now)
+        {
+            return Err(StoreError::ConnectivityGenerationExpired {
+                network_id,
+                node_id,
+            });
+        }
+
+        let key = membership_key(network_id, node_id);
+        let write = self.database.begin_write()?;
+        let mut network = load_network_for_write(&write, network_id)?;
+        require_active_member_for_write(&write, node_id, network_id, &key)?;
+
+        let existing_lease = {
+            let endpoints = write.open_table(ENDPOINTS)?;
+            let record = endpoints
+                .get(key.as_slice())?
+                .map(|value| EndpointLeaseRecord::decode(value.value()))
+                .transpose()?;
+            record
+        };
+        if let Some(record) = &existing_lease {
+            validate_endpoint_key(record, &key)?;
+        }
+        let existing_connectivity = {
+            let connectivity = write.open_table(CONNECTIVITY)?;
+            let record = connectivity
+                .get(key.as_slice())?
+                .map(|value| ConnectivityAuthorityRecord::decode(value.value()))
+                .transpose()?;
+            record
+        };
+        if let Some(record) = &existing_connectivity {
+            validate_connectivity_key(record, &key)?;
+            if existing_lease.is_none() {
+                return Err(malformed(
+                    "connectivity",
+                    "connectivity record has no online lease",
+                ));
+            }
+        }
+
+        let lease_created = existing_lease.is_none();
+        let mut lease =
+            existing_lease.unwrap_or(EndpointLeaseRecord::new(network_id, node_id, &[], now)?);
+        let lease_refreshed = !lease_created && lease.refresh(now);
+        let connectivity_changed = match (&candidate, &existing_connectivity) {
+            (Some(candidate), Some(existing)) => {
+                candidate.encoded_record != existing.encoded_record
+            }
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
+
+        if !lease_created && !lease_refreshed && !connectivity_changed {
+            return Ok(network.revision());
+        }
+        if lease_created || lease_refreshed {
+            let encoded = lease.encode()?;
+            let mut endpoints = write.open_table(ENDPOINTS)?;
+            endpoints.insert(key.as_slice(), encoded.as_slice())?;
+        }
+        if connectivity_changed {
+            let mut connectivity = write.open_table(CONNECTIVITY)?;
+            if let Some(candidate) = &candidate {
+                let encoded = candidate.encode()?;
+                connectivity.insert(key.as_slice(), encoded.as_slice())?;
+            } else {
+                connectivity.remove(key.as_slice())?;
+            }
+        }
+
+        let visible_changed = lease_created || connectivity_changed;
+        let revision = if visible_changed {
+            let revision = network.advance_snapshot()?;
+            let encoded_network = network.encode()?;
+            let mut networks = write.open_table(NETWORKS)?;
+            networks.insert(network_id.as_bytes().as_slice(), encoded_network.as_slice())?;
+            revision
+        } else {
+            network.revision()
+        };
+        write.commit()?;
+        Ok(revision)
+    }
+
+    /// Returns one member's latest complete connectivity generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for persistence, key, or record-decoding failure.
+    pub fn get_connectivity(
+        &self,
+        node_id: NodeId,
+        network_id: NetworkId,
+    ) -> Result<Option<ConnectivityAuthorityRecord>, StoreError> {
+        let key = membership_key(network_id, node_id);
+        let read = self.database.begin_read()?;
+        let connectivity = read.open_table(CONNECTIVITY)?;
+        let Some(value) = connectivity.get(key.as_slice())? else {
+            return Ok(None);
+        };
+        let record = ConnectivityAuthorityRecord::decode(value.value())?;
+        validate_connectivity_key(&record, &key)?;
+        Ok(Some(record))
+    }
+
+    /// Lists every published connectivity generation in one network.
+    ///
+    /// Records are returned in strict node-ID order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for persistence, key, or record-decoding failure.
+    pub fn list_connectivity(
+        &self,
+        network_id: NetworkId,
+    ) -> Result<Vec<ConnectivityAuthorityRecord>, StoreError> {
+        let read = self.database.begin_read()?;
+        let connectivity = read.open_table(CONNECTIVITY)?;
+        let mut records = Vec::new();
+        for entry in connectivity.iter()? {
+            let (key, value) = entry?;
+            let key = decode_identifier::<32>(key.value(), "connectivity", "connectivity key")?;
+            let record = ConnectivityAuthorityRecord::decode(value.value())?;
+            validate_connectivity_key(&record, &key)?;
+            if record.network_id == network_id {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Reads one coherent active-session view in a single redb transaction.
     ///
     /// The view contains the authenticated local node and membership plus each
@@ -1013,6 +1209,7 @@ impl AuthorityStore {
         require_active_membership(&local_membership)?;
 
         let endpoint_table = read.open_table(ENDPOINTS)?;
+        let connectivity_table = read.open_table(CONNECTIVITY)?;
         let mut peers = Vec::new();
         for entry in endpoint_table.iter()? {
             let (key, value) = entry?;
@@ -1026,10 +1223,18 @@ impl AuthorityStore {
             require_enabled_node(&peer_node)?;
             let membership = load_membership_for_read(&read, endpoint_lease.node_id, network_id)?;
             require_active_membership(&membership)?;
+            let connectivity = connectivity_table
+                .get(key.as_slice())?
+                .map(|value| ConnectivityAuthorityRecord::decode(value.value()))
+                .transpose()?;
+            if let Some(record) = &connectivity {
+                validate_connectivity_key(record, &key)?;
+            }
             peers.push(OnlinePeerAuthorityRecord {
                 node: peer_node,
                 membership,
                 endpoint_lease,
+                connectivity,
             });
         }
         peers.sort_by_key(|peer| peer.node.node_id());
@@ -1041,11 +1246,12 @@ impl AuthorityStore {
         })
     }
 
-    /// Removes expired online leases in one transaction.
+    /// Removes expired online leases and connectivity generations atomically.
     ///
-    /// Every affected network advances its snapshot revision exactly once,
-    /// even when multiple peers in that network expire at the same cutoff.
-    /// Returned revisions are ordered by network ID.
+    /// An expired generation is withdrawn without removing a still-current
+    /// online lease. Every affected network advances its snapshot revision
+    /// exactly once, even when multiple leases and generations expire at the
+    /// same cutoff. Returned revisions are ordered by network ID.
     ///
     /// # Errors
     ///
@@ -1067,12 +1273,33 @@ impl AuthorityStore {
                 }
             }
         }
-        if expired.is_empty() {
+        let mut expired_connectivity = BTreeMap::<NetworkId, Vec<[u8; 32]>>::new();
+        {
+            let connectivity = write.open_table(CONNECTIVITY)?;
+            for entry in connectivity.iter()? {
+                let (key, value) = entry?;
+                let key = decode_identifier::<32>(key.value(), "connectivity", "connectivity key")?;
+                let record = ConnectivityAuthorityRecord::decode(value.value())?;
+                validate_connectivity_key(&record, &key)?;
+                if record.expires_at <= now {
+                    expired_connectivity
+                        .entry(record.network_id)
+                        .or_default()
+                        .push(key);
+                }
+            }
+        }
+        if expired.is_empty() && expired_connectivity.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut network_updates = Vec::with_capacity(expired.len());
-        for network_id in expired.keys().copied() {
+        let affected_networks = expired
+            .keys()
+            .chain(expired_connectivity.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut network_updates = Vec::with_capacity(affected_networks.len());
+        for network_id in affected_networks {
             let mut network = load_network_for_write(&write, network_id)?;
             let revision = network.advance_snapshot()?;
             network_updates.push((network_id, network.encode()?, revision));
@@ -1082,6 +1309,19 @@ impl AuthorityStore {
             for keys in expired.values() {
                 for key in keys {
                     endpoint_table.remove(key.as_slice())?;
+                }
+            }
+        }
+        {
+            let mut connectivity = write.open_table(CONNECTIVITY)?;
+            for keys in expired.values() {
+                for key in keys {
+                    connectivity.remove(key.as_slice())?;
+                }
+            }
+            for keys in expired_connectivity.values() {
+                for key in keys {
+                    connectivity.remove(key.as_slice())?;
                 }
             }
         }
@@ -1188,6 +1428,7 @@ impl AuthorityStore {
             NETWORKS,
             MEMBERSHIPS,
             ENDPOINTS,
+            CONNECTIVITY,
             ENROLLMENT_TOKENS,
             JOIN_TOKENS,
         ] {
@@ -1864,6 +2105,176 @@ impl EndpointLeaseRecord {
     }
 }
 
+/// Persisted complete version 0.2 connectivity record for one online member.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConnectivityAuthorityRecord {
+    network_id: NetworkId,
+    node_id: NodeId,
+    generation_id: u64,
+    created_at: u64,
+    expires_at: u64,
+    encoded_record: Vec<u8>,
+}
+
+impl ConnectivityAuthorityRecord {
+    fn new(
+        network_id: NetworkId,
+        node_id: NodeId,
+        generation_bytes: &[u8],
+    ) -> Result<Self, StoreError> {
+        if network_id.is_zero() || node_id.is_zero() {
+            return Err(malformed(
+                "connectivity",
+                "connectivity authority identity is zero",
+            ));
+        }
+        let generation = ConnectivityGenerationView::decode(generation_bytes)?;
+        let encoded_length = CONNECTIVITY_RECORD_FIXED_LENGTH
+            .checked_add(generation.encoded_len())
+            .ok_or(StoreError::LengthOverflow)?;
+        let encoded_length_u16 =
+            u16::try_from(encoded_length).map_err(|_| StoreError::LengthOverflow)?;
+        let mut encoded_record = allocate_record(encoded_length)?;
+        encoded_record[0..2].copy_from_slice(&encoded_length_u16.to_be_bytes());
+        encoded_record[4..20].copy_from_slice(node_id.as_bytes());
+        encoded_record[CONNECTIVITY_RECORD_FIXED_LENGTH..].copy_from_slice(generation_bytes);
+        ConnectivityRecordView::decode(&encoded_record)?;
+        Ok(Self {
+            network_id,
+            node_id,
+            generation_id: generation.generation_id(),
+            created_at: generation.created_at(),
+            expires_at: generation.expires_at(),
+            encoded_record,
+        })
+    }
+
+    /// Returns the virtual network containing this connectivity generation.
+    #[must_use]
+    pub const fn network_id(&self) -> NetworkId {
+        self.network_id
+    }
+
+    /// Returns the publishing node identity.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Returns the random generation correlation identifier.
+    #[must_use]
+    pub const fn generation_id(&self) -> u64 {
+        self.generation_id
+    }
+
+    /// Returns the generation creation Unix time.
+    #[must_use]
+    pub const fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Returns the exclusive generation expiry Unix time.
+    #[must_use]
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    /// Borrows the complete canonical version 0.2 connectivity record.
+    #[must_use]
+    pub fn encoded_record(&self) -> &[u8] {
+        &self.encoded_record
+    }
+
+    /// Borrows the canonical generation nested inside the record.
+    #[must_use]
+    pub fn encoded_generation(&self) -> &[u8] {
+        &self.encoded_record[CONNECTIVITY_RECORD_FIXED_LENGTH..]
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        let length = CONNECTIVITY_AUTHORITY_RECORD_FIXED_LENGTH
+            .checked_add(self.encoded_record.len())
+            .ok_or(StoreError::LengthOverflow)?;
+        let mut bytes = allocate_record(length)?;
+        bytes[0..4].copy_from_slice(&CONNECTIVITY_AUTHORITY_RECORD_MAGIC);
+        bytes[4] = RECORD_VERSION;
+        bytes[8..24].copy_from_slice(self.network_id.as_bytes());
+        bytes[CONNECTIVITY_AUTHORITY_RECORD_FIXED_LENGTH..].copy_from_slice(&self.encoded_record);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
+        let minimum = CONNECTIVITY_AUTHORITY_RECORD_FIXED_LENGTH
+            .checked_add(CONNECTIVITY_RECORD_FIXED_LENGTH)
+            .ok_or(StoreError::LengthOverflow)?;
+        if bytes.len() < minimum {
+            return Err(malformed(
+                "connectivity",
+                "connectivity authority record is truncated",
+            ));
+        }
+        if bytes.get(0..4) != Some(CONNECTIVITY_AUTHORITY_RECORD_MAGIC.as_slice())
+            || bytes[4] != RECORD_VERSION
+        {
+            return Err(malformed(
+                "connectivity",
+                "connectivity authority record header is invalid",
+            ));
+        }
+        if bytes[5..8].iter().any(|byte| *byte != 0) {
+            return Err(malformed(
+                "connectivity",
+                "connectivity authority reserved bytes are non-zero",
+            ));
+        }
+        let network_id = NetworkId::from_bytes(copy_array(
+            bytes,
+            8,
+            "connectivity",
+            "connectivity network ID is truncated",
+        )?);
+        if network_id.is_zero() {
+            return Err(malformed(
+                "connectivity",
+                "connectivity authority network ID is zero",
+            ));
+        }
+        let encoded = &bytes[CONNECTIVITY_AUTHORITY_RECORD_FIXED_LENGTH..];
+        let record = ConnectivityRecordView::decode(encoded)?;
+        let generation = record.generation();
+        let mut encoded_record = allocate_record(encoded.len())?;
+        encoded_record.copy_from_slice(encoded);
+        Ok(Self {
+            network_id,
+            node_id: record.node_id(),
+            generation_id: generation.generation_id(),
+            created_at: generation.created_at(),
+            expires_at: generation.expires_at(),
+            encoded_record,
+        })
+    }
+}
+
+impl std::fmt::Debug for ConnectivityAuthorityRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectivityAuthorityRecord")
+            .field("network_id", &self.network_id)
+            .field("node_id", &self.node_id)
+            .field("generation_id", &self.generation_id)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("encoded_length", &self.encoded_record.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ConnectivityAuthorityRecord {
+    fn drop(&mut self) {
+        self.encoded_record.zeroize();
+    }
+}
+
 /// Coherent authority records used to serve one joined control session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkSessionView {
@@ -1905,6 +2316,7 @@ pub struct OnlinePeerAuthorityRecord {
     node: NodeRecord,
     membership: MembershipRecord,
     endpoint_lease: EndpointLeaseRecord,
+    connectivity: Option<ConnectivityAuthorityRecord>,
 }
 
 impl OnlinePeerAuthorityRecord {
@@ -1924,6 +2336,12 @@ impl OnlinePeerAuthorityRecord {
     #[must_use]
     pub const fn endpoint_lease(&self) -> &EndpointLeaseRecord {
         &self.endpoint_lease
+    }
+
+    /// Returns the peer's latest complete version 0.2 connectivity record.
+    #[must_use]
+    pub const fn connectivity(&self) -> Option<&ConnectivityAuthorityRecord> {
+        self.connectivity.as_ref()
     }
 }
 
@@ -2173,6 +2591,14 @@ pub enum StoreError {
         /// Offline node ID.
         node_id: NodeId,
     },
+    /// A published connectivity generation is already expired at commit time.
+    #[error("connectivity generation for node {node_id} in network {network_id} is expired")]
+    ConnectivityGenerationExpired {
+        /// Network receiving the rejected generation.
+        network_id: NetworkId,
+        /// Publishing node.
+        node_id: NodeId,
+    },
     /// Network membership reached the signed flood-peer policy limit.
     #[error("network {network_id} has reached its member limit")]
     NetworkFull {
@@ -2357,6 +2783,70 @@ fn verify_endpoint_records(read: &redb::ReadTransaction) -> Result<(), StoreErro
     Ok(())
 }
 
+fn verify_connectivity_records(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+    let connectivity = read.open_table(CONNECTIVITY)?;
+    let endpoints = read.open_table(ENDPOINTS)?;
+    let memberships = read.open_table(MEMBERSHIPS)?;
+    let nodes = read.open_table(NODES)?;
+    let networks = read.open_table(NETWORKS)?;
+    for entry in connectivity.iter()? {
+        let (key, value) = entry?;
+        let key = decode_identifier::<32>(key.value(), "connectivity", "connectivity key")?;
+        let record = ConnectivityAuthorityRecord::decode(value.value())?;
+        validate_connectivity_key(&record, &key)?;
+
+        let Some(endpoint_value) = endpoints.get(key.as_slice())? else {
+            return Err(malformed(
+                "connectivity",
+                "connectivity record has no online lease",
+            ));
+        };
+        let endpoint = EndpointLeaseRecord::decode(endpoint_value.value())?;
+        validate_endpoint_key(&endpoint, &key)?;
+
+        let Some(node_value) = nodes.get(record.node_id.as_bytes().as_slice())? else {
+            return Err(StoreError::NodeNotFound {
+                node_id: record.node_id,
+            });
+        };
+        let node = NodeRecord::decode(node_value.value())?;
+        if node.node_id() != record.node_id {
+            return Err(StoreError::RecordKeyMismatch { table: "nodes" });
+        }
+        if !node.enabled {
+            return Err(StoreError::NodeDisabled {
+                node_id: record.node_id,
+            });
+        }
+
+        let Some(network_value) = networks.get(record.network_id.as_bytes().as_slice())? else {
+            return Err(StoreError::NetworkNotFound {
+                network_id: record.network_id,
+            });
+        };
+        let network = NetworkRecord::decode(network_value.value())?;
+        if network.network_id() != record.network_id {
+            return Err(StoreError::RecordKeyMismatch { table: "networks" });
+        }
+
+        let Some(membership_value) = memberships.get(key.as_slice())? else {
+            return Err(StoreError::MembershipNotFound {
+                network_id: record.network_id,
+                node_id: record.node_id,
+            });
+        };
+        let membership = MembershipRecord::decode(membership_value.value())?;
+        validate_membership_key(&membership, &key)?;
+        if membership.status != MembershipStatus::Active {
+            return Err(StoreError::MembershipSuspended {
+                network_id: record.network_id,
+                node_id: record.node_id,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_membership_key(record: &MembershipRecord, key: &[u8; 32]) -> Result<(), StoreError> {
     if membership_key(record.network_id, record.node_id) != *key {
         return Err(StoreError::RecordKeyMismatch {
@@ -2369,6 +2859,18 @@ fn validate_membership_key(record: &MembershipRecord, key: &[u8; 32]) -> Result<
 fn validate_endpoint_key(record: &EndpointLeaseRecord, key: &[u8; 32]) -> Result<(), StoreError> {
     if membership_key(record.network_id, record.node_id) != *key {
         return Err(StoreError::RecordKeyMismatch { table: "endpoints" });
+    }
+    Ok(())
+}
+
+fn validate_connectivity_key(
+    record: &ConnectivityAuthorityRecord,
+    key: &[u8; 32],
+) -> Result<(), StoreError> {
+    if membership_key(record.network_id, record.node_id) != *key {
+        return Err(StoreError::RecordKeyMismatch {
+            table: "connectivity",
+        });
     }
     Ok(())
 }
@@ -2539,12 +3041,45 @@ fn create_empty_tables(write: &redb::WriteTransaction) -> Result<(), StoreError>
     write.open_table(NETWORKS)?;
     write.open_table(MEMBERSHIPS)?;
     write.open_table(ENDPOINTS)?;
+    write.open_table(CONNECTIVITY)?;
     write.open_table(ENROLLMENT_TOKENS)?;
     write.open_table(JOIN_TOKENS)?;
     Ok(())
 }
 
+fn migrate_authority_schema(database: &Database, schema_version: u32) -> Result<(), StoreError> {
+    match schema_version {
+        STORE_SCHEMA_VERSION => Ok(()),
+        LEGACY_STORE_SCHEMA_VERSION => {
+            let write = database.begin_write()?;
+            write.open_table(CONNECTIVITY)?;
+            {
+                let mut metadata = write.open_table(METADATA)?;
+                let current = STORE_SCHEMA_VERSION.to_be_bytes();
+                metadata.insert(SCHEMA_VERSION_KEY, current.as_slice())?;
+            }
+            write.commit()?;
+            Ok(())
+        }
+        actual => Err(StoreError::UnsupportedSchema {
+            actual,
+            supported: STORE_SCHEMA_VERSION,
+        }),
+    }
+}
+
 fn read_metadata(database: &Database) -> Result<ControllerId, StoreError> {
+    let (schema, controller) = read_metadata_unchecked(database)?;
+    if schema != STORE_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            actual: schema,
+            supported: STORE_SCHEMA_VERSION,
+        });
+    }
+    Ok(controller)
+}
+
+fn read_metadata_unchecked(database: &Database) -> Result<(u32, ControllerId), StoreError> {
     let read = database.begin_read()?;
     let metadata = read.open_table(METADATA)?;
     let schema = metadata
@@ -2561,12 +3096,6 @@ fn read_metadata(database: &Database) -> Result<ControllerId, StoreError> {
                     field: SCHEMA_VERSION_KEY,
                 })?,
         );
-    if schema != STORE_SCHEMA_VERSION {
-        return Err(StoreError::UnsupportedSchema {
-            actual: schema,
-            supported: STORE_SCHEMA_VERSION,
-        });
-    }
     let controller = metadata
         .get(CONTROLLER_ID_KEY)?
         .ok_or(StoreError::InvalidMetadata {
@@ -2580,7 +3109,7 @@ fn read_metadata(database: &Database) -> Result<ControllerId, StoreError> {
     if controller.is_zero() {
         return Err(StoreError::InvalidControllerId);
     }
-    Ok(controller)
+    Ok((schema, controller))
 }
 
 fn validate_display_name(display_name: &str) -> Result<(), StoreError> {
@@ -2642,6 +3171,7 @@ const fn malformed(table: &'static str, reason: &'static str) -> StoreError {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::OpenOptions,
         net::Ipv4Addr,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -2649,10 +3179,15 @@ mod tests {
 
     use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
-    use stella_proto::{ConfidentialityPolicy, Endpoint, NetworkPolicy};
+    use stella_proto::{
+        encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
+        ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
+    };
 
     use super::{
         AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord, StoreError,
+        CONTROLLER_ID_KEY, ENDPOINTS, ENROLLMENT_TOKENS, JOIN_TOKENS, LEGACY_STORE_SCHEMA_VERSION,
+        MEMBERSHIPS, METADATA, NETWORKS, NODES, SCHEMA_VERSION_KEY, STORE_SCHEMA_VERSION,
     };
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -2707,6 +3242,35 @@ mod tests {
         }
     }
 
+    fn connectivity_generation(generation_id: u64, created_at: u64) -> Vec<u8> {
+        let candidate = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: u32::MAX - 1,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: format!("192.0.2.{}:45000", generation_id % 200 + 1)
+                .parse()
+                .expect("valid candidate address"),
+            related_address: None,
+            relay_id: None,
+        };
+        let candidates = [candidate];
+        let generation = ConnectivityGenerationRef::new(
+            generation_id,
+            generation_id + 100,
+            created_at,
+            created_at + 600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &candidates,
+        )
+        .expect("valid connectivity generation");
+        let mut encoded = vec![0; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        encoded
+    }
+
     fn endpoint_test_store() -> (PathBuf, AuthorityStore, NodeId, NodeId, NetworkId) {
         let directory = temp_directory();
         std::fs::create_dir(&directory).expect("create test directory");
@@ -2754,6 +3318,63 @@ mod tests {
             AuthorityStore::initialize(&path, controller_id),
             Err(StoreError::Create { .. })
         ));
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn schema_one_is_atomically_migrated_before_verification() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let controller_id = ControllerId::from_bytes([55; 16]);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create legacy database");
+        let database = redb::Builder::new()
+            .create_file(file)
+            .expect("initialize legacy database");
+        let write = database.begin_write().expect("begin legacy transaction");
+        {
+            let mut metadata = write.open_table(METADATA).expect("open metadata");
+            let schema = LEGACY_STORE_SCHEMA_VERSION.to_be_bytes();
+            metadata
+                .insert(SCHEMA_VERSION_KEY, schema.as_slice())
+                .expect("write legacy schema");
+            metadata
+                .insert(CONTROLLER_ID_KEY, controller_id.as_bytes().as_slice())
+                .expect("write controller ID");
+        }
+        write.open_table(NODES).expect("create nodes");
+        write.open_table(NETWORKS).expect("create networks");
+        write.open_table(MEMBERSHIPS).expect("create memberships");
+        write.open_table(ENDPOINTS).expect("create endpoints");
+        write
+            .open_table(ENROLLMENT_TOKENS)
+            .expect("create enrollment tokens");
+        write.open_table(JOIN_TOKENS).expect("create join tokens");
+        write.commit().expect("commit legacy database");
+        drop(database);
+
+        let store = AuthorityStore::open(&path, controller_id).expect("migrate legacy database");
+        assert!(store
+            .list_connectivity(NetworkId::from_bytes([56; 16]))
+            .expect("read migrated connectivity table")
+            .is_empty());
+        let read = store.database.begin_read().expect("read migrated metadata");
+        let metadata = read.open_table(METADATA).expect("open migrated metadata");
+        let schema = metadata
+            .get(SCHEMA_VERSION_KEY)
+            .expect("read schema")
+            .expect("schema exists");
+        assert_eq!(schema.value(), STORE_SCHEMA_VERSION.to_be_bytes());
+        drop(schema);
+        drop(metadata);
+        drop(read);
+        store.verify().expect("migrated database verifies");
+        drop(store);
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
@@ -2847,6 +3468,10 @@ mod tests {
                 .add_member(first_node_id, network_id, 110)
                 .expect("add member");
         }
+        let generation = connectivity_generation(1, 100);
+        store
+            .publish_connectivity(first_node_id, deleted_network_id, Some(&generation), 110)
+            .expect("publish deleted-network connectivity");
         let old_token = store
             .issue_join_token(deleted_network_id, 100, 200)
             .expect("issue join token");
@@ -2864,6 +3489,10 @@ mod tests {
         assert!(store
             .get_membership(first_node_id, deleted_network_id)
             .expect("membership lookup")
+            .is_none());
+        assert!(store
+            .get_connectivity(first_node_id, deleted_network_id)
+            .expect("connectivity lookup")
             .is_none());
         assert!(store
             .get_network(retained_network_id)
@@ -3252,6 +3881,205 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_publication_shares_online_lease_and_snapshot_revision() {
+        let (directory, store, first_id, second_id, network_id) = endpoint_test_store();
+        store
+            .add_member(first_id, network_id, 110)
+            .expect("add publishing member");
+        store
+            .add_member(second_id, network_id, 110)
+            .expect("add observing member");
+
+        let first_generation = connectivity_generation(7, 100);
+        let published = store
+            .publish_connectivity(first_id, network_id, Some(&first_generation), 120)
+            .expect("publish first generation");
+        assert_eq!(published.controller_epoch, 3);
+        assert_eq!(published.snapshot_revision, 4);
+        let lease = store
+            .get_endpoints(first_id, network_id)
+            .expect("read generated lease")
+            .expect("online lease exists");
+        assert_eq!(lease.updated_at(), 120);
+        assert!(lease.endpoints().is_empty());
+        let stored = store
+            .get_connectivity(first_id, network_id)
+            .expect("read connectivity")
+            .expect("connectivity exists");
+        assert_eq!(stored.generation_id(), 7);
+        assert_eq!(stored.encoded_generation(), first_generation);
+        let diagnostic = format!("{stored:?}");
+        assert!(!diagnostic.contains("Abcd1234"));
+        assert!(!diagnostic.contains("Abcdefghijklmnopqrstuv"));
+
+        assert_eq!(
+            store
+                .publish_connectivity(first_id, network_id, Some(&first_generation), 125)
+                .expect("republish identical generation"),
+            published
+        );
+        assert_eq!(
+            store
+                .get_endpoints(first_id, network_id)
+                .expect("read refreshed lease")
+                .expect("online lease exists")
+                .updated_at(),
+            125
+        );
+        assert!(matches!(
+            store.publish_connectivity(first_id, network_id, Some(&first_generation), 700),
+            Err(StoreError::ConnectivityGenerationExpired { .. })
+        ));
+
+        let second_generation = connectivity_generation(8, 130);
+        let replaced = store
+            .publish_connectivity(first_id, network_id, Some(&second_generation), 130)
+            .expect("replace connectivity generation");
+        assert_eq!(replaced.snapshot_revision, 5);
+        let view = store
+            .network_session_view(second_id, network_id)
+            .expect("read peer connectivity view");
+        assert_eq!(view.peers().len(), 1);
+        assert_eq!(
+            view.peers()[0]
+                .connectivity()
+                .expect("peer connectivity exists")
+                .generation_id(),
+            8
+        );
+        store.verify().expect("connectivity state verifies");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn connectivity_backup_withdrawal_and_lease_expiry_are_atomic() {
+        let (directory, store, first_id, second_id, network_id) = endpoint_test_store();
+        store
+            .add_member(first_id, network_id, 110)
+            .expect("add publishing member");
+        store
+            .add_member(second_id, network_id, 110)
+            .expect("add observing member");
+        let generation = connectivity_generation(8, 130);
+        let published = store
+            .publish_connectivity(first_id, network_id, Some(&generation), 130)
+            .expect("publish connectivity generation");
+        assert_eq!(published.snapshot_revision, 4);
+        let backup_path = directory.join("connectivity.backup.redb");
+        store.backup(&backup_path).expect("back up connectivity");
+        let backup = AuthorityStore::open(&backup_path, store.controller_id())
+            .expect("open connectivity backup");
+        assert_eq!(
+            backup
+                .get_connectivity(first_id, network_id)
+                .expect("read backed-up connectivity")
+                .expect("backed-up connectivity exists")
+                .encoded_generation(),
+            generation
+        );
+        drop(backup);
+
+        let withdrawn = store
+            .publish_connectivity(first_id, network_id, None, 135)
+            .expect("withdraw connectivity");
+        assert_eq!(withdrawn.snapshot_revision, 5);
+        assert!(store
+            .get_connectivity(first_id, network_id)
+            .expect("read withdrawn connectivity")
+            .is_none());
+        assert!(store
+            .get_endpoints(first_id, network_id)
+            .expect("read retained lease")
+            .is_some());
+        assert_eq!(
+            store
+                .publish_connectivity(first_id, network_id, None, 140)
+                .expect("repeat withdrawal"),
+            withdrawn
+        );
+
+        let republished = store
+            .publish_connectivity(first_id, network_id, Some(&generation), 145)
+            .expect("republish before expiry");
+        assert_eq!(republished.snapshot_revision, 6);
+        assert!(store
+            .expire_endpoints(174)
+            .expect("retain live connectivity")
+            .is_empty());
+        let expired = store
+            .expire_endpoints(175)
+            .expect("expire connectivity lease");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].snapshot_revision, 7);
+        assert!(store
+            .get_connectivity(first_id, network_id)
+            .expect("read expired connectivity")
+            .is_none());
+        assert!(store
+            .get_endpoints(first_id, network_id)
+            .expect("read expired lease")
+            .is_none());
+        store.verify().expect("connectivity state verifies");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn connectivity_generation_expiry_preserves_a_fresh_online_lease() {
+        let (directory, store, first_id, _, network_id) = endpoint_test_store();
+        store
+            .add_member(first_id, network_id, 110)
+            .expect("add publishing member");
+        let generation = connectivity_generation(11, 100);
+        let published = store
+            .publish_connectivity(first_id, network_id, Some(&generation), 120)
+            .expect("publish connectivity generation");
+        assert_eq!(published.snapshot_revision, 3);
+        assert_eq!(
+            store
+                .refresh_endpoint_lease(first_id, network_id, 690)
+                .expect("refresh online lease"),
+            published
+        );
+        assert!(store
+            .expire_endpoints(699)
+            .expect("retain live generation")
+            .is_empty());
+
+        let generation_expired = store.expire_endpoints(700).expect("expire generation only");
+        assert_eq!(generation_expired.len(), 1);
+        assert_eq!(generation_expired[0].snapshot_revision, 4);
+        assert!(store
+            .get_connectivity(first_id, network_id)
+            .expect("read expired generation")
+            .is_none());
+        assert_eq!(
+            store
+                .get_endpoints(first_id, network_id)
+                .expect("read retained online lease")
+                .expect("online lease remains")
+                .updated_at(),
+            690
+        );
+
+        assert!(store
+            .expire_endpoints(719)
+            .expect("retain fresh online lease")
+            .is_empty());
+        let lease_expired = store.expire_endpoints(720).expect("expire online lease");
+        assert_eq!(lease_expired.len(), 1);
+        assert_eq!(lease_expired[0].snapshot_revision, 5);
+        assert!(store
+            .get_endpoints(first_id, network_id)
+            .expect("read expired online lease")
+            .is_none());
+        store.verify().expect("independent expiry state verifies");
+        drop(store);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
     fn endpoint_leases_refresh_change_and_expire_atomically() {
         let (directory, store, first_id, second_id, network_id) = endpoint_test_store();
 
@@ -3369,6 +4197,10 @@ mod tests {
         store
             .publish_endpoints(node_id, network_id, &[endpoint(2, 5252)], 120)
             .expect("publish endpoint");
+        let first_generation = connectivity_generation(9, 100);
+        store
+            .publish_connectivity(node_id, network_id, Some(&first_generation), 120)
+            .expect("publish connectivity");
 
         store
             .set_membership_status(node_id, network_id, MembershipStatus::Suspended)
@@ -3377,18 +4209,31 @@ mod tests {
             .get_endpoints(node_id, network_id)
             .expect("get suspended endpoint")
             .is_none());
+        assert!(store
+            .get_connectivity(node_id, network_id)
+            .expect("get suspended connectivity")
+            .is_none());
         store
             .set_membership_status(node_id, network_id, MembershipStatus::Active)
             .expect("resume member");
         store
-            .publish_endpoints(node_id, network_id, &[endpoint(2, 5252)], 130)
-            .expect("republish endpoint");
+            .publish_connectivity(
+                node_id,
+                network_id,
+                Some(&connectivity_generation(10, 130)),
+                130,
+            )
+            .expect("republish connectivity");
         assert!(store
             .set_node_enabled(node_id, false)
             .expect("disable node"));
         assert!(store
             .get_endpoints(node_id, network_id)
             .expect("get disabled endpoint")
+            .is_none());
+        assert!(store
+            .get_connectivity(node_id, network_id)
+            .expect("get disabled connectivity")
             .is_none());
         store
             .verify()

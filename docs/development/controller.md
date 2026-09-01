@@ -94,17 +94,20 @@ ten seconds after TLS establishment.
 
 ## Authority store
 
-The redb schema separates metadata, nodes, networks, memberships, endpoints,
-enrollment-token digests, and join-token digests. Every persisted value begins
-with an internal format version and is decoded with explicit size and semantic
-bounds.
+The redb schema separates metadata, nodes, networks, memberships, online
+endpoint leases, version 0.2 connectivity generations, enrollment-token
+digests, and join-token digests. Every persisted value begins with an internal
+format version and is decoded with explicit size and semantic bounds.
 
 Database creation uses create-new file semantics. Metadata binds schema version
-1 to the controller ID, and startup opens every declared table before serving.
-Node and network values have independent magic/version fields, bounded UTF-8
-display names, explicit big-endian counters, and canonical public-key or policy
-bytes. `state verify` walks every record and confirms that its derived node or
-network identity matches the redb key.
+2 to the controller ID, and startup opens every declared table before serving.
+Opening schema version 1 performs an atomic one-way migration that creates the
+empty connectivity table and advances metadata to version 2; older binaries
+then reject the database rather than leaving connectivity state stale. Node and
+network values have independent magic/version fields, bounded UTF-8 display
+names, explicit big-endian counters, and canonical public-key or policy bytes.
+`state verify` walks every record and confirms that its derived node, network,
+authorization, and online-lease relationships match the redb key.
 
 The authority thread enforces these transaction groups:
 
@@ -115,7 +118,14 @@ The authority thread enforces these transaction groups:
   revision, and grant changes;
 - enable or disable a node plus one epoch/revision advance and grant-serial
   rotation for every network in which that node is a member;
-- publish endpoints plus snapshot revision advancement.
+- publish endpoints plus snapshot revision advancement; and
+- publish or withdraw a complete connectivity generation while refreshing the
+  same online lease and shared snapshot revision.
+
+The maintenance transaction expires online leases and connectivity generations
+against their independent deadlines. Lease expiry removes both records;
+generation expiry advances the shared snapshot revision but preserves a
+recently refreshed online lease.
 
 Bearer tokens are generated from operating-system randomness, displayed once
 and stored only as domain-separated SHA-256 digests with an expiry. Enrollment

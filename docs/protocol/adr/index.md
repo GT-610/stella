@@ -39,3 +39,4 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0025: Maintain a warm relay fallback](./0025-maintain-warm-relay-fallback.md)
 - [0026: Bind peer sessions to validated paths](./0026-bind-sessions-to-validated-paths.md)
 - [0027: Distribute connectivity separately from membership records](./0027-separate-connectivity-from-membership-records.md)
+- [0028: Migrate authority state before storing connectivity generations](./0028-migrate-connectivity-authority-state.md)
