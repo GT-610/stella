@@ -9,7 +9,8 @@ use std::{
 use stella_common::{MacAddress, NetworkId, NodeId};
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
-    CommonHeader, ConnectivityCarrier, Endpoint, HandshakeHeader, IceCandidateClass, PacketType,
+    CommonHeader, ConnectivityCarrier, Endpoint, HandshakeHeader, IceCandidate, IceCandidateClass,
+    PacketType, RelayCarrierMask,
 };
 use stella_transport::{Endpoint as TransportEndpoint, PathId};
 use thiserror::Error;
@@ -174,7 +175,7 @@ pub struct NetworkDataPlane {
     max_datagram_size: usize,
     switch: L2Switch,
     handshakes: PeerHandshakeManager,
-    turn_udp_available: bool,
+    available_relay_carriers: u16,
     nominated_direct_paths: BTreeMap<NodeId, SocketAddr>,
     paths: BTreeMap<PathId, PeerPath>,
     peer_paths: BTreeMap<NodeId, Vec<PathId>>,
@@ -215,7 +216,7 @@ impl NetworkDataPlane {
             max_datagram_size,
             switch,
             handshakes,
-            turn_udp_available: false,
+            available_relay_carriers: 0,
             nominated_direct_paths: BTreeMap::new(),
             paths: BTreeMap::new(),
             peer_paths: BTreeMap::new(),
@@ -245,7 +246,7 @@ impl NetworkDataPlane {
             .collect()
     }
 
-    /// Enables or disables local TURN UDP delivery and rebuilds affected paths.
+    /// Enables or disables one local relay carrier and rebuilds affected paths.
     ///
     /// Existing sessions are withdrawn because changing local carrier
     /// availability changes which exact `PathId` can send and receive packets.
@@ -254,11 +255,23 @@ impl NetworkDataPlane {
     ///
     /// Returns [`NetworkDataError`] if rebuilding the current peer path set
     /// exhausts local path identifiers.
-    pub fn set_turn_udp_available(&mut self, available: bool) -> Result<(), NetworkDataError> {
-        if self.turn_udp_available == available {
+    pub fn set_relay_carrier_available(
+        &mut self,
+        carrier: ConnectivityCarrier,
+        available: bool,
+    ) -> Result<(), NetworkDataError> {
+        let Some(bit) = relay_carrier_bit(carrier) else {
+            return Ok(());
+        };
+        let updated = if available {
+            self.available_relay_carriers | bit
+        } else {
+            self.available_relay_carriers & !bit
+        };
+        if self.available_relay_carriers == updated {
             return Ok(());
         }
-        self.turn_udp_available = available;
+        self.available_relay_carriers = updated;
         let peers = self.state.peers().keys().copied().collect::<Vec<_>>();
         for peer in peers {
             self.remove_session(peer);
@@ -850,13 +863,13 @@ impl NetworkDataPlane {
             .ok_or(NetworkDataError::UnknownPath { path_id })
     }
 
-    /// Returns distinct remote TURN UDP candidates currently installed as paths.
+    /// Returns distinct remote relay candidates currently installed as paths.
     #[must_use]
     pub fn relay_endpoints(&self) -> Vec<TransportEndpoint> {
         let mut endpoints = self
             .paths
             .values()
-            .filter(|path| matches!(path.endpoint, TransportEndpoint::TurnUdp { .. }))
+            .filter(|path| path.endpoint.as_relay().is_some())
             .map(|path| path.endpoint.clone())
             .collect::<Vec<_>>();
         endpoints.sort_by_key(ToString::to_string);
@@ -902,7 +915,7 @@ impl NetworkDataPlane {
             .get(&peer)
             .copied()
             .map(TransportEndpoint::Udp);
-        let relay_endpoints = self
+        let mut relay_candidates = self
             .state
             .peers()
             .get(&peer)
@@ -910,18 +923,20 @@ impl NetworkDataPlane {
             .into_iter()
             .flat_map(|connectivity| connectivity.candidates().iter().copied())
             .filter(|candidate| {
-                self.turn_udp_available
-                    && candidate.class == IceCandidateClass::Relay
-                    && candidate.carrier == ConnectivityCarrier::TurnUdp
+                candidate.class == IceCandidateClass::Relay
+                    && self.relay_carrier_available(candidate.carrier)
             })
-            .filter_map(|candidate| {
-                candidate
-                    .relay_id
-                    .map(|relay_id| TransportEndpoint::TurnUdp {
-                        relay_id,
-                        address: candidate.address,
-                    })
-            })
+            .collect::<Vec<_>>();
+        relay_candidates.sort_by_key(|candidate| {
+            (
+                relay_carrier_rank(candidate.carrier),
+                std::cmp::Reverse(candidate.priority),
+                candidate.address,
+            )
+        });
+        let relay_endpoints = relay_candidates
+            .into_iter()
+            .filter_map(relay_transport_endpoint)
             .collect::<Vec<_>>();
         let mut endpoints = self
             .state
@@ -993,6 +1008,13 @@ impl NetworkDataPlane {
         Ok(())
     }
 
+    const fn relay_carrier_available(&self, carrier: ConnectivityCarrier) -> bool {
+        match relay_carrier_bit(carrier) {
+            Some(bit) => self.available_relay_carriers & bit != 0,
+            None => false,
+        }
+    }
+
     fn remove_peer_paths(&mut self, peer: NodeId) {
         if let Some(path_ids) = self.peer_paths.remove(&peer) {
             for path_id in path_ids {
@@ -1035,6 +1057,49 @@ impl NetworkDataPlane {
             self.retired_sessions.remove(&key);
             self.handshakes.retire_session(peer, session_id);
         }
+    }
+}
+
+const fn relay_carrier_bit(carrier: ConnectivityCarrier) -> Option<u16> {
+    match carrier {
+        ConnectivityCarrier::DirectUdp => None,
+        ConnectivityCarrier::TurnUdp => Some(RelayCarrierMask::TURN_UDP.bits()),
+        ConnectivityCarrier::TurnTcp => Some(RelayCarrierMask::TURN_TCP.bits()),
+        ConnectivityCarrier::TurnTls => Some(RelayCarrierMask::TURN_TLS.bits()),
+        ConnectivityCarrier::SecureWebSocket => Some(RelayCarrierMask::SECURE_WEBSOCKET.bits()),
+    }
+}
+
+const fn relay_carrier_rank(carrier: ConnectivityCarrier) -> u8 {
+    match carrier {
+        ConnectivityCarrier::DirectUdp => 0,
+        ConnectivityCarrier::TurnUdp => 1,
+        ConnectivityCarrier::TurnTcp => 2,
+        ConnectivityCarrier::TurnTls => 3,
+        ConnectivityCarrier::SecureWebSocket => 4,
+    }
+}
+
+fn relay_transport_endpoint(candidate: IceCandidate) -> Option<TransportEndpoint> {
+    let relay_id = candidate.relay_id?;
+    match candidate.carrier {
+        ConnectivityCarrier::DirectUdp => None,
+        ConnectivityCarrier::TurnUdp => Some(TransportEndpoint::TurnUdp {
+            relay_id,
+            address: candidate.address,
+        }),
+        ConnectivityCarrier::TurnTcp => Some(TransportEndpoint::TurnTcp {
+            relay_id,
+            address: candidate.address,
+        }),
+        ConnectivityCarrier::TurnTls => Some(TransportEndpoint::TurnTls {
+            relay_id,
+            address: candidate.address,
+        }),
+        ConnectivityCarrier::SecureWebSocket => Some(TransportEndpoint::SecureWebSocket {
+            relay_id,
+            address: candidate.address,
+        }),
     }
 }
 
@@ -1153,7 +1218,7 @@ mod tests {
         time::Duration,
     };
 
-    use stella_common::{MacAddress, NetworkId, RelayId};
+    use stella_common::{MacAddress, NetworkId, NodeId, RelayId};
     use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
     use stella_proto::{
         encode_connectivity_generation, CommonHeader, ConfidentialityPolicy, ConnectivityCarrier,
@@ -1164,7 +1229,7 @@ mod tests {
         network_state::encode_network_state,
         store::{AuthorityStore, NetworkRecord, NodeRecord},
     };
-    use stella_transport::Endpoint as TransportEndpoint;
+    use stella_transport::{Endpoint as TransportEndpoint, RelayCarrier};
 
     use super::{NetworkDataError, NetworkDataPlane};
     use crate::{NetworkState, SnapshotInput};
@@ -1174,6 +1239,26 @@ mod tests {
 
     fn signing_key(seed: u8) -> IdentitySigningKey {
         IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([seed; 32]))
+    }
+
+    fn enable_and_assert_relay_carrier(
+        plane: &mut NetworkDataPlane,
+        peer: NodeId,
+        carrier: ConnectivityCarrier,
+        expected: RelayCarrier,
+    ) {
+        plane
+            .set_relay_carrier_available(carrier, true)
+            .expect("enable relay carrier");
+        let selected = plane.select_peer_path(peer).expect("selected relay path");
+        assert_eq!(
+            plane
+                .transport_endpoint(selected)
+                .expect("selected endpoint")
+                .as_relay()
+                .map(|(carrier, _, _)| carrier),
+            Some(expected)
+        );
     }
 
     fn fixture() -> (
@@ -1449,7 +1534,7 @@ mod tests {
         )
         .expect("relay-aware data plane");
         plane
-            .set_turn_udp_available(true)
+            .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, true)
             .expect("enable TURN UDP paths");
         let relay_endpoint = TransportEndpoint::TurnUdp {
             relay_id,
@@ -1477,6 +1562,105 @@ mod tests {
             Err(NetworkDataError::UnknownPath { path_id }) if path_id == direct_path
         ));
         assert!(!plane.withdraw_direct_path(alice_id, direct_address));
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn relay_carriers_install_only_when_available_and_follow_fallback_order() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_id = derive_node_id(alice_key.public_key());
+        let relay_id = RelayId::from_bytes([0x66; 16]);
+        let base = IceCandidate {
+            class: IceCandidateClass::Relay,
+            carrier: ConnectivityCarrier::TurnUdp,
+            priority: 130,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: "192.0.2.50:50000".parse().expect("TURN UDP address"),
+            related_address: Some("192.0.2.51:45000".parse().expect("related address")),
+            relay_id: Some(relay_id),
+        };
+        let candidates = [
+            base,
+            IceCandidate {
+                carrier: ConnectivityCarrier::TurnTcp,
+                priority: 120,
+                foundation: 2,
+                address: "192.0.2.50:50001".parse().expect("TURN TCP address"),
+                ..base
+            },
+            IceCandidate {
+                carrier: ConnectivityCarrier::TurnTls,
+                priority: 110,
+                foundation: 3,
+                address: "192.0.2.50:50002".parse().expect("TURN TLS address"),
+                ..base
+            },
+            IceCandidate {
+                carrier: ConnectivityCarrier::SecureWebSocket,
+                priority: 100,
+                foundation: 4,
+                address: "192.0.2.50:50003".parse().expect("WebSocket address"),
+                ..base
+            },
+        ];
+        let generation = ConnectivityGenerationRef::new(
+            20,
+            21,
+            130,
+            600,
+            b"Efgh5678",
+            b"Zyxwvutsrqponmlkjihgfe",
+            &candidates,
+        )
+        .expect("multi-carrier generation");
+        let mut encoded = vec![0_u8; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        store
+            .publish_connectivity(alice_id, network_id, Some(&encoded), 130)
+            .expect("publish connectivity");
+
+        let mut plane = NetworkDataPlane::new(
+            state_for_version(
+                &store,
+                &controller,
+                &bob_key,
+                network_id,
+                ProtocolVersion::V0_2,
+            ),
+            MacAddress::from_bytes([0x02, 0, 0, 0, 1, 9]),
+            "127.0.0.1:46002".parse().expect("bob address"),
+            1_200,
+            &bob_key,
+            Duration::ZERO,
+        )
+        .expect("relay-aware data plane");
+        assert!(plane.relay_endpoints().is_empty());
+
+        for (carrier, expected) in [
+            (
+                ConnectivityCarrier::SecureWebSocket,
+                RelayCarrier::SecureWebSocket,
+            ),
+            (ConnectivityCarrier::TurnTls, RelayCarrier::TurnTls),
+            (ConnectivityCarrier::TurnTcp, RelayCarrier::TurnTcp),
+            (ConnectivityCarrier::TurnUdp, RelayCarrier::TurnUdp),
+        ] {
+            enable_and_assert_relay_carrier(&mut plane, alice_id, carrier, expected);
+        }
+
+        plane
+            .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, false)
+            .expect("disable TURN UDP");
+        let selected = plane
+            .select_peer_path(alice_id)
+            .expect("fallback relay path");
+        assert!(matches!(
+            plane.transport_endpoint(selected),
+            Ok(TransportEndpoint::TurnTcp { .. })
+        ));
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");

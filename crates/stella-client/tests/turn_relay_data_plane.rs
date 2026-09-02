@@ -490,9 +490,9 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
     )
     .expect("Bob data plane");
     alice
-        .set_turn_udp_available(true)
+        .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, true)
         .expect("enable Alice relay path");
-    bob.set_turn_udp_available(true)
+    bob.set_relay_carrier_available(ConnectivityCarrier::TurnUdp, true)
         .expect("enable Bob relay path");
     assert_eq!(
         alice.relay_endpoints(),

@@ -42,6 +42,20 @@ impl PathId {
     }
 }
 
+/// Client-to-relay carrier attached to one relayed endpoint.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum RelayCarrier {
+    /// TURN records carried over UDP.
+    TurnUdp,
+    /// TURN records carried over TCP.
+    TurnTcp,
+    /// TURN records carried over TLS over TCP.
+    TurnTls,
+    /// Stella TURN records carried by secure WebSocket.
+    SecureWebSocket,
+}
+
 impl std::fmt::Display for PathId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.get().fmt(formatter)
@@ -61,6 +75,27 @@ pub enum Endpoint {
         /// Exact relayed peer address carried by the candidate.
         address: SocketAddr,
     },
+    /// Peer address reached through one of its TURN TCP relay candidates.
+    TurnTcp {
+        /// Stable relay identity attached to the peer candidate.
+        relay_id: RelayId,
+        /// Exact relayed peer address carried by the candidate.
+        address: SocketAddr,
+    },
+    /// Peer address reached through one of its TURN TLS relay candidates.
+    TurnTls {
+        /// Stable relay identity attached to the peer candidate.
+        relay_id: RelayId,
+        /// Exact relayed peer address carried by the candidate.
+        address: SocketAddr,
+    },
+    /// Peer address reached through one of its secure WebSocket relay candidates.
+    SecureWebSocket {
+        /// Stable relay identity attached to the peer candidate.
+        relay_id: RelayId,
+        /// Exact relayed peer address carried by the candidate.
+        address: SocketAddr,
+    },
 }
 
 impl Endpoint {
@@ -69,7 +104,10 @@ impl Endpoint {
     pub const fn as_udp(&self) -> Option<SocketAddr> {
         match self {
             Self::Udp(address) => Some(*address),
-            Self::TurnUdp { .. } => None,
+            Self::TurnUdp { .. }
+            | Self::TurnTcp { .. }
+            | Self::TurnTls { .. }
+            | Self::SecureWebSocket { .. } => None,
         }
     }
 
@@ -77,8 +115,31 @@ impl Endpoint {
     #[must_use]
     pub const fn as_turn_udp(&self) -> Option<(RelayId, SocketAddr)> {
         match self {
-            Self::Udp(_) => None,
+            Self::Udp(_)
+            | Self::TurnTcp { .. }
+            | Self::TurnTls { .. }
+            | Self::SecureWebSocket { .. } => None,
             Self::TurnUdp { relay_id, address } => Some((*relay_id, *address)),
+        }
+    }
+
+    /// Returns the carrier, relay identity, and peer address for any relayed endpoint.
+    #[must_use]
+    pub const fn as_relay(&self) -> Option<(RelayCarrier, RelayId, SocketAddr)> {
+        match self {
+            Self::Udp(_) => None,
+            Self::TurnUdp { relay_id, address } => {
+                Some((RelayCarrier::TurnUdp, *relay_id, *address))
+            }
+            Self::TurnTcp { relay_id, address } => {
+                Some((RelayCarrier::TurnTcp, *relay_id, *address))
+            }
+            Self::TurnTls { relay_id, address } => {
+                Some((RelayCarrier::TurnTls, *relay_id, *address))
+            }
+            Self::SecureWebSocket { relay_id, address } => {
+                Some((RelayCarrier::SecureWebSocket, *relay_id, *address))
+            }
         }
     }
 }
@@ -89,6 +150,15 @@ impl std::fmt::Display for Endpoint {
             Self::Udp(address) => write!(formatter, "udp://{address}"),
             Self::TurnUdp { relay_id, address } => {
                 write!(formatter, "turn+udp://{relay_id}@{address}")
+            }
+            Self::TurnTcp { relay_id, address } => {
+                write!(formatter, "turn+tcp://{relay_id}@{address}")
+            }
+            Self::TurnTls { relay_id, address } => {
+                write!(formatter, "turn+tls://{relay_id}@{address}")
+            }
+            Self::SecureWebSocket { relay_id, address } => {
+                write!(formatter, "turn+wss://{relay_id}@{address}")
             }
         }
     }
@@ -152,7 +222,7 @@ pub trait DatagramTransport: Send + Sync {
 mod tests {
     use stella_common::RelayId;
 
-    use super::{Endpoint, PathId};
+    use super::{Endpoint, PathId, RelayCarrier};
 
     #[test]
     fn path_ids_are_nonzero_ordered_and_displayed_canonically() {
@@ -184,5 +254,55 @@ mod tests {
                 "192.0.2.30:50000".parse().expect("TURN UDP endpoint")
             ))
         );
+        assert_eq!(
+            endpoint.as_relay(),
+            Some((
+                RelayCarrier::TurnUdp,
+                relay_id,
+                "192.0.2.30:50000".parse().expect("TURN UDP endpoint")
+            ))
+        );
+
+        let stream_endpoints = [
+            (
+                Endpoint::TurnTcp {
+                    relay_id,
+                    address: "192.0.2.30:50001".parse().expect("TURN TCP endpoint"),
+                },
+                RelayCarrier::TurnTcp,
+                "turn+tcp://11111111111111111111111111111111@192.0.2.30:50001",
+            ),
+            (
+                Endpoint::TurnTls {
+                    relay_id,
+                    address: "192.0.2.30:50002".parse().expect("TURN TLS endpoint"),
+                },
+                RelayCarrier::TurnTls,
+                "turn+tls://11111111111111111111111111111111@192.0.2.30:50002",
+            ),
+            (
+                Endpoint::SecureWebSocket {
+                    relay_id,
+                    address: "192.0.2.30:50003".parse().expect("WebSocket endpoint"),
+                },
+                RelayCarrier::SecureWebSocket,
+                "turn+wss://11111111111111111111111111111111@192.0.2.30:50003",
+            ),
+        ];
+        for (endpoint, carrier, display) in stream_endpoints {
+            assert_eq!(endpoint.to_string(), display);
+            assert_eq!(
+                endpoint.as_relay(),
+                Some((carrier, relay_id, endpoint_address(&endpoint)))
+            );
+            assert_eq!(endpoint.as_turn_udp(), None);
+        }
+    }
+
+    fn endpoint_address(endpoint: &Endpoint) -> std::net::SocketAddr {
+        endpoint
+            .as_relay()
+            .map(|(_, _, address)| address)
+            .expect("relayed endpoint")
     }
 }

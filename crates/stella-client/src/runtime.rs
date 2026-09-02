@@ -665,7 +665,9 @@ impl ClientDataRuntime {
         }
         let available = self.relay.is_some();
         for network in self.networks.values_mut() {
-            network.plane.set_turn_udp_available(available)?;
+            network
+                .plane
+                .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, available)?;
         }
         self.relay_buffer.resize(
             self.relay
@@ -765,7 +767,7 @@ impl ClientDataRuntime {
             signing_key,
             self.monotonic_now(),
         )?;
-        plane.set_turn_udp_available(self.relay.is_some())?;
+        plane.set_relay_carrier_available(ConnectivityCarrier::TurnUdp, self.relay.is_some())?;
         self.networks.insert(
             network_id,
             ActiveNetwork {
