@@ -2,7 +2,7 @@
 
 - 状态：草案
 - 协议版本：0.2 扩展
-- 最后更新：2026-08-31
+- 最后更新：2026-09-02
 
 Stella Relay 是不可信数据报传输服务。所有以太网内容仍由正常的端到端 Stella 对等会话
 保护，Relay 不持有会话密钥，也不学习、修改或复制以太网帧。
@@ -13,6 +13,13 @@ Stella Relay 是不可信数据报传输服务。所有以太网内容仍由正�
 允许 HTTPS 或显式代理的网络，部署可以提供 `/stella/turn/v1`，使用 WebSocket 子协议
 `stella-turn.v1`。每个二进制 WebSocket 消息恰好包含一条完整 TURN 消息或 ChannelData
 记录；文本、压缩、尾随字节和超限分片会被拒绝。
+
+客户端可以通过本地配置的显式 HTTP 代理建立这一承载。它先向代理发送有界的 HTTP/1.1
+CONNECT，请求目标和 Host 均为 Relay authority；CONNECT 不携带 Stella、TURN 或成员
+凭据。只接受限时返回、至多 16 KiB 和 64 个字段的完整 HTTP/1.0 或 HTTP/1.1 2xx 响应。
+隧道建立后仍须对 Relay 完成正常 TLS 1.3 名称、Web PKI 和 SPKI pin 校验，然后才发送
+已认证的 WebSocket 升级。首个参考实现不发送 Proxy-Authorization，需要代理认证时会
+失败关闭。
 
 控制器在节点认证后下发短期 Relay 凭据。凭据绑定节点、Relay、签发和过期时间及资源类别，
 通常十分钟内过期。Relay 身份认证只证明谁拥有资源，不替代网络成员授权或 Stella 对等

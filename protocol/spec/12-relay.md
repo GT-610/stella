@@ -2,7 +2,7 @@
 
 - Status: Draft
 - Protocol version: 0.2 extension
-- Last updated: 2026-08-31
+- Last updated: 2026-09-02
 
 ## 1. Scope
 
@@ -290,6 +290,33 @@ records with trailing bytes are rejected.
 The WebSocket carrier exists for HTTP-aware firewalls and explicit proxies. It
 does not alter ICE candidate semantics, Stella packet protection, peer
 permissions, or replay handling.
+
+### 4.1 Explicit HTTP proxy tunnel
+
+An implementation may route the secure WebSocket carrier through a locally
+configured explicit HTTP proxy. Proxy selection is local configuration and is
+not published through the controller or connectivity generation.
+
+The client first opens TCP to the proxy and sends exactly one HTTP/1.1 CONNECT
+request. The request target and the single Host field are the same canonical
+authority used by the subsequent secure WebSocket connection. The CONNECT
+request does not contain the Stella Authorization field, TURN credentials,
+join material, or peer data. The version 0.2 reference profile sends no
+Proxy-Authorization field and treats a 407 response as a failed carrier.
+
+The proxy response header is bounded to 16 KiB and 64 fields and must complete
+within the connection deadline. A client accepts only one complete HTTP/1.0 or
+HTTP/1.1 response with a 2xx status and no bytes following the header. It rejects
+informational responses, redirects, authentication challenges, obsolete folded
+fields, malformed headers, and response bodies without reflecting header values
+into diagnostics.
+
+After a successful CONNECT, the client performs the ordinary TLS 1.3 handshake
+through the tunnel. Relay DNS-name, Web PKI, and SPKI-pin validation are
+unchanged and apply to the relay, never the proxy. Only after TLS succeeds does
+the client send the authenticated WebSocket upgrade defined above. A proxy
+failure may select another advertised relay, but it never permits plaintext
+fallback.
 
 ## 5. Credentials and authorization
 

@@ -76,7 +76,9 @@ export default defineConfig({
                 { text: '0023：客户端数据运行时', link: '/zh/protocol/adr/0023-bound-windows-client-data-runtime' },
                 { text: '0024：ICE 自动连接', link: '/zh/protocol/adr/0024-use-ice-for-connectivity' },
                 { text: '0025：Relay 兜底', link: '/zh/protocol/adr/0025-maintain-warm-relay-fallback' },
-                { text: '0026：已验证路径', link: '/zh/protocol/adr/0026-bind-sessions-to-validated-paths' }
+                { text: '0026：已验证路径', link: '/zh/protocol/adr/0026-bind-sessions-to-validated-paths' },
+                { text: '0027：连接状态分发', link: '/zh/protocol/adr/0027-separate-connectivity-from-membership-records' },
+                { text: '0029：HTTP 代理隧道', link: '/zh/protocol/adr/0029-tunnel-websocket-through-http-proxy' }
               ]
             }
           ],
@@ -184,7 +186,10 @@ export default defineConfig({
             { text: '0023: Client data runtime', link: '/protocol/adr/0023-bound-windows-client-data-runtime' },
             { text: '0024: ICE connectivity', link: '/protocol/adr/0024-use-ice-for-connectivity' },
             { text: '0025: Relay fallback', link: '/protocol/adr/0025-maintain-warm-relay-fallback' },
-            { text: '0026: Validated paths', link: '/protocol/adr/0026-bind-sessions-to-validated-paths' }
+            { text: '0026: Validated paths', link: '/protocol/adr/0026-bind-sessions-to-validated-paths' },
+            { text: '0027: Connectivity state', link: '/protocol/adr/0027-separate-connectivity-from-membership-records' },
+            { text: '0028: Authority migration', link: '/protocol/adr/0028-migrate-connectivity-authority-state' },
+            { text: '0029: HTTP proxy tunnel', link: '/protocol/adr/0029-tunnel-websocket-through-http-proxy' }
           ]
         }
       ],

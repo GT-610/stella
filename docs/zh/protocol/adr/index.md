@@ -34,3 +34,4 @@ ADR 记录约束 Stella 协议或其参考实现的决策。已接受的记录�
 - [0025：维持待命 Relay 兜底路径](./0025-maintain-warm-relay-fallback.md)
 - [0026：将对等会话绑定到已验证路径](./0026-bind-sessions-to-validated-paths.md)
 - [0027：将连接状态与成员记录分开分发](./0027-separate-connectivity-from-membership-records.md)
+- [0029：通过显式 HTTP 代理建立 Secure WebSocket 隧道](./0029-tunnel-websocket-through-http-proxy.md)
