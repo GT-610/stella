@@ -363,16 +363,30 @@ impl ClientDataRuntime {
                 Ready::Tap(event.ok_or(RuntimeError::TapEventChannelClosed)?)
             }
         };
-        match ready {
+        let result = match ready {
             Ready::Udp(received) => self.process_udp(received, signing_key).await,
             Ready::Relay(Ok(received)) => self.process_relay(received, signing_key).await,
-            Ready::Relay(Err(error)) => self.handle_relay_failure(&error),
+            Ready::Relay(Err(error)) => Err(error),
             Ready::RelayRecovery(result) => self.handle_relay_recovery(*result),
             Ready::RelayRetry => {
                 self.start_relay_recovery();
                 Ok(())
             }
             Ready::Tap(event) => self.process_tap_event(event).await,
+        };
+        self.handle_runtime_result(result)
+    }
+
+    fn handle_runtime_result(
+        &mut self,
+        result: Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        match result {
+            Err(error @ RuntimeError::Turn(_)) => {
+                self.handle_relay_failure(&error)?;
+                Ok(())
+            }
+            result => result,
         }
     }
 
@@ -2280,9 +2294,9 @@ mod tests {
         next_relay_dns_result, preferred_relay_settings, random_ice_credential,
         relay_reconnect_cap, relay_reconnect_delay, relay_selections, turn_bind_address, unix_time,
         ClientDataRuntime, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
-        RuntimeError, RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
-        MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY,
-        TURN_UDP_MAX_DATAGRAM_SIZE,
+        RuntimeError, RuntimeRelayCarrier, TurnUdpError, ICE_PASSWORD_RANDOM_LENGTH,
+        ICE_USERNAME_RANDOM_LENGTH, MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY,
+        TAP_EVENT_QUEUE_CAPACITY, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
     use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
 
@@ -2458,6 +2472,22 @@ mod tests {
             .expect("runtime progress while relay recovery is pending")
             .expect_err("malformed datagram is rejected");
         assert!(matches!(error, RuntimeError::Codec(_)));
+        runtime.shutdown().await.expect("shutdown test runtime");
+    }
+
+    #[tokio::test]
+    async fn turn_result_enters_relay_recovery_without_becoming_fatal() {
+        let mut runtime = runtime_with_pending_relay_recovery().await;
+        let recovery = runtime
+            .relay_recovery
+            .take()
+            .expect("pending recovery task");
+        recovery.abort();
+        runtime
+            .handle_runtime_result(Err(RuntimeError::Turn(TurnUdpError::ActorStopped)))
+            .expect("TURN failure enters recovery");
+        assert!(runtime.take_connectivity_changed());
+        assert!(runtime.relay.is_none());
         runtime.shutdown().await.expect("shutdown test runtime");
     }
 
