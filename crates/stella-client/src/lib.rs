@@ -52,4 +52,5 @@ pub use tls::{SpkiPin, SpkiPinParseError};
 pub use turn::{
     TurnCredentials, TurnTcpClient, TurnTcpClientConfig, TurnTcpError, TurnTlsClient,
     TurnTlsClientConfig, TurnTlsError, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+    TurnWebSocketClient, TurnWebSocketClientConfig, TurnWebSocketError,
 };

@@ -8,6 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use stella_common::RelayId;
@@ -20,8 +21,10 @@ use stella_proto::{
     TurnChannelDataView, TurnChannelNumber, MAX_RELAY_SPKI_PINS,
 };
 use stella_transport::{
+    read_websocket_record, turn_websocket_config, write_websocket_record,
     Endpoint as TransportEndpoint, ReceivedDatagram, RelayCarrier, TransportCapabilities,
-    TurnStream, TurnStreamError, MAX_TURN_STREAM_RECORD_SIZE,
+    TurnStream, TurnStreamError, WebSocketRecordError, MAX_TURN_STREAM_RECORD_SIZE,
+    STELLA_TURN_WEBSOCKET_PATH, STELLA_TURN_WEBSOCKET_SUBPROTOCOL,
 };
 use thiserror::Error;
 use tokio::{
@@ -31,6 +34,17 @@ use tokio::{
     time::{timeout_at, Instant},
 };
 use tokio_rustls::{client::TlsStream, rustls::pki_types::ServerName};
+use tokio_tungstenite::{
+    client_async_with_config,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{
+            header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
+            HeaderValue, Request, Response,
+        },
+    },
+    WebSocketStream,
+};
 use zeroize::Zeroizing;
 
 use crate::tls;
@@ -234,6 +248,115 @@ impl TurnTlsClientConfig {
     }
 }
 
+/// Configuration for one authenticated TURN allocation reached over secure WebSocket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnWebSocketClientConfig {
+    /// Stable identity of the configured relay service.
+    pub relay_id: RelayId,
+    /// Numeric HTTPS WebSocket listener address.
+    pub server_address: SocketAddr,
+    /// Local client socket address; port zero requests an ephemeral port.
+    pub bind_address: SocketAddr,
+    /// Canonical certificate server name, or empty for a pin-only numeric address.
+    pub tls_server_name: String,
+    /// Certificate checks required by the authenticated controller configuration.
+    pub trust: RelayTrustRequirements,
+    /// Canonically ordered accepted SHA-256 `SubjectPublicKeyInfo` digests.
+    pub spki_pins: Vec<[u8; 32]>,
+    /// Largest complete Stella datagram carried through this allocation.
+    pub max_datagram_size: usize,
+    /// Requested allocation lifetime, capped by the relay.
+    pub allocation_lifetime_seconds: u32,
+    /// Advertised allocation inactivity timeout.
+    pub idle_timeout_seconds: u32,
+    /// Complete reliable transaction deadline.
+    pub transaction_timeout: Duration,
+}
+
+impl TurnWebSocketClientConfig {
+    /// Creates a conservative secure WebSocket TURN client configuration.
+    #[must_use]
+    pub fn new(
+        relay_id: RelayId,
+        server_address: SocketAddr,
+        bind_address: SocketAddr,
+        tls_server_name: String,
+        trust: RelayTrustRequirements,
+        spki_pins: Vec<[u8; 32]>,
+    ) -> Self {
+        Self {
+            relay_id,
+            server_address,
+            bind_address,
+            tls_server_name,
+            trust,
+            spki_pins,
+            max_datagram_size: 1_200,
+            allocation_lifetime_seconds: 600,
+            idle_timeout_seconds: 120,
+            transaction_timeout: DEFAULT_TRANSACTION_TIMEOUT,
+        }
+    }
+
+    fn validate(&self) -> Result<(), TurnUdpError> {
+        TurnClientConfig::from(self).validate()?;
+        if self.trust.is_empty() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN WebSocket TLS trust",
+                reason: "must require Web PKI validation or an SPKI pin",
+            });
+        }
+        if self.trust.contains(RelayTrustRequirements::WEB_PKI) && self.tls_server_name.is_empty() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN WebSocket TLS server name",
+                reason: "must be present when Web PKI validation is required",
+            });
+        }
+        if self.trust.contains(RelayTrustRequirements::SPKI_PIN) == self.spki_pins.is_empty() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN WebSocket TLS SPKI pins",
+                reason: "must be present exactly when SPKI validation is required",
+            });
+        }
+        if self.spki_pins.len() > usize::from(MAX_RELAY_SPKI_PINS) {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN WebSocket TLS SPKI pins",
+                reason: "exceeds the protocol maximum",
+            });
+        }
+        if self.spki_pins.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN WebSocket TLS SPKI pins",
+                reason: "must be unique and in canonical order",
+            });
+        }
+        let _server_name = self.server_name()?;
+        Ok(())
+    }
+
+    fn server_name(&self) -> Result<ServerName<'static>, TurnUdpError> {
+        if self.tls_server_name.is_empty() {
+            return Ok(ServerName::IpAddress(self.server_address.ip().into()));
+        }
+        ServerName::try_from(self.tls_server_name.clone()).map_err(|_| {
+            TurnUdpError::InvalidConfig {
+                field: "TURN WebSocket TLS server name",
+                reason: "must be a valid DNS name or IP address",
+            }
+        })
+    }
+
+    fn authority(&self) -> String {
+        if self.tls_server_name.is_empty() {
+            return self.server_address.to_string();
+        }
+        match self.tls_server_name.parse::<IpAddr>() {
+            Ok(IpAddr::V6(address)) => format!("[{address}]:{}", self.server_address.port()),
+            _ => format!("{}:{}", self.tls_server_name, self.server_address.port()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TurnClientConfig {
     carrier: RelayCarrier,
@@ -328,6 +451,21 @@ impl From<&TurnTlsClientConfig> for TurnClientConfig {
     fn from(config: &TurnTlsClientConfig) -> Self {
         Self {
             carrier: RelayCarrier::TurnTls,
+            relay_id: config.relay_id,
+            server_address: config.server_address,
+            bind_address: config.bind_address,
+            max_datagram_size: config.max_datagram_size,
+            allocation_lifetime_seconds: config.allocation_lifetime_seconds,
+            idle_timeout_seconds: config.idle_timeout_seconds,
+            transaction_timeout: config.transaction_timeout,
+        }
+    }
+}
+
+impl From<&TurnWebSocketClientConfig> for TurnClientConfig {
+    fn from(config: &TurnWebSocketClientConfig) -> Self {
+        Self {
+            carrier: RelayCarrier::SecureWebSocket,
             relay_id: config.relay_id,
             server_address: config.server_address,
             bind_address: config.bind_address,
@@ -449,6 +587,15 @@ pub enum TurnUdpError {
     /// Reliable TURN record framing or byte-stream I/O failed.
     #[error(transparent)]
     Stream(#[from] TurnStreamError),
+    /// Secure WebSocket record framing, protocol handling, or I/O failed.
+    #[error(transparent)]
+    WebSocket(#[from] WebSocketRecordError),
+    /// The HTTPS upgrade did not select the exact Stella WebSocket profile.
+    #[error("TURN WebSocket upgrade response is invalid: {detail}")]
+    InvalidWebSocketUpgrade {
+        /// Stable non-secret rule description.
+        detail: &'static str,
+    },
     /// A retransmitting request received no matching response before its deadline.
     #[error("TURN {method:?} transaction timed out")]
     TransactionTimeout {
@@ -526,6 +673,9 @@ pub type TurnTcpError = TurnUdpError;
 /// TURN TLS client error type shared with the carrier-neutral TURN state machine.
 pub type TurnTlsError = TurnUdpError;
 
+/// Secure WebSocket TURN client error shared with the carrier-neutral TURN state machine.
+pub type TurnWebSocketError = TurnUdpError;
+
 enum ClientIo {
     Udp {
         socket: UdpSocket,
@@ -533,6 +683,7 @@ enum ClientIo {
     },
     Tcp(TurnStream<TcpStream>),
     Tls(Box<TurnStream<TlsStream<TcpStream>>>),
+    WebSocket(Box<WebSocketStream<TlsStream<TcpStream>>>),
 }
 
 impl ClientIo {
@@ -541,11 +692,12 @@ impl ClientIo {
             Self::Udp { .. } => RelayCarrier::TurnUdp,
             Self::Tcp(_) => RelayCarrier::TurnTcp,
             Self::Tls(_) => RelayCarrier::TurnTls,
+            Self::WebSocket(_) => RelayCarrier::SecureWebSocket,
         }
     }
 
     const fn is_reliable(&self) -> bool {
-        matches!(self, Self::Tcp(_) | Self::Tls(_))
+        matches!(self, Self::Tcp(_) | Self::Tls(_) | Self::WebSocket(_))
     }
 
     async fn send_record(&mut self, record: &[u8]) -> Result<(), TurnUdpError> {
@@ -562,6 +714,11 @@ impl ClientIo {
             }
             Self::Tcp(stream) => stream.write_record(record).await.map_err(Into::into),
             Self::Tls(stream) => stream.write_record(record).await.map_err(Into::into),
+            Self::WebSocket(stream) => {
+                write_websocket_record(stream.as_mut(), record, MAX_TURN_STREAM_RECORD_SIZE)
+                    .await
+                    .map_err(Into::into)
+            }
         }
     }
 
@@ -598,6 +755,11 @@ impl ClientIo {
             }
             Self::Tcp(stream) => stream.read_record().await.map_err(Into::into),
             Self::Tls(stream) => stream.read_record().await.map_err(Into::into),
+            Self::WebSocket(stream) => {
+                read_websocket_record(stream.as_mut(), MAX_TURN_STREAM_RECORD_SIZE)
+                    .await
+                    .map_err(Into::into)
+            }
         }
     }
 }
@@ -1336,6 +1498,266 @@ impl fmt::Debug for TurnTlsClient {
             .field("shutdown", &self.inner.shutdown.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
+}
+
+/// One live authenticated secure WebSocket TURN allocation with bounded queues.
+pub struct TurnWebSocketClient {
+    inner: TurnUdpClient,
+}
+
+impl TurnWebSocketClient {
+    /// Connects with TLS 1.3, authenticates the HTTP upgrade, allocates, and starts the actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] for configuration, credentials, TCP, TLS,
+    /// HTTP upgrade, WebSocket, TURN authentication, integrity, or allocation failure.
+    pub async fn allocate(
+        config: TurnWebSocketClientConfig,
+        credentials: TurnCredentials,
+    ) -> Result<Self, TurnWebSocketError> {
+        config.validate()?;
+        credentials.validate_time(unix_time()?)?;
+        let request = websocket_upgrade_request(&config, &credentials)?;
+        let socket = if config.server_address.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+        .map_err(|source| TurnUdpError::Io {
+            operation: "create TURN WebSocket socket",
+            source,
+        })?;
+        socket
+            .bind(config.bind_address)
+            .map_err(|source| TurnUdpError::Io {
+                operation: "bind TURN WebSocket socket",
+                source,
+            })?;
+        let stream = socket
+            .connect(config.server_address)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "connect TURN WebSocket socket",
+                source,
+            })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|source| TurnUdpError::Io {
+                operation: "configure TURN WebSocket no-delay",
+                source,
+            })?;
+        let local_address = stream.local_addr().map_err(|source| TurnUdpError::Io {
+            operation: "query local TURN WebSocket address",
+            source,
+        })?;
+        let server_name = config.server_name()?;
+        let connector =
+            tls::relay_connector(config.trust, &config.spki_pins).map_err(|source| {
+                TurnUdpError::Io {
+                    operation: "configure TURN WebSocket TLS trust",
+                    source,
+                }
+            })?;
+        let stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "complete TURN WebSocket TLS handshake",
+                source,
+            })?;
+        let websocket_config = turn_websocket_config(MAX_TURN_STREAM_RECORD_SIZE)?;
+        let (stream, response) = client_async_with_config(request, stream, Some(websocket_config))
+            .await
+            .map_err(WebSocketRecordError::from)?;
+        validate_websocket_upgrade_response(&response)?;
+        let io = ClientIo::WebSocket(Box::new(stream));
+        let inner = TurnUdpClient::allocate_connected(
+            TurnClientConfig::from(&config),
+            credentials,
+            io,
+            local_address,
+        )
+        .await?;
+        Ok(Self { inner })
+    }
+
+    /// Returns the relay identity attached to this local allocation.
+    #[must_use]
+    pub const fn relay_id(&self) -> RelayId {
+        self.inner.relay_id()
+    }
+
+    /// Returns the public relayed candidate address.
+    #[must_use]
+    pub const fn relayed_address(&self) -> SocketAddr {
+        self.inner.relayed_address()
+    }
+
+    /// Returns the client TCP address observed beneath TLS and WebSocket.
+    #[must_use]
+    pub const fn mapped_address(&self) -> SocketAddr {
+        self.inner.mapped_address()
+    }
+
+    /// Returns the local TCP socket address used for the WebSocket allocation.
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.inner.local_address()
+    }
+
+    /// Returns the enforced complete Stella datagram limit.
+    #[must_use]
+    pub const fn capabilities(&self) -> TransportCapabilities {
+        self.inner.capabilities()
+    }
+
+    /// Returns the local secure WebSocket relay candidate published to authorized peers.
+    #[must_use]
+    pub const fn local_endpoint(&self) -> TransportEndpoint {
+        self.inner.local_endpoint()
+    }
+
+    /// Creates or refreshes a peer permission and channel binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn prepare_peer(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), TurnWebSocketError> {
+        self.inner.prepare_peer(endpoint).await
+    }
+
+    /// Creates or refreshes only the TURN permission for a peer candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn permit_peer(
+        &self,
+        endpoint: &TransportEndpoint,
+    ) -> Result<(), TurnWebSocketError> {
+        self.inner.permit_peer(endpoint).await
+    }
+
+    /// Sends one complete datagram through a prepared secure WebSocket relay path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] for endpoint mismatch, size, permission,
+    /// channel binding, actor, framing, or WebSocket failure.
+    pub async fn send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnWebSocketError> {
+        self.inner.send_to(endpoint, datagram).await
+    }
+
+    /// Sends one complete datagram as a TURN Send indication over WebSocket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] for endpoint mismatch, size, permission,
+    /// actor, codec, framing, or WebSocket failure.
+    pub async fn send_indication_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnWebSocketError> {
+        self.inner.send_indication_to(endpoint, datagram).await
+    }
+
+    /// Replaces short-lived credentials and verifies them with an allocation refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] when credentials are expired or the refresh fails.
+    pub async fn replace_credentials(
+        &self,
+        credentials: TurnCredentials,
+    ) -> Result<(), TurnWebSocketError> {
+        self.inner.replace_credentials(credentials).await
+    }
+
+    /// Receives one complete relayed datagram without exposing partial data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] for insufficient output, actor failure, or shutdown.
+    pub async fn receive(&self, output: &mut [u8]) -> Result<ReceivedDatagram, TurnWebSocketError> {
+        self.inner.receive(output).await
+    }
+
+    /// Deletes the allocation, stops the actor, and cancels pending receives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] when deletion or actor joining fails.
+    pub async fn shutdown(&self) -> Result<(), TurnWebSocketError> {
+        self.inner.shutdown().await
+    }
+}
+
+impl fmt::Debug for TurnWebSocketClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnWebSocketClient")
+            .field("relay_id", &self.inner.relay_id)
+            .field("relayed_address", &self.inner.relayed_address)
+            .field("mapped_address", &self.inner.mapped_address)
+            .field("local_address", &self.inner.local_address)
+            .field("capabilities", &self.inner.capabilities)
+            .field("shutdown", &self.inner.shutdown.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+fn websocket_upgrade_request(
+    config: &TurnWebSocketClientConfig,
+    credentials: &TurnCredentials,
+) -> Result<Request<()>, TurnUdpError> {
+    let uri = format!("wss://{}{}", config.authority(), STELLA_TURN_WEBSOCKET_PATH);
+    let mut request = uri
+        .into_client_request()
+        .map_err(WebSocketRecordError::from)?;
+    request.headers_mut().insert(
+        SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static(STELLA_TURN_WEBSOCKET_SUBPROTOCOL),
+    );
+    let encoded_username = Zeroizing::new(URL_SAFE_NO_PAD.encode(credentials.username.as_slice()));
+    let encoded_secret = Zeroizing::new(URL_SAFE_NO_PAD.encode(credentials.password.as_slice()));
+    let authorization = Zeroizing::new(format!(
+        "Stella {}.{}",
+        encoded_username.as_str(),
+        encoded_secret.as_str()
+    ));
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(authorization.as_str()).map_err(|_| TurnUdpError::InvalidConfig {
+            field: "TURN WebSocket authorization",
+            reason: "must encode as one valid HTTP field value",
+        })?,
+    );
+    Ok(request)
+}
+
+fn validate_websocket_upgrade_response<B>(response: &Response<B>) -> Result<(), TurnUdpError> {
+    let mut protocols = response.headers().get_all(SEC_WEBSOCKET_PROTOCOL).iter();
+    let selected = protocols.next().and_then(|value| value.to_str().ok());
+    if selected != Some(STELLA_TURN_WEBSOCKET_SUBPROTOCOL) || protocols.next().is_some() {
+        return Err(TurnUdpError::InvalidWebSocketUpgrade {
+            detail: "must select exactly the stella-turn.v1 subprotocol",
+        });
+    }
+    if response.headers().contains_key(SEC_WEBSOCKET_EXTENSIONS) {
+        return Err(TurnUdpError::InvalidWebSocketUpgrade {
+            detail: "must not negotiate WebSocket extensions",
+        });
+    }
+    Ok(())
 }
 
 enum Command {
@@ -2286,7 +2708,6 @@ mod tests {
     };
 
     use stella_common::{NodeId, RelayId};
-    #[cfg(windows)]
     use stella_proto::RelayTrustRequirements;
     use stella_server::{
         relay_credentials::RelayCredentialAuthority,
@@ -2301,10 +2722,15 @@ mod tests {
         Endpoint as TransportEndpoint, TurnStream, MAX_TURN_STREAM_RECORD_SIZE,
     };
     use tokio::{net::TcpListener, sync::oneshot, time::timeout};
+    use tokio_tungstenite::tungstenite::http::{
+        header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
+        Response,
+    };
 
     use super::{
-        encode_message, transact_initial, ClientIo, TurnCredentials, TurnTcpClient,
-        TurnTcpClientConfig, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+        encode_message, transact_initial, validate_websocket_upgrade_response,
+        websocket_upgrade_request, ClientIo, TurnCredentials, TurnTcpClient, TurnTcpClientConfig,
+        TurnUdpClient, TurnUdpClientConfig, TurnUdpError, TurnWebSocketClientConfig,
     };
     #[cfg(windows)]
     use super::{TurnTlsClient, TurnTlsClientConfig};
@@ -2747,6 +3173,61 @@ mod tests {
             .expect("relay task join")
             .expect("relay run");
         std::fs::remove_dir_all(&directory).expect("remove TLS test directory");
+    }
+
+    #[test]
+    fn websocket_upgrade_request_and_response_are_strict_and_canonical() {
+        let config = TurnWebSocketClientConfig::new(
+            RelayId::from_bytes([0x77; 16]),
+            "192.0.2.30:443".parse().expect("relay address"),
+            "0.0.0.0:0".parse().expect("bind address"),
+            "relay.example.test".to_owned(),
+            RelayTrustRequirements::SPKI_PIN,
+            vec![[1; 32]],
+        );
+        let credentials =
+            TurnCredentials::new(b"123:node".to_vec(), b"0123456789abcdef".to_vec(), 100)
+                .expect("credentials");
+        let request = websocket_upgrade_request(&config, &credentials).expect("upgrade request");
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://relay.example.test:443/stella/turn/v1"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .expect("subprotocol"),
+            "stella-turn.v1"
+        );
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).expect("authorization"),
+            "Stella MTIzOm5vZGU.MDEyMzQ1Njc4OWFiY2RlZg"
+        );
+        assert!(!request.headers().contains_key(SEC_WEBSOCKET_EXTENSIONS));
+
+        let accepted = Response::builder()
+            .header(SEC_WEBSOCKET_PROTOCOL, "stella-turn.v1")
+            .body(())
+            .expect("accepted response");
+        validate_websocket_upgrade_response(&accepted).expect("valid response");
+        let compressed = Response::builder()
+            .header(SEC_WEBSOCKET_PROTOCOL, "stella-turn.v1")
+            .header(SEC_WEBSOCKET_EXTENSIONS, "permessage-deflate")
+            .body(())
+            .expect("compressed response");
+        assert!(matches!(
+            validate_websocket_upgrade_response(&compressed),
+            Err(TurnUdpError::InvalidWebSocketUpgrade { .. })
+        ));
+        let wrong_protocol = Response::builder()
+            .header(SEC_WEBSOCKET_PROTOCOL, "other")
+            .body(())
+            .expect("wrong protocol response");
+        assert!(matches!(
+            validate_websocket_upgrade_response(&wrong_protocol),
+            Err(TurnUdpError::InvalidWebSocketUpgrade { .. })
+        ));
     }
 
     #[test]

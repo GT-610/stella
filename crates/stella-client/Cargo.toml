@@ -28,6 +28,7 @@ thiserror.workspace = true
 toml = "0.9.8"
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring"] }
+tokio-tungstenite.workspace = true
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 webpki-roots = "=1.0.9"
