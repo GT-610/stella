@@ -28,6 +28,7 @@ use stella_transport::{
 };
 use thiserror::Error;
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream, UdpSocket},
     sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
@@ -62,6 +63,8 @@ const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TURN_UDP_DATAGRAM_SIZE: usize = 65_503;
 const REQUESTED_TRANSPORT_UDP: [u8; 4] = [17, 0, 0, 0];
+const MAX_HTTP_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_HTTP_CONNECT_FIELDS: usize = 64;
 
 /// Configuration for one authenticated TURN allocation reached over UDP.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +260,8 @@ pub struct TurnWebSocketClientConfig {
     pub server_address: SocketAddr,
     /// Local client socket address; port zero requests an ephemeral port.
     pub bind_address: SocketAddr,
+    /// Optional explicit HTTP proxy used to establish the TLS tunnel.
+    pub proxy_address: Option<SocketAddr>,
     /// Canonical certificate server name, or empty for a pin-only numeric address.
     pub tls_server_name: String,
     /// Certificate checks required by the authenticated controller configuration.
@@ -288,6 +293,7 @@ impl TurnWebSocketClientConfig {
             relay_id,
             server_address,
             bind_address,
+            proxy_address: None,
             tls_server_name,
             trust,
             spki_pins,
@@ -355,6 +361,10 @@ impl TurnWebSocketClientConfig {
             _ => format!("{}:{}", self.tls_server_name, self.server_address.port()),
         }
     }
+
+    fn connection_address(&self) -> SocketAddr {
+        self.proxy_address.unwrap_or(self.server_address)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,6 +372,7 @@ struct TurnClientConfig {
     carrier: RelayCarrier,
     relay_id: RelayId,
     server_address: SocketAddr,
+    connection_address: SocketAddr,
     bind_address: SocketAddr,
     max_datagram_size: usize,
     allocation_lifetime_seconds: u32,
@@ -383,10 +394,19 @@ impl TurnClientConfig {
                 reason: "must use a specified address and non-zero port",
             });
         }
-        if self.server_address.is_ipv4() != self.bind_address.is_ipv4() {
+        if self.connection_address.port() == 0
+            || self.connection_address.ip().is_unspecified()
+            || self.connection_address.ip().is_multicast()
+        {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "connection address",
+                reason: "must use a specified unicast address and non-zero port",
+            });
+        }
+        if self.connection_address.is_ipv4() != self.bind_address.is_ipv4() {
             return Err(TurnUdpError::InvalidConfig {
                 field: "bind address",
-                reason: "must use the TURN server address family",
+                reason: "must use the outbound connection address family",
             });
         }
         if !(1_200..=MAX_TURN_UDP_DATAGRAM_SIZE).contains(&self.max_datagram_size) {
@@ -423,6 +443,7 @@ impl From<TurnUdpClientConfig> for TurnClientConfig {
             carrier: RelayCarrier::TurnUdp,
             relay_id: config.relay_id,
             server_address: config.server_address,
+            connection_address: config.server_address,
             bind_address: config.bind_address,
             max_datagram_size: config.max_datagram_size,
             allocation_lifetime_seconds: config.allocation_lifetime_seconds,
@@ -438,6 +459,7 @@ impl From<TurnTcpClientConfig> for TurnClientConfig {
             carrier: RelayCarrier::TurnTcp,
             relay_id: config.relay_id,
             server_address: config.server_address,
+            connection_address: config.server_address,
             bind_address: config.bind_address,
             max_datagram_size: config.max_datagram_size,
             allocation_lifetime_seconds: config.allocation_lifetime_seconds,
@@ -453,6 +475,7 @@ impl From<&TurnTlsClientConfig> for TurnClientConfig {
             carrier: RelayCarrier::TurnTls,
             relay_id: config.relay_id,
             server_address: config.server_address,
+            connection_address: config.server_address,
             bind_address: config.bind_address,
             max_datagram_size: config.max_datagram_size,
             allocation_lifetime_seconds: config.allocation_lifetime_seconds,
@@ -468,6 +491,7 @@ impl From<&TurnWebSocketClientConfig> for TurnClientConfig {
             carrier: RelayCarrier::SecureWebSocket,
             relay_id: config.relay_id,
             server_address: config.server_address,
+            connection_address: config.connection_address(),
             bind_address: config.bind_address,
             max_datagram_size: config.max_datagram_size,
             allocation_lifetime_seconds: config.allocation_lifetime_seconds,
@@ -593,6 +617,21 @@ pub enum TurnUdpError {
     /// The HTTPS upgrade did not select the exact Stella WebSocket profile.
     #[error("TURN WebSocket upgrade response is invalid: {detail}")]
     InvalidWebSocketUpgrade {
+        /// Stable non-secret rule description.
+        detail: &'static str,
+    },
+    /// The explicit HTTP proxy did not complete CONNECT before the deadline.
+    #[error("TURN WebSocket HTTP proxy negotiation timed out")]
+    HttpProxyTimeout,
+    /// The explicit HTTP proxy returned a non-success status.
+    #[error("TURN WebSocket HTTP proxy rejected CONNECT with status {status_code}")]
+    HttpProxyRejected {
+        /// Numeric HTTP status without response fields or reason text.
+        status_code: u16,
+    },
+    /// The explicit HTTP proxy response violated the bounded CONNECT profile.
+    #[error("TURN WebSocket HTTP proxy response is invalid: {detail}")]
+    InvalidHttpProxyResponse {
         /// Stable non-secret rule description.
         detail: &'static str,
     },
@@ -1519,7 +1558,8 @@ impl TurnWebSocketClient {
         config.validate()?;
         credentials.validate_time(unix_time()?)?;
         let request = websocket_upgrade_request(&config, &credentials)?;
-        let socket = if config.server_address.is_ipv4() {
+        let connection_address = config.connection_address();
+        let socket = if connection_address.is_ipv4() {
             TcpSocket::new_v4()
         } else {
             TcpSocket::new_v6()
@@ -1534,13 +1574,14 @@ impl TurnWebSocketClient {
                 operation: "bind TURN WebSocket socket",
                 source,
             })?;
-        let stream = socket
-            .connect(config.server_address)
-            .await
-            .map_err(|source| TurnUdpError::Io {
-                operation: "connect TURN WebSocket socket",
-                source,
-            })?;
+        let stream =
+            socket
+                .connect(connection_address)
+                .await
+                .map_err(|source| TurnUdpError::Io {
+                    operation: "connect TURN WebSocket socket",
+                    source,
+                })?;
         stream
             .set_nodelay(true)
             .map_err(|source| TurnUdpError::Io {
@@ -1551,6 +1592,11 @@ impl TurnWebSocketClient {
             operation: "query local TURN WebSocket address",
             source,
         })?;
+        let mut stream = stream;
+        if config.proxy_address.is_some() {
+            negotiate_http_connect(&mut stream, &config.authority(), config.transaction_timeout)
+                .await?;
+        }
         let server_name = config.server_name()?;
         let connector =
             tls::relay_connector(config.trust, &config.spki_pins).map_err(|source| {
@@ -1758,6 +1804,174 @@ fn validate_websocket_upgrade_response<B>(response: &Response<B>) -> Result<(), 
         });
     }
     Ok(())
+}
+
+async fn negotiate_http_connect(
+    stream: &mut TcpStream,
+    authority: &str,
+    transaction_timeout: Duration,
+) -> Result<(), TurnUdpError> {
+    let deadline =
+        Instant::now()
+            .checked_add(transaction_timeout)
+            .ok_or(TurnUdpError::DeadlineOverflow {
+                field: "HTTP proxy CONNECT",
+            })?;
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    timeout_at(deadline, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| TurnUdpError::HttpProxyTimeout)?
+        .map_err(|source| TurnUdpError::Io {
+            operation: "write HTTP proxy CONNECT request",
+            source,
+        })?;
+
+    let mut response = Vec::with_capacity(1_024);
+    loop {
+        if response.len() == MAX_HTTP_CONNECT_RESPONSE_BYTES {
+            return Err(TurnUdpError::InvalidHttpProxyResponse {
+                detail: "header exceeds 16 KiB",
+            });
+        }
+        let mut byte = [0_u8; 1];
+        timeout_at(deadline, stream.read_exact(&mut byte))
+            .await
+            .map_err(|_| TurnUdpError::HttpProxyTimeout)?
+            .map_err(|source| TurnUdpError::Io {
+                operation: "read HTTP proxy CONNECT response",
+                source,
+            })?;
+        response.push(byte[0]);
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    validate_http_connect_response(&response)?;
+
+    let mut trailing = [0_u8; 1];
+    match stream.try_read(&mut trailing) {
+        Ok(0) => Err(TurnUdpError::InvalidHttpProxyResponse {
+            detail: "proxy closed the tunnel before TLS",
+        }),
+        Ok(_) => Err(TurnUdpError::InvalidHttpProxyResponse {
+            detail: "bytes follow the CONNECT response header",
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(source) => Err(TurnUdpError::Io {
+            operation: "inspect HTTP proxy CONNECT response boundary",
+            source,
+        }),
+    }
+}
+
+fn validate_http_connect_response(response: &[u8]) -> Result<(), TurnUdpError> {
+    if !response.ends_with(b"\r\n\r\n") || !response.is_ascii() {
+        return Err(TurnUdpError::InvalidHttpProxyResponse {
+            detail: "header must be complete ASCII with CRLF line endings",
+        });
+    }
+    let text =
+        std::str::from_utf8(&response[..response.len().saturating_sub(4)]).map_err(|_| {
+            TurnUdpError::InvalidHttpProxyResponse {
+                detail: "header must be valid ASCII",
+            }
+        })?;
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().ok_or(TurnUdpError::InvalidHttpProxyResponse {
+        detail: "status line is missing",
+    })?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    let version = status_parts.next().unwrap_or_default();
+    let status_text = status_parts.next().unwrap_or_default();
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") || status_parts.next().is_none() {
+        return Err(TurnUdpError::InvalidHttpProxyResponse {
+            detail: "status line must use HTTP/1.0 or HTTP/1.1",
+        });
+    }
+    if status_text.len() != 3 || !status_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(TurnUdpError::InvalidHttpProxyResponse {
+            detail: "status code must contain three decimal digits",
+        });
+    }
+    let status_code =
+        status_text
+            .parse::<u16>()
+            .map_err(|_| TurnUdpError::InvalidHttpProxyResponse {
+                detail: "status code is outside the HTTP range",
+            })?;
+
+    let mut field_count = 0_usize;
+    let mut saw_content_length = false;
+    for line in lines {
+        field_count = field_count.saturating_add(1);
+        if field_count > MAX_HTTP_CONNECT_FIELDS {
+            return Err(TurnUdpError::InvalidHttpProxyResponse {
+                detail: "header exceeds 64 fields",
+            });
+        }
+        if line.starts_with([' ', '\t']) {
+            return Err(TurnUdpError::InvalidHttpProxyResponse {
+                detail: "obsolete folded fields are forbidden",
+            });
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(TurnUdpError::InvalidHttpProxyResponse {
+                detail: "header field is malformed",
+            })?;
+        if name.is_empty() || !name.bytes().all(is_http_token) {
+            return Err(TurnUdpError::InvalidHttpProxyResponse {
+                detail: "header field name is invalid",
+            });
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if !value
+            .bytes()
+            .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte))
+        {
+            return Err(TurnUdpError::InvalidHttpProxyResponse {
+                detail: "header field value contains a control character",
+            });
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(TurnUdpError::InvalidHttpProxyResponse {
+                detail: "CONNECT response must not carry a transfer encoding",
+            });
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if saw_content_length || value != "0" {
+                return Err(TurnUdpError::InvalidHttpProxyResponse {
+                    detail: "CONNECT response body is forbidden",
+                });
+            }
+            saw_content_length = true;
+        }
+    }
+    if !(200..=299).contains(&status_code) {
+        return Err(TurnUdpError::HttpProxyRejected { status_code });
+    }
+    Ok(())
+}
+
+const fn is_http_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 enum Command {
@@ -2721,22 +2935,102 @@ mod tests {
     use stella_transport::{
         Endpoint as TransportEndpoint, TurnStream, MAX_TURN_STREAM_RECORD_SIZE,
     };
-    use tokio::{net::TcpListener, sync::oneshot, time::timeout};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+        time::timeout,
+    };
     use tokio_tungstenite::tungstenite::http::{
         header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
         Response,
     };
 
     use super::{
-        encode_message, transact_initial, validate_websocket_upgrade_response,
-        websocket_upgrade_request, ClientIo, TurnCredentials, TurnTcpClient, TurnTcpClientConfig,
-        TurnUdpClient, TurnUdpClientConfig, TurnUdpError, TurnWebSocketClientConfig,
+        encode_message, negotiate_http_connect, transact_initial, validate_http_connect_response,
+        validate_websocket_upgrade_response, websocket_upgrade_request, ClientIo, TurnCredentials,
+        TurnTcpClient, TurnTcpClientConfig, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+        TurnWebSocketClientConfig,
     };
     #[cfg(windows)]
     use super::{TurnTlsClient, TurnTlsClientConfig, TurnWebSocketClient};
 
     #[cfg(windows)]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn http_connect_response_is_strict_bounded_and_redacted() {
+        validate_http_connect_response(
+            b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n",
+        )
+        .expect("valid CONNECT response");
+        assert!(matches!(
+            validate_http_connect_response(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=secret\r\n\r\n"
+            ),
+            Err(TurnUdpError::HttpProxyRejected { status_code: 407 })
+        ));
+        assert!(matches!(
+            validate_http_connect_response(
+                b"HTTP/1.1 200 Connection Established\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            Err(TurnUdpError::InvalidHttpProxyResponse { .. })
+        ));
+        assert!(matches!(
+            validate_http_connect_response(
+                b"HTTP/1.1 200 Connection Established\r\n folded: value\r\n\r\n"
+            ),
+            Err(TurnUdpError::InvalidHttpProxyResponse { .. })
+        ));
+        let error = TurnUdpError::HttpProxyRejected { status_code: 407 };
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_negotiation_sends_only_canonical_authority() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = listener.local_addr().expect("proxy listener address");
+        let (release_sender, release_receiver) = oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _client) = listener.accept().await.expect("accept proxy client");
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                stream
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("read CONNECT request");
+                request.push(byte[0]);
+                assert!(request.len() <= 1_024);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert_eq!(
+                request,
+                b"CONNECT relay.example.test:443 HTTP/1.1\r\nHost: relay.example.test:443\r\n\r\n"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("write CONNECT response");
+            let _ = release_receiver.await;
+        });
+        let mut stream = TcpStream::connect(proxy_address)
+            .await
+            .expect("connect proxy client");
+        negotiate_http_connect(
+            &mut stream,
+            "relay.example.test:443",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("establish CONNECT tunnel");
+        release_sender.send(()).expect("release proxy");
+        proxy.await.expect("proxy task");
+    }
 
     #[tokio::test]
     async fn reliable_transactions_use_one_complete_framed_exchange() {

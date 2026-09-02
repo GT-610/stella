@@ -135,6 +135,7 @@ pub struct ClientDataRuntime {
     udp_buffer: Vec<u8>,
     deferred_udp: VecDeque<DeferredUdpDatagram>,
     direct_candidates: Vec<IceCandidate>,
+    secure_websocket_proxy: Option<SocketAddr>,
     connectivity_revision: Option<u64>,
     relay: Option<WarmRelay>,
     relay_buffer: Vec<u8>,
@@ -200,7 +201,7 @@ impl ClientDataRuntime {
         let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
         let (discovery, relay) = tokio::join!(
             discover_server_reflexive(&udp, stun_servers),
-            allocate_preferred_relay(config.udp_bind, connectivity),
+            allocate_preferred_relay(config.udp_bind, config.secure_websocket_proxy, connectivity,),
         );
         let discovery = match discovery {
             Ok(discovery) => discovery,
@@ -229,6 +230,7 @@ impl ClientDataRuntime {
             udp_buffer: vec![0_u8; max_datagram_size],
             deferred_udp: discovery.deferred.into(),
             direct_candidates,
+            secure_websocket_proxy: config.secure_websocket_proxy,
             connectivity_revision: connectivity.map(ConnectivityConfigState::revision),
             relay,
             relay_buffer: vec![0_u8; relay_buffer_size],
@@ -642,7 +644,11 @@ impl ClientDataRuntime {
         if self.connectivity_revision == revision {
             return Ok(());
         }
-        let selected = preferred_relay_settings(self.udp.local_address(), connectivity)?;
+        let selected = preferred_relay_settings(
+            self.udp.local_address(),
+            self.secure_websocket_proxy,
+            connectivity,
+        )?;
         match (self.relay.as_mut(), selected) {
             (Some(current), Some(selected)) if current.settings == selected.settings => {
                 current
@@ -670,6 +676,7 @@ impl ClientDataRuntime {
                 ConnectivityCarrier::TurnUdp,
                 ConnectivityCarrier::TurnTcp,
                 ConnectivityCarrier::TurnTls,
+                ConnectivityCarrier::SecureWebSocket,
             ] {
                 let available = self
                     .relay
@@ -1076,6 +1083,7 @@ struct RelaySettings {
     tls_server_name: String,
     trust: RelayTrustRequirements,
     spki_pins: Vec<[u8; 32]>,
+    proxy_address: Option<SocketAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1165,6 +1173,7 @@ impl RelaySettings {
         config.max_datagram_size = self.max_datagram_size;
         config.allocation_lifetime_seconds = self.allocation_lifetime_seconds;
         config.idle_timeout_seconds = self.idle_timeout_seconds;
+        config.proxy_address = self.proxy_address;
         config
     }
 }
@@ -1575,9 +1584,10 @@ fn configured_datagram_size(config: &ClientConfig) -> usize {
 
 async fn allocate_preferred_relay(
     bind_address: SocketAddr,
+    secure_websocket_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<WarmRelay>, RuntimeError> {
-    let selections = relay_selections(bind_address, connectivity)?;
+    let selections = relay_selections(bind_address, secure_websocket_proxy, connectivity)?;
     let mut last_error = None;
     for selected in selections {
         match allocate_relay(selected).await {
@@ -1593,15 +1603,19 @@ async fn allocate_preferred_relay(
 
 fn preferred_relay_settings(
     bind_address: SocketAddr,
+    secure_websocket_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<SelectedRelay>, RuntimeError> {
-    Ok(relay_selections(bind_address, connectivity)?
-        .into_iter()
-        .next())
+    Ok(
+        relay_selections(bind_address, secure_websocket_proxy, connectivity)?
+            .into_iter()
+            .next(),
+    )
 }
 
 fn relay_selections(
     bind_address: SocketAddr,
+    secure_websocket_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Vec<SelectedRelay>, RuntimeError> {
     let Some(connectivity) = connectivity else {
@@ -1618,17 +1632,21 @@ fn relay_selections(
             service.carriers().contains(carrier.mask()) && carrier.port(service.ports()) != 0
         }) {
             for relay_address in service.addresses() {
-                let Some(turn_bind) = turn_bind_address(bind_address, relay_address.address) else {
+                let server_address =
+                    SocketAddr::new(relay_address.address, carrier.port(service.ports()));
+                let proxy_address = (carrier == RuntimeRelayCarrier::Websocket)
+                    .then_some(secure_websocket_proxy)
+                    .flatten();
+                let connection_address = proxy_address.unwrap_or(server_address);
+                let Some(turn_bind) = turn_bind_address(bind_address, connection_address.ip())
+                else {
                     continue;
                 };
                 selections.push(SelectedRelay {
                     settings: RelaySettings {
                         carrier,
                         relay_id: service.relay_id(),
-                        server_address: SocketAddr::new(
-                            relay_address.address,
-                            carrier.port(service.ports()),
-                        ),
+                        server_address,
                         bind_address: turn_bind,
                         max_datagram_size: usize::try_from(service.max_datagram_size())
                             .unwrap_or(TURN_UDP_MAX_DATAGRAM_SIZE)
@@ -1650,6 +1668,7 @@ fn relay_selections(
                         } else {
                             Vec::new()
                         },
+                        proxy_address,
                     },
                     credentials: TurnCredentials::new(
                         service.credential_username().to_vec(),
@@ -1846,6 +1865,7 @@ mod tests {
         let config = connectivity_config();
         let selections = relay_selections(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
+            None,
             Some(&config),
         )
         .expect("relay selections");
@@ -1918,15 +1938,41 @@ mod tests {
             RelayTrustRequirements::SPKI_PIN
         );
         assert_eq!(selections[6].settings.spki_pins, vec![[1; 32]]);
+        assert_eq!(selections[6].settings.proxy_address, None);
         assert_eq!(selections[0].settings.trust, RelayTrustRequirements::NONE);
         assert!(selections[0].settings.spki_pins.is_empty());
         let preferred = preferred_relay_settings(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
+            None,
             Some(&config),
         )
         .expect("preferred selection")
         .expect("configured relay service");
         assert_eq!(preferred.settings, selections[0].settings);
+    }
+
+    #[test]
+    fn websocket_relay_selection_uses_configured_proxy_family() {
+        let config = connectivity_config();
+        let proxy = "198.51.100.50:8080"
+            .parse::<SocketAddr>()
+            .expect("HTTP proxy");
+        let proxied = relay_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            Some(proxy),
+            Some(&config),
+        )
+        .expect("proxied relay selections");
+        assert_eq!(proxied[6].settings.proxy_address, Some(proxy));
+        assert_eq!(proxied[7].settings.proxy_address, Some(proxy));
+        assert_eq!(
+            proxied[6].settings.bind_address,
+            "0.0.0.0:0".parse::<SocketAddr>().expect("proxy bind")
+        );
+        assert_eq!(
+            proxied[7].settings.bind_address,
+            "0.0.0.0:0".parse::<SocketAddr>().expect("proxy bind")
+        );
     }
 
     #[test]
