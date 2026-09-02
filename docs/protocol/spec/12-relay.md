@@ -255,14 +255,37 @@ cannot be accepted are silently dropped as required by their one-way nature.
 ## 4. Secure WebSocket carrier
 
 An HTTPS deployment may expose `/stella/turn/v1` with WebSocket subprotocol
-`stella-turn.v1`. Authentication occurs before upgrade using controller-issued
-credentials, TLS trust, and the same allocation policy as the TURN listener.
+`stella-turn.v1`. The client sends an HTTP/1.1 GET upgrade request for that
+exact path, offers exactly that subprotocol, and does not offer any WebSocket
+extension. Redirects, a different selected subprotocol, or any negotiated
+extension fail the connection.
+
+Authentication occurs before upgrade using the controller-issued relay
+credential. The request carries exactly one `Authorization` field with this
+case-insensitive scheme and case-sensitive credential value:
+
+```text
+Authorization: Stella <username-base64url>.<secret-base64url>
+```
+
+Both values use RFC 4648 URL-safe Base64 without padding. Empty segments,
+non-canonical encodings, extra separators, expired credentials, and credentials
+for another relay are rejected before the `101 Switching Protocols` response.
+An authentication failure uses HTTP 401 without identifying whether the
+username, secret, expiry, or relay scope failed. The field value is secret and
+never appears in access logs, errors, status output, or traces. The normal TURN
+long-term credential exchange and message integrity checks still run after the
+upgrade; pre-upgrade authentication limits access to the WebSocket service but
+does not replace TURN record authentication or allocation policy.
 
 Each binary WebSocket message contains exactly one complete TURN message or one
-complete TURN ChannelData record. Fragmented WebSocket messages are
-reassembled only up to the configured relay-record limit. Text messages,
-compression extensions, mixed records, empty messages, and records with
-trailing bytes are rejected.
+complete TURN ChannelData stream record. STUN messages retain their exact
+header-declared length; ChannelData uses the same four-byte alignment padding
+as TURN TCP and TLS. Fragmented WebSocket messages are reassembled only up to
+the configured relay-record limit. Ping, Pong, and Close remain WebSocket
+control frames and never enter TURN processing. Text messages, compression
+extensions, mixed records, empty messages, non-zero ChannelData padding, and
+records with trailing bytes are rejected.
 
 The WebSocket carrier exists for HTTP-aware firewalls and explicit proxies. It
 does not alter ICE candidate semantics, Stella packet protection, peer
