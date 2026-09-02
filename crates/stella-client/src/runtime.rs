@@ -45,6 +45,7 @@ const TAP_EVENT_QUEUE_CAPACITY: usize = 256;
 const ETHERNET_HEADER_LENGTH: u16 = 14;
 const TURN_UDP_MAX_DATAGRAM_SIZE: usize = 65_503;
 const ICE_GENERATION_MAX_LIFETIME: u64 = 600;
+const ICE_GENERATION_REFRESH_LEAD: u64 = 120;
 const ICE_USERNAME_RANDOM_LENGTH: usize = 6;
 const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
 const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
@@ -560,6 +561,60 @@ impl ClientDataRuntime {
             .map_err(RuntimeError::Codec)
     }
 
+    /// Adds generations for new networks and rotates credentials before expiry.
+    ///
+    /// Returns `true` when the controller must receive a fresh publication.
+    /// Relay-backed generations rotate only when the current relay credential
+    /// can extend their expiry; a newer controller connectivity revision is
+    /// otherwise required first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] for clock, randomness, credential, or generation
+    /// validation failure.
+    pub fn refresh_connectivity_generations(
+        &mut self,
+        states: &BTreeMap<NetworkId, NetworkState>,
+    ) -> Result<bool, RuntimeError> {
+        let before = self
+            .connectivity_generations
+            .iter()
+            .map(|(network_id, generation)| (*network_id, generation.generation_id))
+            .collect::<BTreeMap<_, _>>();
+        self.reconcile_local_connectivity_generations(states)?;
+        if self.connectivity_generations.is_empty() {
+            return Ok(!before.is_empty());
+        }
+        let wall_time = unix_time()?;
+        let refresh_deadline = wall_time.saturating_add(ICE_GENERATION_REFRESH_LEAD);
+        let prospective_expiry =
+            LocalConnectivityGeneration::expiry_at(wall_time, self.relay.as_ref())?;
+        let due = self
+            .connectivity_generations
+            .iter()
+            .filter_map(|(network_id, generation)| {
+                (generation.expires_at <= refresh_deadline
+                    && prospective_expiry > generation.expires_at)
+                    .then_some(*network_id)
+            })
+            .collect::<Vec<_>>();
+        for network_id in due {
+            let replacement = LocalConnectivityGeneration::new_at(
+                wall_time,
+                self.relay.as_ref(),
+                &self.direct_candidates,
+            )?;
+            self.connectivity_generations
+                .insert(network_id, replacement);
+        }
+        let after = self
+            .connectivity_generations
+            .iter()
+            .map(|(network_id, generation)| (*network_id, generation.generation_id))
+            .collect::<BTreeMap<_, _>>();
+        Ok(before != after)
+    }
+
     /// Returns the deployment connectivity revision currently applied locally.
     #[must_use]
     pub const fn connectivity_revision(&self) -> Option<u64> {
@@ -1034,21 +1089,15 @@ impl LocalConnectivityGeneration {
         direct_candidates: &[IceCandidate],
     ) -> Result<Self, RuntimeError> {
         let created_at = unix_time()?;
-        let maximum_expiry = created_at
-            .checked_add(ICE_GENERATION_MAX_LIFETIME)
-            .ok_or(RuntimeError::ConnectivityExpiryOverflow)?;
-        let expires_at = if let Some(relay) = relay {
-            if relay.credential_expires_at <= created_at {
-                return Err(TurnUdpError::CredentialExpired {
-                    expires_at: relay.credential_expires_at,
-                    now: created_at,
-                }
-                .into());
-            }
-            relay.credential_expires_at.min(maximum_expiry)
-        } else {
-            maximum_expiry
-        };
+        Self::new_at(created_at, relay, direct_candidates)
+    }
+
+    fn new_at(
+        created_at: u64,
+        relay: Option<&WarmRelay>,
+        direct_candidates: &[IceCandidate],
+    ) -> Result<Self, RuntimeError> {
+        let expires_at = Self::expiry_at(created_at, relay)?;
         let generation_id = random_nonzero_u64()?;
         let tie_breaker = random_nonzero_u64()?;
         let username_fragment = random_ice_credential(ICE_USERNAME_RANDOM_LENGTH)?;
@@ -1087,6 +1136,24 @@ impl LocalConnectivityGeneration {
         };
         generation.as_ref()?;
         Ok(generation)
+    }
+
+    fn expiry_at(created_at: u64, relay: Option<&WarmRelay>) -> Result<u64, RuntimeError> {
+        let maximum_expiry = created_at
+            .checked_add(ICE_GENERATION_MAX_LIFETIME)
+            .ok_or(RuntimeError::ConnectivityExpiryOverflow)?;
+        if let Some(relay) = relay {
+            if relay.credential_expires_at <= created_at {
+                return Err(TurnUdpError::CredentialExpired {
+                    expires_at: relay.credential_expires_at,
+                    now: created_at,
+                }
+                .into());
+            }
+            Ok(relay.credential_expires_at.min(maximum_expiry))
+        } else {
+            Ok(maximum_expiry)
+        }
     }
 
     fn as_ref(&self) -> Result<ConnectivityGenerationRef<'_>, stella_proto::CodecError> {
@@ -1600,5 +1667,26 @@ mod tests {
         let generation = generation.as_ref().expect("validated generation");
         assert_eq!(generation.candidates(), &[candidate]);
         assert!(generation.expires_at() > generation.created_at());
+    }
+
+    #[test]
+    fn direct_only_generation_rotation_extends_expiry() {
+        let candidate = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 8,
+            max_datagram_size: 1_200,
+            address: "192.0.2.71:47001".parse().expect("host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let initial = LocalConnectivityGeneration::new_at(100, None, &[candidate])
+            .expect("initial direct generation");
+        let replacement = LocalConnectivityGeneration::new_at(581, None, &[candidate])
+            .expect("replacement direct generation");
+        assert_eq!(initial.expires_at, 700);
+        assert_eq!(replacement.expires_at, 1_181);
+        assert!(replacement.expires_at > initial.expires_at);
     }
 }

@@ -412,6 +412,12 @@ async fn synchronize_and_publish_connectivity(
                 .context("could not replace Windows relay configuration")?;
             publish = true;
         }
+        if data
+            .refresh_connectivity_generations(active.networks())
+            .context("could not refresh local connectivity generations")?
+        {
+            publish = true;
+        }
         if !publish {
             return Ok(());
         }
