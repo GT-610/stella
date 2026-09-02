@@ -729,7 +729,7 @@ impl ClientDataRuntime {
         output: IceOutput,
         signing_key: &IdentitySigningKey,
     ) -> Result<(), RuntimeError> {
-        let (transmissions, nominations) = output.into_parts();
+        let (transmissions, nominations, failures) = output.into_all_parts();
         for transmission in transmissions {
             self.udp
                 .send_to(
@@ -738,21 +738,40 @@ impl ClientDataRuntime {
                 )
                 .await?;
         }
-        if nominations.is_empty() {
-            return Ok(());
-        }
+        let mut path_changed = false;
         for nomination in nominations {
             self.networks
                 .get_mut(&network_id)
                 .ok_or(RuntimeError::TapWorkerStopped { network_id })?
                 .plane
                 .nominate_direct_path(nomination.peer_node_id, nomination.address)?;
+            path_changed = true;
             tracing::info!(
                 %network_id,
                 peer_node_id = %nomination.peer_node_id,
                 address = %nomination.address,
                 "nominated direct UDP path"
             );
+        }
+        for failure in failures {
+            let withdrawn = self
+                .networks
+                .get_mut(&network_id)
+                .ok_or(RuntimeError::TapWorkerStopped { network_id })?
+                .plane
+                .withdraw_direct_path(failure.peer_node_id, failure.address);
+            if withdrawn {
+                path_changed = true;
+                tracing::warn!(
+                    %network_id,
+                    peer_node_id = %failure.peer_node_id,
+                    address = %failure.address,
+                    "withdrew direct UDP path after ICE consent failure"
+                );
+            }
+        }
+        if !path_changed {
+            return Ok(());
         }
         let wall_time = unix_time()?;
         let monotonic_now = self.monotonic_now();

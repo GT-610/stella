@@ -331,6 +331,46 @@ impl NetworkDataPlane {
         Ok(())
     }
 
+    /// Withdraws one failed nominated direct path without disturbing relay paths.
+    ///
+    /// A stale failure for an older address is ignored so a newly nominated
+    /// replacement cannot be removed by a delayed consent timeout. Any session
+    /// pinned to the failed path is removed, allowing the next maintenance pass
+    /// or runtime-triggered handshake to select the best remaining relay path.
+    pub fn withdraw_direct_path(&mut self, peer: NodeId, address: SocketAddr) -> bool {
+        if self.nominated_direct_paths.get(&peer) != Some(&address) {
+            return false;
+        }
+        self.nominated_direct_paths.remove(&peer);
+        let endpoint = TransportEndpoint::Udp(address);
+        let path_id = self
+            .peer_paths
+            .get(&peer)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|path_id| {
+                self.paths
+                    .get(path_id)
+                    .is_some_and(|path| path.endpoint == endpoint)
+            });
+        let Some(path_id) = path_id else {
+            return true;
+        };
+        if self
+            .sessions
+            .get(&peer)
+            .is_some_and(|session| session.path_id == path_id)
+        {
+            self.remove_session(peer);
+        }
+        self.paths.remove(&path_id);
+        if let Some(peer_paths) = self.peer_paths.get_mut(&peer) {
+            peer_paths.retain(|candidate| *candidate != path_id);
+        }
+        true
+    }
+
     /// Starts preferred-initiator handshakes for peers without a session.
     ///
     /// # Errors
@@ -1430,6 +1470,13 @@ mod tests {
             .expect("direct path");
         assert_eq!(plane.select_peer_path(alice_id), Some(direct_path));
         assert_ne!(direct_path, relay_path);
+        assert!(plane.withdraw_direct_path(alice_id, direct_address));
+        assert_eq!(plane.select_peer_path(alice_id), Some(relay_path));
+        assert!(matches!(
+            plane.transport_endpoint(direct_path),
+            Err(NetworkDataError::UnknownPath { path_id }) if path_id == direct_path
+        ));
+        assert!(!plane.withdraw_direct_path(alice_id, direct_address));
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");

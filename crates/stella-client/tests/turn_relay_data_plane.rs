@@ -750,6 +750,79 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         NetworkDataError::NoPeerSession { peer_node_id } if peer_node_id == alice_id
     ));
 
+    assert!(alice.withdraw_direct_path(bob_id, bob_direct_address));
+    assert!(bob.withdraw_direct_path(alice_id, alice_direct_address));
+    let recovery_start = Duration::from_secs(42);
+    let mut pending = alice
+        .start_handshakes(&alice_key, CONTROL_TIME, recovery_start)
+        .expect("start Alice relay recovery handshake")
+        .into_parts()
+        .0;
+    let mut from_alice = true;
+    if pending.is_empty() {
+        pending = bob
+            .start_handshakes(&bob_key, CONTROL_TIME, recovery_start)
+            .expect("start Bob relay recovery handshake")
+            .into_parts()
+            .0;
+        from_alice = false;
+    }
+    for flight in 0..8 {
+        if pending.is_empty() {
+            break;
+        }
+        let now = recovery_start.saturating_add(Duration::from_millis(flight));
+        let (next, delivered) = if from_alice {
+            relay_flight(
+                &alice,
+                &alice_turn,
+                &mut bob,
+                &bob_turn,
+                &bob_key,
+                pending,
+                now,
+            )
+            .await
+        } else {
+            relay_flight(
+                &bob,
+                &bob_turn,
+                &mut alice,
+                &alice_turn,
+                &alice_key,
+                pending,
+                now,
+            )
+            .await
+        };
+        assert!(delivered.is_none());
+        pending = next;
+        from_alice = !from_alice;
+    }
+    assert!(
+        pending.is_empty(),
+        "relay recovery handshake did not converge"
+    );
+
+    let recovered_broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xf6);
+    let outbound = alice
+        .accept_tap_frame(&recovered_broadcast, Duration::from_secs(43))
+        .expect("route recovered relay broadcast")
+        .into_parts()
+        .0;
+    let (responses, delivered) = relay_flight(
+        &alice,
+        &alice_turn,
+        &mut bob,
+        &bob_turn,
+        &bob_key,
+        outbound,
+        Duration::from_secs(43),
+    )
+    .await;
+    assert!(responses.is_empty());
+    assert_eq!(delivered.as_deref(), Some(recovered_broadcast.as_slice()));
+
     alice_turn.shutdown().await.expect("shutdown Alice TURN");
     bob_turn.shutdown().await.expect("shutdown Bob TURN");
     let _result = shutdown_sender.send(());

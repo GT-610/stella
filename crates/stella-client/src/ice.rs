@@ -22,6 +22,8 @@ type HmacSha256 = Hmac<Sha256>;
 const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const CONSENT_INTERVAL: Duration = Duration::from_secs(15);
+const DIRECT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_TRANSACTIONS: usize = 256;
 const MAX_REMOTE_CANDIDATES: usize = 32;
 
@@ -129,11 +131,21 @@ pub struct IceNomination {
     pub address: SocketAddr,
 }
 
+/// One previously nominated direct path that failed consent freshness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcePathFailure {
+    /// Authorized peer whose direct path stopped responding.
+    pub peer_node_id: NodeId,
+    /// Exact nominated address that failed repeated consent checks.
+    pub address: SocketAddr,
+}
+
 /// Output produced by an inbound check or maintenance poll.
 #[derive(Debug, Default)]
 pub struct IceOutput {
     transmissions: Vec<IceTransmission>,
     nominations: Vec<IceNomination>,
+    failures: Vec<IcePathFailure>,
 }
 
 impl IceOutput {
@@ -149,10 +161,28 @@ impl IceOutput {
         &self.nominations
     }
 
+    /// Borrows direct paths that failed consent freshness.
+    #[must_use]
+    pub fn failures(&self) -> &[IcePathFailure] {
+        &self.failures
+    }
+
     /// Consumes output into transmissions and nominations.
     #[must_use]
     pub fn into_parts(self) -> (Vec<IceTransmission>, Vec<IceNomination>) {
         (self.transmissions, self.nominations)
+    }
+
+    /// Consumes output into transmissions, nominations, and failed paths.
+    #[must_use]
+    pub fn into_all_parts(
+        self,
+    ) -> (
+        Vec<IceTransmission>,
+        Vec<IceNomination>,
+        Vec<IcePathFailure>,
+    ) {
+        (self.transmissions, self.nominations, self.failures)
     }
 }
 
@@ -252,6 +282,8 @@ impl IceAgent {
             active_transaction: None,
             succeeded: None,
             nominated: None,
+            next_consent_at: None,
+            retry_at: Duration::ZERO,
         };
         if self.peers.get(&config.node_id).is_some_and(|current| {
             current.generation_id == replacement.generation_id
@@ -287,13 +319,29 @@ impl IceAgent {
     ///
     /// Returns [`IceError`] for randomness, capacity, encoding, or deadline failure.
     pub fn poll(&mut self, now: Duration) -> Result<IceOutput, IceError> {
-        self.expire_transactions(now);
+        let failures = self.expire_transactions(now);
+        let consent_due = self
+            .peers
+            .iter()
+            .filter_map(|(peer_node_id, peer)| {
+                (peer.active_transaction.is_none()
+                    && peer
+                        .next_consent_at
+                        .is_some_and(|next_consent_at| now >= next_consent_at))
+                .then_some((*peer_node_id, peer.nominated))
+            })
+            .filter_map(|(peer_node_id, target)| target.map(|target| (peer_node_id, target)))
+            .collect::<Vec<_>>();
+        for (peer_node_id, target) in consent_due {
+            self.create_transaction(peer_node_id, target, TransactionKind::Consent, now)?;
+        }
         let to_start = self
             .peers
             .iter()
             .filter(|(_, peer)| {
                 peer.nominated.is_none()
                     && peer.active_transaction.is_none()
+                    && now >= peer.retry_at
                     && peer.next_candidate < peer.candidates.len()
             })
             .map(|(peer_node_id, peer)| (*peer_node_id, peer.candidates[peer.next_candidate]))
@@ -302,7 +350,7 @@ impl IceAgent {
             if let Some(peer) = self.peers.get_mut(&peer_node_id) {
                 peer.next_candidate += 1;
             }
-            self.create_transaction(peer_node_id, target, false, now)?;
+            self.create_transaction(peer_node_id, target, TransactionKind::Connectivity, now)?;
         }
         let mut transmissions = Vec::new();
         let mut due = self
@@ -327,6 +375,7 @@ impl IceAgent {
         Ok(IceOutput {
             transmissions,
             nominations: Vec::new(),
+            failures,
         })
     }
 
@@ -411,15 +460,24 @@ impl IceAgent {
                 bytes: response,
             }],
             nominations: Vec::new(),
+            failures: Vec::new(),
         };
         if use_candidate {
+            let newly_nominated = self
+                .peers
+                .get(&peer_node_id)
+                .is_some_and(|peer| peer.nominated != Some(source));
             if let Some(peer) = self.peers.get_mut(&peer_node_id) {
                 peer.nominated = Some(source);
+                peer.next_consent_at = Some(now.saturating_add(CONSENT_INTERVAL));
+                peer.retry_at = Duration::ZERO;
             }
-            output.nominations.push(IceNomination {
-                peer_node_id,
-                address: source,
-            });
+            if newly_nominated {
+                output.nominations.push(IceNomination {
+                    peer_node_id,
+                    address: source,
+                });
+            }
         }
         let triggered = self
             .peers
@@ -427,7 +485,8 @@ impl IceAgent {
             .is_some_and(|peer| peer.nominated.is_none() && peer.active_transaction.is_none());
         if triggered {
             self.learn_peer_reflexive(peer_node_id, source, priority);
-            let transaction_id = self.create_transaction(peer_node_id, source, false, now)?;
+            let transaction_id =
+                self.create_transaction(peer_node_id, source, TransactionKind::Connectivity, now)?;
             if let Some(transaction) = self.transactions.get_mut(&transaction_id) {
                 output.transmissions.push(transaction.transmission());
                 transaction.next_send = now.saturating_add(transaction.retransmit);
@@ -451,7 +510,7 @@ impl IceAgent {
             });
         }
         let peer_node_id = transaction.peer_node_id;
-        let nomination = transaction.nomination;
+        let kind = transaction.kind;
         let peer_tie_breaker = {
             let peer = self
                 .peers
@@ -472,20 +531,38 @@ impl IceAgent {
             peer.succeeded = Some(source);
         }
         let mut output = IceOutput::default();
-        if nomination {
-            if let Some(peer) = self.peers.get_mut(&peer_node_id) {
-                peer.nominated = Some(source);
+        match kind {
+            TransactionKind::Nomination => {
+                if let Some(peer) = self.peers.get_mut(&peer_node_id) {
+                    peer.nominated = Some(source);
+                    peer.next_consent_at = Some(now.saturating_add(CONSENT_INTERVAL));
+                    peer.retry_at = Duration::ZERO;
+                }
+                output.nominations.push(IceNomination {
+                    peer_node_id,
+                    address: source,
+                });
             }
-            output.nominations.push(IceNomination {
-                peer_node_id,
-                address: source,
-            });
-        } else if self.local_controlling(peer_node_id, peer_tie_breaker) {
-            let transaction_id = self.create_transaction(peer_node_id, source, true, now)?;
-            if let Some(transaction) = self.transactions.get_mut(&transaction_id) {
-                output.transmissions.push(transaction.transmission());
-                transaction.next_send = now.saturating_add(transaction.retransmit);
+            TransactionKind::Connectivity
+                if self.local_controlling(peer_node_id, peer_tie_breaker) =>
+            {
+                let transaction_id = self.create_transaction(
+                    peer_node_id,
+                    source,
+                    TransactionKind::Nomination,
+                    now,
+                )?;
+                if let Some(transaction) = self.transactions.get_mut(&transaction_id) {
+                    output.transmissions.push(transaction.transmission());
+                    transaction.next_send = now.saturating_add(transaction.retransmit);
+                }
             }
+            TransactionKind::Consent => {
+                if let Some(peer) = self.peers.get_mut(&peer_node_id) {
+                    peer.next_consent_at = Some(now.saturating_add(CONSENT_INTERVAL));
+                }
+            }
+            TransactionKind::Connectivity => {}
         }
         Ok(Some(output))
     }
@@ -520,7 +597,7 @@ impl IceAgent {
         &mut self,
         peer_node_id: NodeId,
         target: SocketAddr,
-        nomination: bool,
+        kind: TransactionKind,
         now: Duration,
     ) -> Result<StunTransactionId, IceError> {
         if self.transactions.len() >= MAX_ACTIVE_TRANSACTIONS {
@@ -552,7 +629,7 @@ impl IceAgent {
             OwnedAttribute::new(StunAttributeType::PRIORITY, priority.to_vec()),
             OwnedAttribute::new(role_type, role.to_vec()),
         ];
-        if nomination {
+        if kind == TransactionKind::Nomination {
             attributes.push(OwnedAttribute::new(
                 StunAttributeType::USE_CANDIDATE,
                 Vec::new(),
@@ -572,7 +649,7 @@ impl IceAgent {
             Transaction {
                 peer_node_id,
                 target,
-                nomination,
+                kind,
                 request,
                 next_send: now,
                 retransmit: INITIAL_RETRANSMIT_TIMEOUT,
@@ -585,22 +662,43 @@ impl IceAgent {
         Ok(transaction_id)
     }
 
-    fn expire_transactions(&mut self, now: Duration) {
+    fn expire_transactions(&mut self, now: Duration) -> Vec<IcePathFailure> {
         let expired = self
             .transactions
             .iter()
             .filter_map(|(transaction_id, transaction)| {
-                (now >= transaction.deadline).then_some((*transaction_id, transaction.peer_node_id))
+                (now >= transaction.deadline).then_some((
+                    *transaction_id,
+                    transaction.peer_node_id,
+                    transaction.target,
+                    transaction.kind,
+                ))
             })
             .collect::<Vec<_>>();
-        for (transaction_id, peer_node_id) in expired {
+        let mut failures = Vec::new();
+        for (transaction_id, peer_node_id, target, kind) in expired {
             self.transactions.remove(&transaction_id);
             if let Some(peer) = self.peers.get_mut(&peer_node_id) {
                 if peer.active_transaction == Some(transaction_id) {
                     peer.active_transaction = None;
                 }
+                if kind == TransactionKind::Consent && peer.nominated == Some(target) {
+                    peer.nominated = None;
+                    peer.succeeded = None;
+                    peer.next_consent_at = None;
+                    peer.next_candidate = 0;
+                    peer.retry_at = now.saturating_add(DIRECT_RETRY_INTERVAL);
+                    failures.push(IcePathFailure {
+                        peer_node_id,
+                        address: target,
+                    });
+                } else if peer.nominated.is_none() && peer.next_candidate >= peer.candidates.len() {
+                    peer.next_candidate = 0;
+                    peer.retry_at = now.saturating_add(DIRECT_RETRY_INTERVAL);
+                }
             }
         }
+        failures
     }
 
     fn remove_peer_transactions(&mut self, peer_node_id: NodeId) {
@@ -645,16 +743,25 @@ struct Peer {
     active_transaction: Option<StunTransactionId>,
     succeeded: Option<SocketAddr>,
     nominated: Option<SocketAddr>,
+    next_consent_at: Option<Duration>,
+    retry_at: Duration,
 }
 
 struct Transaction {
     peer_node_id: NodeId,
     target: SocketAddr,
-    nomination: bool,
+    kind: TransactionKind,
     request: Vec<u8>,
     next_send: Duration,
     retransmit: Duration,
     deadline: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionKind {
+    Connectivity,
+    Nomination,
+    Consent,
 }
 
 impl Transaction {
@@ -1068,6 +1175,39 @@ mod tests {
         assert_eq!(
             bob_nomination.expect("Bob nomination").address,
             alice_candidate.address
+        );
+        let (consent, nominations, failures) = alice
+            .poll(Duration::from_secs(16))
+            .expect("send consent check")
+            .into_all_parts();
+        assert_eq!(consent.len(), 1);
+        assert!(nominations.is_empty());
+        assert!(failures.is_empty());
+        let (transmissions, nominations, failures) = alice
+            .poll(Duration::from_secs(21))
+            .expect("expire consent check")
+            .into_all_parts();
+        assert!(transmissions.is_empty());
+        assert!(nominations.is_empty());
+        assert_eq!(
+            failures,
+            vec![super::IcePathFailure {
+                peer_node_id: bob_id,
+                address: bob_candidate.address,
+            }]
+        );
+        assert!(alice
+            .poll(Duration::from_secs(50))
+            .expect("respect direct retry backoff")
+            .transmissions()
+            .is_empty());
+        assert_eq!(
+            alice
+                .poll(Duration::from_secs(51))
+                .expect("retry direct connectivity")
+                .transmissions()
+                .len(),
+            1
         );
         let diagnostic = format!("{alice:?}");
         assert!(!diagnostic.contains("AliceUfr"));
