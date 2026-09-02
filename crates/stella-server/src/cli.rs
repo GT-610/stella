@@ -5,7 +5,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -18,12 +18,15 @@ use stella_server::{
     active::serve_control_session,
     authority::{AuthorityHandle, AuthorityThread},
     bootstrap::{initialize_controller, BootstrapOptions},
-    config::{ServerConfig, TurnTcpRelaySettings, TurnUdpRelaySettings},
+    config::{ServerConfig, TurnTcpRelaySettings, TurnTlsRelaySettings, TurnUdpRelaySettings},
     identity::load_controller_identity,
     relay_credentials::{create_relay_credential_key, load_relay_credential_authority},
     runtime::{run_controller, SessionError, SessionHandler},
     store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
-    turn_relay::{TurnTcpRelay, TurnTcpRelayConfig, TurnUdpRelay, TurnUdpRelayConfig},
+    tls::load_tls_server_config,
+    turn_relay::{
+        TurnTcpRelay, TurnTcpRelayConfig, TurnTlsRelay, TurnUdpRelay, TurnUdpRelayConfig,
+    },
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zeroize::Zeroizing;
@@ -198,6 +201,7 @@ enum RelayCommand {
 enum RelayCarrierArg {
     Udp,
     Tcp,
+    Tls,
 }
 
 #[derive(Clone, Copy, Debug, Args)]
@@ -248,6 +252,20 @@ impl From<TurnUdpRelaySettings> for RelayRunSettings {
 
 impl From<TurnTcpRelaySettings> for RelayRunSettings {
     fn from(settings: TurnTcpRelaySettings) -> Self {
+        Self {
+            relay_id: settings.relay_id,
+            credential_key_path: settings.credential_key_path,
+            credential_lifetime_seconds: settings.credential_lifetime_seconds,
+            port: settings.port,
+            max_datagram_size: settings.max_datagram_size,
+            allocation_lifetime_seconds: settings.allocation_lifetime_seconds,
+            idle_timeout_seconds: settings.idle_timeout_seconds,
+        }
+    }
+}
+
+impl From<TurnTlsRelaySettings> for RelayRunSettings {
+    fn from(settings: TurnTlsRelaySettings) -> Self {
         Self {
             relay_id: settings.relay_id,
             credential_key_path: settings.credential_key_path,
@@ -364,6 +382,10 @@ async fn execute_relay(config_path: &Path, command: RelayCommand) -> Result<()> 
             .turn_tcp_relay_settings(args.id)
             .context("could not resolve configured TURN TCP relay")?
             .into(),
+        RelayCarrierArg::Tls => config
+            .turn_tls_relay_settings(args.id)
+            .context("could not resolve configured TURN TLS relay")?
+            .into(),
     };
     if args.listen.port() != settings.port {
         return Err(anyhow!(
@@ -393,6 +415,7 @@ async fn execute_relay(config_path: &Path, command: RelayCommand) -> Result<()> 
     match args.carrier {
         RelayCarrierArg::Udp => run_turn_udp(args, settings, credentials).await,
         RelayCarrierArg::Tcp => run_turn_tcp(args, settings, credentials).await,
+        RelayCarrierArg::Tls => run_turn_tls(args, settings, credentials, &config).await,
     }
 }
 
@@ -401,6 +424,7 @@ impl RelayCarrierArg {
         match self {
             Self::Udp => "UDP",
             Self::Tcp => "TCP",
+            Self::Tls => "TLS",
         }
     }
 }
@@ -437,19 +461,7 @@ async fn run_turn_tcp(
     settings: RelayRunSettings,
     credentials: stella_server::relay_credentials::RelayCredentialAuthority,
 ) -> Result<()> {
-    let mut relay_config = TurnTcpRelayConfig::new(
-        settings.relay_id,
-        args.listen,
-        args.allocation_bind.unwrap_or(args.listen.ip()),
-        args.advertise,
-    );
-    relay_config.max_datagram_size = settings.max_datagram_size;
-    relay_config.allocation_lifetime_seconds = settings.allocation_lifetime_seconds;
-    relay_config.idle_timeout_seconds = settings.idle_timeout_seconds;
-    relay_config.max_allocations = args.max_allocations;
-    relay_config.max_allocations_per_node = args.max_allocations_per_node;
-    relay_config.max_permissions_per_allocation = args.max_permissions_per_allocation;
-    relay_config.max_channels_per_allocation = args.max_channels_per_allocation;
+    let relay_config = stream_relay_config(args, &settings);
     let relay = TurnTcpRelay::bind(relay_config, credentials)
         .await
         .context("could not bind TURN TCP relay")?;
@@ -463,6 +475,53 @@ async fn run_turn_tcp(
         .run(ctrl_c_shutdown())
         .await
         .context("TURN TCP relay runtime failed")
+}
+
+async fn run_turn_tls(
+    args: RelayRunArgs,
+    settings: RelayRunSettings,
+    credentials: stella_server::relay_credentials::RelayCredentialAuthority,
+    server: &ServerConfig,
+) -> Result<()> {
+    let relay_config = stream_relay_config(args, &settings);
+    let tls_config =
+        load_tls_server_config(&server.tls_certificate_path, &server.tls_private_key_path)
+            .context("could not load TURN TLS identity")?;
+    let relay = TurnTlsRelay::bind(
+        relay_config,
+        credentials,
+        tls_config,
+        Duration::from_secs(server.limits.tls_handshake_timeout_seconds),
+    )
+    .await
+    .context("could not bind TURN TLS relay")?;
+    tracing::info!(
+        relay_id = %settings.relay_id,
+        listen = %relay.local_address().context("could not query TURN TLS listener")?,
+        advertise = %args.advertise,
+        "starting TURN TLS relay"
+    );
+    relay
+        .run(ctrl_c_shutdown())
+        .await
+        .context("TURN TLS relay runtime failed")
+}
+
+fn stream_relay_config(args: RelayRunArgs, settings: &RelayRunSettings) -> TurnTcpRelayConfig {
+    let mut relay_config = TurnTcpRelayConfig::new(
+        settings.relay_id,
+        args.listen,
+        args.allocation_bind.unwrap_or(args.listen.ip()),
+        args.advertise,
+    );
+    relay_config.max_datagram_size = settings.max_datagram_size;
+    relay_config.allocation_lifetime_seconds = settings.allocation_lifetime_seconds;
+    relay_config.idle_timeout_seconds = settings.idle_timeout_seconds;
+    relay_config.max_allocations = args.max_allocations;
+    relay_config.max_allocations_per_node = args.max_allocations_per_node;
+    relay_config.max_permissions_per_allocation = args.max_permissions_per_allocation;
+    relay_config.max_channels_per_allocation = args.max_channels_per_allocation;
+    relay_config
 }
 
 fn apply_relay_limits(
@@ -1016,6 +1075,20 @@ mod tests {
             "tcp",
             "--listen",
             "0.0.0.0:3478",
+            "--advertise",
+            "192.0.2.30",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "stella-server",
+            "relay",
+            "run",
+            "--id",
+            "01010101010101010101010101010101",
+            "--carrier",
+            "tls",
+            "--listen",
+            "0.0.0.0:443",
             "--advertise",
             "192.0.2.30",
         ])

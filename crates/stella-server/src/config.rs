@@ -216,6 +216,44 @@ impl ServerConfig {
             idle_timeout_seconds: relay.idle_timeout_seconds,
         })
     }
+
+    /// Resolves one configured TURN TLS relay into executable service settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when connectivity services are absent, the
+    /// relay ID is unknown, TURN TLS is not advertised, or a numeric bound
+    /// cannot be represented by this platform.
+    pub fn turn_tls_relay_settings(
+        &self,
+        relay_id: RelayId,
+    ) -> Result<TurnTlsRelaySettings, ConfigError> {
+        let connectivity = self
+            .connectivity
+            .as_ref()
+            .ok_or_else(|| invalid_connectivity("connectivity services are not configured"))?;
+        let relay = connectivity
+            .relay_services
+            .iter()
+            .find(|relay| relay.relay_id == relay_id)
+            .ok_or_else(|| invalid_connectivity("requested relay ID is not configured"))?;
+        if !relay.carriers.contains(RelayCarrierMask::TURN_TLS) || relay.ports.turn_tls == 0 {
+            return Err(invalid_connectivity(
+                "requested relay does not advertise TURN TLS",
+            ));
+        }
+        let max_datagram_size =
+            usize::try_from(relay.max_datagram_size).map_err(|_| ConfigError::LengthOverflow)?;
+        Ok(TurnTlsRelaySettings {
+            relay_id,
+            credential_key_path: connectivity.credential_key_path.clone(),
+            credential_lifetime_seconds: connectivity.credential_lifetime_seconds,
+            port: relay.ports.turn_tls,
+            max_datagram_size,
+            allocation_lifetime_seconds: relay.allocation_lifetime_seconds,
+            idle_timeout_seconds: relay.idle_timeout_seconds,
+        })
+    }
 }
 
 /// Executable settings derived from one advertised TURN UDP relay service.
@@ -247,6 +285,25 @@ pub struct TurnTcpRelaySettings {
     /// Controller-issued credential lifetime used by the shared authority.
     pub credential_lifetime_seconds: u64,
     /// Advertised TURN TCP port.
+    pub port: u16,
+    /// Advertised relayed Stella datagram ceiling.
+    pub max_datagram_size: usize,
+    /// Maximum granted allocation lifetime.
+    pub allocation_lifetime_seconds: u32,
+    /// Allocation inactivity deadline.
+    pub idle_timeout_seconds: u32,
+}
+
+/// Executable settings derived from one advertised TURN TLS relay service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnTlsRelaySettings {
+    /// Stable configured relay identity.
+    pub relay_id: RelayId,
+    /// Protected shared credential authority key path.
+    pub credential_key_path: PathBuf,
+    /// Controller-issued credential lifetime used by the shared authority.
+    pub credential_lifetime_seconds: u64,
+    /// Advertised TURN TLS port.
     pub port: u16,
     /// Advertised relayed Stella datagram ceiling.
     pub max_datagram_size: usize,
@@ -866,6 +923,11 @@ private_key = "secrets/tls-key.pem"
             .expect("resolve TURN TCP settings");
         assert_eq!(tcp_settings.port, 3479);
         assert_eq!(tcp_settings.max_datagram_size, 1_200);
+        let tls_settings = parsed
+            .turn_tls_relay_settings(relay_id)
+            .expect("resolve TURN TLS settings");
+        assert_eq!(tls_settings.port, 443);
+        assert_eq!(tls_settings.max_datagram_size, 1_200);
 
         let connectivity = parsed.connectivity.expect("connectivity configured");
         assert_eq!(connectivity.revision, 7);

@@ -36,6 +36,76 @@ C:\Stella\stella-server.exe --config C:\Stella\server.toml init `
 文件所在目录为基准。请在主机及上游防火墙中放行 TCP 44900 端口，或 `listen`
 指定的自定义端口。
 
+## 配置连接服务
+
+可选的 0.2 `[connectivity]` 配置让控制器下发 STUN、Relay 位置、TLS 信任材料和绑定节点
+的短期 Relay 凭据。内置服务端可以运行 TURN UDP、TURN TCP 和 TURN TLS；STUN 与 Secure
+WebSocket 仍需单独部署。
+
+先创建共享凭据签发密钥：
+
+```powershell
+& C:\Stella\stella-server.exe relay-key create `
+  --output C:\Stella\secrets\relay-credential.key
+```
+
+然后添加配置修订、至少一个 STUN 和 Relay：
+
+```toml
+[connectivity]
+revision = 1
+credential_key = "secrets/relay-credential.key"
+credential_lifetime_seconds = 300
+stun_servers = ["192.0.2.20:3478"]
+
+[[connectivity.relays]]
+id = "01010101010101010101010101010101"
+priority = 0
+region = "primary"
+hostname = "relay.example.net"
+tls_server_name = "relay.example.net"
+require_web_pki = true
+turn_udp = 3478
+turn_tcp = 3479
+turn_tls = 443
+addresses = ["192.0.2.30", "2001:db8::30"]
+```
+
+非零端口启用对应承载。私有 TLS 证书可省略 `require_web_pki`，改为配置一个或多个规范
+`sha256/<standard-base64>` SPKI 固定值。服务定义变化后必须递增 `revision`。凭据密钥只应
+由控制器和 Relay 进程读取；客户端只接收绑定其节点身份与 Relay ID 的短期凭据。
+
+分别启动三个承载：
+
+```powershell
+$Server = 'C:\Stella\stella-server.exe'
+$Config = 'C:\Stella\server.toml'
+
+& $Server --config $Config relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier udp `
+  --listen 0.0.0.0:3478 `
+  --advertise 192.0.2.30
+
+& $Server --config $Config relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier tcp `
+  --listen 0.0.0.0:3479 `
+  --advertise 192.0.2.30
+
+& $Server --config $Config relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier tls `
+  --listen 0.0.0.0:443 `
+  --advertise 192.0.2.30
+```
+
+在主机与上游防火墙中放行 UDP 3478、TCP 3479 和 443。三个承载都会为每个分配创建动态
+UDP socket，这些端口同样必须可用；Relay 位于 NAT 后时还需转发 Windows UDP 动态端口
+范围，直接使用公网 IP 更合适。TLS 进程复用 `[tls]` 的证书与私钥，证书必须覆盖
+`tls_server_name`。每个进程都会拒绝与 `turn_udp`、`turn_tcp` 或 `turn_tls` 不一致的
+监听端口，并在 Ctrl+C 后有序退出。
+
 ## 创建网络和注册材料
 
 ```powershell

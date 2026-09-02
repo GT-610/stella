@@ -1,6 +1,7 @@
 # 服务器管理 CLI
 
-`stella-server` 初始化控制器部署、运行 TLS 控制平面服务，并提供授权管理命令。每个
+`stella-server` 初始化控制器部署、运行 TLS 控制平面和 TURN UDP/TCP/TLS 服务，
+创建受保护的 Relay 凭据密钥，并提供授权管理命令。每个
 命令都会加载 `--config` 指定的严格 TOML 配置（默认为 `server.toml`）。访问授权状态
 的命令会从受保护的控制器身份推导控制器 ID，打开配置的 redb 数据库，并在串行化授权
 线程上执行数据库工作。
@@ -39,6 +40,57 @@ config=<configuration path>
 
 请通过可信渠道将控制器 ID 和 SPKI 固定值交给客户端。私钥从不输出，`run` 也不会
 重新生成缺失文件。
+
+## 创建 Relay 凭据密钥
+
+```powershell
+stella-server relay-key create `
+  --output C:\Stella\secrets\relay-credential.key
+```
+
+该命令从操作系统取得非零随机 256 位密钥，使用与控制器身份相同的原生受保护文件策略
+创建并同步目标，只输出 `key=<path>`。它不会覆盖已有文件，也不会输出密钥字节。该文件
+只应由控制器和验证短期凭据的 Relay 进程读取，绝不能复制给客户端。
+
+## 运行 TURN Relay
+
+```powershell
+stella-server --config C:\Stella\server.toml relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier udp `
+  --listen 0.0.0.0:3478 `
+  --advertise 192.0.2.30
+```
+
+`relay run` 从 `[connectivity]` 按 ID 选择 Relay，加载受保护的凭据密钥，并运行
+`--carrier udp|tcp|tls` 指定的承载直到 Ctrl+C；默认仍为 UDP。监听端口必须分别等于
+配置中的 `turn_udp`、`turn_tcp` 或 `turn_tls`。`--advertise` 是返回给远端节点的可达
+中继地址；本地分配 socket 需要绑定其他 IP 时使用 `--allocation-bind`。
+
+TCP 和 TLS 应各自在独立进程中运行：
+
+```powershell
+stella-server --config C:\Stella\server.toml relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier tcp `
+  --listen 0.0.0.0:3479 `
+  --advertise 192.0.2.30
+
+stella-server --config C:\Stella\server.toml relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier tls `
+  --listen 0.0.0.0:443 `
+  --advertise 192.0.2.30
+```
+
+TLS 承载复用顶层 `[tls]` 中的证书和受保护 PKCS#8 私钥，只允许 TLS 1.3、禁用 early
+data，并使用 `limits.tls_handshake_timeout_seconds` 限制握手。证书必须覆盖控制器下发的
+Relay TLS 名称，并满足相应 Web PKI、SPKI 固定或两者同时校验。
+
+默认全局最多 1024 个分配、每节点 4 个，每个分配最多 128 个权限和 Channel。三个承载
+都创建 UDP 中继分配；TCP 和 TLS 只改变客户端到 Relay 的控制与数据承载。每个分配当前
+使用操作系统选择的动态 UDP 端口，因此主机防火墙必须允许这些 socket。Secure WebSocket
+和有界分配端口池仍待后续实现。
 
 ## 运行控制器
 
