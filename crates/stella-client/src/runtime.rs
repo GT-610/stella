@@ -1,4 +1,4 @@
-//! Windows UDP and TAP execution runtime for active network data planes.
+//! Windows direct, relayed, and TAP execution runtime for active network data planes.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -38,7 +38,8 @@ use crate::{
     ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
     NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState, StunDiscoveryError,
     TurnCredentials, TurnTcpClient, TurnTcpClientConfig, TurnTlsClient, TurnTlsClientConfig,
-    TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+    TurnUdpClient, TurnUdpClientConfig, TurnUdpError, TurnWebSocketClient,
+    TurnWebSocketClientConfig,
 };
 
 const TAP_WRITE_QUEUE_CAPACITY: usize = 64;
@@ -1082,6 +1083,7 @@ enum RuntimeRelayCarrier {
     Udp,
     Tcp,
     Tls,
+    Websocket,
 }
 
 impl RuntimeRelayCarrier {
@@ -1090,6 +1092,7 @@ impl RuntimeRelayCarrier {
             Self::Udp => ConnectivityCarrier::TurnUdp,
             Self::Tcp => ConnectivityCarrier::TurnTcp,
             Self::Tls => ConnectivityCarrier::TurnTls,
+            Self::Websocket => ConnectivityCarrier::SecureWebSocket,
         }
     }
 
@@ -1098,6 +1101,7 @@ impl RuntimeRelayCarrier {
             Self::Udp => RelayCarrierMask::TURN_UDP,
             Self::Tcp => RelayCarrierMask::TURN_TCP,
             Self::Tls => RelayCarrierMask::TURN_TLS,
+            Self::Websocket => RelayCarrierMask::SECURE_WEBSOCKET,
         }
     }
 
@@ -1106,7 +1110,12 @@ impl RuntimeRelayCarrier {
             Self::Udp => ports.turn_udp,
             Self::Tcp => ports.turn_tcp,
             Self::Tls => ports.turn_tls,
+            Self::Websocket => ports.secure_websocket,
         }
+    }
+
+    const fn uses_tls(self) -> bool {
+        matches!(self, Self::Tls | Self::Websocket)
     }
 }
 
@@ -1143,6 +1152,21 @@ impl RelaySettings {
         config.idle_timeout_seconds = self.idle_timeout_seconds;
         config
     }
+
+    fn websocket_client_config(&self) -> TurnWebSocketClientConfig {
+        let mut config = TurnWebSocketClientConfig::new(
+            self.relay_id,
+            self.server_address,
+            self.bind_address,
+            self.tls_server_name.clone(),
+            self.trust,
+            self.spki_pins.clone(),
+        );
+        config.max_datagram_size = self.max_datagram_size;
+        config.allocation_lifetime_seconds = self.allocation_lifetime_seconds;
+        config.idle_timeout_seconds = self.idle_timeout_seconds;
+        config
+    }
 }
 
 struct SelectedRelay {
@@ -1155,6 +1179,7 @@ enum WarmRelayClient {
     Udp(TurnUdpClient),
     Tcp(TurnTcpClient),
     Tls(TurnTlsClient),
+    Websocket(TurnWebSocketClient),
 }
 
 impl WarmRelayClient {
@@ -1163,6 +1188,7 @@ impl WarmRelayClient {
             Self::Udp(_) => ConnectivityCarrier::TurnUdp,
             Self::Tcp(_) => ConnectivityCarrier::TurnTcp,
             Self::Tls(_) => ConnectivityCarrier::TurnTls,
+            Self::Websocket(_) => ConnectivityCarrier::SecureWebSocket,
         }
     }
 
@@ -1171,6 +1197,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.relay_id(),
             Self::Tcp(client) => client.relay_id(),
             Self::Tls(client) => client.relay_id(),
+            Self::Websocket(client) => client.relay_id(),
         }
     }
 
@@ -1179,6 +1206,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.relayed_address(),
             Self::Tcp(client) => client.relayed_address(),
             Self::Tls(client) => client.relayed_address(),
+            Self::Websocket(client) => client.relayed_address(),
         }
     }
 
@@ -1187,6 +1215,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.mapped_address(),
             Self::Tcp(client) => client.mapped_address(),
             Self::Tls(client) => client.mapped_address(),
+            Self::Websocket(client) => client.mapped_address(),
         }
     }
 
@@ -1195,6 +1224,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.capabilities(),
             Self::Tcp(client) => client.capabilities(),
             Self::Tls(client) => client.capabilities(),
+            Self::Websocket(client) => client.capabilities(),
         }
     }
 
@@ -1203,6 +1233,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.replace_credentials(credentials).await,
             Self::Tcp(client) => client.replace_credentials(credentials).await,
             Self::Tls(client) => client.replace_credentials(credentials).await,
+            Self::Websocket(client) => client.replace_credentials(credentials).await,
         }
     }
 
@@ -1211,6 +1242,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.prepare_peer(endpoint).await,
             Self::Tcp(client) => client.prepare_peer(endpoint).await,
             Self::Tls(client) => client.prepare_peer(endpoint).await,
+            Self::Websocket(client) => client.prepare_peer(endpoint).await,
         }
     }
 
@@ -1223,6 +1255,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.send_to(endpoint, datagram).await,
             Self::Tcp(client) => client.send_to(endpoint, datagram).await,
             Self::Tls(client) => client.send_to(endpoint, datagram).await,
+            Self::Websocket(client) => client.send_to(endpoint, datagram).await,
         }
     }
 
@@ -1231,6 +1264,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.receive(output).await,
             Self::Tcp(client) => client.receive(output).await,
             Self::Tls(client) => client.receive(output).await,
+            Self::Websocket(client) => client.receive(output).await,
         }
     }
 
@@ -1239,6 +1273,7 @@ impl WarmRelayClient {
             Self::Udp(client) => client.shutdown().await,
             Self::Tcp(client) => client.shutdown().await,
             Self::Tls(client) => client.shutdown().await,
+            Self::Websocket(client) => client.shutdown().await,
         }
     }
 }
@@ -1577,6 +1612,7 @@ fn relay_selections(
         RuntimeRelayCarrier::Udp,
         RuntimeRelayCarrier::Tcp,
         RuntimeRelayCarrier::Tls,
+        RuntimeRelayCarrier::Websocket,
     ] {
         for service in connectivity.relay_services().iter().filter(|service| {
             service.carriers().contains(carrier.mask()) && carrier.port(service.ports()) != 0
@@ -1599,17 +1635,17 @@ fn relay_selections(
                             .min(TURN_UDP_MAX_DATAGRAM_SIZE),
                         allocation_lifetime_seconds: service.allocation_lifetime_seconds(),
                         idle_timeout_seconds: service.idle_timeout_seconds(),
-                        tls_server_name: if carrier == RuntimeRelayCarrier::Tls {
+                        tls_server_name: if carrier.uses_tls() {
                             service.tls_server_name().to_owned()
                         } else {
                             String::new()
                         },
-                        trust: if carrier == RuntimeRelayCarrier::Tls {
+                        trust: if carrier.uses_tls() {
                             service.trust()
                         } else {
                             RelayTrustRequirements::NONE
                         },
-                        spki_pins: if carrier == RuntimeRelayCarrier::Tls {
+                        spki_pins: if carrier.uses_tls() {
                             service.spki_pins().to_vec()
                         } else {
                             Vec::new()
@@ -1641,6 +1677,13 @@ async fn allocate_relay(selected: SelectedRelay) -> Result<WarmRelay, RuntimeErr
         RuntimeRelayCarrier::Tls => WarmRelayClient::Tls(
             TurnTlsClient::allocate(selected.settings.tls_client_config(), selected.credentials)
                 .await?,
+        ),
+        RuntimeRelayCarrier::Websocket => WarmRelayClient::Websocket(
+            TurnWebSocketClient::allocate(
+                selected.settings.websocket_client_config(),
+                selected.credentials,
+            )
+            .await?,
         ),
     };
     Ok(WarmRelay {
@@ -1754,7 +1797,8 @@ mod tests {
             carriers: RelayCarrierMask::from_bits(
                 RelayCarrierMask::TURN_UDP.bits()
                     | RelayCarrierMask::TURN_TCP.bits()
-                    | RelayCarrierMask::TURN_TLS.bits(),
+                    | RelayCarrierMask::TURN_TLS.bits()
+                    | RelayCarrierMask::SECURE_WEBSOCKET.bits(),
             )
             .expect("test relay carriers"),
             priority: 4,
@@ -1773,7 +1817,7 @@ mod tests {
                 turn_udp: 3_478,
                 turn_tcp: 3_479,
                 turn_tls: 443,
-                secure_websocket: 0,
+                secure_websocket: 8_443,
             },
             addresses: &addresses,
             spki_pins: &[[1; 32]],
@@ -1798,14 +1842,14 @@ mod tests {
     }
 
     #[test]
-    fn relay_selection_prefers_udp_then_tcp_then_tls_and_uses_ephemeral_family_binds() {
+    fn relay_selection_uses_udp_tcp_tls_then_websocket_with_family_binds() {
         let config = connectivity_config();
         let selections = relay_selections(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             Some(&config),
         )
         .expect("relay selections");
-        assert_eq!(selections.len(), 6);
+        assert_eq!(selections.len(), 8);
         assert_eq!(selections[0].settings.carrier, RuntimeRelayCarrier::Udp);
         assert_eq!(
             selections[0].settings.server_address,
@@ -1852,6 +1896,28 @@ mod tests {
             RelayTrustRequirements::SPKI_PIN
         );
         assert_eq!(selections[4].settings.spki_pins, vec![[1; 32]]);
+        assert_eq!(
+            selections[6].settings.carrier,
+            RuntimeRelayCarrier::Websocket
+        );
+        assert_eq!(
+            selections[6].settings.server_address,
+            "192.0.2.20:8443"
+                .parse::<SocketAddr>()
+                .expect("IPv4 WebSocket server")
+        );
+        assert_eq!(
+            selections[7].settings.server_address,
+            "[2001:db8::20]:8443"
+                .parse::<SocketAddr>()
+                .expect("IPv6 WebSocket server")
+        );
+        assert_eq!(selections[6].settings.tls_server_name, "relay.example.test");
+        assert_eq!(
+            selections[6].settings.trust,
+            RelayTrustRequirements::SPKI_PIN
+        );
+        assert_eq!(selections[6].settings.spki_pins, vec![[1; 32]]);
         assert_eq!(selections[0].settings.trust, RelayTrustRequirements::NONE);
         assert!(selections[0].settings.spki_pins.is_empty());
         let preferred = preferred_relay_settings(
