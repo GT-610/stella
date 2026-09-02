@@ -37,7 +37,8 @@ use crate::{
     },
     ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
     NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState, StunDiscoveryError,
-    TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+    TurnCredentials, TurnTcpClient, TurnTcpClientConfig, TurnUdpClient, TurnUdpClientConfig,
+    TurnUdpError,
 };
 
 const TAP_WRITE_QUEUE_CAPACITY: usize = 64;
@@ -198,7 +199,7 @@ impl ClientDataRuntime {
         let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
         let (discovery, relay) = tokio::join!(
             discover_server_reflexive(&udp, stun_servers),
-            allocate_preferred_turn_udp(config.udp_bind, connectivity),
+            allocate_preferred_relay(config.udp_bind, connectivity),
         );
         let discovery = match discovery {
             Ok(discovery) => discovery,
@@ -640,7 +641,7 @@ impl ClientDataRuntime {
         if self.connectivity_revision == revision {
             return Ok(());
         }
-        let selected = preferred_turn_udp_settings(self.udp.local_address(), connectivity)?;
+        let selected = preferred_relay_settings(self.udp.local_address(), connectivity)?;
         match (self.relay.as_mut(), selected) {
             (Some(current), Some(selected)) if current.settings == selected.settings => {
                 current
@@ -650,7 +651,7 @@ impl ClientDataRuntime {
                 current.credential_expires_at = selected.credential_expires_at;
             }
             (_, Some(selected)) => {
-                let replacement = allocate_turn_udp(selected).await?;
+                let replacement = allocate_relay(selected).await?;
                 let previous = self.relay.replace(replacement);
                 if let Some(previous) = previous {
                     previous.client.shutdown().await?;
@@ -663,11 +664,16 @@ impl ClientDataRuntime {
             }
             (None, None) => {}
         }
-        let available = self.relay.is_some();
         for network in self.networks.values_mut() {
-            network
-                .plane
-                .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, available)?;
+            for carrier in [ConnectivityCarrier::TurnUdp, ConnectivityCarrier::TurnTcp] {
+                let available = self
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.settings.carrier.connectivity_carrier() == carrier);
+                network
+                    .plane
+                    .set_relay_carrier_available(carrier, available)?;
+            }
         }
         self.relay_buffer.resize(
             self.relay
@@ -767,7 +773,10 @@ impl ClientDataRuntime {
             signing_key,
             self.monotonic_now(),
         )?;
-        plane.set_relay_carrier_available(ConnectivityCarrier::TurnUdp, self.relay.is_some())?;
+        if let Some(relay) = &self.relay {
+            plane
+                .set_relay_carrier_available(relay.settings.carrier.connectivity_carrier(), true)?;
+        }
         self.networks.insert(
             network_id,
             ActiveNetwork {
@@ -859,7 +868,7 @@ impl ClientDataRuntime {
                 TransportEndpoint::Udp(_) => {
                     self.udp.send_to(&endpoint, datagram.bytes()).await?;
                 }
-                TransportEndpoint::TurnUdp { .. } => {
+                TransportEndpoint::TurnUdp { .. } | TransportEndpoint::TurnTcp { .. } => {
                     self.relay
                         .as_ref()
                         .ok_or(TurnUdpError::ActorStopped)?
@@ -1043,13 +1052,14 @@ struct RuntimeIceAgent {
 }
 
 struct WarmRelay {
-    settings: TurnUdpSettings,
+    settings: RelaySettings,
     credential_expires_at: u64,
-    client: TurnUdpClient,
+    client: WarmRelayClient,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TurnUdpSettings {
+struct RelaySettings {
+    carrier: RuntimeRelayCarrier,
     relay_id: stella_common::RelayId,
     server_address: SocketAddr,
     bind_address: SocketAddr,
@@ -1058,8 +1068,37 @@ struct TurnUdpSettings {
     idle_timeout_seconds: u32,
 }
 
-impl TurnUdpSettings {
-    const fn client_config(self) -> TurnUdpClientConfig {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeRelayCarrier {
+    Udp,
+    Tcp,
+}
+
+impl RuntimeRelayCarrier {
+    const fn connectivity_carrier(self) -> ConnectivityCarrier {
+        match self {
+            Self::Udp => ConnectivityCarrier::TurnUdp,
+            Self::Tcp => ConnectivityCarrier::TurnTcp,
+        }
+    }
+
+    const fn mask(self) -> RelayCarrierMask {
+        match self {
+            Self::Udp => RelayCarrierMask::TURN_UDP,
+            Self::Tcp => RelayCarrierMask::TURN_TCP,
+        }
+    }
+
+    const fn port(self, ports: stella_proto::RelayPorts) -> u16 {
+        match self {
+            Self::Udp => ports.turn_udp,
+            Self::Tcp => ports.turn_tcp,
+        }
+    }
+}
+
+impl RelaySettings {
+    const fn udp_client_config(self) -> TurnUdpClientConfig {
         let mut config =
             TurnUdpClientConfig::new(self.relay_id, self.server_address, self.bind_address);
         config.max_datagram_size = self.max_datagram_size;
@@ -1067,12 +1106,102 @@ impl TurnUdpSettings {
         config.idle_timeout_seconds = self.idle_timeout_seconds;
         config
     }
+
+    const fn tcp_client_config(self) -> TurnTcpClientConfig {
+        let mut config =
+            TurnTcpClientConfig::new(self.relay_id, self.server_address, self.bind_address);
+        config.max_datagram_size = self.max_datagram_size;
+        config.allocation_lifetime_seconds = self.allocation_lifetime_seconds;
+        config.idle_timeout_seconds = self.idle_timeout_seconds;
+        config
+    }
 }
 
-struct SelectedTurnUdp {
-    settings: TurnUdpSettings,
+struct SelectedRelay {
+    settings: RelaySettings,
     credentials: TurnCredentials,
     credential_expires_at: u64,
+}
+
+enum WarmRelayClient {
+    Udp(TurnUdpClient),
+    Tcp(TurnTcpClient),
+}
+
+impl WarmRelayClient {
+    const fn carrier(&self) -> ConnectivityCarrier {
+        match self {
+            Self::Udp(_) => ConnectivityCarrier::TurnUdp,
+            Self::Tcp(_) => ConnectivityCarrier::TurnTcp,
+        }
+    }
+
+    const fn relay_id(&self) -> stella_common::RelayId {
+        match self {
+            Self::Udp(client) => client.relay_id(),
+            Self::Tcp(client) => client.relay_id(),
+        }
+    }
+
+    const fn relayed_address(&self) -> SocketAddr {
+        match self {
+            Self::Udp(client) => client.relayed_address(),
+            Self::Tcp(client) => client.relayed_address(),
+        }
+    }
+
+    const fn mapped_address(&self) -> SocketAddr {
+        match self {
+            Self::Udp(client) => client.mapped_address(),
+            Self::Tcp(client) => client.mapped_address(),
+        }
+    }
+
+    const fn capabilities(&self) -> stella_transport::TransportCapabilities {
+        match self {
+            Self::Udp(client) => client.capabilities(),
+            Self::Tcp(client) => client.capabilities(),
+        }
+    }
+
+    async fn replace_credentials(&self, credentials: TurnCredentials) -> Result<(), TurnUdpError> {
+        match self {
+            Self::Udp(client) => client.replace_credentials(credentials).await,
+            Self::Tcp(client) => client.replace_credentials(credentials).await,
+        }
+    }
+
+    async fn prepare_peer(&self, endpoint: &TransportEndpoint) -> Result<(), TurnUdpError> {
+        match self {
+            Self::Udp(client) => client.prepare_peer(endpoint).await,
+            Self::Tcp(client) => client.prepare_peer(endpoint).await,
+        }
+    }
+
+    async fn send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnUdpError> {
+        match self {
+            Self::Udp(client) => client.send_to(endpoint, datagram).await,
+            Self::Tcp(client) => client.send_to(endpoint, datagram).await,
+        }
+    }
+
+    async fn receive(&self, output: &mut [u8]) -> Result<ReceivedDatagram, TurnUdpError> {
+        match self {
+            Self::Udp(client) => client.receive(output).await,
+            Self::Tcp(client) => client.receive(output).await,
+        }
+    }
+
+    async fn shutdown(&self) -> Result<(), TurnUdpError> {
+        match self {
+            Self::Udp(client) => client.shutdown().await,
+            Self::Tcp(client) => client.shutdown().await,
+        }
+    }
 }
 
 struct LocalConnectivityGeneration {
@@ -1117,7 +1246,7 @@ impl LocalConnectivityGeneration {
             .max(1);
             candidates.push(IceCandidate {
                 class: IceCandidateClass::Relay,
-                carrier: ConnectivityCarrier::TurnUdp,
+                carrier: relay.client.carrier(),
                 priority: RELAY_CANDIDATE_PRIORITY,
                 foundation,
                 max_datagram_size: u32::try_from(relay.client.capabilities().max_datagram_size)
@@ -1370,14 +1499,14 @@ fn configured_datagram_size(config: &ClientConfig) -> usize {
         .min(MAX_UDP_DATAGRAM_SIZE)
 }
 
-async fn allocate_preferred_turn_udp(
+async fn allocate_preferred_relay(
     bind_address: SocketAddr,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<WarmRelay>, RuntimeError> {
-    let selections = turn_udp_selections(bind_address, connectivity)?;
+    let selections = relay_selections(bind_address, connectivity)?;
     let mut last_error = None;
     for selected in selections {
-        match allocate_turn_udp(selected).await {
+        match allocate_relay(selected).await {
             Ok(relay) => return Ok(Some(relay)),
             Err(error) => last_error = Some(error),
         }
@@ -1388,59 +1517,70 @@ async fn allocate_preferred_turn_udp(
     }
 }
 
-fn preferred_turn_udp_settings(
+fn preferred_relay_settings(
     bind_address: SocketAddr,
     connectivity: Option<&ConnectivityConfigState>,
-) -> Result<Option<SelectedTurnUdp>, RuntimeError> {
-    Ok(turn_udp_selections(bind_address, connectivity)?
+) -> Result<Option<SelectedRelay>, RuntimeError> {
+    Ok(relay_selections(bind_address, connectivity)?
         .into_iter()
         .next())
 }
 
-fn turn_udp_selections(
+fn relay_selections(
     bind_address: SocketAddr,
     connectivity: Option<&ConnectivityConfigState>,
-) -> Result<Vec<SelectedTurnUdp>, RuntimeError> {
+) -> Result<Vec<SelectedRelay>, RuntimeError> {
     let Some(connectivity) = connectivity else {
         return Ok(Vec::new());
     };
     let mut selections = Vec::new();
-    for service in connectivity.relay_services().iter().filter(|service| {
-        service.carriers().contains(RelayCarrierMask::TURN_UDP) && service.ports().turn_udp != 0
-    }) {
-        for relay_address in service.addresses() {
-            let Some(turn_bind) = turn_bind_address(bind_address, relay_address.address) else {
-                continue;
-            };
-            selections.push(SelectedTurnUdp {
-                settings: TurnUdpSettings {
-                    relay_id: service.relay_id(),
-                    server_address: SocketAddr::new(
-                        relay_address.address,
-                        service.ports().turn_udp,
-                    ),
-                    bind_address: turn_bind,
-                    max_datagram_size: usize::try_from(service.max_datagram_size())
-                        .unwrap_or(TURN_UDP_MAX_DATAGRAM_SIZE)
-                        .min(TURN_UDP_MAX_DATAGRAM_SIZE),
-                    allocation_lifetime_seconds: service.allocation_lifetime_seconds(),
-                    idle_timeout_seconds: service.idle_timeout_seconds(),
-                },
-                credentials: TurnCredentials::new(
-                    service.credential_username().to_vec(),
-                    service.credential_secret().to_vec(),
-                    service.credential_expires_at(),
-                )?,
-                credential_expires_at: service.credential_expires_at(),
-            });
+    for carrier in [RuntimeRelayCarrier::Udp, RuntimeRelayCarrier::Tcp] {
+        for service in connectivity.relay_services().iter().filter(|service| {
+            service.carriers().contains(carrier.mask()) && carrier.port(service.ports()) != 0
+        }) {
+            for relay_address in service.addresses() {
+                let Some(turn_bind) = turn_bind_address(bind_address, relay_address.address) else {
+                    continue;
+                };
+                selections.push(SelectedRelay {
+                    settings: RelaySettings {
+                        carrier,
+                        relay_id: service.relay_id(),
+                        server_address: SocketAddr::new(
+                            relay_address.address,
+                            carrier.port(service.ports()),
+                        ),
+                        bind_address: turn_bind,
+                        max_datagram_size: usize::try_from(service.max_datagram_size())
+                            .unwrap_or(TURN_UDP_MAX_DATAGRAM_SIZE)
+                            .min(TURN_UDP_MAX_DATAGRAM_SIZE),
+                        allocation_lifetime_seconds: service.allocation_lifetime_seconds(),
+                        idle_timeout_seconds: service.idle_timeout_seconds(),
+                    },
+                    credentials: TurnCredentials::new(
+                        service.credential_username().to_vec(),
+                        service.credential_secret().to_vec(),
+                        service.credential_expires_at(),
+                    )?,
+                    credential_expires_at: service.credential_expires_at(),
+                });
+            }
         }
     }
     Ok(selections)
 }
 
-async fn allocate_turn_udp(selected: SelectedTurnUdp) -> Result<WarmRelay, RuntimeError> {
-    let client =
-        TurnUdpClient::allocate(selected.settings.client_config(), selected.credentials).await?;
+async fn allocate_relay(selected: SelectedRelay) -> Result<WarmRelay, RuntimeError> {
+    let client = match selected.settings.carrier {
+        RuntimeRelayCarrier::Udp => WarmRelayClient::Udp(
+            TurnUdpClient::allocate(selected.settings.udp_client_config(), selected.credentials)
+                .await?,
+        ),
+        RuntimeRelayCarrier::Tcp => WarmRelayClient::Tcp(
+            TurnTcpClient::allocate(selected.settings.tcp_client_config(), selected.credentials)
+                .await?,
+        ),
+    };
     Ok(WarmRelay {
         settings: selected.settings,
         credential_expires_at: selected.credential_expires_at,
@@ -1520,9 +1660,10 @@ mod tests {
     };
 
     use super::{
-        effective_tap_mtu, preferred_turn_udp_settings, random_ice_credential, turn_bind_address,
-        turn_udp_selections, ConnectivityConfigState, LocalConnectivityGeneration,
-        ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
+        effective_tap_mtu, preferred_relay_settings, random_ice_credential, relay_selections,
+        turn_bind_address, ConnectivityConfigState, LocalConnectivityGeneration,
+        RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
+        TURN_UDP_MAX_DATAGRAM_SIZE,
     };
 
     fn connectivity_config() -> ConnectivityConfigState {
@@ -1548,7 +1689,10 @@ mod tests {
         ];
         let service = RelayServiceRef {
             relay_id: RelayId::from_bytes([0x52; 16]),
-            carriers: RelayCarrierMask::TURN_UDP,
+            carriers: RelayCarrierMask::from_bits(
+                RelayCarrierMask::TURN_UDP.bits() | RelayCarrierMask::TURN_TCP.bits(),
+            )
+            .expect("test relay carriers"),
             priority: 4,
             max_datagram_size: 65_507,
             allocation_lifetime_seconds: 600,
@@ -1563,7 +1707,7 @@ mod tests {
             trust: RelayTrustRequirements::NONE,
             ports: RelayPorts {
                 turn_udp: 3_478,
-                turn_tcp: 0,
+                turn_tcp: 3_479,
                 turn_tls: 0,
                 secure_websocket: 0,
             },
@@ -1590,14 +1734,15 @@ mod tests {
     }
 
     #[test]
-    fn turn_udp_selection_preserves_controller_order_and_uses_ephemeral_family_binds() {
+    fn relay_selection_prefers_udp_then_tcp_and_uses_ephemeral_family_binds() {
         let config = connectivity_config();
-        let selections = turn_udp_selections(
+        let selections = relay_selections(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             Some(&config),
         )
-        .expect("TURN UDP selections");
-        assert_eq!(selections.len(), 2);
+        .expect("relay selections");
+        assert_eq!(selections.len(), 4);
+        assert_eq!(selections[0].settings.carrier, RuntimeRelayCarrier::Udp);
         assert_eq!(
             selections[0].settings.server_address,
             "192.0.2.20:3478"
@@ -1612,16 +1757,23 @@ mod tests {
             selections[1].settings.bind_address,
             "[::]:0".parse::<SocketAddr>().expect("IPv6 bind")
         );
+        assert_eq!(selections[2].settings.carrier, RuntimeRelayCarrier::Tcp);
+        assert_eq!(
+            selections[2].settings.server_address,
+            "192.0.2.20:3479"
+                .parse::<SocketAddr>()
+                .expect("IPv4 TCP server")
+        );
         assert_eq!(
             selections[0].settings.max_datagram_size,
             TURN_UDP_MAX_DATAGRAM_SIZE
         );
-        let preferred = preferred_turn_udp_settings(
+        let preferred = preferred_relay_settings(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             Some(&config),
         )
         .expect("preferred selection")
-        .expect("configured TURN UDP service");
+        .expect("configured relay service");
         assert_eq!(preferred.settings, selections[0].settings);
     }
 
