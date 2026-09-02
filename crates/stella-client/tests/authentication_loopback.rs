@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use stella_client::{
     authenticate_controller, ActiveControl, BearerCredential, ClientError, ControllerTrust,
     Enrollment, SpkiPin,
@@ -20,7 +21,7 @@ use stella_common::NetworkId;
 use stella_crypto::{derive_node_id, IdentitySigningKey};
 use stella_proto::{
     ConfidentialityPolicy, ConnectivityCarrier, ConnectivityGenerationRef, Endpoint, IceCandidate,
-    IceCandidateClass, NetworkPolicy, ProtocolVersion,
+    IceCandidateClass, NetworkPolicy, ProtocolVersion, CONTROL_MAGIC,
 };
 use stella_server::{
     active::serve_control_session,
@@ -30,6 +31,8 @@ use stella_server::{
     store::{AuthorityStore, NetworkRecord},
 };
 use tokio::{
+    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     sync::oneshot,
     time::{sleep, Instant},
 };
@@ -374,6 +377,170 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .expect("join server task")
         .expect("server shuts down cleanly");
     std::fs::remove_dir_all(&directory).expect("remove test deployment");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the real proxy, TLS controller, enrollment, and reauthentication are one security scenario"
+)]
+async fn proxied_client_enrolls_and_reauthenticates_without_plaintext_credentials() {
+    let directory = temp_directory();
+    let config_path = directory.join("server.toml");
+    let controller_address = reserve_loopback_address();
+    let initialized = initialize_controller(
+        &config_path,
+        &BootstrapOptions {
+            listen: controller_address,
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("initialize proxied controller deployment");
+    let config = ServerConfig::load(&config_path).expect("load proxied controller configuration");
+    let store = AuthorityStore::open(&config.database_path, initialized.controller_id)
+        .expect("open proxied authority before server starts");
+    let issued_at = now();
+    let enrollment_token = store
+        .issue_enrollment_token(issued_at, issued_at + 3_600)
+        .expect("issue proxied enrollment token");
+    let enrollment_secret = *enrollment_token.expose_secret();
+    let enrollment_text = URL_SAFE_NO_PAD.encode(enrollment_secret);
+    let credential = BearerCredential::from_bytes(enrollment_secret);
+    drop(store);
+
+    let handler: SessionHandler = Arc::new(|session| {
+        Box::pin(async move {
+            serve_control_session(session)
+                .await
+                .map_err(|error| Box::new(error) as SessionError)
+        })
+    });
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    let server_path = config_path.clone();
+    let server = tokio::spawn(async move {
+        run_controller(
+            &server_path,
+            async move {
+                let _shutdown = shutdown_receiver.await;
+            },
+            handler,
+        )
+        .await
+    });
+    wait_for_tcp_listener(controller_address).await;
+
+    let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind controller proxy");
+    let proxy_address = proxy_listener
+        .local_addr()
+        .expect("controller proxy address");
+    let controller_authority = format!("localhost:{}", controller_address.port());
+    let expected_request =
+        format!("CONNECT {controller_authority} HTTP/1.1\r\nHost: {controller_authority}\r\n\r\n")
+            .into_bytes();
+    let pin = SpkiPin::from_digest(initialized.tls_spki_sha256);
+    let pin_text = pin.to_string();
+    let proxy = tokio::spawn(async move {
+        for _connection in 0..2 {
+            let (mut downstream, _client) = proxy_listener
+                .accept()
+                .await
+                .expect("accept proxied controller connection");
+            let request = read_connect_request(&mut downstream).await;
+            assert_eq!(request, expected_request);
+            assert!(!contains_subslice(&request, &enrollment_secret));
+            assert!(!contains_subslice(&request, enrollment_text.as_bytes()));
+            assert!(!contains_subslice(&request, pin_text.as_bytes()));
+            assert!(!contains_subslice(&request, &CONTROL_MAGIC));
+
+            let mut upstream = TcpStream::connect(controller_address)
+                .await
+                .expect("connect proxy to real controller");
+            downstream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("accept controller CONNECT");
+            copy_bidirectional(&mut downstream, &mut upstream)
+                .await
+                .expect("forward controller TLS tunnel");
+        }
+    });
+
+    let trust = ControllerTrust::new(
+        controller_address,
+        String::from("localhost"),
+        initialized.controller_id,
+        vec![pin],
+    )
+    .expect("valid proxied controller trust")
+    .with_https_proxy(Some(proxy_address));
+    let node_key = IdentitySigningKey::generate().expect("generate proxied node identity");
+    let node_id = derive_node_id(node_key.public_key());
+
+    let first = authenticate_controller(
+        &trust,
+        &node_key,
+        Some(Enrollment::new(&credential, "Proxied Windows client")),
+    )
+    .await
+    .expect("enroll through controller proxy");
+    assert_eq!(first.node_id(), node_id);
+    assert_eq!(first.controller_id(), initialized.controller_id);
+    drop(first);
+
+    let second = authenticate_controller(&trust, &node_key, None)
+        .await
+        .expect("reauthenticate through controller proxy");
+    assert_eq!(second.node_id(), node_id);
+    assert_eq!(second.controller_id(), initialized.controller_id);
+    drop(second);
+
+    proxy.await.expect("controller proxy task");
+    shutdown_sender.send(()).expect("request server shutdown");
+    server
+        .await
+        .expect("join server task")
+        .expect("server shuts down cleanly");
+    std::fs::remove_dir_all(&directory).expect("remove proxied test deployment");
+}
+
+async fn wait_for_tcp_listener(address: SocketAddr) {
+    for _attempt in 0..100 {
+        match TcpStream::connect(address).await {
+            Ok(stream) => {
+                drop(stream);
+                return;
+            }
+            Err(_) => sleep(Duration::from_millis(10)).await,
+        }
+    }
+    TcpStream::connect(address)
+        .await
+        .expect("controller listener becomes ready");
+}
+
+async fn read_connect_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .await
+            .expect("read controller CONNECT request");
+        request.push(byte[0]);
+        assert!(request.len() <= 1_024);
+        if request.ends_with(b"\r\n\r\n") {
+            return request;
+        }
+    }
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 async fn authentication_error_after_listener_ready(
