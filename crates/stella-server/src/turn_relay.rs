@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use futures_util::StreamExt;
 use stella_common::{NodeId, RelayId};
 use stella_proto::{
     decode_stun_xor_address, encode_stun_error_code, encode_stun_message, encode_stun_xor_address,
@@ -16,7 +18,11 @@ use stella_proto::{
     StunAttributeType, StunClass, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
     StunTransactionId, TurnChannelDataView, TurnChannelNumber,
 };
-use stella_transport::{TurnStream, MAX_TURN_STREAM_RECORD_SIZE};
+use stella_transport::{
+    read_websocket_record, turn_websocket_config, write_websocket_record, TurnStream,
+    WebSocketRecordError, MAX_TURN_STREAM_RECORD_SIZE, STELLA_TURN_WEBSOCKET_PATH,
+    STELLA_TURN_WEBSOCKET_SUBPROTOCOL,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -26,6 +32,22 @@ use tokio::{
     time::{timeout, MissedTickBehavior},
 };
 use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+use tokio_tungstenite::{
+    accept_hdr_async_with_config,
+    tungstenite::{
+        handshake::server::{
+            ErrorResponse, Request as WebSocketRequest, Response as WebSocketResponse,
+        },
+        http::{
+            header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
+            HeaderValue, StatusCode,
+        },
+        protocol::WebSocketConfig,
+        Error as WebSocketError,
+    },
+    WebSocketStream,
+};
+use zeroize::Zeroizing;
 
 use crate::{
     relay_credentials::{RelayCredentialAuthority, TurnNonceStatus},
@@ -672,6 +694,274 @@ impl fmt::Debug for TurnTlsRelay {
     }
 }
 
+/// One bound secure WebSocket TURN relay with pre-upgrade credential authentication.
+pub struct TurnWebSocketRelay {
+    config: TurnTcpRelayConfig,
+    listener: TcpListener,
+    core: Arc<Mutex<TurnRelayCore>>,
+    acceptor: TlsAcceptor,
+    credentials: Arc<RelayCredentialAuthority>,
+    websocket_config: WebSocketConfig,
+    handshake_timeout: Duration,
+}
+
+impl TurnWebSocketRelay {
+    /// Validates limits, binds HTTPS, and installs TLS and WebSocket policy.
+    ///
+    /// The shared [`TurnTcpRelayConfig`] describes the reliable TURN and UDP
+    /// allocation limits. `tls_config` must disable early data; callers normally
+    /// obtain it from [`crate::tls::load_tls_server_config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] for invalid limits, TLS policy, credential
+    /// scope, handshake deadline, WebSocket bounds, or listener bind failure.
+    pub async fn bind(
+        config: TurnTcpRelayConfig,
+        credentials: RelayCredentialAuthority,
+        tls_config: Arc<ServerConfig>,
+        handshake_timeout: Duration,
+    ) -> Result<Self, TurnRelayError> {
+        config.validate()?;
+        if handshake_timeout.is_zero() || handshake_timeout > MAX_TLS_HANDSHAKE_TIMEOUT {
+            return Err(invalid_config(
+                "WebSocket handshake timeout must be between one nanosecond and 60 seconds",
+            ));
+        }
+        if tls_config.max_early_data_size != 0 {
+            return Err(invalid_config(
+                "TURN WebSocket TLS early data must be disabled",
+            ));
+        }
+        let websocket_config = turn_websocket_config(MAX_TURN_STREAM_RECORD_SIZE)?;
+        let listener = TcpListener::bind(config.listen_address)
+            .await
+            .map_err(|source| TurnRelayError::BindTcp {
+                address: config.listen_address,
+                source,
+            })?;
+        let credentials = Arc::new(credentials);
+        let core = TurnRelayCore::new_shared(config.into(), Arc::clone(&credentials))?;
+        Ok(Self {
+            config,
+            listener,
+            core: Arc::new(Mutex::new(core)),
+            acceptor: TlsAcceptor::from(tls_config),
+            credentials,
+            websocket_config,
+            handshake_timeout,
+        })
+    }
+
+    /// Returns the actual HTTPS listener address, including an assigned port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] if the operating system cannot report the
+    /// bound listener address.
+    pub fn local_address(&self) -> Result<SocketAddr, TurnRelayError> {
+        self.listener
+            .local_addr()
+            .map_err(|source| TurnRelayError::TcpLocalAddress { source })
+    }
+
+    /// Serves authenticated secure WebSocket TURN sessions until shutdown.
+    ///
+    /// TCP, TLS, HTTP upgrade, authentication, or record failures close only
+    /// their client session. Listener failure or an internal task panic
+    /// terminates the runtime for service-manager restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] for listener, clock, or task failures.
+    pub async fn run<F>(self, shutdown: F) -> Result<(), TurnRelayError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let mut shutdown = std::pin::pin!(shutdown);
+        let mut cleanup = tokio::time::interval(Duration::from_secs(1));
+        cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut sessions = JoinSet::new();
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                _ = cleanup.tick() => {
+                    self.core.lock().await.remove_expired(Instant::now());
+                }
+                accepted = self.listener.accept() => {
+                    let (stream, client) = accepted.map_err(|source| TurnRelayError::AcceptTcp { source })?;
+                    stream.set_nodelay(true).map_err(|source| TurnRelayError::ConfigureTcp {
+                        client,
+                        source,
+                    })?;
+                    let core = Arc::clone(&self.core);
+                    let acceptor = self.acceptor.clone();
+                    let credentials = Arc::clone(&self.credentials);
+                    let relay_id = self.config.relay_id;
+                    let websocket_config = self.websocket_config;
+                    let handshake_timeout = self.handshake_timeout;
+                    sessions.spawn(async move {
+                        let handshake = timeout(handshake_timeout, async {
+                            let stream = acceptor
+                                .accept(stream)
+                                .await
+                                .map_err(|source| TurnRelayError::TlsHandshake { client, source })?;
+                            accept_websocket_client(
+                                stream,
+                                client,
+                                relay_id,
+                                credentials,
+                                websocket_config,
+                            )
+                            .await
+                        })
+                        .await
+                        .map_err(|_| TurnRelayError::WebSocketHandshakeTimeout { client });
+                        let session = match handshake {
+                            Ok(Ok(stream)) => run_websocket_client(stream, client, core).await,
+                            Ok(Err(error)) | Err(error) => Err(error),
+                        };
+                        (client, session)
+                    });
+                }
+                joined = sessions.join_next(), if !sessions.is_empty() => {
+                    if let Some(result) = joined {
+                        let (client, session) = result.map_err(|source| TurnRelayError::ClientTaskJoin { source })?;
+                        if let Err(error) = session {
+                            tracing::debug!(%client, %error, "TURN WebSocket client session closed");
+                        }
+                    }
+                }
+            }
+        }
+        sessions.abort_all();
+        while let Some(result) = sessions.join_next().await {
+            if let Err(source) = result {
+                if !source.is_cancelled() {
+                    return Err(TurnRelayError::ClientTaskJoin { source });
+                }
+            }
+        }
+        self.core.lock().await.shutdown().await
+    }
+}
+
+impl fmt::Debug for TurnWebSocketRelay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnWebSocketRelay")
+            .field("config", &self.config)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(clippy::result_large_err)] // Tungstenite's callback API fixes ErrorResponse by value.
+async fn accept_websocket_client<S>(
+    stream: S,
+    client: SocketAddr,
+    relay_id: RelayId,
+    credentials: Arc<RelayCredentialAuthority>,
+    websocket_config: WebSocketConfig,
+) -> Result<WebSocketStream<S>, TurnRelayError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    accept_hdr_async_with_config(
+        stream,
+        move |request: &WebSocketRequest, response: WebSocketResponse| {
+            authorize_websocket_upgrade(request, response, relay_id, &credentials)
+        },
+        Some(websocket_config),
+    )
+    .await
+    .map_err(|source| TurnRelayError::WebSocketHandshake { client, source })
+}
+
+#[allow(clippy::result_large_err)] // Required by Tungstenite's Callback result type.
+fn authorize_websocket_upgrade(
+    request: &WebSocketRequest,
+    mut response: WebSocketResponse,
+    relay_id: RelayId,
+    credentials: &RelayCredentialAuthority,
+) -> Result<WebSocketResponse, ErrorResponse> {
+    if request.uri().path() != STELLA_TURN_WEBSOCKET_PATH || request.uri().query().is_some() {
+        return Err(websocket_rejection(StatusCode::BAD_REQUEST));
+    }
+    if request.headers().contains_key(SEC_WEBSOCKET_EXTENSIONS) {
+        return Err(websocket_rejection(StatusCode::BAD_REQUEST));
+    }
+    let mut protocols = request.headers().get_all(SEC_WEBSOCKET_PROTOCOL).iter();
+    let protocol = protocols.next().map(HeaderValue::as_bytes);
+    if protocol != Some(STELLA_TURN_WEBSOCKET_SUBPROTOCOL.as_bytes()) || protocols.next().is_some()
+    {
+        return Err(websocket_rejection(StatusCode::BAD_REQUEST));
+    }
+    let mut authorizations = request.headers().get_all(AUTHORIZATION).iter();
+    let authorization = authorizations.next().and_then(|value| value.to_str().ok());
+    if authorizations.next().is_some() {
+        return Err(websocket_rejection(StatusCode::UNAUTHORIZED));
+    }
+    let Some(authorization) = authorization.and_then(decode_websocket_authorization) else {
+        return Err(websocket_rejection(StatusCode::UNAUTHORIZED));
+    };
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => return Err(websocket_rejection(StatusCode::INTERNAL_SERVER_ERROR)),
+    };
+    if credentials
+        .verify(
+            relay_id,
+            authorization.username.as_slice(),
+            authorization.secret.as_slice(),
+            now,
+        )
+        .is_none()
+    {
+        return Err(websocket_rejection(StatusCode::UNAUTHORIZED));
+    }
+    response.headers_mut().insert(
+        SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static(STELLA_TURN_WEBSOCKET_SUBPROTOCOL),
+    );
+    Ok(response)
+}
+
+struct DecodedWebSocketAuthorization {
+    username: Zeroizing<Vec<u8>>,
+    secret: Zeroizing<Vec<u8>>,
+}
+
+fn decode_websocket_authorization(authorization: &str) -> Option<DecodedWebSocketAuthorization> {
+    let (scheme, encoded) = authorization.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("stella") || encoded.contains(' ') {
+        return None;
+    }
+    let (username, secret) = encoded.split_once('.')?;
+    if secret.contains('.') {
+        return None;
+    }
+    Some(DecodedWebSocketAuthorization {
+        username: decode_websocket_credential_segment(username)?,
+        secret: decode_websocket_credential_segment(secret)?,
+    })
+}
+
+fn decode_websocket_credential_segment(encoded: &str) -> Option<Zeroizing<Vec<u8>>> {
+    if encoded.is_empty() {
+        return None;
+    }
+    let decoded = Zeroizing::new(URL_SAFE_NO_PAD.decode(encoded).ok()?);
+    let canonical = Zeroizing::new(URL_SAFE_NO_PAD.encode(decoded.as_slice()));
+    (canonical.as_str() == encoded).then_some(decoded)
+}
+
+fn websocket_rejection(status: StatusCode) -> ErrorResponse {
+    let mut response = ErrorResponse::new(None);
+    *response.status_mut() = status;
+    response
+}
+
 async fn run_stream_client<S>(
     stream: S,
     client: SocketAddr,
@@ -725,12 +1015,70 @@ where
     result
 }
 
+async fn run_websocket_client<S>(
+    stream: WebSocketStream<S>,
+    client: SocketAddr,
+    core: Arc<Mutex<TurnRelayCore>>,
+) -> Result<(), TurnRelayError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut writer, mut reader) = stream.split();
+    let (sender, mut outbound) = mpsc::channel(256);
+    let sink = ClientSink::Stream { client, sender };
+    let mut writer_task = tokio::spawn(async move {
+        while let Some(record) = outbound.recv().await {
+            write_websocket_record(&mut writer, &record, MAX_TURN_STREAM_RECORD_SIZE).await?;
+        }
+        Ok::<_, TurnRelayError>(())
+    });
+    let mut writer_joined = false;
+    let result = loop {
+        tokio::select! {
+            joined = &mut writer_task => {
+                writer_joined = true;
+                break joined.map_err(|source| TurnRelayError::ClientWriterTaskJoin { source })?;
+            }
+            record = read_websocket_record(&mut reader, MAX_TURN_STREAM_RECORD_SIZE) => {
+                let record = match record {
+                    Ok(record) => record,
+                    Err(error) => break Err(error.into()),
+                };
+                let now_unix = unix_time()?;
+                let now = Instant::now();
+                let response = core
+                    .lock()
+                    .await
+                    .handle_client_record(&record, client, sink.clone(), now_unix, now)
+                    .await?;
+                if let Some(response) = response {
+                    sink.send(response).await?;
+                }
+            }
+        }
+    };
+    core.lock().await.remove_client(client);
+    drop(sink);
+    if !writer_joined {
+        writer_task.abort();
+        let _result = writer_task.await;
+    }
+    result
+}
+
 impl TurnRelayCore {
     fn new(
         config: TurnRelayRuntimeConfig,
         credentials: RelayCredentialAuthority,
     ) -> Result<Self, TurnRelayError> {
-        let authenticator = TurnAuthenticator::new(credentials, config.relay_id)?;
+        Self::new_shared(config, Arc::new(credentials))
+    }
+
+    fn new_shared(
+        config: TurnRelayRuntimeConfig,
+        credentials: Arc<RelayCredentialAuthority>,
+    ) -> Result<Self, TurnRelayError> {
+        let authenticator = TurnAuthenticator::new_shared(credentials, config.relay_id)?;
         Ok(Self {
             config,
             authenticator,
@@ -2130,6 +2478,21 @@ pub enum TurnRelayError {
         #[source]
         source: std::io::Error,
     },
+    /// A secure WebSocket client did not complete TLS and HTTP upgrade in time.
+    #[error("TURN WebSocket handshake with {client} timed out")]
+    WebSocketHandshakeTimeout {
+        /// Connected client transport address.
+        client: SocketAddr,
+    },
+    /// A secure WebSocket client failed its HTTP upgrade or pre-authentication.
+    #[error("TURN WebSocket handshake with {client} failed")]
+    WebSocketHandshake {
+        /// Connected client transport address.
+        client: SocketAddr,
+        /// Underlying HTTP or WebSocket protocol failure.
+        #[source]
+        source: WebSocketError,
+    },
     /// A per-client relay allocation socket could not be bound.
     #[error("unable to bind TURN allocation socket on {address}")]
     BindAllocation {
@@ -2162,8 +2525,8 @@ pub enum TurnRelayError {
         #[source]
         source: std::io::Error,
     },
-    /// A TCP session ended before accepting another response record.
-    #[error("TURN TCP client stream {client} is closed")]
+    /// A reliable session ended before accepting another response record.
+    #[error("TURN reliable client stream {client} is closed")]
     ClientStreamClosed {
         /// Connected client transport address.
         client: SocketAddr,
@@ -2216,6 +2579,9 @@ pub enum TurnRelayError {
     /// Reliable TURN record framing or stream I/O failed.
     #[error(transparent)]
     Stream(#[from] stella_transport::TurnStreamError),
+    /// Secure WebSocket record framing, protocol handling, or I/O failed.
+    #[error(transparent)]
+    WebSocket(#[from] WebSocketRecordError),
     /// Authenticated response signing failed.
     #[error("unable to sign TURN response integrity")]
     ResponseIntegrity,
@@ -2228,6 +2594,7 @@ mod tests {
         time::Duration,
     };
 
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::{Digest, Sha256};
     use stella_common::{NodeId, RelayId};
@@ -2238,9 +2605,16 @@ mod tests {
         StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
     };
     use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
+    use tokio_tungstenite::tungstenite::{
+        handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
+        http::{
+            header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
+            StatusCode,
+        },
+    };
     use zeroize::Zeroizing;
 
-    use super::{TurnUdpRelay, TurnUdpRelayConfig};
+    use super::{authorize_websocket_upgrade, TurnUdpRelay, TurnUdpRelayConfig};
     use crate::relay_credentials::RelayCredentialAuthority;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -2249,6 +2623,108 @@ mod tests {
         realm: Vec<u8>,
         nonce: Vec<u8>,
         relayed_address: SocketAddr,
+    }
+
+    #[test]
+    fn websocket_upgrade_accepts_only_valid_canonical_credentials() {
+        let relay_id = RelayId::from_bytes([0x51; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x52; 32], 300).expect("credential authority");
+        let credential = authority
+            .issue(
+                relay_id,
+                NodeId::from_bytes([0x53; 16]),
+                unix_time_for_test(),
+            )
+            .expect("issue credential");
+        let authorization = websocket_authorization(credential.username(), credential.secret());
+        let accepted = authorize_websocket_upgrade(
+            &websocket_request("/stella/turn/v1", &authorization, "stella-turn.v1", None),
+            websocket_response(),
+            relay_id,
+            &authority,
+        )
+        .expect("authorize canonical credential");
+        assert_eq!(
+            accepted
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .expect("selected subprotocol"),
+            "stella-turn.v1"
+        );
+
+        let wrong_secret = websocket_authorization(credential.username(), b"wrong secret");
+        assert_eq!(
+            authorize_websocket_upgrade(
+                &websocket_request("/stella/turn/v1", &wrong_secret, "stella-turn.v1", None),
+                websocket_response(),
+                relay_id,
+                &authority,
+            )
+            .expect_err("reject wrong secret")
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let noncanonical = format!("{authorization}=");
+        assert_eq!(
+            authorize_websocket_upgrade(
+                &websocket_request("/stella/turn/v1", &noncanonical, "stella-turn.v1", None),
+                websocket_response(),
+                relay_id,
+                &authority,
+            )
+            .expect_err("reject padded credential")
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_rejects_ambiguous_or_wrong_profiles() {
+        let relay_id = RelayId::from_bytes([0x54; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x55; 32], 300).expect("credential authority");
+        let credential = authority
+            .issue(
+                relay_id,
+                NodeId::from_bytes([0x56; 16]),
+                unix_time_for_test(),
+            )
+            .expect("issue credential");
+        let authorization = websocket_authorization(credential.username(), credential.secret());
+
+        let duplicate = WebSocketRequest::builder()
+            .uri("/stella/turn/v1")
+            .header(SEC_WEBSOCKET_PROTOCOL, "stella-turn.v1")
+            .header(AUTHORIZATION, &authorization)
+            .header(AUTHORIZATION, &authorization)
+            .body(())
+            .expect("duplicate authorization request");
+        assert_eq!(
+            authorize_websocket_upgrade(&duplicate, websocket_response(), relay_id, &authority)
+                .expect_err("reject duplicate authorization")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        for request in [
+            websocket_request("/wrong", &authorization, "stella-turn.v1", None),
+            websocket_request("/stella/turn/v1", &authorization, "other", None),
+            websocket_request(
+                "/stella/turn/v1",
+                &authorization,
+                "stella-turn.v1",
+                Some("permessage-deflate"),
+            ),
+        ] {
+            assert_eq!(
+                authorize_websocket_upgrade(&request, websocket_response(), relay_id, &authority)
+                    .expect_err("reject wrong WebSocket profile")
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 
     #[tokio::test]
@@ -2829,6 +3305,37 @@ mod tests {
         digest.update(b":");
         digest.update(password);
         Zeroizing::new(digest.finalize().into())
+    }
+
+    fn websocket_authorization(username: &[u8], secret: &[u8]) -> String {
+        format!(
+            "Stella {}.{}",
+            URL_SAFE_NO_PAD.encode(username),
+            URL_SAFE_NO_PAD.encode(secret)
+        )
+    }
+
+    fn websocket_request(
+        path: &str,
+        authorization: &str,
+        subprotocol: &str,
+        extension: Option<&str>,
+    ) -> WebSocketRequest {
+        let mut request = WebSocketRequest::builder()
+            .uri(path)
+            .header(SEC_WEBSOCKET_PROTOCOL, subprotocol)
+            .header(AUTHORIZATION, authorization);
+        if let Some(extension) = extension {
+            request = request.header(SEC_WEBSOCKET_EXTENSIONS, extension);
+        }
+        request.body(()).expect("WebSocket request")
+    }
+
+    fn websocket_response() -> WebSocketResponse {
+        WebSocketResponse::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .body(())
+            .expect("WebSocket response")
     }
 
     fn unix_time_for_test() -> u64 {
