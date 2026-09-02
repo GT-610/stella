@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
@@ -175,6 +175,7 @@ pub struct NetworkDataPlane {
     switch: L2Switch,
     handshakes: PeerHandshakeManager,
     turn_udp_available: bool,
+    nominated_direct_paths: BTreeMap<NodeId, SocketAddr>,
     paths: BTreeMap<PathId, PeerPath>,
     peer_paths: BTreeMap<NodeId, Vec<PathId>>,
     next_path_id: u64,
@@ -215,6 +216,7 @@ impl NetworkDataPlane {
             switch,
             handshakes,
             turn_udp_available: false,
+            nominated_direct_paths: BTreeMap::new(),
             paths: BTreeMap::new(),
             peer_paths: BTreeMap::new(),
             next_path_id: 1,
@@ -262,6 +264,69 @@ impl NetworkDataPlane {
             self.remove_session(peer);
             self.remove_peer_paths(peer);
             self.install_peer_paths(peer)?;
+        }
+        Ok(())
+    }
+
+    /// Installs and prefers one direct UDP path after connectivity-layer nomination.
+    ///
+    /// An existing session on another path is marked for a fresh Stella
+    /// handshake. The old session is retained only if that new handshake
+    /// succeeds, using the normal receive-only grace period.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] when the peer is unknown, the address
+    /// family is incompatible, the address is unusable, or path identifiers
+    /// are exhausted.
+    pub fn nominate_direct_path(
+        &mut self,
+        peer: NodeId,
+        address: SocketAddr,
+    ) -> Result<(), NetworkDataError> {
+        if !self.state.peers().contains_key(&peer) {
+            return Err(NetworkDataError::NoPeerPath { peer_node_id: peer });
+        }
+        if !self.udp_family.matches_socket(address) || !usable_direct_address(address) {
+            return Err(NetworkDataError::UnauthorizedEndpoint {
+                peer_node_id: peer,
+                endpoint: TransportEndpoint::Udp(address),
+            });
+        }
+        let endpoint = TransportEndpoint::Udp(address);
+        let path_id = self
+            .peer_paths
+            .get(&peer)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|path_id| {
+                self.paths
+                    .get(path_id)
+                    .is_some_and(|path| path.endpoint == endpoint)
+            })
+            .map_or_else(
+                || {
+                    let path_id = self.allocate_path_id()?;
+                    self.paths.insert(
+                        path_id,
+                        PeerPath {
+                            peer_node_id: peer,
+                            endpoint: endpoint.clone(),
+                        },
+                    );
+                    Ok::<_, NetworkDataError>(path_id)
+                },
+                Ok,
+            )?;
+        let peer_paths = self.peer_paths.entry(peer).or_default();
+        peer_paths.retain(|existing| *existing != path_id);
+        peer_paths.insert(0, path_id);
+        self.nominated_direct_paths.insert(peer, address);
+        if let Some(session) = self.sessions.get_mut(&peer) {
+            if session.path_id != path_id {
+                session.rekeying = true;
+            }
         }
         Ok(())
     }
@@ -513,6 +578,7 @@ impl NetworkDataPlane {
             self.peer_paths.clear();
             self.switch = L2Switch::new(replacement.policy(), primary_mac, now)?;
             self.handshakes = PeerHandshakeManager::new(replacement.local_grant().node_id);
+            self.nominated_direct_paths.clear();
         }
         self.state = replacement;
         let current_peers: Vec<NodeId> = self.state.peers().keys().copied().collect();
@@ -521,6 +587,7 @@ impl NetworkDataPlane {
                 self.remove_session(peer);
                 self.remove_peer_paths(peer);
                 self.handshakes.remove_peer(peer);
+                self.nominated_direct_paths.remove(&peer);
             }
         }
         for peer in current_peers {
@@ -542,6 +609,7 @@ impl NetworkDataPlane {
                 self.remove_session(peer);
             }
             if endpoints_changed {
+                self.nominated_direct_paths.remove(&peer);
                 self.remove_peer_paths(peer);
                 self.install_peer_paths(peer)?;
             }
@@ -789,6 +857,11 @@ impl NetworkDataPlane {
     }
 
     fn install_peer_paths(&mut self, peer: NodeId) -> Result<(), NetworkDataError> {
+        let nominated_direct = self
+            .nominated_direct_paths
+            .get(&peer)
+            .copied()
+            .map(TransportEndpoint::Udp);
         let relay_endpoints = self
             .state
             .peers()
@@ -830,8 +903,22 @@ impl NetworkDataPlane {
                 endpoint.port(),
             )
         });
-        let mut path_ids =
-            Vec::with_capacity(relay_endpoints.len().saturating_add(endpoints.len()));
+        let mut path_ids = Vec::with_capacity(
+            usize::from(nominated_direct.is_some())
+                .saturating_add(relay_endpoints.len())
+                .saturating_add(endpoints.len()),
+        );
+        if let Some(endpoint) = nominated_direct {
+            let path_id = self.allocate_path_id()?;
+            self.paths.insert(
+                path_id,
+                PeerPath {
+                    peer_node_id: peer,
+                    endpoint,
+                },
+            );
+            path_ids.push(path_id);
+        }
         for endpoint in relay_endpoints {
             let path_id = self.allocate_path_id()?;
             self.paths.insert(
@@ -844,12 +931,20 @@ impl NetworkDataPlane {
             path_ids.push(path_id);
         }
         for endpoint in endpoints {
+            let endpoint = TransportEndpoint::Udp(endpoint_socket_address(endpoint));
+            if path_ids.iter().any(|path_id| {
+                self.paths
+                    .get(path_id)
+                    .is_some_and(|path| path.endpoint == endpoint)
+            }) {
+                continue;
+            }
             let path_id = self.allocate_path_id()?;
             self.paths.insert(
                 path_id,
                 PeerPath {
                     peer_node_id: peer,
-                    endpoint: TransportEndpoint::Udp(endpoint_socket_address(endpoint)),
+                    endpoint,
                 },
             );
             path_ids.push(path_id);
@@ -928,6 +1023,13 @@ impl IpFamily {
             (Self::V4, Endpoint::UdpIpv4 { .. }) | (Self::V6, Endpoint::UdpIpv6 { .. })
         )
     }
+
+    const fn matches_socket(self, endpoint: SocketAddr) -> bool {
+        matches!(
+            (self, endpoint),
+            (Self::V4, SocketAddr::V4(_)) | (Self::V6, SocketAddr::V6(_))
+        )
+    }
 }
 
 impl From<IpAddr> for IpFamily {
@@ -943,6 +1045,27 @@ fn endpoint_socket_address(endpoint: Endpoint) -> SocketAddr {
     match endpoint {
         Endpoint::UdpIpv4 { address, port, .. } => SocketAddr::new(IpAddr::V4(address), port),
         Endpoint::UdpIpv6 { address, port, .. } => SocketAddr::new(IpAddr::V6(address), port),
+    }
+}
+
+fn usable_direct_address(address: SocketAddr) -> bool {
+    if address.port() == 0 {
+        return false;
+    }
+    match address.ip() {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && address != Ipv4Addr::BROADCAST
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_unicast_link_local()
+                && address.to_ipv4_mapped().is_none()
+        }
     }
 }
 
@@ -1227,12 +1350,12 @@ mod tests {
     }
 
     #[test]
-    fn relay_candidates_install_distinct_preferred_transport_paths() {
+    fn relay_candidates_wait_for_direct_nomination_before_path_upgrade() {
         let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
         let alice_id = derive_node_id(alice_key.public_key());
         let relay_id = RelayId::from_bytes([0x55; 16]);
         let relay_address: SocketAddr = "192.0.2.44:50000".parse().expect("relay address");
-        let candidate = IceCandidate {
+        let relay_candidate = IceCandidate {
             class: IceCandidateClass::Relay,
             carrier: ConnectivityCarrier::TurnUdp,
             priority: 100,
@@ -1242,7 +1365,18 @@ mod tests {
             related_address: Some("192.0.2.45:45000".parse().expect("related address")),
             relay_id: Some(relay_id),
         };
-        let candidates = [candidate];
+        let direct_address: SocketAddr = "192.0.2.46:45000".parse().expect("direct address");
+        let direct_candidate = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 200,
+            foundation: 2,
+            max_datagram_size: 1_200,
+            address: direct_address,
+            related_address: Some("10.0.0.2:45000".parse().expect("direct base address")),
+            relay_id: None,
+        };
+        let candidates = [direct_candidate, relay_candidate];
         let generation = ConnectivityGenerationRef::new(
             10,
             11,
@@ -1286,6 +1420,16 @@ mod tests {
             .expect("relay path");
         assert_eq!(plane.select_peer_path(alice_id), Some(relay_path));
         assert_eq!(plane.relay_endpoints(), vec![relay_endpoint]);
+
+        plane
+            .nominate_direct_path(alice_id, direct_address)
+            .expect("nominate direct path");
+        let direct_endpoint = TransportEndpoint::Udp(direct_address);
+        let direct_path = plane
+            .resolve_peer_path(alice_id, &direct_endpoint)
+            .expect("direct path");
+        assert_eq!(plane.select_peer_path(alice_id), Some(direct_path));
+        assert_ne!(direct_path, relay_path);
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
