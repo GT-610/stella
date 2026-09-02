@@ -9,6 +9,7 @@ mod control;
 mod data_plane;
 mod error;
 mod handshake;
+mod http_proxy;
 mod ice;
 mod identity;
 mod network;
