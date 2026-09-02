@@ -79,7 +79,8 @@ export default defineConfig({
                 { text: '0026：已验证路径', link: '/zh/protocol/adr/0026-bind-sessions-to-validated-paths' },
                 { text: '0027：连接状态分发', link: '/zh/protocol/adr/0027-separate-connectivity-from-membership-records' },
                 { text: '0029：HTTP 代理隧道', link: '/zh/protocol/adr/0029-tunnel-websocket-through-http-proxy' },
-                { text: '0030：代理控制引导', link: '/zh/protocol/adr/0030-bootstrap-control-through-http-proxy' }
+                { text: '0030：代理控制引导', link: '/zh/protocol/adr/0030-bootstrap-control-through-http-proxy' },
+                { text: '0031：Relay 建立期限', link: '/zh/protocol/adr/0031-bound-relay-carrier-establishment' }
               ]
             }
           ],
@@ -191,7 +192,8 @@ export default defineConfig({
             { text: '0027: Connectivity state', link: '/protocol/adr/0027-separate-connectivity-from-membership-records' },
             { text: '0028: Authority migration', link: '/protocol/adr/0028-migrate-connectivity-authority-state' },
             { text: '0029: HTTP proxy tunnel', link: '/protocol/adr/0029-tunnel-websocket-through-http-proxy' },
-            { text: '0030: Proxy control bootstrap', link: '/protocol/adr/0030-bootstrap-control-through-http-proxy' }
+            { text: '0030: Proxy control bootstrap', link: '/protocol/adr/0030-bootstrap-control-through-http-proxy' },
+            { text: '0031: Relay establishment bounds', link: '/protocol/adr/0031-bound-relay-carrier-establishment' }
           ]
         }
       ],

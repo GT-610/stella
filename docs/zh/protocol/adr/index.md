@@ -36,3 +36,4 @@ ADR 记录约束 Stella 协议或其参考实现的决策。已接受的记录�
 - [0027：将连接状态与成员记录分开分发](./0027-separate-connectivity-from-membership-records.md)
 - [0029：通过显式 HTTP 代理建立 Secure WebSocket 隧道](./0029-tunnel-websocket-through-http-proxy.md)
 - [0030：通过本地 HTTP 代理引导控制器 TLS](./0030-bootstrap-control-through-http-proxy.md)
+- [0031：限制 Relay carrier 建立时间](./0031-bound-relay-carrier-establishment.md)

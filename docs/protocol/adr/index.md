@@ -42,3 +42,4 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0028: Migrate authority state before storing connectivity generations](./0028-migrate-connectivity-authority-state.md)
 - [0029: Tunnel secure WebSocket relay through an explicit HTTP proxy](./0029-tunnel-websocket-through-http-proxy.md)
 - [0030: Bootstrap controller TLS through the local HTTP proxy](./0030-bootstrap-control-through-http-proxy.md)
+- [0031: Bound relay carrier establishment](./0031-bound-relay-carrier-establishment.md)
