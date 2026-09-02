@@ -157,7 +157,7 @@ pub struct ClientDataRuntime {
     udp_buffer: Vec<u8>,
     deferred_udp: VecDeque<DeferredUdpDatagram>,
     direct_candidates: Vec<IceCandidate>,
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
     connectivity_revision: Option<u64>,
     relay: Option<WarmRelay>,
     relay_buffer: Vec<u8>,
@@ -223,7 +223,7 @@ impl ClientDataRuntime {
         let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
         let (discovery, relay) = tokio::join!(
             discover_server_reflexive(&udp, stun_servers),
-            allocate_preferred_relay(config.udp_bind, config.secure_websocket_proxy, connectivity,),
+            allocate_preferred_relay(config.udp_bind, config.https_proxy, connectivity,),
         );
         let discovery = match discovery {
             Ok(discovery) => discovery,
@@ -252,7 +252,7 @@ impl ClientDataRuntime {
             udp_buffer: vec![0_u8; max_datagram_size],
             deferred_udp: discovery.deferred.into(),
             direct_candidates,
-            secure_websocket_proxy: config.secure_websocket_proxy,
+            https_proxy: config.https_proxy,
             connectivity_revision: connectivity.map(ConnectivityConfigState::revision),
             relay,
             relay_buffer: vec![0_u8; relay_buffer_size],
@@ -666,12 +666,9 @@ impl ClientDataRuntime {
         if self.connectivity_revision == revision {
             return Ok(());
         }
-        let selected = preferred_relay_settings(
-            self.udp.local_address(),
-            self.secure_websocket_proxy,
-            connectivity,
-        )
-        .await?;
+        let selected =
+            preferred_relay_settings(self.udp.local_address(), self.https_proxy, connectivity)
+                .await?;
         match (self.relay.as_mut(), selected) {
             (Some(current), Some(selected)) if current.settings == selected.settings => {
                 current
@@ -1609,10 +1606,10 @@ fn configured_datagram_size(config: &ClientConfig) -> usize {
 
 async fn allocate_preferred_relay(
     bind_address: SocketAddr,
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<WarmRelay>, RuntimeError> {
-    let selections = relay_selections(bind_address, secure_websocket_proxy, connectivity).await?;
+    let selections = relay_selections(bind_address, https_proxy, connectivity).await?;
     let mut last_error = None;
     for selected in selections {
         match allocate_relay(selected).await {
@@ -1628,28 +1625,25 @@ async fn allocate_preferred_relay(
 
 async fn preferred_relay_settings(
     bind_address: SocketAddr,
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<SelectedRelay>, RuntimeError> {
-    Ok(
-        relay_selections(bind_address, secure_websocket_proxy, connectivity)
-            .await?
-            .into_iter()
-            .next(),
-    )
+    Ok(relay_selections(bind_address, https_proxy, connectivity)
+        .await?
+        .into_iter()
+        .next())
 }
 
 async fn relay_selections(
     bind_address: SocketAddr,
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Vec<SelectedRelay>, RuntimeError> {
     let Some(connectivity) = connectivity else {
         return Ok(Vec::new());
     };
     let (resolved_services, last_dns_error) =
-        resolve_configured_relay_services(connectivity.relay_services(), secure_websocket_proxy)
-            .await;
+        resolve_configured_relay_services(connectivity.relay_services(), https_proxy).await;
     let mut selections = Vec::new();
     for carrier in [
         RuntimeRelayCarrier::Udp,
@@ -1661,16 +1655,16 @@ async fn relay_selections(
             service.carriers().contains(carrier.mask()) && carrier.port(service.ports()) != 0
         }) {
             let proxied_hostname = carrier == RuntimeRelayCarrier::Websocket
-                && secure_websocket_proxy.is_some()
+                && https_proxy.is_some()
                 && !service.hostname().is_empty();
-            let target_addresses = match (proxied_hostname, secure_websocket_proxy) {
+            let target_addresses = match (proxied_hostname, https_proxy) {
                 (true, Some(proxy)) => vec![proxy.ip()],
                 _ => resolved_addresses.clone(),
             };
             for relay_address in target_addresses {
                 let server_address = SocketAddr::new(relay_address, carrier.port(service.ports()));
                 let proxy_address = (carrier == RuntimeRelayCarrier::Websocket)
-                    .then_some(secure_websocket_proxy)
+                    .then_some(https_proxy)
                     .flatten();
                 let connection_address = proxy_address.unwrap_or(server_address);
                 let Some(turn_bind) = turn_bind_address(bind_address, connection_address.ip())
@@ -1728,7 +1722,7 @@ async fn relay_selections(
 
 async fn resolve_configured_relay_services(
     services: &[crate::RelayServiceState],
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
 ) -> (
     Vec<(&crate::RelayServiceState, Vec<IpAddr>)>,
     Option<RuntimeError>,
@@ -1736,7 +1730,7 @@ async fn resolve_configured_relay_services(
     let mut resolved_services = Vec::with_capacity(services.len());
     let mut last_dns_error = None;
     for service in services {
-        let proxy_resolves_only_websocket = secure_websocket_proxy.is_some()
+        let proxy_resolves_only_websocket = https_proxy.is_some()
             && service.carriers() == RelayCarrierMask::SECURE_WEBSOCKET
             && !service.hostname().is_empty();
         let addresses = if proxy_resolves_only_websocket {

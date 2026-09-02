@@ -40,8 +40,8 @@ pub struct ClientConfig {
     pub display_name: String,
     /// Local UDP socket bind address.
     pub udp_bind: SocketAddr,
-    /// Optional explicit HTTP proxy used only for secure WebSocket relay.
-    pub secure_websocket_proxy: Option<SocketAddr>,
+    /// Optional explicit HTTP proxy used for controller TLS and secure WebSocket relay.
+    pub https_proxy: Option<SocketAddr>,
     /// Canonically ordered numeric endpoints published after joining.
     pub advertised_endpoints: Vec<Endpoint>,
     /// Durable desired memberships in stable network-ID order.
@@ -130,12 +130,21 @@ impl ClientConfig {
             .iter()
             .map(|pin| SpkiPin::from_str(pin).map_err(ClientConfigError::SpkiPin))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(proxy) = raw.transport.https_proxy {
+            if proxy.port() == 0 || proxy.ip().is_unspecified() || proxy.ip().is_multicast() {
+                return Err(invalid(
+                    "transport.https_proxy",
+                    "must use a specified unicast address and non-zero port",
+                ));
+            }
+        }
         let controller = ControllerTrust::new(
             raw.controller.address,
             raw.controller.tls_name,
             controller_id,
             pins,
-        )?;
+        )?
+        .with_https_proxy(raw.transport.https_proxy);
         let mut advertised_endpoints = raw
             .transport
             .advertised_endpoints
@@ -144,15 +153,6 @@ impl ClientConfig {
             .collect::<Result<Vec<_>, _>>()?;
         advertised_endpoints.sort_by(endpoint_order);
         validate_endpoints(&advertised_endpoints)?;
-        if let Some(proxy) = raw.transport.secure_websocket_proxy {
-            if proxy.port() == 0 || proxy.ip().is_unspecified() || proxy.ip().is_multicast() {
-                return Err(invalid(
-                    "transport.secure_websocket_proxy",
-                    "must use a specified unicast address and non-zero port",
-                ));
-            }
-        }
-
         let mut networks = raw
             .networks
             .into_iter()
@@ -170,7 +170,7 @@ impl ClientConfig {
             identity_path: resolve_path(base_directory, &raw.identity.node_key),
             display_name: raw.identity.display_name,
             udp_bind: raw.transport.udp_bind,
-            secure_websocket_proxy: raw.transport.secure_websocket_proxy,
+            https_proxy: raw.transport.https_proxy,
             advertised_endpoints,
             networks,
             log_filter: raw.logging.filter,
@@ -287,7 +287,7 @@ struct RawIdentity {
 struct RawTransport {
     udp_bind: SocketAddr,
     #[serde(default)]
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
     #[serde(default)]
     advertised_endpoints: Vec<RawEndpoint>,
 }
@@ -462,7 +462,7 @@ display_name = "Windows node"
 
 [transport]
 udp_bind = "0.0.0.0:45100"
-secure_websocket_proxy = "127.0.0.1:8080"
+https_proxy = "127.0.0.1:8080"
 
 [[transport.advertised_endpoints]]
 address = "192.0.2.10:45100"
@@ -490,9 +490,10 @@ tap_adapter = "Stella LAN"
         assert_eq!(config.identity_path, base.join("secrets/node.pk8"));
         assert_eq!(config.controller.address().to_string(), "127.0.0.1:44900");
         assert_eq!(
-            config.secure_websocket_proxy,
+            config.https_proxy,
             Some("127.0.0.1:8080".parse().expect("proxy address"))
         );
+        assert_eq!(config.controller.https_proxy(), config.https_proxy);
         assert_eq!(config.advertised_endpoints.len(), 1);
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.log_filter, "info,stella_client=info");
@@ -550,7 +551,7 @@ tap_adapter = "Stella LAN"
         assert!(matches!(
             ClientConfig::parse(&bad_proxy, Path::new(".")),
             Err(ClientConfigError::InvalidValue {
-                field: "transport.secure_websocket_proxy",
+                field: "transport.https_proxy",
                 ..
             })
         ));

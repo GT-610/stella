@@ -83,9 +83,9 @@ struct InitArgs {
     /// Local UDP bind address reserved for the data plane.
     #[arg(long, default_value = "0.0.0.0:45100")]
     udp_bind: SocketAddr,
-    /// Explicit HTTP proxy used only for secure WebSocket relay.
+    /// Explicit HTTP proxy used for controller TLS and secure WebSocket relay.
     #[arg(long, value_name = "IP:PORT")]
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
     /// Node PKCS#8 path, relative to the configuration file by default.
     #[arg(long, value_name = "PATH", default_value = DEFAULT_IDENTITY_PATH)]
     identity: PathBuf,
@@ -528,8 +528,8 @@ fn status(config_path: &Path, output: &mut dyn Write) -> Result<()> {
         config.controller.controller_id()
     )?;
     writeln!(output, "udp_bind={}", config.udp_bind)?;
-    if let Some(proxy) = config.secure_websocket_proxy {
-        writeln!(output, "secure_websocket_proxy={proxy}")?;
+    if let Some(proxy) = config.https_proxy {
+        writeln!(output, "https_proxy={proxy}")?;
     }
     writeln!(output, "desired_networks={}", config.networks.len())?;
     for network in &config.networks {
@@ -720,7 +720,7 @@ fn configuration_document(args: &InitArgs) -> Result<String> {
         },
         transport: InitialTransport {
             udp_bind: args.udp_bind,
-            secure_websocket_proxy: args.secure_websocket_proxy,
+            https_proxy: args.https_proxy,
             advertised_endpoints: Vec::new(),
         },
         networks: Vec::new(),
@@ -759,7 +759,7 @@ struct InitialIdentity<'a> {
 struct InitialTransport {
     udp_bind: SocketAddr,
     #[serde(skip_serializing_if = "Option::is_none")]
-    secure_websocket_proxy: Option<SocketAddr>,
+    https_proxy: Option<SocketAddr>,
     advertised_endpoints: Vec<InitialEndpoint>,
 }
 
@@ -948,7 +948,7 @@ mod tests {
             spki_pins: vec![SpkiPin::from_digest([0x42; 32])],
             display_name: "Windows node".to_owned(),
             udp_bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 45_100)),
-            secure_websocket_proxy: None,
+            https_proxy: None,
             identity: PathBuf::from("secrets/node.pk8"),
         }
     }

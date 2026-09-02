@@ -1,6 +1,10 @@
 //! Controller connection authentication and ordered session ownership.
 
-use std::{fmt, net::SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use stella_common::{ControllerId, NodeId};
 use stella_control::{
@@ -24,7 +28,12 @@ use tokio::{
 use tokio_rustls::{client::TlsStream, rustls::pki_types::ServerName};
 use zeroize::Zeroizing;
 
-use crate::{tls, ClientError, ConnectivityConfigState, SpkiPin};
+use crate::{
+    http_proxy::{negotiate_http_connect, HttpConnectError},
+    tls, ClientError, ConnectivityConfigState, SpkiPin,
+};
+
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One redacted fixed-width enrollment or join bearer credential.
 #[derive(Clone)]
@@ -76,6 +85,7 @@ pub struct ControllerTrust {
     tls_name: String,
     controller_id: ControllerId,
     spki_pins: Vec<SpkiPin>,
+    https_proxy: Option<SocketAddr>,
 }
 
 impl ControllerTrust {
@@ -103,7 +113,15 @@ impl ControllerTrust {
             tls_name,
             controller_id,
             spki_pins,
+            https_proxy: None,
         })
+    }
+
+    /// Uses one numeric explicit HTTP proxy for controller TLS bootstrap.
+    #[must_use]
+    pub const fn with_https_proxy(mut self, https_proxy: Option<SocketAddr>) -> Self {
+        self.https_proxy = https_proxy;
+        self
     }
 
     /// Returns the numeric controller TCP address.
@@ -128,6 +146,12 @@ impl ControllerTrust {
     #[must_use]
     pub fn spki_pins(&self) -> &[SpkiPin] {
         &self.spki_pins
+    }
+
+    /// Returns the optional numeric HTTP proxy used for controller TLS.
+    #[must_use]
+    pub const fn https_proxy(&self) -> Option<SocketAddr> {
+        self.https_proxy
     }
 }
 
@@ -266,12 +290,24 @@ pub async fn authenticate_controller(
     identity: &IdentitySigningKey,
     enrollment: Option<Enrollment<'_>>,
 ) -> Result<AuthenticatedControl, ClientError> {
-    let tcp = TcpStream::connect(trust.address())
+    let connection_address = trust.https_proxy().unwrap_or(trust.address());
+    let mut tcp = TcpStream::connect(connection_address)
         .await
-        .map_err(|source| ClientError::Connect {
-            address: trust.address(),
-            source,
+        .map_err(|source| match trust.https_proxy() {
+            Some(_) => ClientError::HttpProxyIo {
+                operation: "connection",
+                source,
+            },
+            None => ClientError::Connect {
+                address: trust.address(),
+                source,
+            },
         })?;
+    if trust.https_proxy().is_some() {
+        negotiate_http_connect(&mut tcp, &controller_authority(trust), HTTP_CONNECT_TIMEOUT)
+            .await
+            .map_err(map_http_connect_error)?;
+    }
     let server_name = ServerName::try_from(trust.tls_name().to_owned())
         .map_err(|_| ClientError::InvalidTlsServerName)?;
     let mut stream = tls::connector(trust.spki_pins())?
@@ -454,6 +490,27 @@ pub async fn authenticate_controller(
         server_time,
         connectivity_config,
     })
+}
+
+fn controller_authority(trust: &ControllerTrust) -> String {
+    match trust.tls_name().parse::<IpAddr>() {
+        Ok(IpAddr::V6(address)) => format!("[{address}]:{}", trust.address().port()),
+        _ => format!("{}:{}", trust.tls_name(), trust.address().port()),
+    }
+}
+
+fn map_http_connect_error(error: HttpConnectError) -> ClientError {
+    match error {
+        HttpConnectError::Timeout => ClientError::HttpProxyTimeout,
+        HttpConnectError::Io { operation, source } => {
+            ClientError::HttpProxyIo { operation, source }
+        }
+        HttpConnectError::Rejected { status_code } => {
+            ClientError::HttpProxyRejected { status_code }
+        }
+        HttpConnectError::Invalid { detail } => ClientError::InvalidHttpProxyResponse { detail },
+        HttpConnectError::DeadlineOverflow => ClientError::HttpProxyDeadlineOverflow,
+    }
 }
 
 async fn read_authenticated_messages(

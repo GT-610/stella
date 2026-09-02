@@ -25,6 +25,33 @@ pub enum ClientError {
         #[source]
         source: io::Error,
     },
+    /// The explicit HTTP proxy did not complete CONNECT before the deadline.
+    #[error("controller HTTP proxy negotiation timed out")]
+    HttpProxyTimeout,
+    /// Connecting to or exchanging the CONNECT preface with the proxy failed.
+    #[error("controller HTTP proxy {operation} failed")]
+    HttpProxyIo {
+        /// Stable operation name without target or credential material.
+        operation: &'static str,
+        /// Underlying socket failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The explicit HTTP proxy returned a non-success status.
+    #[error("controller HTTP proxy rejected CONNECT with status {status_code}")]
+    HttpProxyRejected {
+        /// Numeric HTTP status without response fields or reason text.
+        status_code: u16,
+    },
+    /// The explicit HTTP proxy response violated the bounded CONNECT profile.
+    #[error("controller HTTP proxy response is invalid: {detail}")]
+    InvalidHttpProxyResponse {
+        /// Stable non-secret rule description.
+        detail: &'static str,
+    },
+    /// The monotonic CONNECT deadline could not be represented.
+    #[error("controller HTTP proxy deadline overflowed")]
+    HttpProxyDeadlineOverflow,
     /// TLS setup or handshake I/O failed.
     #[error("controller TLS connection failed: {0}")]
     Tls(#[source] io::Error),
