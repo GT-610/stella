@@ -2087,11 +2087,11 @@ mod tests {
     };
 
     use super::{
-        allocate_relay_selections, effective_tap_mtu, next_relay_dns_result,
-        preferred_relay_settings, random_ice_credential, relay_selections, turn_bind_address,
-        unix_time, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
-        RuntimeError, RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
-        TURN_UDP_MAX_DATAGRAM_SIZE,
+        allocate_relay_selections, effective_tap_mtu, matching_relay_selection,
+        next_relay_dns_result, preferred_relay_settings, random_ice_credential, relay_selections,
+        turn_bind_address, unix_time, ConnectivityConfigState, LocalConnectivityGeneration,
+        RelayDnsFuture, RuntimeError, RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH,
+        ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
 
     fn connectivity_config() -> ConnectivityConfigState {
@@ -2318,6 +2318,31 @@ mod tests {
             proxied[7].settings.bind_address,
             "0.0.0.0:0".parse::<SocketAddr>().expect("proxy bind")
         );
+    }
+
+    #[tokio::test]
+    async fn relay_refresh_matches_current_websocket_before_preferred_udp() {
+        let selections = relay_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            None,
+            Some(&connectivity_config()),
+        )
+        .await
+        .expect("relay selections");
+        assert_eq!(selections[0].settings.carrier, RuntimeRelayCarrier::Udp);
+        let current = selections
+            .iter()
+            .find(|selection| selection.settings.carrier == RuntimeRelayCarrier::Websocket)
+            .expect("WebSocket selection")
+            .settings
+            .clone();
+        let matching = matching_relay_selection(&current, &selections)
+            .expect("matching current relay selection");
+        assert_eq!(matching.settings.carrier, RuntimeRelayCarrier::Websocket);
+
+        let mut materially_changed = current;
+        materially_changed.max_datagram_size -= 1;
+        assert!(matching_relay_selection(&materially_changed, &selections).is_none());
     }
 
     #[tokio::test]
