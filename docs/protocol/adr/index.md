@@ -46,3 +46,4 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0032: Bound relay DNS preparation](./0032-bound-relay-dns-preparation.md)
 - [0033: Preserve the reachable relay carrier on refresh](./0033-preserve-relay-carrier-on-refresh.md)
 - [0034: Recover relay without restarting direct sessions](./0034-recover-relay-without-restarting-direct-sessions.md)
+- [0035: Preserve valid forwarding during controller reconnect](./0035-preserve-forwarding-during-controller-reconnect.md)

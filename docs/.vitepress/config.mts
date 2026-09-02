@@ -83,7 +83,8 @@ export default defineConfig({
                 { text: '0031：Relay 建立期限', link: '/zh/protocol/adr/0031-bound-relay-carrier-establishment' },
                 { text: '0032：Relay DNS 期限', link: '/zh/protocol/adr/0032-bound-relay-dns-preparation' },
                 { text: '0033：Relay 刷新', link: '/zh/protocol/adr/0033-preserve-relay-carrier-on-refresh' },
-                { text: '0034：Relay 热恢复', link: '/zh/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' }
+                { text: '0034：Relay 热恢复', link: '/zh/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' },
+                { text: '0035：控制重连保活', link: '/zh/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' }
               ]
             }
           ],
@@ -199,7 +200,8 @@ export default defineConfig({
             { text: '0031: Relay establishment bounds', link: '/protocol/adr/0031-bound-relay-carrier-establishment' },
             { text: '0032: Relay DNS bounds', link: '/protocol/adr/0032-bound-relay-dns-preparation' },
             { text: '0033: Preserve relay carrier', link: '/protocol/adr/0033-preserve-relay-carrier-on-refresh' },
-            { text: '0034: Hot relay recovery', link: '/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' }
+            { text: '0034: Hot relay recovery', link: '/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' },
+            { text: '0035: Preserve reconnect forwarding', link: '/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' }
           ]
         }
       ],
