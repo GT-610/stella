@@ -2025,7 +2025,7 @@ fn unix_time() -> Result<u64, RuntimeError> {
 mod tests {
     use std::{
         future::pending,
-        net::SocketAddr,
+        net::{IpAddr, SocketAddr},
         sync::{Arc, Mutex},
         time::{Duration, SystemTime},
     };
@@ -2038,10 +2038,11 @@ mod tests {
     };
 
     use super::{
-        allocate_relay_selections, effective_tap_mtu, preferred_relay_settings,
-        random_ice_credential, relay_selections, turn_bind_address, unix_time,
-        ConnectivityConfigState, LocalConnectivityGeneration, RuntimeError, RuntimeRelayCarrier,
-        ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
+        allocate_relay_selections, effective_tap_mtu, next_relay_dns_result,
+        preferred_relay_settings, random_ice_credential, relay_selections, turn_bind_address,
+        unix_time, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
+        RuntimeError, RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
+        TURN_UDP_MAX_DATAGRAM_SIZE,
     };
 
     fn connectivity_config() -> ConnectivityConfigState {
@@ -2304,6 +2305,24 @@ mod tests {
         assert_eq!(selections[0].settings.server_address.ip(), proxy.ip());
         assert_eq!(selections[0].settings.server_address.port(), 8_443);
         assert_eq!(selections[0].settings.server_hostname, "relay.invalid");
+    }
+
+    #[tokio::test]
+    async fn relay_dns_completion_is_not_blocked_by_earlier_pending_query() {
+        let address = "192.0.2.90".parse::<IpAddr>().expect("relay address");
+        let mut queries = vec![
+            Some(Box::pin(pending()) as RelayDnsFuture),
+            Some(Box::pin(async move { (1_usize, Ok(vec![address])) }) as RelayDnsFuture),
+        ];
+        let (index, result) =
+            tokio::time::timeout(Duration::from_secs(1), next_relay_dns_result(&mut queries))
+                .await
+                .expect("concurrent DNS polling")
+                .expect("completed DNS query");
+        assert_eq!(index, 1);
+        assert_eq!(result.expect("resolved addresses"), [address]);
+        assert!(queries[0].is_some());
+        assert!(queries[1].is_none());
     }
 
     #[tokio::test]
