@@ -1,6 +1,6 @@
 //! TURN long-term credential authentication for Stella relay requests.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -21,7 +21,7 @@ const REALM_PREFIX: &str = "stella-relay:";
 
 /// Relay-scoped TURN long-term credential verifier.
 pub struct TurnAuthenticator {
-    authority: RelayCredentialAuthority,
+    authority: Arc<RelayCredentialAuthority>,
     relay_id: RelayId,
     realm: Box<[u8]>,
 }
@@ -35,6 +35,13 @@ impl TurnAuthenticator {
     /// relay identity.
     pub fn new(
         authority: RelayCredentialAuthority,
+        relay_id: RelayId,
+    ) -> Result<Self, RelayCredentialError> {
+        Self::new_shared(Arc::new(authority), relay_id)
+    }
+
+    pub(crate) fn new_shared(
+        authority: Arc<RelayCredentialAuthority>,
         relay_id: RelayId,
     ) -> Result<Self, RelayCredentialError> {
         if relay_id.is_zero() {
