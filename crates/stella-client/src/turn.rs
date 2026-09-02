@@ -1951,7 +1951,7 @@ mod tests {
     use stella_common::{NodeId, RelayId};
     use stella_server::{
         relay_credentials::RelayCredentialAuthority,
-        turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
+        turn_relay::{TurnTcpRelay, TurnTcpRelayConfig, TurnUdpRelay, TurnUdpRelayConfig},
     };
     use stella_transport::{
         Endpoint as TransportEndpoint, TurnStream, MAX_TURN_STREAM_RECORD_SIZE,
@@ -1959,8 +1959,8 @@ mod tests {
     use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
     use super::{
-        encode_message, transact_initial, ClientIo, TurnCredentials, TurnTcpClientConfig,
-        TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+        encode_message, transact_initial, ClientIo, TurnCredentials, TurnTcpClient,
+        TurnTcpClientConfig, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
     };
 
     #[tokio::test]
@@ -2156,6 +2156,114 @@ mod tests {
             )
             .await
             .expect("refresh with replacement credential");
+
+        client_a.shutdown().await.expect("shutdown A");
+        client_b.shutdown().await.expect("shutdown B");
+        let _result = shutdown_sender.send(());
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect("relay shutdown timeout")
+            .expect("relay task join")
+            .expect("relay run");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn tcp_allocations_preserve_datagrams_in_both_directions() {
+        let relay_id = RelayId::from_bytes([0x31; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x52; 32], 300).expect("credential authority");
+        let now = unix_time_for_test();
+        let credential_a = authority
+            .issue(relay_id, NodeId::from_bytes([0x41; 16]), now)
+            .expect("issue A credential");
+        let credential_b = authority
+            .issue(relay_id, NodeId::from_bytes([0x42; 16]), now)
+            .expect("issue B credential");
+        let mut relay_config = TurnTcpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        relay_config.max_datagram_size = 1_200;
+        let relay = TurnTcpRelay::bind(relay_config, authority)
+            .await
+            .expect("bind TCP relay");
+        let relay_address = relay.local_address().expect("TCP relay address");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let relay_task = tokio::spawn(relay.run(async move {
+            let _result = shutdown_receiver.await;
+        }));
+
+        let client_config = TurnTcpClientConfig::new(
+            relay_id,
+            relay_address,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        );
+        let client_a = TurnTcpClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential_a.username().to_vec(),
+                credential_a.secret().to_vec(),
+                credential_a.expires_at(),
+            )
+            .expect("A credentials"),
+        )
+        .await
+        .expect("allocate A over TCP");
+        let client_b = TurnTcpClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential_b.username().to_vec(),
+                credential_b.secret().to_vec(),
+                credential_b.expires_at(),
+            )
+            .expect("B credentials"),
+        )
+        .await
+        .expect("allocate B over TCP");
+        assert_eq!(client_a.mapped_address(), client_a.local_address());
+        assert_eq!(client_b.mapped_address(), client_b.local_address());
+        let endpoint_a = TransportEndpoint::TurnTcp {
+            relay_id,
+            address: client_a.relayed_address(),
+        };
+        let endpoint_b = TransportEndpoint::TurnTcp {
+            relay_id,
+            address: client_b.relayed_address(),
+        };
+        client_a
+            .prepare_peer(&endpoint_b)
+            .await
+            .expect("prepare B from A");
+        client_b
+            .prepare_peer(&endpoint_a)
+            .await
+            .expect("prepare A from B");
+
+        let mut received = [0_u8; 64];
+        client_a
+            .send_to(&endpoint_b, b"A to B over TCP")
+            .await
+            .expect("relay A to B");
+        let metadata = timeout(Duration::from_secs(2), client_b.receive(&mut received))
+            .await
+            .expect("B receive timeout")
+            .expect("B receive");
+        assert_eq!(metadata.source, endpoint_a);
+        assert_eq!(&received[..metadata.length], b"A to B over TCP");
+
+        client_b
+            .send_to(&endpoint_a, b"B to A over TCP")
+            .await
+            .expect("relay B to A");
+        let metadata = timeout(Duration::from_secs(2), client_a.receive(&mut received))
+            .await
+            .expect("A receive timeout")
+            .expect("A receive");
+        assert_eq!(metadata.source, endpoint_b);
+        assert_eq!(&received[..metadata.length], b"B to A over TCP");
 
         client_a.shutdown().await.expect("shutdown A");
         client_b.shutdown().await.expect("shutdown B");

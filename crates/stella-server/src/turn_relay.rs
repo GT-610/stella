@@ -1,4 +1,4 @@
-//! Bounded authenticated TURN-over-UDP relay runtime.
+//! Bounded authenticated TURN relay runtimes over UDP and TCP.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -12,14 +12,15 @@ use std::{
 use stella_common::{NodeId, RelayId};
 use stella_proto::{
     decode_stun_xor_address, encode_stun_error_code, encode_stun_message, encode_stun_xor_address,
-    encode_turn_channel_data, CodecError, StunAttributeRef, StunAttributeType, StunClass,
-    StunMessageRef, StunMessageType, StunMessageView, StunMethod, StunTransactionId,
-    TurnChannelDataView, TurnChannelNumber,
+    encode_turn_channel_data, encode_turn_channel_data_stream, CodecError, StunAttributeRef,
+    StunAttributeType, StunClass, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
+    StunTransactionId, TurnChannelDataView, TurnChannelNumber,
 };
+use stella_transport::{TurnStream, MAX_TURN_STREAM_RECORD_SIZE};
 use thiserror::Error;
 use tokio::{
-    net::UdpSocket,
-    sync::{mpsc, oneshot},
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::{mpsc, oneshot, Mutex},
     task::JoinSet,
     time::MissedTickBehavior,
 };
@@ -138,15 +139,201 @@ impl TurnUdpRelayConfig {
     }
 }
 
+/// Runtime limits and addresses for one TURN TCP listener.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurnTcpRelayConfig {
+    /// Stable relay identity used by controller-issued credentials.
+    pub relay_id: RelayId,
+    /// Client-facing TURN TCP listener address.
+    pub listen_address: SocketAddr,
+    /// Local IP used when binding per-client allocation sockets.
+    pub allocation_bind_address: IpAddr,
+    /// Address returned to clients in XOR-RELAYED-ADDRESS.
+    pub advertised_address: IpAddr,
+    /// Largest relayed Stella datagram accepted by this deployment.
+    pub max_datagram_size: usize,
+    /// Maximum granted allocation lifetime.
+    pub allocation_lifetime_seconds: u32,
+    /// Allocation inactivity deadline.
+    pub idle_timeout_seconds: u32,
+    /// Global active allocation limit.
+    pub max_allocations: usize,
+    /// Active allocation limit for one authenticated node.
+    pub max_allocations_per_node: usize,
+    /// Maximum simultaneously permitted peer IPs per allocation.
+    pub max_permissions_per_allocation: usize,
+    /// Maximum live channel bindings per allocation.
+    pub max_channels_per_allocation: usize,
+}
+
+impl TurnTcpRelayConfig {
+    /// Creates conservative defaults around one TCP listener and advertised IP.
+    #[must_use]
+    pub const fn new(
+        relay_id: RelayId,
+        listen_address: SocketAddr,
+        allocation_bind_address: IpAddr,
+        advertised_address: IpAddr,
+    ) -> Self {
+        let udp = TurnUdpRelayConfig::new(
+            relay_id,
+            listen_address,
+            allocation_bind_address,
+            advertised_address,
+        );
+        Self {
+            relay_id: udp.relay_id,
+            listen_address: udp.listen_address,
+            allocation_bind_address: udp.allocation_bind_address,
+            advertised_address: udp.advertised_address,
+            max_datagram_size: udp.max_datagram_size,
+            allocation_lifetime_seconds: udp.allocation_lifetime_seconds,
+            idle_timeout_seconds: udp.idle_timeout_seconds,
+            max_allocations: udp.max_allocations,
+            max_allocations_per_node: udp.max_allocations_per_node,
+            max_permissions_per_allocation: udp.max_permissions_per_allocation,
+            max_channels_per_allocation: udp.max_channels_per_allocation,
+        }
+    }
+
+    fn validate(self) -> Result<(), TurnRelayError> {
+        TurnRelayRuntimeConfig::from(self).validate(self.listen_address)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TurnRelayRuntimeConfig {
+    relay_id: RelayId,
+    allocation_bind_address: IpAddr,
+    advertised_address: IpAddr,
+    max_datagram_size: usize,
+    allocation_lifetime_seconds: u32,
+    idle_timeout_seconds: u32,
+    max_allocations: usize,
+    max_allocations_per_node: usize,
+    max_permissions_per_allocation: usize,
+    max_channels_per_allocation: usize,
+}
+
+impl TurnRelayRuntimeConfig {
+    fn validate(self, listen_address: SocketAddr) -> Result<(), TurnRelayError> {
+        let config = TurnUdpRelayConfig {
+            relay_id: self.relay_id,
+            listen_address,
+            allocation_bind_address: self.allocation_bind_address,
+            advertised_address: self.advertised_address,
+            max_datagram_size: self.max_datagram_size,
+            allocation_lifetime_seconds: self.allocation_lifetime_seconds,
+            idle_timeout_seconds: self.idle_timeout_seconds,
+            max_allocations: self.max_allocations,
+            max_allocations_per_node: self.max_allocations_per_node,
+            max_permissions_per_allocation: self.max_permissions_per_allocation,
+            max_channels_per_allocation: self.max_channels_per_allocation,
+        };
+        config.validate()
+    }
+}
+
+impl From<TurnUdpRelayConfig> for TurnRelayRuntimeConfig {
+    fn from(config: TurnUdpRelayConfig) -> Self {
+        Self {
+            relay_id: config.relay_id,
+            allocation_bind_address: config.allocation_bind_address,
+            advertised_address: config.advertised_address,
+            max_datagram_size: config.max_datagram_size,
+            allocation_lifetime_seconds: config.allocation_lifetime_seconds,
+            idle_timeout_seconds: config.idle_timeout_seconds,
+            max_allocations: config.max_allocations,
+            max_allocations_per_node: config.max_allocations_per_node,
+            max_permissions_per_allocation: config.max_permissions_per_allocation,
+            max_channels_per_allocation: config.max_channels_per_allocation,
+        }
+    }
+}
+
+impl From<TurnTcpRelayConfig> for TurnRelayRuntimeConfig {
+    fn from(config: TurnTcpRelayConfig) -> Self {
+        Self {
+            relay_id: config.relay_id,
+            allocation_bind_address: config.allocation_bind_address,
+            advertised_address: config.advertised_address,
+            max_datagram_size: config.max_datagram_size,
+            allocation_lifetime_seconds: config.allocation_lifetime_seconds,
+            idle_timeout_seconds: config.idle_timeout_seconds,
+            max_allocations: config.max_allocations,
+            max_allocations_per_node: config.max_allocations_per_node,
+            max_permissions_per_allocation: config.max_permissions_per_allocation,
+            max_channels_per_allocation: config.max_channels_per_allocation,
+        }
+    }
+}
+
 /// One bound TURN UDP relay ready to serve requests.
 pub struct TurnUdpRelay {
     config: TurnUdpRelayConfig,
-    authenticator: TurnAuthenticator,
     control: Arc<UdpSocket>,
+    core: TurnRelayCore,
+}
+
+struct TurnRelayCore {
+    config: TurnRelayRuntimeConfig,
+    authenticator: TurnAuthenticator,
     allocations: HashMap<SocketAddr, Allocation>,
     allocation_tasks: JoinSet<()>,
     response_cache: HashMap<ResponseCacheKey, CachedResponse>,
     response_cache_order: VecDeque<ResponseCacheKey>,
+}
+
+#[derive(Clone)]
+enum ClientSink {
+    Udp {
+        control: Arc<UdpSocket>,
+        client: SocketAddr,
+    },
+    Tcp {
+        client: SocketAddr,
+        sender: mpsc::Sender<Vec<u8>>,
+    },
+}
+
+struct ClientConnection {
+    address: SocketAddr,
+    sink: ClientSink,
+}
+
+impl ClientSink {
+    const fn is_stream(&self) -> bool {
+        matches!(self, Self::Tcp { .. })
+    }
+
+    async fn send(&self, record: Vec<u8>) -> Result<(), TurnRelayError> {
+        match self {
+            Self::Udp { control, client } => {
+                control.send_to(&record, *client).await.map_err(|source| {
+                    TurnRelayError::SendControl {
+                        client: *client,
+                        source,
+                    }
+                })?;
+                Ok(())
+            }
+            Self::Tcp { client, sender } => sender
+                .send(record)
+                .await
+                .map_err(|_| TurnRelayError::ClientStreamClosed { client: *client }),
+        }
+    }
+
+    async fn send_data(&self, record: Vec<u8>) {
+        match self {
+            Self::Udp { control, client } => {
+                let _result = control.send_to(&record, *client).await;
+            }
+            Self::Tcp { sender, .. } => {
+                let _result = sender.try_send(record);
+            }
+        }
+    }
 }
 
 impl TurnUdpRelay {
@@ -161,7 +348,6 @@ impl TurnUdpRelay {
         credentials: RelayCredentialAuthority,
     ) -> Result<Self, TurnRelayError> {
         config.validate()?;
-        let authenticator = TurnAuthenticator::new(credentials, config.relay_id)?;
         let control = UdpSocket::bind(config.listen_address)
             .await
             .map_err(|source| TurnRelayError::BindControl {
@@ -170,12 +356,8 @@ impl TurnUdpRelay {
             })?;
         Ok(Self {
             config,
-            authenticator,
             control: Arc::new(control),
-            allocations: HashMap::new(),
-            allocation_tasks: JoinSet::new(),
-            response_cache: HashMap::new(),
-            response_cache_order: VecDeque::new(),
+            core: TurnRelayCore::new(config.into(), credentials)?,
         })
     }
 
@@ -211,8 +393,8 @@ impl TurnUdpRelay {
         loop {
             tokio::select! {
                 () = &mut shutdown => break,
-                _ = cleanup.tick() => self.remove_expired(Instant::now()),
-                joined = self.allocation_tasks.join_next(), if !self.allocation_tasks.is_empty() => {
+                _ = cleanup.tick() => self.core.remove_expired(Instant::now()),
+                joined = self.core.allocation_tasks.join_next(), if !self.core.allocation_tasks.is_empty() => {
                     if let Some(result) = joined {
                         result.map_err(|source| TurnRelayError::AllocationTaskJoin { source })?;
                     }
@@ -223,18 +405,199 @@ impl TurnUdpRelay {
                     })?;
                     let now_unix = unix_time()?;
                     let now = Instant::now();
-                    if let Some(response) = self
-                        .handle_client_record(&receive_buffer[..length], client, now_unix, now)
+                    let sink = ClientSink::Udp {
+                        control: Arc::clone(&self.control),
+                        client,
+                    };
+                    if let Some(response) = self.core
+                        .handle_client_record(&receive_buffer[..length], client, sink.clone(), now_unix, now)
                         .await?
                     {
-                        self.control
-                            .send_to(&response, client)
-                            .await
-                            .map_err(|source| TurnRelayError::SendControl { client, source })?;
+                        sink.send(response).await?;
                     }
                 }
             }
         }
+        self.core.shutdown().await
+    }
+}
+
+/// One bound TURN TCP relay ready to serve reliable client sessions.
+pub struct TurnTcpRelay {
+    config: TurnTcpRelayConfig,
+    listener: TcpListener,
+    core: Arc<Mutex<TurnRelayCore>>,
+}
+
+impl TurnTcpRelay {
+    /// Validates configuration and binds the client-facing TCP listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] for invalid limits, credential scope, or an
+    /// operating-system bind failure.
+    pub async fn bind(
+        config: TurnTcpRelayConfig,
+        credentials: RelayCredentialAuthority,
+    ) -> Result<Self, TurnRelayError> {
+        config.validate()?;
+        let listener = TcpListener::bind(config.listen_address)
+            .await
+            .map_err(|source| TurnRelayError::BindTcp {
+                address: config.listen_address,
+                source,
+            })?;
+        let core = TurnRelayCore::new(config.into(), credentials)?;
+        Ok(Self {
+            config,
+            listener,
+            core: Arc::new(Mutex::new(core)),
+        })
+    }
+
+    /// Returns the actual TCP listener address, including an assigned port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] if the operating system cannot report the
+    /// bound listener address.
+    pub fn local_address(&self) -> Result<SocketAddr, TurnRelayError> {
+        self.listener
+            .local_addr()
+            .map_err(|source| TurnRelayError::TcpLocalAddress { source })
+    }
+
+    /// Serves framed TURN TCP sessions until `shutdown` resolves.
+    ///
+    /// Malformed records close only their client session. Listener failure or
+    /// an internal task panic terminates the runtime for service-manager restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] for listener, clock, or task failures.
+    pub async fn run<F>(self, shutdown: F) -> Result<(), TurnRelayError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let mut shutdown = std::pin::pin!(shutdown);
+        let mut cleanup = tokio::time::interval(Duration::from_secs(1));
+        cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut sessions = JoinSet::new();
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                _ = cleanup.tick() => {
+                    self.core.lock().await.remove_expired(Instant::now());
+                }
+                accepted = self.listener.accept() => {
+                    let (stream, client) = accepted.map_err(|source| TurnRelayError::AcceptTcp { source })?;
+                    stream.set_nodelay(true).map_err(|source| TurnRelayError::ConfigureTcp {
+                        client,
+                        source,
+                    })?;
+                    let core = Arc::clone(&self.core);
+                    sessions.spawn(async move {
+                        (client, run_tcp_client(stream, client, core).await)
+                    });
+                }
+                joined = sessions.join_next(), if !sessions.is_empty() => {
+                    if let Some(result) = joined {
+                        let (client, session) = result.map_err(|source| TurnRelayError::ClientTaskJoin { source })?;
+                        if let Err(error) = session {
+                            tracing::debug!(%client, %error, "TURN TCP client session closed");
+                        }
+                    }
+                }
+            }
+        }
+        sessions.abort_all();
+        while let Some(result) = sessions.join_next().await {
+            if let Err(source) = result {
+                if !source.is_cancelled() {
+                    return Err(TurnRelayError::ClientTaskJoin { source });
+                }
+            }
+        }
+        self.core.lock().await.shutdown().await
+    }
+}
+
+impl fmt::Debug for TurnTcpRelay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnTcpRelay")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+async fn run_tcp_client(
+    stream: TcpStream,
+    client: SocketAddr,
+    core: Arc<Mutex<TurnRelayCore>>,
+) -> Result<(), TurnRelayError> {
+    let (reader, writer) = stream.into_split();
+    let mut reader = TurnStream::new(reader, MAX_TURN_STREAM_RECORD_SIZE)?;
+    let mut writer = TurnStream::new(writer, MAX_TURN_STREAM_RECORD_SIZE)?;
+    let (sender, mut outbound) = mpsc::channel(256);
+    let sink = ClientSink::Tcp { client, sender };
+    let mut writer_task = tokio::spawn(async move {
+        while let Some(record) = outbound.recv().await {
+            writer.write_record(&record).await?;
+        }
+        Ok::<_, TurnRelayError>(())
+    });
+    let mut writer_joined = false;
+    let result = loop {
+        tokio::select! {
+            joined = &mut writer_task => {
+                writer_joined = true;
+                break joined.map_err(|source| TurnRelayError::ClientWriterTaskJoin { source })?;
+            }
+            record = reader.read_record() => {
+                let record = match record {
+                    Ok(record) => record,
+                    Err(error) => break Err(error.into()),
+                };
+                let now_unix = unix_time()?;
+                let now = Instant::now();
+                let response = core
+                    .lock()
+                    .await
+                    .handle_client_record(&record, client, sink.clone(), now_unix, now)
+                    .await?;
+                if let Some(response) = response {
+                    sink.send(response).await?;
+                }
+            }
+        }
+    };
+    core.lock().await.remove_client(client);
+    drop(sink);
+    if !writer_joined {
+        writer_task.abort();
+        let _result = writer_task.await;
+    }
+    result
+}
+
+impl TurnRelayCore {
+    fn new(
+        config: TurnRelayRuntimeConfig,
+        credentials: RelayCredentialAuthority,
+    ) -> Result<Self, TurnRelayError> {
+        let authenticator = TurnAuthenticator::new(credentials, config.relay_id)?;
+        Ok(Self {
+            config,
+            authenticator,
+            allocations: HashMap::new(),
+            allocation_tasks: JoinSet::new(),
+            response_cache: HashMap::new(),
+            response_cache_order: VecDeque::new(),
+        })
+    }
+
+    async fn shutdown(&mut self) -> Result<(), TurnRelayError> {
         self.allocations.clear();
         while let Some(result) = self.allocation_tasks.join_next().await {
             result.map_err(|source| TurnRelayError::AllocationTaskJoin { source })?;
@@ -242,10 +605,18 @@ impl TurnUdpRelay {
         Ok(())
     }
 
+    fn remove_client(&mut self, client: SocketAddr) {
+        self.allocations.remove(&client);
+        self.response_cache
+            .retain(|key, _response| key.client != client);
+        self.response_cache_order.retain(|key| key.client != client);
+    }
+
     async fn handle_client_record(
         &mut self,
         input: &[u8],
         client: SocketAddr,
+        sink: ClientSink,
         now_unix: u64,
         now: Instant,
     ) -> Result<Option<Vec<u8>>, TurnRelayError> {
@@ -253,7 +624,12 @@ impl TurnUdpRelay {
             return Ok(None);
         }
         if input[0] & 0xc0 == 0x40 {
-            let Ok(channel_data) = TurnChannelDataView::decode_datagram(input) else {
+            let channel_data = if sink.is_stream() {
+                TurnChannelDataView::decode_stream(input)
+            } else {
+                TurnChannelDataView::decode_datagram(input)
+            };
+            let Ok(channel_data) = channel_data else {
                 return Ok(None);
             };
             self.handle_channel_data(client, channel_data, now).await;
@@ -287,7 +663,7 @@ impl TurnUdpRelay {
         let response = match message.message_type().method {
             StunMethod::Binding => Self::handle_binding(&message, client)?,
             StunMethod::Allocate => {
-                self.handle_allocate(&message, client, now_unix, now)
+                self.handle_allocate(&message, client, sink, now_unix, now)
                     .await?
             }
             StunMethod::Refresh => self.handle_refresh(&message, client, now_unix, now)?,
@@ -330,6 +706,7 @@ impl TurnUdpRelay {
         &mut self,
         message: &StunMessageView<'_>,
         client: SocketAddr,
+        sink: ClientSink,
         now_unix: u64,
         now: Instant,
     ) -> Result<Vec<u8>, TurnRelayError> {
@@ -402,7 +779,17 @@ impl TurnUdpRelay {
             );
         }
         let (allocation, response) = self
-            .create_allocation(message, client, node_id, lifetime, now, &authenticated)
+            .create_allocation(
+                message,
+                ClientConnection {
+                    address: client,
+                    sink,
+                },
+                node_id,
+                lifetime,
+                now,
+                &authenticated,
+            )
             .await?;
         self.allocations.insert(client, allocation);
         Ok(response)
@@ -411,7 +798,7 @@ impl TurnUdpRelay {
     async fn create_allocation(
         &mut self,
         message: &StunMessageView<'_>,
-        client: SocketAddr,
+        client: ClientConnection,
         node_id: NodeId,
         lifetime: u32,
         now: Instant,
@@ -430,8 +817,7 @@ impl TurnUdpRelay {
         let (command_sender, command_receiver) = mpsc::channel(ALLOCATION_COMMAND_CAPACITY);
         self.allocation_tasks.spawn(run_allocation_actor(
             socket,
-            Arc::clone(&self.control),
-            client,
+            client.sink,
             self.config.max_datagram_size,
             self.config.max_permissions_per_allocation,
             self.config.max_channels_per_allocation,
@@ -459,7 +845,7 @@ impl TurnUdpRelay {
                 ),
                 OwnedAttribute::new(
                     StunAttributeType::XOR_MAPPED_ADDRESS,
-                    xor_address_value(client, message.transaction_id())?,
+                    xor_address_value(client.address, message.transaction_id())?,
                 ),
                 OwnedAttribute::new(StunAttributeType::LIFETIME, lifetime.to_be_bytes().to_vec()),
                 OwnedAttribute::new(StunAttributeType::SOFTWARE, SOFTWARE.to_vec()),
@@ -1023,9 +1409,9 @@ impl fmt::Debug for TurnUdpRelay {
         formatter
             .debug_struct("TurnUdpRelay")
             .field("config", &self.config)
-            .field("authenticator", &self.authenticator)
-            .field("allocation_count", &self.allocations.len())
-            .field("response_cache_count", &self.response_cache.len())
+            .field("authenticator", &self.core.authenticator)
+            .field("allocation_count", &self.core.allocations.len())
+            .field("response_cache_count", &self.core.response_cache.len())
             .finish_non_exhaustive()
     }
 }
@@ -1088,8 +1474,7 @@ struct ChannelBinding {
 
 struct AllocationActor {
     socket: UdpSocket,
-    control: Arc<UdpSocket>,
-    client: SocketAddr,
+    sink: ClientSink,
     max_datagram_size: usize,
     max_permissions: usize,
     max_channels: usize,
@@ -1099,8 +1484,7 @@ struct AllocationActor {
 
 async fn run_allocation_actor(
     socket: UdpSocket,
-    control: Arc<UdpSocket>,
-    client: SocketAddr,
+    sink: ClientSink,
     max_datagram_size: usize,
     max_permissions: usize,
     max_channels: usize,
@@ -1108,8 +1492,7 @@ async fn run_allocation_actor(
 ) {
     let mut actor = AllocationActor {
         socket,
-        control,
-        client,
+        sink,
         max_datagram_size,
         max_permissions,
         max_channels,
@@ -1267,8 +1650,14 @@ impl AllocationActor {
             .iter()
             .find_map(|(channel, binding)| (binding.peer == peer).then_some(*channel));
         let encoded = if let Some(channel) = channel {
-            let mut encoded = vec![0_u8; data.len().saturating_add(4)];
-            let Ok(length) = encode_turn_channel_data(channel, data, &mut encoded) else {
+            let padding = usize::from(self.sink.is_stream()) * 3;
+            let mut encoded = vec![0_u8; data.len().saturating_add(4).saturating_add(padding)];
+            let length = if self.sink.is_stream() {
+                encode_turn_channel_data_stream(channel, data, &mut encoded)
+            } else {
+                encode_turn_channel_data(channel, data, &mut encoded)
+            };
+            let Ok(length) = length else {
                 return;
             };
             encoded.truncate(length);
@@ -1294,7 +1683,7 @@ impl AllocationActor {
             };
             encoded
         };
-        let _result = self.control.send_to(&encoded, self.client).await;
+        self.sink.send_data(encoded).await;
     }
 
     fn cleanup(&mut self, now: Instant) {
@@ -1524,7 +1913,7 @@ fn invalid_config(reason: &'static str) -> TurnRelayError {
     TurnRelayError::InvalidConfig { reason }
 }
 
-/// TURN UDP relay startup or runtime failure.
+/// TURN relay startup or runtime failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum TurnRelayError {
@@ -1543,9 +1932,41 @@ pub enum TurnRelayError {
         #[source]
         source: std::io::Error,
     },
+    /// Client-facing TCP listener bind failed.
+    #[error("unable to bind TURN TCP listener {address}")]
+    BindTcp {
+        /// Requested listener address.
+        address: SocketAddr,
+        /// Underlying socket failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// Bound listener address could not be queried.
     #[error("unable to query TURN UDP listener address")]
     LocalAddress {
+        /// Underlying socket failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Bound TCP listener address could not be queried.
+    #[error("unable to query TURN TCP listener address")]
+    TcpLocalAddress {
+        /// Underlying socket failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Accepting a TURN TCP client failed.
+    #[error("TURN TCP listener accept failed")]
+    AcceptTcp {
+        /// Underlying socket failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Configuring an accepted TURN TCP socket failed.
+    #[error("unable to configure TURN TCP client {client}")]
+    ConfigureTcp {
+        /// Connected client transport address.
+        client: SocketAddr,
         /// Underlying socket failure.
         #[source]
         source: std::io::Error,
@@ -1582,6 +2003,26 @@ pub enum TurnRelayError {
         #[source]
         source: std::io::Error,
     },
+    /// A TCP session ended before accepting another response record.
+    #[error("TURN TCP client stream {client} is closed")]
+    ClientStreamClosed {
+        /// Connected client transport address.
+        client: SocketAddr,
+    },
+    /// A TURN TCP session task panicked or was cancelled unexpectedly.
+    #[error("TURN TCP client session task failed")]
+    ClientTaskJoin {
+        /// Tokio task join failure.
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    /// A TURN TCP writer task panicked or was cancelled unexpectedly.
+    #[error("TURN TCP client writer task failed")]
+    ClientWriterTaskJoin {
+        /// Tokio task join failure.
+        #[source]
+        source: tokio::task::JoinError,
+    },
     /// A per-allocation actor panicked or was cancelled unexpectedly.
     #[error("TURN allocation task failed")]
     AllocationTaskJoin {
@@ -1613,6 +2054,9 @@ pub enum TurnRelayError {
     /// TURN wire encoding failed.
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// Reliable TURN record framing or stream I/O failed.
+    #[error(transparent)]
+    Stream(#[from] stella_transport::TurnStreamError),
     /// Authenticated response signing failed.
     #[error("unable to sign TURN response integrity")]
     ResponseIntegrity,

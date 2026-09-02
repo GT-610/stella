@@ -103,7 +103,7 @@ impl<S> TurnStream<S> {
 
 impl<S> TurnStream<S>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + Unpin,
 {
     /// Reads exactly one complete TURN stream record.
     ///
@@ -131,7 +131,12 @@ where
             .map_err(|source| TurnStreamError::Read { source })?;
         Ok(record)
     }
+}
 
+impl<S> TurnStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
     /// Writes exactly one complete TURN stream record and flushes it.
     ///
     /// # Errors
@@ -162,7 +167,9 @@ where
             .await
             .map_err(|source| TurnStreamError::Write { source })
     }
+}
 
+impl<S> TurnStream<S> {
     fn validate_length(&self, length: usize) -> Result<(), TurnStreamError> {
         if length > self.max_record_size {
             return Err(TurnStreamError::RecordTooLarge {
