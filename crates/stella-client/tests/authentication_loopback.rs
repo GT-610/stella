@@ -17,7 +17,7 @@ use stella_client::{
     authenticate_controller, ActiveControl, BearerCredential, ClientError, ControllerTrust,
     Enrollment, SpkiPin,
 };
-use stella_common::NetworkId;
+use stella_common::{ControllerId, NetworkId};
 use stella_crypto::{derive_node_id, IdentitySigningKey};
 use stella_proto::{
     ConfidentialityPolicy, ConnectivityCarrier, ConnectivityGenerationRef, Endpoint, IceCandidate,
@@ -503,6 +503,65 @@ async fn proxied_client_enrolls_and_reauthenticates_without_plaintext_credential
         .expect("join server task")
         .expect("server shuts down cleanly");
     std::fs::remove_dir_all(&directory).expect("remove proxied test deployment");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn controller_proxy_rejection_is_status_only_and_precedes_enrollment() {
+    let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind rejecting controller proxy");
+    let proxy_address = proxy_listener
+        .local_addr()
+        .expect("rejecting controller proxy address");
+    let controller_address = SocketAddr::from((Ipv4Addr::LOCALHOST, 44_900));
+    let expected_request =
+        b"CONNECT localhost:44900 HTTP/1.1\r\nHost: localhost:44900\r\n\r\n".to_vec();
+    let enrollment_secret = [0x5a; BearerCredential::LENGTH];
+    let enrollment_text = URL_SAFE_NO_PAD.encode(enrollment_secret);
+    let pin = SpkiPin::from_digest([0x6b; 32]);
+    let pin_text = pin.to_string();
+    let proxy = tokio::spawn(async move {
+        let (mut stream, _client) = proxy_listener
+            .accept()
+            .await
+            .expect("accept rejected controller connection");
+        let request = read_connect_request(&mut stream).await;
+        assert_eq!(request, expected_request);
+        assert!(!contains_subslice(&request, &enrollment_secret));
+        assert!(!contains_subslice(&request, enrollment_text.as_bytes()));
+        assert!(!contains_subslice(&request, pin_text.as_bytes()));
+        assert!(!contains_subslice(&request, &CONTROL_MAGIC));
+        stream
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=super-secret\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .expect("reject controller CONNECT");
+    });
+
+    let trust = ControllerTrust::new(
+        controller_address,
+        String::from("localhost"),
+        ControllerId::from_bytes([0x7c; 16]),
+        vec![pin],
+    )
+    .expect("valid rejected controller trust")
+    .with_https_proxy(Some(proxy_address));
+    let identity = IdentitySigningKey::generate().expect("generate rejected proxy identity");
+    let credential = BearerCredential::from_bytes(enrollment_secret);
+    let error = authenticate_controller(
+        &trust,
+        &identity,
+        Some(Enrollment::new(&credential, "Rejected proxy client")),
+    )
+    .await
+    .expect_err("proxy rejection prevents controller TLS");
+    assert!(matches!(
+        error,
+        ClientError::HttpProxyRejected { status_code: 407 }
+    ));
+    assert!(!error.to_string().contains("super-secret"));
+    proxy.await.expect("rejecting controller proxy task");
 }
 
 async fn wait_for_tcp_listener(address: SocketAddr) {
