@@ -1229,6 +1229,7 @@ version = "0.1.0"
 dependencies = [
  "socket2",
  "stella-common",
+ "stella-proto",
  "thiserror",
  "tokio",
 ]

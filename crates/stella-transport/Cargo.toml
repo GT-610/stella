@@ -10,8 +10,9 @@ version.workspace = true
 [dependencies]
 socket2 = { version = "0.6.5", default-features = false }
 stella-common = { path = "../stella-common" }
+stella-proto = { path = "../stella-proto" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "sync"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "time"] }

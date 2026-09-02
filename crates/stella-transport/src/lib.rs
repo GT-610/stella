@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod turn_stream;
 mod udp;
 
 use std::{future::Future, net::SocketAddr, num::NonZeroU64, pin::Pin};
@@ -10,6 +11,7 @@ use std::{future::Future, net::SocketAddr, num::NonZeroU64, pin::Pin};
 use stella_common::RelayId;
 
 pub use error::{IoErrorClass, IoOperation, TransportError};
+pub use turn_stream::{TurnStream, TurnStreamError, MAX_TURN_STREAM_RECORD_SIZE};
 pub use udp::{
     UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
     MIN_UDP_DATAGRAM_SIZE,
