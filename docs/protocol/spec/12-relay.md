@@ -128,7 +128,8 @@ MESSAGE-INTEGRITY, ERROR-CODE, UNKNOWN-ATTRIBUTES, CHANNEL-NUMBER, LIFETIME,
 XOR-PEER-ADDRESS, DATA, REALM, NONCE, XOR-RELAYED-ADDRESS,
 REQUESTED-TRANSPORT, DONT-FRAGMENT, MESSAGE-INTEGRITY-SHA256,
 PASSWORD-ALGORITHM, USERHASH, XOR-MAPPED-ADDRESS, SOFTWARE, ALTERNATE-SERVER,
-and FINGERPRINT. Extension attribute values remain length bounded. Unknown
+PRIORITY, USE-CANDIDATE, FINGERPRINT, ICE-CONTROLLED, and ICE-CONTROLLING.
+Extension attribute values remain length bounded. Unknown
 comprehension-required attributes are reported to TURN behavior code; unknown
 optional attributes may be ignored according to the relevant RFC. Attribute
 padding is ignored on receipt and emitted as zero.

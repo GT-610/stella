@@ -580,12 +580,20 @@ impl StunAttributeType {
     pub const USERHASH: Self = Self(0x001e);
     /// XOR-MAPPED-ADDRESS.
     pub const XOR_MAPPED_ADDRESS: Self = Self(0x0020);
+    /// ICE candidate priority.
+    pub const PRIORITY: Self = Self(0x0024);
+    /// ICE regular or aggressive nomination marker.
+    pub const USE_CANDIDATE: Self = Self(0x0025);
     /// SOFTWARE.
     pub const SOFTWARE: Self = Self(0x8022);
     /// ALTERNATE-SERVER.
     pub const ALTERNATE_SERVER: Self = Self(0x8023);
     /// FINGERPRINT.
     pub const FINGERPRINT: Self = Self(0x8028);
+    /// ICE controlled-role tie breaker.
+    pub const ICE_CONTROLLED: Self = Self(0x8029);
+    /// ICE controlling-role tie breaker.
+    pub const ICE_CONTROLLING: Self = Self(0x802a);
 
     /// Creates a non-zero extension attribute type.
     #[must_use]
@@ -1405,6 +1413,12 @@ mod tests {
                 raw
             );
         }
+        assert_eq!(StunAttributeType::PRIORITY.as_u16(), 0x0024);
+        assert_eq!(StunAttributeType::USE_CANDIDATE.as_u16(), 0x0025);
+        assert_eq!(StunAttributeType::ICE_CONTROLLED.as_u16(), 0x8029);
+        assert_eq!(StunAttributeType::ICE_CONTROLLING.as_u16(), 0x802a);
+        assert!(StunAttributeType::PRIORITY.comprehension_required());
+        assert!(!StunAttributeType::ICE_CONTROLLING.comprehension_required());
     }
 
     #[test]
