@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    future::pending,
+    future::{pending, Future},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -26,7 +26,11 @@ use stella_transport::{
     UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
 };
 use thiserror::Error;
-use tokio::{net::lookup_host, sync::mpsc, time::timeout};
+use tokio::{
+    net::lookup_host,
+    sync::mpsc,
+    time::{timeout, timeout_at, Instant},
+};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -52,6 +56,7 @@ const ICE_USERNAME_RANDOM_LENGTH: usize = 6;
 const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
 const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
 const RELAY_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const RELAY_CARRIER_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Failure while owning the Windows client data-plane runtime.
 #[derive(Debug, Error)]
@@ -133,6 +138,14 @@ pub enum RuntimeError {
     RelayDnsEmpty {
         /// Canonical controller-provided relay hostname.
         hostname: String,
+    },
+    /// One relay carrier exhausted its complete establishment budget.
+    #[error("relay {relay_id} {carrier:?} establishment timed out")]
+    RelayCarrierTimeout {
+        /// Controller-issued relay service identity.
+        relay_id: stella_common::RelayId,
+        /// Carrier whose shared establishment budget expired.
+        carrier: ConnectivityCarrier,
     },
     /// Per-network authenticated routing failed.
     #[error(transparent)]
@@ -1610,11 +1623,47 @@ async fn allocate_preferred_relay(
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<WarmRelay>, RuntimeError> {
     let selections = relay_selections(bind_address, https_proxy, connectivity).await?;
+    allocate_relay_selections(
+        selections,
+        RELAY_CARRIER_ESTABLISHMENT_TIMEOUT,
+        allocate_relay,
+    )
+    .await
+}
+
+async fn allocate_relay_selections<T, F, Fut>(
+    selections: Vec<SelectedRelay>,
+    carrier_timeout: Duration,
+    mut allocator: F,
+) -> Result<Option<T>, RuntimeError>
+where
+    F: FnMut(SelectedRelay) -> Fut,
+    Fut: Future<Output = Result<T, RuntimeError>>,
+{
     let mut last_error = None;
+    let mut current_carrier = None;
+    let mut carrier_deadline = Instant::now();
+    let mut timed_out_carrier = None;
     for selected in selections {
-        match allocate_relay(selected).await {
-            Ok(relay) => return Ok(Some(relay)),
-            Err(error) => last_error = Some(error),
+        let carrier = selected.settings.carrier;
+        if timed_out_carrier == Some(carrier) {
+            continue;
+        }
+        if current_carrier != Some(carrier) {
+            current_carrier = Some(carrier);
+            carrier_deadline = Instant::now() + carrier_timeout;
+        }
+        let relay_id = selected.settings.relay_id;
+        match timeout_at(carrier_deadline, allocator(selected)).await {
+            Ok(Ok(relay)) => return Ok(Some(relay)),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                timed_out_carrier = Some(carrier);
+                last_error = Some(RuntimeError::RelayCarrierTimeout {
+                    relay_id,
+                    carrier: carrier.connectivity_carrier(),
+                });
+            }
         }
     }
     match last_error {
