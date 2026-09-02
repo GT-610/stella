@@ -1,5 +1,7 @@
 //! Windows client command-line parsing, initialization, and network intent.
 
+#[cfg(target_os = "windows")]
+use std::future::Future;
 use std::{
     fs::OpenOptions,
     io::Write,
@@ -30,6 +32,39 @@ const MAXIMUM_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(target_os = "windows")]
 const DATA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(target_os = "windows")]
+struct ControlSessionFailure {
+    error: anyhow::Error,
+    minimum_reconnect_delay: Option<Duration>,
+}
+
+#[cfg(target_os = "windows")]
+enum ActiveRuntimeFailure {
+    Control(ControlSessionFailure),
+    Data(anyhow::Error),
+}
+
+#[cfg(target_os = "windows")]
+impl ActiveRuntimeFailure {
+    fn control(error: anyhow::Error) -> Self {
+        Self::Control(ControlSessionFailure {
+            error,
+            minimum_reconnect_delay: None,
+        })
+    }
+
+    fn control_after(error: anyhow::Error, delay: Duration) -> Self {
+        Self::Control(ControlSessionFailure {
+            error,
+            minimum_reconnect_delay: Some(delay),
+        })
+    }
+
+    fn data(error: anyhow::Error) -> Self {
+        Self::Data(error)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -182,6 +217,86 @@ async fn run_client(config_path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+async fn supervise_control(
+    config: &ClientConfig,
+    identity: &stella_crypto::IdentitySigningKey,
+) -> Result<()> {
+    let mut attempt = 0_u32;
+    let mut data = None;
+    let mut reconnect_delay: Option<Duration> = None;
+    loop {
+        if let Some(delay) = reconnect_delay.take() {
+            tracing::info!(
+                delay_ms = delay.as_millis(),
+                data_plane_active = data.is_some(),
+                "waiting before controller reconnect"
+            );
+            if let Some(runtime) = data.as_mut() {
+                if let Err(error) =
+                    drive_data_until(runtime, identity, tokio::time::sleep(delay)).await
+                {
+                    tracing::warn!(%error, "data plane failed during controller reconnect wait");
+                    shutdown_data_runtime(&mut data).await;
+                }
+            } else {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        let activation = if let Some(runtime) = data.as_mut() {
+            match drive_data_until(runtime, identity, activate_control(config, identity)).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%error, "data plane failed during controller activation");
+                    shutdown_data_runtime(&mut data).await;
+                    continue;
+                }
+            }
+        } else {
+            activate_control(config, identity).await
+        };
+        let active = match activation {
+            Ok(active) => {
+                tracing::info!(
+                    networks = active.networks().len(),
+                    data_plane_reused = data.is_some(),
+                    "controller state is active"
+                );
+                attempt = 0;
+                active
+            }
+            Err(error) => {
+                tracing::warn!(error = ?error, "controller activation failed");
+                reconnect_delay = Some(full_jitter(reconnect_cap(attempt))?);
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        match run_active_control(config, identity, active, &mut data).await {
+            Ok(()) => {}
+            Err(ActiveRuntimeFailure::Control(failure)) => {
+                tracing::warn!(error = ?failure.error, "active controller session ended");
+                let jitter = full_jitter(reconnect_cap(attempt))?;
+                reconnect_delay = Some(
+                    failure
+                        .minimum_reconnect_delay
+                        .map_or(jitter, |minimum| minimum.max(jitter)),
+                );
+                attempt = attempt.saturating_add(1);
+            }
+            Err(ActiveRuntimeFailure::Data(error)) => {
+                tracing::warn!(error = ?error, "active data plane ended");
+                shutdown_data_runtime(&mut data).await;
+                reconnect_delay = Some(full_jitter(reconnect_cap(attempt))?);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 async fn supervise_control(
     config: &ClientConfig,
     identity: &stella_crypto::IdentitySigningKey,
@@ -267,31 +382,37 @@ async fn run_active_control(
     config: &ClientConfig,
     identity: &stella_crypto::IdentitySigningKey,
     mut active: ActiveControl,
-) -> Result<()> {
-    let mut data = ClientDataRuntime::start_with_connectivity(
-        config,
-        active.networks(),
-        identity,
-        active.connectivity_config(),
-    )
-    .await
-    .context("could not start Windows UDP/TAP data plane")?;
-    let result = async {
-        publish_configured_endpoints(config, &mut active).await?;
-        synchronize_and_publish_connectivity(&mut active, &mut data, true).await?;
-        data.reconcile(config, active.networks(), identity)
-            .await
-            .context("could not reconcile data plane after reachability publication")?;
-        tracing::info!(
-            udp = %data.local_udp_address(),
-            networks = active.networks().len(),
-            "Windows data plane is active"
-        );
-        run_active_io(config, identity, &mut active, &mut data).await
+    data: &mut Option<ClientDataRuntime>,
+) -> std::result::Result<(), ActiveRuntimeFailure> {
+    if data.is_none() {
+        let runtime = ClientDataRuntime::start_with_connectivity(
+            config,
+            active.networks(),
+            identity,
+            active.connectivity_config(),
+        )
+        .await
+        .context("could not start Windows UDP/TAP data plane")
+        .map_err(ActiveRuntimeFailure::data)?;
+        *data = Some(runtime);
     }
-    .await;
-    let shutdown = data.shutdown().await.context("data-plane shutdown failed");
-    result.and(shutdown)
+    let data = data.as_mut().ok_or_else(|| {
+        ActiveRuntimeFailure::data(anyhow::anyhow!("Windows data runtime is unavailable"))
+    })?;
+    publish_configured_endpoints(config, &mut active)
+        .await
+        .map_err(ActiveRuntimeFailure::control)?;
+    synchronize_and_publish_connectivity(&mut active, data, true).await?;
+    data.reconcile(config, active.networks(), identity)
+        .await
+        .context("could not reconcile data plane after reachability publication")
+        .map_err(ActiveRuntimeFailure::data)?;
+    tracing::info!(
+        udp = %data.local_udp_address(),
+        networks = active.networks().len(),
+        "Windows data plane is active"
+    );
+    run_active_io(config, identity, &mut active, data).await
 }
 
 #[cfg(target_os = "windows")]
@@ -300,7 +421,7 @@ async fn run_active_io(
     identity: &stella_crypto::IdentitySigningKey,
     active: &mut ActiveControl,
     data: &mut ClientDataRuntime,
-) -> Result<()> {
+) -> std::result::Result<(), ActiveRuntimeFailure> {
     let heartbeat_sleep = tokio::time::sleep(heartbeat_interval(active));
     tokio::pin!(heartbeat_sleep);
     let mut maintenance = tokio::time::interval(DATA_MAINTENANCE_INTERVAL);
@@ -308,24 +429,43 @@ async fn run_active_io(
     loop {
         tokio::select! {
             update = active.receive_update() => {
-                let update = update?;
+                let update = update
+                    .context("could not receive controller update")
+                    .map_err(ActiveRuntimeFailure::control)?;
                 match &update {
-                stella_client::ControlUpdate::ServerShutdown { deadline } => {
-                    anyhow::bail!("controller requested shutdown with deadline {deadline}")
-                }
-                stella_client::ControlUpdate::ControllerError {
-                    status,
-                    retry_after_ms,
-                } => anyhow::bail!(
-                    "controller sent status {status} with retry delay {retry_after_ms:?}"
-                ),
+                    stella_client::ControlUpdate::ServerShutdown { deadline } => {
+                        return Err(ActiveRuntimeFailure::control_after(
+                            anyhow::anyhow!(
+                                "controller requested shutdown with deadline {deadline}"
+                            ),
+                            reconnect_delay_until(*deadline),
+                        ));
+                    }
+                    stella_client::ControlUpdate::ControllerError {
+                        status,
+                        retry_after_ms,
+                    } => {
+                        let error = anyhow::anyhow!(
+                            "controller sent status {status} with retry delay {retry_after_ms:?}"
+                        );
+                        return Err(match retry_after_ms {
+                            Some(delay) => {
+                                ActiveRuntimeFailure::control_after(
+                                    error,
+                                    Duration::from_millis(u64::from(*delay)),
+                                )
+                            }
+                            None => ActiveRuntimeFailure::control(error),
+                        });
+                    }
                     _ => {}
                 }
                 synchronize_and_publish_connectivity(active, data, false).await?;
                 tracing::debug!(?update, "applied controller update");
                 data.reconcile(config, active.networks(), identity)
                     .await
-                    .context("could not reconcile data plane after control update")?;
+                    .context("could not reconcile data plane after control update")
+                    .map_err(ActiveRuntimeFailure::data)?;
                 heartbeat_sleep.as_mut().reset(
                     tokio::time::Instant::now() + heartbeat_interval(active)
                 );
@@ -334,11 +474,14 @@ async fn run_active_io(
                 let interval = heartbeat_interval(active);
                 let acknowledgement_timeout = interval
                     .checked_mul(3)
-                    .ok_or_else(|| anyhow::anyhow!("heartbeat timeout overflow"))?;
+                    .ok_or_else(|| anyhow::anyhow!("heartbeat timeout overflow"))
+                    .map_err(ActiveRuntimeFailure::control)?;
                 let report = tokio::time::timeout(acknowledgement_timeout, active.heartbeat())
                     .await
-                    .context("three heartbeat acknowledgement periods elapsed")?
-                    .context("heartbeat failed")?;
+                    .context("three heartbeat acknowledgement periods elapsed")
+                    .map_err(ActiveRuntimeFailure::control)?
+                    .context("heartbeat failed")
+                    .map_err(ActiveRuntimeFailure::control)?;
                 tracing::debug!(
                     counter = report.counter(),
                     server_time = report.server_time(),
@@ -348,7 +491,8 @@ async fn run_active_io(
                 synchronize_and_publish_connectivity(active, data, false).await?;
                 data.reconcile(config, active.networks(), identity)
                     .await
-                    .context("could not reconcile data plane after heartbeat")?;
+                    .context("could not reconcile data plane after heartbeat")
+                    .map_err(ActiveRuntimeFailure::data)?;
                 heartbeat_sleep.as_mut().reset(
                     tokio::time::Instant::now() + heartbeat_interval(active)
                 );
@@ -356,27 +500,15 @@ async fn run_active_io(
             _ = maintenance.tick() => {
                 data.maintain(identity)
                     .await
-                    .context("data-plane maintenance failed")?;
+                    .context("data-plane maintenance failed")
+                    .map_err(ActiveRuntimeFailure::data)?;
             }
             result = data.receive_next(identity) => {
-                match result {
-                    Ok(()) => {
-                        if data.take_connectivity_changed() {
-                            publish_current_connectivity(active, data)
-                                .await
-                                .context("could not publish recovered Relay connectivity")?;
-                        }
-                    }
-                    Err(RuntimeError::Network(error)) => {
-                        tracing::debug!(%error, "dropped invalid peer datagram");
-                    }
-                    Err(RuntimeError::Codec(error)) => {
-                        tracing::debug!(%error, "dropped malformed Stella datagram");
-                    }
-                    Err(RuntimeError::TapWriteQueueFull { network_id }) => {
-                        tracing::warn!(%network_id, "dropped frame because TAP queue is full");
-                    }
-                    Err(error) => return Err(error).context("data-plane I/O failed"),
+                handle_data_runtime_result(result)
+                    .context("data-plane I/O failed")
+                    .map_err(ActiveRuntimeFailure::data)?;
+                if data.take_connectivity_changed() {
+                    publish_current_connectivity(active, data).await?;
                 }
             }
         }
@@ -387,20 +519,25 @@ async fn run_active_io(
 async fn publish_current_connectivity(
     active: &mut ActiveControl,
     data: &ClientDataRuntime,
-) -> Result<()> {
+) -> std::result::Result<(), ActiveRuntimeFailure> {
     if active.connection().protocol_version() != stella_proto::ProtocolVersion::V0_2 {
         return Ok(());
     }
     let network_ids = active.networks().keys().copied().collect::<Vec<_>>();
     for network_id in network_ids {
-        let generation = data.connectivity_generation(network_id)?;
+        let generation = data
+            .connectivity_generation(network_id)
+            .with_context(|| format!("could not read connectivity for network {network_id}"))
+            .map_err(ActiveRuntimeFailure::data)?;
         tokio::time::timeout(
             CONTROL_OPERATION_TIMEOUT,
             active.publish_connectivity(network_id, generation),
         )
         .await
-        .with_context(|| format!("connectivity publication timed out for network {network_id}"))?
-        .with_context(|| format!("could not publish connectivity for network {network_id}"))?;
+        .with_context(|| format!("connectivity publication timed out for network {network_id}"))
+        .map_err(ActiveRuntimeFailure::control)?
+        .with_context(|| format!("could not publish connectivity for network {network_id}"))
+        .map_err(ActiveRuntimeFailure::control)?;
     }
     Ok(())
 }
@@ -410,7 +547,7 @@ async fn synchronize_and_publish_connectivity(
     active: &mut ActiveControl,
     data: &mut ClientDataRuntime,
     mut publish: bool,
-) -> Result<()> {
+) -> std::result::Result<(), ActiveRuntimeFailure> {
     loop {
         let control_revision = active
             .connectivity_config()
@@ -418,12 +555,14 @@ async fn synchronize_and_publish_connectivity(
         if data.connectivity_revision() != control_revision {
             data.replace_connectivity_config(active.connectivity_config(), active.networks())
                 .await
-                .context("could not replace Windows relay configuration")?;
+                .context("could not replace Windows relay configuration")
+                .map_err(ActiveRuntimeFailure::data)?;
             publish = true;
         }
         if data
             .refresh_connectivity_generations(active.networks())
-            .context("could not refresh local connectivity generations")?
+            .context("could not refresh local connectivity generations")
+            .map_err(ActiveRuntimeFailure::data)?
         {
             publish = true;
         }
@@ -439,6 +578,67 @@ async fn synchronize_and_publish_connectivity(
             return Ok(());
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+async fn drive_data_until<F, T>(
+    data: &mut ClientDataRuntime,
+    identity: &stella_crypto::IdentitySigningKey,
+    operation: F,
+) -> std::result::Result<T, RuntimeError>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(operation);
+    let mut maintenance = tokio::time::interval(DATA_MAINTENANCE_INTERVAL);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            output = &mut operation => return Ok(output),
+            _ = maintenance.tick() => data.maintain(identity).await?,
+            result = data.receive_next(identity) => handle_data_runtime_result(result)?,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn handle_data_runtime_result(
+    result: std::result::Result<(), RuntimeError>,
+) -> std::result::Result<(), RuntimeError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(RuntimeError::Network(error)) => {
+            tracing::debug!(%error, "dropped invalid peer datagram");
+            Ok(())
+        }
+        Err(RuntimeError::Codec(error)) => {
+            tracing::debug!(%error, "dropped malformed Stella datagram");
+            Ok(())
+        }
+        Err(RuntimeError::TapWriteQueueFull { network_id }) => {
+            tracing::warn!(%network_id, "dropped frame because TAP queue is full");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn shutdown_data_runtime(data: &mut Option<ClientDataRuntime>) {
+    let Some(runtime) = data.take() else {
+        return;
+    };
+    if let Err(error) = runtime.shutdown().await {
+        tracing::warn!(%error, "data-plane shutdown failed");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn reconnect_delay_until(deadline: u64) -> Duration {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(deadline, |duration| duration.as_secs());
+    Duration::from_secs(deadline.saturating_sub(now))
 }
 
 #[cfg(not(target_os = "windows"))]
