@@ -638,6 +638,11 @@ fn reconnect_delay_until(deadline: u64) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(deadline, |duration| duration.as_secs());
+    reconnect_delay_from(deadline, now)
+}
+
+#[cfg(target_os = "windows")]
+const fn reconnect_delay_from(deadline: u64, now: u64) -> Duration {
     Duration::from_secs(deadline.saturating_sub(now))
 }
 
@@ -1120,6 +1125,8 @@ fn write_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::{collections::BTreeMap, time::Duration};
     use std::{
         net::{Ipv4Addr, SocketAddr},
         path::PathBuf,
@@ -1128,13 +1135,19 @@ mod tests {
     };
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    #[cfg(windows)]
+    use stella_client::ClientDataRuntime;
     use stella_client::{load_node_identity, ClientConfig, SpkiPin};
     use stella_common::{ControllerId, NetworkId};
+    #[cfg(windows)]
+    use stella_crypto::{IdentitySeed, IdentitySigningKey};
 
     use super::{
         configuration_document, full_jitter, initialize, persist_network_intent, reconnect_cap,
         remove_network_intent, status, CliCredential, InitArgs, MAXIMUM_RECONNECT_DELAY,
     };
+    #[cfg(windows)]
+    use super::{drive_data_until, reconnect_delay_from};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1179,6 +1192,54 @@ mod tests {
         for _sample in 0..32 {
             assert!(full_jitter(reconnect_cap(4)).expect("generate jitter") <= reconnect_cap(4));
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pending_control_operation_keeps_data_runtime_progressing() {
+        let mut args = init_args();
+        args.udp_bind = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let document = configuration_document(&args).expect("encode test configuration");
+        let config = ClientConfig::parse(&document, std::path::Path::new("."))
+            .expect("parse test configuration");
+        let identity = IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x63; 32]));
+        let mut data = ClientDataRuntime::start(&config, &BTreeMap::new(), &identity)
+            .await
+            .expect("start data runtime without TAP networks");
+        let target = data.local_udp_address();
+        let operation = async move {
+            let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test sender");
+            sender
+                .send_to(&[0xff], target)
+                .await
+                .expect("send malformed data-plane datagram");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            0x63_u8
+        };
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            drive_data_until(&mut data, &identity, operation),
+        )
+        .await
+        .expect("control operation wait remains bounded")
+        .expect("data runtime remains healthy");
+        assert_eq!(output, 0x63);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), data.receive_next(&identity))
+                .await
+                .is_err(),
+            "the reconnect driver should have consumed the queued UDP datagram"
+        );
+        data.shutdown().await.expect("shutdown test data runtime");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authenticated_shutdown_deadline_is_a_minimum_reconnect_delay() {
+        assert_eq!(reconnect_delay_from(105, 100), Duration::from_secs(5));
+        assert_eq!(reconnect_delay_from(99, 100), Duration::ZERO);
     }
 
     #[test]
