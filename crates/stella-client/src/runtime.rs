@@ -18,7 +18,7 @@ use stella_common::{MacAddress, NetworkId};
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
     CommonHeader, ConnectivityCarrier, ConnectivityGenerationRef, IceCandidate, IceCandidateClass,
-    RelayCarrierMask,
+    RelayCarrierMask, RelayTrustRequirements,
 };
 use stella_tap::{TapCancellationHandle, TapConfig, TapDevice, TapError, WindowsTapDevice};
 use stella_transport::{
@@ -37,8 +37,8 @@ use crate::{
     },
     ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
     NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState, StunDiscoveryError,
-    TurnCredentials, TurnTcpClient, TurnTcpClientConfig, TurnUdpClient, TurnUdpClientConfig,
-    TurnUdpError,
+    TurnCredentials, TurnTcpClient, TurnTcpClientConfig, TurnTlsClient, TurnTlsClientConfig,
+    TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
 };
 
 const TAP_WRITE_QUEUE_CAPACITY: usize = 64;
@@ -665,7 +665,11 @@ impl ClientDataRuntime {
             (None, None) => {}
         }
         for network in self.networks.values_mut() {
-            for carrier in [ConnectivityCarrier::TurnUdp, ConnectivityCarrier::TurnTcp] {
+            for carrier in [
+                ConnectivityCarrier::TurnUdp,
+                ConnectivityCarrier::TurnTcp,
+                ConnectivityCarrier::TurnTls,
+            ] {
                 let available = self
                     .relay
                     .as_ref()
@@ -868,7 +872,9 @@ impl ClientDataRuntime {
                 TransportEndpoint::Udp(_) => {
                     self.udp.send_to(&endpoint, datagram.bytes()).await?;
                 }
-                TransportEndpoint::TurnUdp { .. } | TransportEndpoint::TurnTcp { .. } => {
+                TransportEndpoint::TurnUdp { .. }
+                | TransportEndpoint::TurnTcp { .. }
+                | TransportEndpoint::TurnTls { .. } => {
                     self.relay
                         .as_ref()
                         .ok_or(TurnUdpError::ActorStopped)?
@@ -1057,7 +1063,7 @@ struct WarmRelay {
     client: WarmRelayClient,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RelaySettings {
     carrier: RuntimeRelayCarrier,
     relay_id: stella_common::RelayId,
@@ -1066,12 +1072,16 @@ struct RelaySettings {
     max_datagram_size: usize,
     allocation_lifetime_seconds: u32,
     idle_timeout_seconds: u32,
+    tls_server_name: String,
+    trust: RelayTrustRequirements,
+    spki_pins: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeRelayCarrier {
     Udp,
     Tcp,
+    Tls,
 }
 
 impl RuntimeRelayCarrier {
@@ -1079,6 +1089,7 @@ impl RuntimeRelayCarrier {
         match self {
             Self::Udp => ConnectivityCarrier::TurnUdp,
             Self::Tcp => ConnectivityCarrier::TurnTcp,
+            Self::Tls => ConnectivityCarrier::TurnTls,
         }
     }
 
@@ -1086,6 +1097,7 @@ impl RuntimeRelayCarrier {
         match self {
             Self::Udp => RelayCarrierMask::TURN_UDP,
             Self::Tcp => RelayCarrierMask::TURN_TCP,
+            Self::Tls => RelayCarrierMask::TURN_TLS,
         }
     }
 
@@ -1093,12 +1105,13 @@ impl RuntimeRelayCarrier {
         match self {
             Self::Udp => ports.turn_udp,
             Self::Tcp => ports.turn_tcp,
+            Self::Tls => ports.turn_tls,
         }
     }
 }
 
 impl RelaySettings {
-    const fn udp_client_config(self) -> TurnUdpClientConfig {
+    const fn udp_client_config(&self) -> TurnUdpClientConfig {
         let mut config =
             TurnUdpClientConfig::new(self.relay_id, self.server_address, self.bind_address);
         config.max_datagram_size = self.max_datagram_size;
@@ -1107,9 +1120,24 @@ impl RelaySettings {
         config
     }
 
-    const fn tcp_client_config(self) -> TurnTcpClientConfig {
+    const fn tcp_client_config(&self) -> TurnTcpClientConfig {
         let mut config =
             TurnTcpClientConfig::new(self.relay_id, self.server_address, self.bind_address);
+        config.max_datagram_size = self.max_datagram_size;
+        config.allocation_lifetime_seconds = self.allocation_lifetime_seconds;
+        config.idle_timeout_seconds = self.idle_timeout_seconds;
+        config
+    }
+
+    fn tls_client_config(&self) -> TurnTlsClientConfig {
+        let mut config = TurnTlsClientConfig::new(
+            self.relay_id,
+            self.server_address,
+            self.bind_address,
+            self.tls_server_name.clone(),
+            self.trust,
+            self.spki_pins.clone(),
+        );
         config.max_datagram_size = self.max_datagram_size;
         config.allocation_lifetime_seconds = self.allocation_lifetime_seconds;
         config.idle_timeout_seconds = self.idle_timeout_seconds;
@@ -1126,6 +1154,7 @@ struct SelectedRelay {
 enum WarmRelayClient {
     Udp(TurnUdpClient),
     Tcp(TurnTcpClient),
+    Tls(TurnTlsClient),
 }
 
 impl WarmRelayClient {
@@ -1133,6 +1162,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(_) => ConnectivityCarrier::TurnUdp,
             Self::Tcp(_) => ConnectivityCarrier::TurnTcp,
+            Self::Tls(_) => ConnectivityCarrier::TurnTls,
         }
     }
 
@@ -1140,6 +1170,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.relay_id(),
             Self::Tcp(client) => client.relay_id(),
+            Self::Tls(client) => client.relay_id(),
         }
     }
 
@@ -1147,6 +1178,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.relayed_address(),
             Self::Tcp(client) => client.relayed_address(),
+            Self::Tls(client) => client.relayed_address(),
         }
     }
 
@@ -1154,6 +1186,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.mapped_address(),
             Self::Tcp(client) => client.mapped_address(),
+            Self::Tls(client) => client.mapped_address(),
         }
     }
 
@@ -1161,6 +1194,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.capabilities(),
             Self::Tcp(client) => client.capabilities(),
+            Self::Tls(client) => client.capabilities(),
         }
     }
 
@@ -1168,6 +1202,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.replace_credentials(credentials).await,
             Self::Tcp(client) => client.replace_credentials(credentials).await,
+            Self::Tls(client) => client.replace_credentials(credentials).await,
         }
     }
 
@@ -1175,6 +1210,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.prepare_peer(endpoint).await,
             Self::Tcp(client) => client.prepare_peer(endpoint).await,
+            Self::Tls(client) => client.prepare_peer(endpoint).await,
         }
     }
 
@@ -1186,6 +1222,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.send_to(endpoint, datagram).await,
             Self::Tcp(client) => client.send_to(endpoint, datagram).await,
+            Self::Tls(client) => client.send_to(endpoint, datagram).await,
         }
     }
 
@@ -1193,6 +1230,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.receive(output).await,
             Self::Tcp(client) => client.receive(output).await,
+            Self::Tls(client) => client.receive(output).await,
         }
     }
 
@@ -1200,6 +1238,7 @@ impl WarmRelayClient {
         match self {
             Self::Udp(client) => client.shutdown().await,
             Self::Tcp(client) => client.shutdown().await,
+            Self::Tls(client) => client.shutdown().await,
         }
     }
 }
@@ -1534,7 +1573,11 @@ fn relay_selections(
         return Ok(Vec::new());
     };
     let mut selections = Vec::new();
-    for carrier in [RuntimeRelayCarrier::Udp, RuntimeRelayCarrier::Tcp] {
+    for carrier in [
+        RuntimeRelayCarrier::Udp,
+        RuntimeRelayCarrier::Tcp,
+        RuntimeRelayCarrier::Tls,
+    ] {
         for service in connectivity.relay_services().iter().filter(|service| {
             service.carriers().contains(carrier.mask()) && carrier.port(service.ports()) != 0
         }) {
@@ -1556,6 +1599,21 @@ fn relay_selections(
                             .min(TURN_UDP_MAX_DATAGRAM_SIZE),
                         allocation_lifetime_seconds: service.allocation_lifetime_seconds(),
                         idle_timeout_seconds: service.idle_timeout_seconds(),
+                        tls_server_name: if carrier == RuntimeRelayCarrier::Tls {
+                            service.tls_server_name().to_owned()
+                        } else {
+                            String::new()
+                        },
+                        trust: if carrier == RuntimeRelayCarrier::Tls {
+                            service.trust()
+                        } else {
+                            RelayTrustRequirements::NONE
+                        },
+                        spki_pins: if carrier == RuntimeRelayCarrier::Tls {
+                            service.spki_pins().to_vec()
+                        } else {
+                            Vec::new()
+                        },
                     },
                     credentials: TurnCredentials::new(
                         service.credential_username().to_vec(),
@@ -1578,6 +1636,10 @@ async fn allocate_relay(selected: SelectedRelay) -> Result<WarmRelay, RuntimeErr
         ),
         RuntimeRelayCarrier::Tcp => WarmRelayClient::Tcp(
             TurnTcpClient::allocate(selected.settings.tcp_client_config(), selected.credentials)
+                .await?,
+        ),
+        RuntimeRelayCarrier::Tls => WarmRelayClient::Tls(
+            TurnTlsClient::allocate(selected.settings.tls_client_config(), selected.credentials)
                 .await?,
         ),
     };
@@ -1690,7 +1752,9 @@ mod tests {
         let service = RelayServiceRef {
             relay_id: RelayId::from_bytes([0x52; 16]),
             carriers: RelayCarrierMask::from_bits(
-                RelayCarrierMask::TURN_UDP.bits() | RelayCarrierMask::TURN_TCP.bits(),
+                RelayCarrierMask::TURN_UDP.bits()
+                    | RelayCarrierMask::TURN_TCP.bits()
+                    | RelayCarrierMask::TURN_TLS.bits(),
             )
             .expect("test relay carriers"),
             priority: 4,
@@ -1700,19 +1764,19 @@ mod tests {
             credential_issued_at: now,
             credential_expires_at: now + 600,
             hostname: "",
-            tls_server_name: "",
+            tls_server_name: "relay.example.test",
             credential_username: b"node-runtime-test",
             credential_secret: b"0123456789abcdef0123456789abcdef",
             region: "test",
-            trust: RelayTrustRequirements::NONE,
+            trust: RelayTrustRequirements::SPKI_PIN,
             ports: RelayPorts {
                 turn_udp: 3_478,
                 turn_tcp: 3_479,
-                turn_tls: 0,
+                turn_tls: 443,
                 secure_websocket: 0,
             },
             addresses: &addresses,
-            spki_pins: &[],
+            spki_pins: &[[1; 32]],
         };
         let mut relay_bytes = vec![0_u8; 4 + service.encoded_len().expect("service length")];
         encode_relay_service_list(&[service], &mut relay_bytes).expect("encode relay list");
@@ -1734,14 +1798,14 @@ mod tests {
     }
 
     #[test]
-    fn relay_selection_prefers_udp_then_tcp_and_uses_ephemeral_family_binds() {
+    fn relay_selection_prefers_udp_then_tcp_then_tls_and_uses_ephemeral_family_binds() {
         let config = connectivity_config();
         let selections = relay_selections(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             Some(&config),
         )
         .expect("relay selections");
-        assert_eq!(selections.len(), 4);
+        assert_eq!(selections.len(), 6);
         assert_eq!(selections[0].settings.carrier, RuntimeRelayCarrier::Udp);
         assert_eq!(
             selections[0].settings.server_address,
@@ -1768,6 +1832,28 @@ mod tests {
             selections[0].settings.max_datagram_size,
             TURN_UDP_MAX_DATAGRAM_SIZE
         );
+        assert_eq!(selections[4].settings.carrier, RuntimeRelayCarrier::Tls);
+        assert_eq!(
+            selections[4].settings.server_address,
+            "192.0.2.20:443"
+                .parse::<SocketAddr>()
+                .expect("IPv4 TLS server")
+        );
+        assert_eq!(selections[5].settings.carrier, RuntimeRelayCarrier::Tls);
+        assert_eq!(
+            selections[5].settings.server_address,
+            "[2001:db8::20]:443"
+                .parse::<SocketAddr>()
+                .expect("IPv6 TLS server")
+        );
+        assert_eq!(selections[4].settings.tls_server_name, "relay.example.test");
+        assert_eq!(
+            selections[4].settings.trust,
+            RelayTrustRequirements::SPKI_PIN
+        );
+        assert_eq!(selections[4].settings.spki_pins, vec![[1; 32]]);
+        assert_eq!(selections[0].settings.trust, RelayTrustRequirements::NONE);
+        assert!(selections[0].settings.spki_pins.is_empty());
         let preferred = preferred_relay_settings(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             Some(&config),
