@@ -2716,7 +2716,7 @@ mod tests {
     #[cfg(windows)]
     use stella_server::{
         tls::{create_self_signed_tls_identity, load_tls_server_config, DEFAULT_TLS_VALIDITY_DAYS},
-        turn_relay::TurnTlsRelay,
+        turn_relay::{TurnTlsRelay, TurnWebSocketRelay},
     };
     use stella_transport::{
         Endpoint as TransportEndpoint, TurnStream, MAX_TURN_STREAM_RECORD_SIZE,
@@ -2733,7 +2733,7 @@ mod tests {
         TurnUdpClient, TurnUdpClientConfig, TurnUdpError, TurnWebSocketClientConfig,
     };
     #[cfg(windows)]
-    use super::{TurnTlsClient, TurnTlsClientConfig};
+    use super::{TurnTlsClient, TurnTlsClientConfig, TurnWebSocketClient};
 
     #[cfg(windows)]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -3173,6 +3173,140 @@ mod tests {
             .expect("relay task join")
             .expect("relay run");
         std::fs::remove_dir_all(&directory).expect("remove TLS test directory");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn websocket_allocations_authenticate_upgrade_and_preserve_datagrams() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create WebSocket TLS test directory");
+        let certificate = directory.join("relay-cert.pem");
+        let private_key = directory.join("relay-key.pem");
+        let identity = create_self_signed_tls_identity(
+            &certificate,
+            &private_key,
+            &[],
+            DEFAULT_TLS_VALIDITY_DAYS,
+        )
+        .expect("create WebSocket relay TLS identity");
+        let tls_config = load_tls_server_config(&certificate, &private_key)
+            .expect("load WebSocket relay TLS identity");
+
+        let relay_id = RelayId::from_bytes([0x71; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x72; 32], 300).expect("credential authority");
+        let now = unix_time_for_test();
+        let credential_a = authority
+            .issue(relay_id, NodeId::from_bytes([0x73; 16]), now)
+            .expect("issue A credential");
+        let credential_b = authority
+            .issue(relay_id, NodeId::from_bytes([0x74; 16]), now)
+            .expect("issue B credential");
+        let mut relay_config = TurnTcpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        relay_config.max_datagram_size = 1_200;
+        let relay =
+            TurnWebSocketRelay::bind(relay_config, authority, tls_config, Duration::from_secs(2))
+                .await
+                .expect("bind secure WebSocket relay");
+        let relay_address = relay.local_address().expect("WebSocket relay address");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let relay_task = tokio::spawn(relay.run(async move {
+            let _result = shutdown_receiver.await;
+        }));
+
+        let client_config = TurnWebSocketClientConfig::new(
+            relay_id,
+            relay_address,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            "localhost".to_owned(),
+            RelayTrustRequirements::SPKI_PIN,
+            vec![identity.spki_sha256],
+        );
+        let client_a = TurnWebSocketClient::allocate(
+            client_config.clone(),
+            TurnCredentials::new(
+                credential_a.username().to_vec(),
+                credential_a.secret().to_vec(),
+                credential_a.expires_at(),
+            )
+            .expect("A credentials"),
+        )
+        .await
+        .expect("allocate A over secure WebSocket");
+        let client_b = TurnWebSocketClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential_b.username().to_vec(),
+                credential_b.secret().to_vec(),
+                credential_b.expires_at(),
+            )
+            .expect("B credentials"),
+        )
+        .await
+        .expect("allocate B over secure WebSocket");
+        let endpoint_a = client_a.local_endpoint();
+        let endpoint_b = client_b.local_endpoint();
+        assert!(matches!(
+            endpoint_a,
+            TransportEndpoint::SecureWebSocket { .. }
+        ));
+        assert!(matches!(
+            endpoint_b,
+            TransportEndpoint::SecureWebSocket { .. }
+        ));
+        client_a
+            .prepare_peer(&endpoint_b)
+            .await
+            .expect("prepare B from A");
+        client_b
+            .prepare_peer(&endpoint_a)
+            .await
+            .expect("prepare A from B");
+
+        let mut received = [0_u8; 64];
+        client_a
+            .send_to(&endpoint_b, b"A to B over secure WebSocket")
+            .await
+            .expect("relay A to B");
+        let metadata = timeout(Duration::from_secs(2), client_b.receive(&mut received))
+            .await
+            .expect("B receive timeout")
+            .expect("B receive");
+        assert_eq!(metadata.source, endpoint_a);
+        assert_eq!(
+            &received[..metadata.length],
+            b"A to B over secure WebSocket"
+        );
+
+        client_b
+            .send_to(&endpoint_a, b"B to A over secure WebSocket")
+            .await
+            .expect("relay B to A");
+        let metadata = timeout(Duration::from_secs(2), client_a.receive(&mut received))
+            .await
+            .expect("A receive timeout")
+            .expect("A receive");
+        assert_eq!(metadata.source, endpoint_b);
+        assert_eq!(
+            &received[..metadata.length],
+            b"B to A over secure WebSocket"
+        );
+
+        client_a.shutdown().await.expect("shutdown A");
+        client_b.shutdown().await.expect("shutdown B");
+        let _result = shutdown_sender.send(());
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect("relay shutdown timeout")
+            .expect("relay task join")
+            .expect("relay run");
+        std::fs::remove_dir_all(&directory).expect("remove WebSocket TLS test directory");
     }
 
     #[test]
