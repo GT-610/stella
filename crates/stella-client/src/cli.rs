@@ -265,14 +265,20 @@ async fn run_active_control(
     identity: &stella_crypto::IdentitySigningKey,
     mut active: ActiveControl,
 ) -> Result<()> {
-    let mut data = ClientDataRuntime::start(config, active.networks(), identity)
-        .await
-        .context("could not start Windows UDP/TAP data plane")?;
+    let mut data = ClientDataRuntime::start_with_connectivity(
+        config,
+        active.networks(),
+        identity,
+        active.connectivity_config(),
+    )
+    .await
+    .context("could not start Windows UDP/TAP data plane")?;
     let result = async {
         publish_configured_endpoints(config, &mut active).await?;
+        synchronize_and_publish_connectivity(&mut active, &mut data, true).await?;
         data.reconcile(config, active.networks(), identity)
             .await
-            .context("could not reconcile data plane after endpoint publication")?;
+            .context("could not reconcile data plane after reachability publication")?;
         tracing::info!(
             udp = %data.local_udp_address(),
             networks = active.networks().len(),
@@ -300,7 +306,7 @@ async fn run_active_io(
         tokio::select! {
             update = active.receive_update() => {
                 let update = update?;
-                match update {
+                match &update {
                 stella_client::ControlUpdate::ServerShutdown { deadline } => {
                     anyhow::bail!("controller requested shutdown with deadline {deadline}")
                 }
@@ -310,8 +316,10 @@ async fn run_active_io(
                 } => anyhow::bail!(
                     "controller sent status {status} with retry delay {retry_after_ms:?}"
                 ),
-                    update => tracing::debug!(?update, "applied controller update"),
+                    _ => {}
                 }
+                synchronize_and_publish_connectivity(active, data, false).await?;
+                tracing::debug!(?update, "applied controller update");
                 data.reconcile(config, active.networks(), identity)
                     .await
                     .context("could not reconcile data plane after control update")?;
@@ -334,6 +342,7 @@ async fn run_active_io(
                     updated_networks = report.updated_networks().len(),
                     "controller heartbeat acknowledged"
                 );
+                synchronize_and_publish_connectivity(active, data, false).await?;
                 data.reconcile(config, active.networks(), identity)
                     .await
                     .context("could not reconcile data plane after heartbeat")?;
@@ -361,6 +370,58 @@ async fn run_active_io(
                     Err(error) => return Err(error).context("data-plane I/O failed"),
                 }
             }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn publish_current_connectivity(
+    active: &mut ActiveControl,
+    data: &ClientDataRuntime,
+) -> Result<()> {
+    if active.connection().protocol_version() != stella_proto::ProtocolVersion::V0_2 {
+        return Ok(());
+    }
+    let network_ids = active.networks().keys().copied().collect::<Vec<_>>();
+    for network_id in network_ids {
+        let generation = data.connectivity_generation(network_id)?;
+        tokio::time::timeout(
+            CONTROL_OPERATION_TIMEOUT,
+            active.publish_connectivity(network_id, generation),
+        )
+        .await
+        .with_context(|| format!("connectivity publication timed out for network {network_id}"))?
+        .with_context(|| format!("could not publish connectivity for network {network_id}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn synchronize_and_publish_connectivity(
+    active: &mut ActiveControl,
+    data: &mut ClientDataRuntime,
+    mut publish: bool,
+) -> Result<()> {
+    loop {
+        let control_revision = active
+            .connectivity_config()
+            .map(stella_client::ConnectivityConfigState::revision);
+        if data.connectivity_revision() != control_revision {
+            data.replace_connectivity_config(active.connectivity_config(), active.networks())
+                .await
+                .context("could not replace Windows relay configuration")?;
+            publish = true;
+        }
+        if !publish {
+            return Ok(());
+        }
+        publish_current_connectivity(active, data).await?;
+        publish = false;
+        let latest_revision = active
+            .connectivity_config()
+            .map(stella_client::ConnectivityConfigState::revision);
+        if data.connectivity_revision() == latest_revision {
+            return Ok(());
         }
     }
 }
