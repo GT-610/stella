@@ -45,8 +45,8 @@ and upstream firewalls.
 
 This optional version 0.2 section lets the controller distribute STUN servers,
 Relay locations, TLS trust, and short-lived node-scoped Relay credentials. The
-built-in server can run the configured TURN UDP service; STUN and the other
-advertised Relay carriers still require separately deployed services.
+built-in server can run the configured TURN UDP and TURN TCP services; STUN and
+the secure Relay carriers still require separately deployed services.
 
 Create the shared credential authority key without exposing it on stdout:
 
@@ -72,6 +72,7 @@ hostname = "relay.example.net"
 tls_server_name = "relay.example.net"
 require_web_pki = true
 turn_udp = 3478
+turn_tcp = 3479
 turn_tls = 443
 addresses = ["192.0.2.30", "2001:db8::30"]
 ```
@@ -89,7 +90,7 @@ Relay processes. Clients receive only short-lived credentials bound to their
 node identity and a specific Relay ID. The controller refreshes them halfway
 through their remaining lifetime over the authenticated control channel.
 
-Start the built-in TURN UDP relay in a separate process:
+Start the built-in TURN UDP and TCP carriers in separate processes:
 
 ```powershell
 $Server = 'C:\Stella\stella-server.exe'
@@ -97,21 +98,29 @@ $Config = 'C:\Stella\server.toml'
 
 & $Server --config $Config relay run `
   --id 01010101010101010101010101010101 `
+  --carrier udp `
   --listen 0.0.0.0:3478 `
+  --advertise 192.0.2.30
+
+& $Server --config $Config relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier tcp `
+  --listen 0.0.0.0:3479 `
   --advertise 192.0.2.30
 ```
 
-Allow inbound UDP 3478 through the host and upstream firewalls. The advertised
-IP must be reachable by every client. The current relay asks Windows for a
+Allow inbound UDP 3478 and TCP 3479 through the host and upstream firewalls.
+The advertised IP must be reachable by every client. Both carriers ask Windows for a
 dynamic UDP port for each allocation, so those sockets must also be allowed by
 the host firewall. If the relay is behind NAT, forward the Windows UDP dynamic
 port range as well as 3478; a directly assigned public IP is preferable. You
 can inspect the current range with `netsh int ipv4 show dynamicport udp`.
 
-The process refuses a listener port that differs from the selected relay's
-`turn_udp` value and exits cleanly on Ctrl+C. Use `--allocation-bind` for a
+Each process refuses a listener port that differs from the selected relay's
+matching `turn_udp` or `turn_tcp` value and exits cleanly on Ctrl+C. Use
+`--allocation-bind` for a
 specific local allocation address. Capacity flags and current carrier limits
-are documented in the [server CLI reference](/api/server-cli#run-a-turn-udp-relay).
+are documented in the [server CLI reference](/api/server-cli#run-a-turn-relay).
 
 ## Create a network and enrollment material
 

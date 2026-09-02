@@ -178,6 +178,44 @@ impl ServerConfig {
             idle_timeout_seconds: relay.idle_timeout_seconds,
         })
     }
+
+    /// Resolves one configured TURN TCP relay into executable service settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when connectivity services are absent, the
+    /// relay ID is unknown, TURN TCP is not advertised, or a numeric bound
+    /// cannot be represented by this platform.
+    pub fn turn_tcp_relay_settings(
+        &self,
+        relay_id: RelayId,
+    ) -> Result<TurnTcpRelaySettings, ConfigError> {
+        let connectivity = self
+            .connectivity
+            .as_ref()
+            .ok_or_else(|| invalid_connectivity("connectivity services are not configured"))?;
+        let relay = connectivity
+            .relay_services
+            .iter()
+            .find(|relay| relay.relay_id == relay_id)
+            .ok_or_else(|| invalid_connectivity("requested relay ID is not configured"))?;
+        if !relay.carriers.contains(RelayCarrierMask::TURN_TCP) || relay.ports.turn_tcp == 0 {
+            return Err(invalid_connectivity(
+                "requested relay does not advertise TURN TCP",
+            ));
+        }
+        let max_datagram_size =
+            usize::try_from(relay.max_datagram_size).map_err(|_| ConfigError::LengthOverflow)?;
+        Ok(TurnTcpRelaySettings {
+            relay_id,
+            credential_key_path: connectivity.credential_key_path.clone(),
+            credential_lifetime_seconds: connectivity.credential_lifetime_seconds,
+            port: relay.ports.turn_tcp,
+            max_datagram_size,
+            allocation_lifetime_seconds: relay.allocation_lifetime_seconds,
+            idle_timeout_seconds: relay.idle_timeout_seconds,
+        })
+    }
 }
 
 /// Executable settings derived from one advertised TURN UDP relay service.
@@ -190,6 +228,25 @@ pub struct TurnUdpRelaySettings {
     /// Controller-issued credential lifetime used by the shared authority.
     pub credential_lifetime_seconds: u64,
     /// Advertised TURN UDP port.
+    pub port: u16,
+    /// Advertised relayed Stella datagram ceiling.
+    pub max_datagram_size: usize,
+    /// Maximum granted allocation lifetime.
+    pub allocation_lifetime_seconds: u32,
+    /// Allocation inactivity deadline.
+    pub idle_timeout_seconds: u32,
+}
+
+/// Executable settings derived from one advertised TURN TCP relay service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnTcpRelaySettings {
+    /// Stable configured relay identity.
+    pub relay_id: RelayId,
+    /// Protected shared credential authority key path.
+    pub credential_key_path: PathBuf,
+    /// Controller-issued credential lifetime used by the shared authority.
+    pub credential_lifetime_seconds: u64,
+    /// Advertised TURN TCP port.
     pub port: u16,
     /// Advertised relayed Stella datagram ceiling.
     pub max_datagram_size: usize,
@@ -784,7 +841,7 @@ private_key = "secrets/tls-key.pem"
     fn connectivity_services_are_protocol_validated_and_canonicalized() {
         let pin = format!("sha256/{}", STANDARD.encode([1_u8; 32]));
         let document = format!(
-            "{VALID_CONFIG}\n[connectivity]\nrevision = 7\ncredential_key = \"secrets/relay-credential.key\"\ncredential_lifetime_seconds = 300\nstun_servers = [\"192.0.2.20:3478\", \"[2001:db8::20]:3478\"]\n\n[[connectivity.relays]]\nid = \"02020202020202020202020202020202\"\npriority = 20\nhostname = \"relay-b.example.com\"\ntls_server_name = \"relay-b.example.com\"\nregion = \"backup\"\nrequire_web_pki = true\nturn_tls = 443\naddresses = [\"192.0.2.31\"]\n\n[[connectivity.relays]]\nid = \"01010101010101010101010101010101\"\npriority = 10\nhostname = \"relay-a.example.com\"\ntls_server_name = \"relay-a.example.com\"\nregion = \"primary\"\nturn_udp = 3478\nturn_tls = 443\naddresses = [\"192.0.2.30\", \"2001:db8::30\"]\nspki_pins = [\"{pin}\"]\n"
+            "{VALID_CONFIG}\n[connectivity]\nrevision = 7\ncredential_key = \"secrets/relay-credential.key\"\ncredential_lifetime_seconds = 300\nstun_servers = [\"192.0.2.20:3478\", \"[2001:db8::20]:3478\"]\n\n[[connectivity.relays]]\nid = \"02020202020202020202020202020202\"\npriority = 20\nhostname = \"relay-b.example.com\"\ntls_server_name = \"relay-b.example.com\"\nregion = \"backup\"\nrequire_web_pki = true\nturn_tls = 443\naddresses = [\"192.0.2.31\"]\n\n[[connectivity.relays]]\nid = \"01010101010101010101010101010101\"\npriority = 10\nhostname = \"relay-a.example.com\"\ntls_server_name = \"relay-a.example.com\"\nregion = \"primary\"\nturn_udp = 3478\nturn_tcp = 3479\nturn_tls = 443\naddresses = [\"192.0.2.30\", \"2001:db8::30\"]\nspki_pins = [\"{pin}\"]\n"
         );
         let parsed = ServerConfig::parse(&document, Path::new("C:/stella"))
             .expect("valid connectivity services");
@@ -804,6 +861,11 @@ private_key = "secrets/tls-key.pem"
         assert_eq!(settings.max_datagram_size, 1_200);
         assert_eq!(settings.allocation_lifetime_seconds, 600);
         assert_eq!(settings.idle_timeout_seconds, 120);
+        let tcp_settings = parsed
+            .turn_tcp_relay_settings(relay_id)
+            .expect("resolve TURN TCP settings");
+        assert_eq!(tcp_settings.port, 3479);
+        assert_eq!(tcp_settings.max_datagram_size, 1_200);
 
         let connectivity = parsed.connectivity.expect("connectivity configured");
         assert_eq!(connectivity.revision, 7);
@@ -818,6 +880,7 @@ private_key = "secrets/tls-key.pem"
         let primary = &connectivity.relay_services[0];
         assert_eq!(primary.priority, 10);
         assert!(primary.carriers.contains(RelayCarrierMask::TURN_UDP));
+        assert!(primary.carriers.contains(RelayCarrierMask::TURN_TCP));
         assert!(primary.carriers.contains(RelayCarrierMask::TURN_TLS));
         assert!(primary.trust.contains(RelayTrustRequirements::SPKI_PIN));
         assert_eq!(primary.addresses[0].priority, 0);

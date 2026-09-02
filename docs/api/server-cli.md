@@ -1,7 +1,7 @@
 # Server administration CLI
 
 `stella-server` initializes a controller deployment, runs its TLS control-plane
-service and TURN UDP relays, creates protected relay credential keys, and
+service and TURN UDP/TCP relays, creates protected relay credential keys, and
 provides authority administration commands. Commands that use deployment state
 load the strict TOML configuration named by `--config` (default: `server.toml`). Commands that
 access authority state derive the controller ID from the protected controller
@@ -62,21 +62,34 @@ The parent directory must already exist. Keep the file with the controller and
 every separately deployed relay process that verifies its credentials; never
 copy it to clients.
 
-## Run a TURN UDP relay
+## Run a TURN relay
 
 ```powershell
 stella-server --config C:\Stella\server.toml relay run `
   --id 01010101010101010101010101010101 `
+  --carrier udp `
   --listen 0.0.0.0:3478 `
   --advertise 192.0.2.30
 ```
 
 `relay run` selects the relay with the matching ID from `[connectivity]`, loads
-the configured protected credential key, and serves TURN over UDP until Ctrl+C.
-The listener port must equal that relay's advertised `turn_udp` port. The
+the configured protected credential key, and serves the carrier selected by
+`--carrier udp|tcp` until Ctrl+C. UDP remains the default for command
+compatibility. The listener port must equal the selected relay's advertised
+`turn_udp` or `turn_tcp` port. The
 advertised address is returned as the relayed address and therefore must be an
 address that remote peers can actually reach. Use `--allocation-bind` when the
 allocation sockets should bind a different local IP from the listener.
+
+Run TCP on its configured port in a separate process:
+
+```powershell
+stella-server --config C:\Stella\server.toml relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier tcp `
+  --listen 0.0.0.0:3479 `
+  --advertise 192.0.2.30
+```
 
 The default capacity is 1024 concurrent allocations globally, four per node,
 and 128 permissions and channels per allocation. The corresponding
@@ -86,13 +99,15 @@ bound memory and socket use. Datagram size, allocation lifetime, idle timeout,
 credential lifetime, and credential key path come from the selected configured
 relay service.
 
-The current built-in relay supports TURN UDP only. Each allocation uses an
+The built-in relay supports TURN UDP and TURN TCP. Both carriers create a UDP
+relayed allocation because Stella carries datagrams; TCP only changes the
+client-to-relay control and data carrier. Each allocation uses an
 operating-system-selected UDP port rather than a configurable allocation port
 pool. A public deployment must permit those sockets through the host firewall;
 if the relay host is behind NAT, the public address and the operating system's
 UDP dynamic port range must also be forwarded. Running the relay directly on a
-public address is strongly preferred. TURN TCP, TLS, WebSocket, and a bounded
-allocation port pool are future work.
+public address is strongly preferred. TURN TLS, WebSocket, and a bounded
+allocation port pool remain future work.
 
 ## Run the controller
 
