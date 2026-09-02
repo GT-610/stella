@@ -3603,6 +3603,129 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("remove WebSocket TLS test directory");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn websocket_allocation_traverses_canonical_http_connect_proxy() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create proxied WebSocket test directory");
+        let certificate = directory.join("relay-cert.pem");
+        let private_key = directory.join("relay-key.pem");
+        let identity = create_self_signed_tls_identity(
+            &certificate,
+            &private_key,
+            &[],
+            DEFAULT_TLS_VALIDITY_DAYS,
+        )
+        .expect("create proxied WebSocket relay TLS identity");
+        let tls_config = load_tls_server_config(&certificate, &private_key)
+            .expect("load proxied WebSocket relay TLS identity");
+
+        let relay_id = RelayId::from_bytes([0x75; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x76; 32], 300).expect("credential authority");
+        let now = unix_time_for_test();
+        let credential = authority
+            .issue(relay_id, NodeId::from_bytes([0x77; 16]), now)
+            .expect("issue proxied credential");
+        let mut relay_config = TurnTcpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        relay_config.max_datagram_size = 1_200;
+        let relay =
+            TurnWebSocketRelay::bind(relay_config, authority, tls_config, Duration::from_secs(2))
+                .await
+                .expect("bind proxied secure WebSocket relay");
+        let relay_address = relay.local_address().expect("WebSocket relay address");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let relay_task = tokio::spawn(relay.run(async move {
+            let _result = shutdown_receiver.await;
+        }));
+
+        let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind HTTP CONNECT proxy");
+        let proxy_address = proxy_listener.local_addr().expect("HTTP proxy address");
+        let expected_request = format!(
+            "CONNECT localhost:{} HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
+            relay_address.port(),
+            relay_address.port()
+        );
+        let proxy_task = tokio::spawn(async move {
+            let (mut downstream, _client) = proxy_listener
+                .accept()
+                .await
+                .expect("accept proxied client");
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                downstream
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("read proxied CONNECT request");
+                request.push(byte[0]);
+                assert!(request.len() <= 1_024);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert_eq!(request, expected_request.as_bytes());
+            let mut upstream = TcpStream::connect(relay_address)
+                .await
+                .expect("connect proxy to WebSocket relay");
+            downstream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("write proxy success response");
+            tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
+                .await
+                .expect("forward proxied WebSocket tunnel");
+        });
+
+        let mut client_config = TurnWebSocketClientConfig::new(
+            relay_id,
+            relay_address,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            "localhost".to_owned(),
+            RelayTrustRequirements::SPKI_PIN,
+            vec![identity.spki_sha256],
+        );
+        client_config.proxy_address = Some(proxy_address);
+        let client = TurnWebSocketClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential.username().to_vec(),
+                credential.secret().to_vec(),
+                credential.expires_at(),
+            )
+            .expect("proxied credentials"),
+        )
+        .await
+        .expect("allocate through HTTP CONNECT proxy");
+        assert!(matches!(
+            client.local_endpoint(),
+            TransportEndpoint::SecureWebSocket { .. }
+        ));
+        client
+            .shutdown()
+            .await
+            .expect("shutdown proxied allocation");
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("proxy shutdown timeout")
+            .expect("proxy task");
+        let _result = shutdown_sender.send(());
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect("relay shutdown timeout")
+            .expect("relay task join")
+            .expect("relay run");
+        std::fs::remove_dir_all(&directory).expect("remove proxied WebSocket test directory");
+    }
+
     #[test]
     fn websocket_upgrade_request_and_response_are_strict_and_canonical() {
         let config = TurnWebSocketClientConfig::new(
