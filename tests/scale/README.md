@@ -30,10 +30,19 @@ It also creates a 101st known node and verifies that membership admission fails
 with `NetworkFull`, proving that the configured bound is enforced rather than
 allowing unbounded growth.
 
+`crates/stella-client/tests/relay_scale.rs` runs the same 32-node and 100-node
+profiles against a live TURN UDP listener. It issues a distinct authenticated
+credential per node, creates every allocation concurrently, verifies that every
+client receives a unique relayed address, keeps all allocations live together,
+and then deletes them cleanly. The listener limit equals the profile size, so a
+distinct extra node must receive TURN status 486 rather than exceeding the
+configured bound.
+
 Run the profiles with metrics visible:
 
 ```powershell
 cargo test -p stella-server --test membership_scale -- --nocapture
+cargo test -p stella-client --test relay_scale -- --nocapture
 ```
 
 ## What this does not prove
