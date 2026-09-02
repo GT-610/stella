@@ -262,6 +262,8 @@ pub struct TurnWebSocketClientConfig {
     pub bind_address: SocketAddr,
     /// Optional explicit HTTP proxy used to establish the TLS tunnel.
     pub proxy_address: Option<SocketAddr>,
+    /// Canonical WebSocket authority hostname, or empty for the numeric address.
+    pub server_hostname: String,
     /// Canonical certificate server name, or empty for a pin-only numeric address.
     pub tls_server_name: String,
     /// Certificate checks required by the authenticated controller configuration.
@@ -289,11 +291,13 @@ impl TurnWebSocketClientConfig {
         trust: RelayTrustRequirements,
         spki_pins: Vec<[u8; 32]>,
     ) -> Self {
+        let server_hostname = tls_server_name.clone();
         Self {
             relay_id,
             server_address,
             bind_address,
             proxy_address: None,
+            server_hostname,
             tls_server_name,
             trust,
             spki_pins,
@@ -336,29 +340,45 @@ impl TurnWebSocketClientConfig {
                 reason: "must be unique and in canonical order",
             });
         }
+        if !self.server_hostname.is_empty()
+            && ServerName::try_from(self.server_hostname.clone()).is_err()
+        {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN WebSocket server hostname",
+                reason: "must be a valid DNS name or IP address",
+            });
+        }
         let _server_name = self.server_name()?;
         Ok(())
     }
 
     fn server_name(&self) -> Result<ServerName<'static>, TurnUdpError> {
-        if self.tls_server_name.is_empty() {
+        let name = if self.tls_server_name.is_empty() {
+            &self.server_hostname
+        } else {
+            &self.tls_server_name
+        };
+        if name.is_empty() {
             return Ok(ServerName::IpAddress(self.server_address.ip().into()));
         }
-        ServerName::try_from(self.tls_server_name.clone()).map_err(|_| {
-            TurnUdpError::InvalidConfig {
-                field: "TURN WebSocket TLS server name",
-                reason: "must be a valid DNS name or IP address",
-            }
+        ServerName::try_from(name.clone()).map_err(|_| TurnUdpError::InvalidConfig {
+            field: "TURN WebSocket TLS server name",
+            reason: "must be a valid DNS name or IP address",
         })
     }
 
     fn authority(&self) -> String {
-        if self.tls_server_name.is_empty() {
+        let hostname = if self.server_hostname.is_empty() {
+            &self.tls_server_name
+        } else {
+            &self.server_hostname
+        };
+        if hostname.is_empty() {
             return self.server_address.to_string();
         }
-        match self.tls_server_name.parse::<IpAddr>() {
+        match hostname.parse::<IpAddr>() {
             Ok(IpAddr::V6(address)) => format!("[{address}]:{}", self.server_address.port()),
-            _ => format!("{}:{}", self.tls_server_name, self.server_address.port()),
+            _ => format!("{hostname}:{}", self.server_address.port()),
         }
     }
 
@@ -3728,7 +3748,7 @@ mod tests {
 
     #[test]
     fn websocket_upgrade_request_and_response_are_strict_and_canonical() {
-        let config = TurnWebSocketClientConfig::new(
+        let mut config = TurnWebSocketClientConfig::new(
             RelayId::from_bytes([0x77; 16]),
             "192.0.2.30:443".parse().expect("relay address"),
             "0.0.0.0:0".parse().expect("bind address"),
@@ -3736,13 +3756,14 @@ mod tests {
             RelayTrustRequirements::SPKI_PIN,
             vec![[1; 32]],
         );
+        config.server_hostname = "relay-connect.example.test".to_owned();
         let credentials =
             TurnCredentials::new(b"123:node".to_vec(), b"0123456789abcdef".to_vec(), 100)
                 .expect("credentials");
         let request = websocket_upgrade_request(&config, &credentials).expect("upgrade request");
         assert_eq!(
             request.uri().to_string(),
-            "wss://relay.example.test:443/stella/turn/v1"
+            "wss://relay-connect.example.test:443/stella/turn/v1"
         );
         assert_eq!(
             request

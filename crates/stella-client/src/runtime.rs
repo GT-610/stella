@@ -18,7 +18,7 @@ use stella_common::{MacAddress, NetworkId};
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
     CommonHeader, ConnectivityCarrier, ConnectivityGenerationRef, IceCandidate, IceCandidateClass,
-    RelayCarrierMask, RelayTrustRequirements,
+    RelayCarrierMask, RelayTrustRequirements, MAX_RELAY_ADDRESSES,
 };
 use stella_tap::{TapCancellationHandle, TapConfig, TapDevice, TapError, WindowsTapDevice};
 use stella_transport::{
@@ -26,7 +26,7 @@ use stella_transport::{
     UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
 };
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::{net::lookup_host, sync::mpsc, time::timeout};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -51,6 +51,7 @@ const ICE_GENERATION_REFRESH_LEAD: u64 = 120;
 const ICE_USERNAME_RANDOM_LENGTH: usize = 6;
 const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
 const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
+const RELAY_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Failure while owning the Windows client data-plane runtime.
 #[derive(Debug, Error)]
@@ -112,6 +113,27 @@ pub enum RuntimeError {
     /// Host-interface enumeration or same-socket STUN discovery failed.
     #[error(transparent)]
     Stun(#[from] StunDiscoveryError),
+    /// A DNS-only relay hostname could not be resolved and had no numeric fallback.
+    #[error("could not resolve relay hostname {hostname}")]
+    RelayDnsResolution {
+        /// Canonical controller-provided relay hostname.
+        hostname: String,
+        /// Operating-system resolver failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A DNS-only relay hostname exceeded the bounded resolver deadline.
+    #[error("relay hostname resolution timed out for {hostname}")]
+    RelayDnsTimeout {
+        /// Canonical controller-provided relay hostname.
+        hostname: String,
+    },
+    /// A DNS-only relay hostname resolved without any usable address.
+    #[error("relay hostname {hostname} resolved without a usable address")]
+    RelayDnsEmpty {
+        /// Canonical controller-provided relay hostname.
+        hostname: String,
+    },
     /// Per-network authenticated routing failed.
     #[error(transparent)]
     Network(#[from] NetworkDataError),
@@ -648,7 +670,8 @@ impl ClientDataRuntime {
             self.udp.local_address(),
             self.secure_websocket_proxy,
             connectivity,
-        )?;
+        )
+        .await?;
         match (self.relay.as_mut(), selected) {
             (Some(current), Some(selected)) if current.settings == selected.settings => {
                 current
@@ -1084,6 +1107,7 @@ struct RelaySettings {
     trust: RelayTrustRequirements,
     spki_pins: Vec<[u8; 32]>,
     proxy_address: Option<SocketAddr>,
+    server_hostname: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1174,6 +1198,7 @@ impl RelaySettings {
         config.allocation_lifetime_seconds = self.allocation_lifetime_seconds;
         config.idle_timeout_seconds = self.idle_timeout_seconds;
         config.proxy_address = self.proxy_address;
+        config.server_hostname.clone_from(&self.server_hostname);
         config
     }
 }
@@ -1587,7 +1612,7 @@ async fn allocate_preferred_relay(
     secure_websocket_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<WarmRelay>, RuntimeError> {
-    let selections = relay_selections(bind_address, secure_websocket_proxy, connectivity)?;
+    let selections = relay_selections(bind_address, secure_websocket_proxy, connectivity).await?;
     let mut last_error = None;
     for selected in selections {
         match allocate_relay(selected).await {
@@ -1601,19 +1626,20 @@ async fn allocate_preferred_relay(
     }
 }
 
-fn preferred_relay_settings(
+async fn preferred_relay_settings(
     bind_address: SocketAddr,
     secure_websocket_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
 ) -> Result<Option<SelectedRelay>, RuntimeError> {
     Ok(
-        relay_selections(bind_address, secure_websocket_proxy, connectivity)?
+        relay_selections(bind_address, secure_websocket_proxy, connectivity)
+            .await?
             .into_iter()
             .next(),
     )
 }
 
-fn relay_selections(
+async fn relay_selections(
     bind_address: SocketAddr,
     secure_websocket_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
@@ -1621,6 +1647,9 @@ fn relay_selections(
     let Some(connectivity) = connectivity else {
         return Ok(Vec::new());
     };
+    let (resolved_services, last_dns_error) =
+        resolve_configured_relay_services(connectivity.relay_services(), secure_websocket_proxy)
+            .await;
     let mut selections = Vec::new();
     for carrier in [
         RuntimeRelayCarrier::Udp,
@@ -1628,12 +1657,18 @@ fn relay_selections(
         RuntimeRelayCarrier::Tls,
         RuntimeRelayCarrier::Websocket,
     ] {
-        for service in connectivity.relay_services().iter().filter(|service| {
+        for (service, resolved_addresses) in resolved_services.iter().filter(|(service, _)| {
             service.carriers().contains(carrier.mask()) && carrier.port(service.ports()) != 0
         }) {
-            for relay_address in service.addresses() {
-                let server_address =
-                    SocketAddr::new(relay_address.address, carrier.port(service.ports()));
+            let proxied_hostname = carrier == RuntimeRelayCarrier::Websocket
+                && secure_websocket_proxy.is_some()
+                && !service.hostname().is_empty();
+            let target_addresses = match (proxied_hostname, secure_websocket_proxy) {
+                (true, Some(proxy)) => vec![proxy.ip()],
+                _ => resolved_addresses.clone(),
+            };
+            for relay_address in target_addresses {
+                let server_address = SocketAddr::new(relay_address, carrier.port(service.ports()));
                 let proxy_address = (carrier == RuntimeRelayCarrier::Websocket)
                     .then_some(secure_websocket_proxy)
                     .flatten();
@@ -1669,6 +1704,11 @@ fn relay_selections(
                             Vec::new()
                         },
                         proxy_address,
+                        server_hostname: if carrier == RuntimeRelayCarrier::Websocket {
+                            service.hostname().to_owned()
+                        } else {
+                            String::new()
+                        },
                     },
                     credentials: TurnCredentials::new(
                         service.credential_username().to_vec(),
@@ -1680,7 +1720,103 @@ fn relay_selections(
             }
         }
     }
-    Ok(selections)
+    match (selections.is_empty(), last_dns_error) {
+        (true, Some(error)) => Err(error),
+        _ => Ok(selections),
+    }
+}
+
+async fn resolve_configured_relay_services(
+    services: &[crate::RelayServiceState],
+    secure_websocket_proxy: Option<SocketAddr>,
+) -> (
+    Vec<(&crate::RelayServiceState, Vec<IpAddr>)>,
+    Option<RuntimeError>,
+) {
+    let mut resolved_services = Vec::with_capacity(services.len());
+    let mut last_dns_error = None;
+    for service in services {
+        let proxy_resolves_only_websocket = secure_websocket_proxy.is_some()
+            && service.carriers() == RelayCarrierMask::SECURE_WEBSOCKET
+            && !service.hostname().is_empty();
+        let addresses = if proxy_resolves_only_websocket {
+            service
+                .addresses()
+                .iter()
+                .map(|address| address.address)
+                .collect()
+        } else {
+            match resolve_relay_addresses(service).await {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    last_dns_error = Some(error);
+                    Vec::new()
+                }
+            }
+        };
+        resolved_services.push((service, addresses));
+    }
+    (resolved_services, last_dns_error)
+}
+
+async fn resolve_relay_addresses(
+    service: &crate::RelayServiceState,
+) -> Result<Vec<IpAddr>, RuntimeError> {
+    let mut addresses = service
+        .addresses()
+        .iter()
+        .map(|address| address.address)
+        .collect::<Vec<_>>();
+    if service.hostname().is_empty() || addresses.len() == usize::from(MAX_RELAY_ADDRESSES) {
+        return Ok(addresses);
+    }
+    let hostname = service.hostname().to_owned();
+    let resolved = match timeout(RELAY_DNS_TIMEOUT, lookup_host((hostname.clone(), 1))).await {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(source)) if addresses.is_empty() => {
+            return Err(RuntimeError::RelayDnsResolution { hostname, source });
+        }
+        Ok(Err(source)) => {
+            tracing::warn!(hostname, %source, "could not augment numeric relay addresses from DNS");
+            return Ok(addresses);
+        }
+        Err(_) if addresses.is_empty() => {
+            return Err(RuntimeError::RelayDnsTimeout { hostname });
+        }
+        Err(_) => {
+            tracing::warn!(hostname, "relay DNS augmentation timed out");
+            return Ok(addresses);
+        }
+    };
+    let mut dns_addresses = resolved.map(|address| address.ip()).collect::<Vec<_>>();
+    dns_addresses.sort_unstable();
+    dns_addresses.dedup();
+    for address in dns_addresses {
+        if addresses.len() == usize::from(MAX_RELAY_ADDRESSES) {
+            break;
+        }
+        if !addresses.contains(&address) && usable_relay_dns_address(address) {
+            addresses.push(address);
+        }
+    }
+    if addresses.is_empty() {
+        return Err(RuntimeError::RelayDnsEmpty { hostname });
+    }
+    Ok(addresses)
+}
+
+const fn usable_relay_dns_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_multicast()
+                && (address.segments()[0] & 0xffc0) != 0xfe80
+                && address.to_ipv4_mapped().is_none()
+        }
+    }
 }
 
 async fn allocate_relay(selected: SelectedRelay) -> Result<WarmRelay, RuntimeError> {
@@ -1780,12 +1916,12 @@ mod tests {
     use stella_proto::{
         encode_relay_service_list, encode_stun_server_list, ConnectivityCarrier, IceCandidate,
         IceCandidateClass, RelayAddress, RelayCarrierMask, RelayPorts, RelayServiceRef,
-        RelayTrustRequirements, StunServer,
+        RelayTrustRequirements, StunServer, MAX_RELAY_ADDRESSES,
     };
 
     use super::{
         effective_tap_mtu, preferred_relay_settings, random_ice_credential, relay_selections,
-        turn_bind_address, ConnectivityConfigState, LocalConnectivityGeneration,
+        turn_bind_address, unix_time, ConnectivityConfigState, LocalConnectivityGeneration,
         RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
         TURN_UDP_MAX_DATAGRAM_SIZE,
     };
@@ -1847,6 +1983,44 @@ mod tests {
             .expect("decode connectivity config")
     }
 
+    fn dns_only_websocket_config(hostname: &str) -> ConnectivityConfigState {
+        let now = unix_time().expect("test time");
+        let stun_servers = [StunServer {
+            priority: 0,
+            address: "192.0.2.10:3478".parse().expect("STUN address"),
+        }];
+        let mut stun_bytes = vec![0_u8; 28];
+        encode_stun_server_list(&stun_servers, &mut stun_bytes).expect("encode STUN list");
+        let service = RelayServiceRef {
+            relay_id: stella_common::RelayId::from_bytes([0x92; 16]),
+            carriers: RelayCarrierMask::SECURE_WEBSOCKET,
+            priority: 0,
+            max_datagram_size: 1_200,
+            allocation_lifetime_seconds: 600,
+            idle_timeout_seconds: 120,
+            credential_issued_at: now,
+            credential_expires_at: now + 600,
+            hostname,
+            tls_server_name: hostname,
+            credential_username: b"node-dns-test",
+            credential_secret: b"0123456789abcdef0123456789abcdef",
+            region: "test",
+            trust: RelayTrustRequirements::SPKI_PIN,
+            ports: RelayPorts {
+                turn_udp: 0,
+                turn_tcp: 0,
+                turn_tls: 0,
+                secure_websocket: 8_443,
+            },
+            addresses: &[],
+            spki_pins: &[[2; 32]],
+        };
+        let mut relay_bytes = vec![0_u8; 4 + service.encoded_len().expect("service length")];
+        encode_relay_service_list(&[service], &mut relay_bytes).expect("encode DNS relay list");
+        ConnectivityConfigState::from_wire(10, &stun_bytes, &relay_bytes, now)
+            .expect("decode DNS connectivity config")
+    }
+
     #[test]
     fn effective_mtu_preserves_lower_host_setting_and_caps_higher_setting() {
         assert_eq!(
@@ -1860,14 +2034,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn relay_selection_uses_udp_tcp_tls_then_websocket_with_family_binds() {
+    #[tokio::test]
+    async fn relay_selection_uses_udp_tcp_tls_then_websocket_with_family_binds() {
         let config = connectivity_config();
         let selections = relay_selections(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             None,
             Some(&config),
         )
+        .await
         .expect("relay selections");
         assert_eq!(selections.len(), 8);
         assert_eq!(selections[0].settings.carrier, RuntimeRelayCarrier::Udp);
@@ -1946,13 +2121,14 @@ mod tests {
             None,
             Some(&config),
         )
+        .await
         .expect("preferred selection")
         .expect("configured relay service");
         assert_eq!(preferred.settings, selections[0].settings);
     }
 
-    #[test]
-    fn websocket_relay_selection_uses_configured_proxy_family() {
+    #[tokio::test]
+    async fn websocket_relay_selection_uses_configured_proxy_family() {
         let config = connectivity_config();
         let proxy = "198.51.100.50:8080"
             .parse::<SocketAddr>()
@@ -1962,6 +2138,7 @@ mod tests {
             Some(proxy),
             Some(&config),
         )
+        .await
         .expect("proxied relay selections");
         assert_eq!(proxied[6].settings.proxy_address, Some(proxy));
         assert_eq!(proxied[7].settings.proxy_address, Some(proxy));
@@ -1973,6 +2150,42 @@ mod tests {
             proxied[7].settings.bind_address,
             "0.0.0.0:0".parse::<SocketAddr>().expect("proxy bind")
         );
+    }
+
+    #[tokio::test]
+    async fn dns_only_websocket_relays_resolve_or_delegate_to_proxy() {
+        let direct = dns_only_websocket_config("localhost");
+        let selections = relay_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            None,
+            Some(&direct),
+        )
+        .await
+        .expect("resolve DNS-only relay");
+        assert!(!selections.is_empty());
+        assert!(selections.len() <= usize::from(MAX_RELAY_ADDRESSES));
+        assert!(selections.iter().all(|selection| {
+            selection.settings.server_address.ip().is_loopback()
+                && selection.settings.server_address.port() == 8_443
+                && selection.settings.server_hostname == "localhost"
+        }));
+
+        let proxy = "198.51.100.50:8080"
+            .parse::<SocketAddr>()
+            .expect("HTTP proxy");
+        let delegated = dns_only_websocket_config("relay.invalid");
+        let selections = relay_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            Some(proxy),
+            Some(&delegated),
+        )
+        .await
+        .expect("delegate DNS-only relay to proxy");
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].settings.proxy_address, Some(proxy));
+        assert_eq!(selections[0].settings.server_address.ip(), proxy.ip());
+        assert_eq!(selections[0].settings.server_address.port(), 8_443);
+        assert_eq!(selections[0].settings.server_hostname, "relay.invalid");
     }
 
     #[test]
