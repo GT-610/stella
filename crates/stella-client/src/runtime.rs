@@ -1953,7 +1953,12 @@ fn unix_time() -> Result<u64, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, time::SystemTime};
+    use std::{
+        future::pending,
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime},
+    };
 
     use stella_common::RelayId;
     use stella_proto::{
@@ -1963,10 +1968,10 @@ mod tests {
     };
 
     use super::{
-        effective_tap_mtu, preferred_relay_settings, random_ice_credential, relay_selections,
-        turn_bind_address, unix_time, ConnectivityConfigState, LocalConnectivityGeneration,
-        RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
-        TURN_UDP_MAX_DATAGRAM_SIZE,
+        allocate_relay_selections, effective_tap_mtu, preferred_relay_settings,
+        random_ice_credential, relay_selections, turn_bind_address, unix_time,
+        ConnectivityConfigState, LocalConnectivityGeneration, RuntimeError, RuntimeRelayCarrier,
+        ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
 
     fn connectivity_config() -> ConnectivityConfigState {
@@ -2229,6 +2234,86 @@ mod tests {
         assert_eq!(selections[0].settings.server_address.ip(), proxy.ip());
         assert_eq!(selections[0].settings.server_address.port(), 8_443);
         assert_eq!(selections[0].settings.server_hostname, "relay.invalid");
+    }
+
+    #[tokio::test]
+    async fn relay_carrier_timeout_skips_remaining_addresses_and_advances() {
+        let selections = relay_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            None,
+            Some(&connectivity_config()),
+        )
+        .await
+        .expect("relay selections");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded_attempts = Arc::clone(&attempts);
+        let selected = tokio::time::timeout(
+            Duration::from_secs(1),
+            allocate_relay_selections(selections, Duration::from_millis(20), move |selection| {
+                let attempts = Arc::clone(&recorded_attempts);
+                let carrier = selection.settings.carrier;
+                async move {
+                    attempts.lock().expect("attempt log").push(carrier);
+                    if carrier == RuntimeRelayCarrier::Udp {
+                        pending::<Result<RuntimeRelayCarrier, RuntimeError>>().await
+                    } else {
+                        Ok(carrier)
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("bounded fallback")
+        .expect("next carrier succeeds")
+        .expect("selected relay carrier");
+        assert_eq!(selected, RuntimeRelayCarrier::Tcp);
+        assert_eq!(
+            *attempts.lock().expect("attempt log"),
+            [RuntimeRelayCarrier::Udp, RuntimeRelayCarrier::Tcp]
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_fallback_returns_last_safe_timeout_after_all_carriers() {
+        let selections = relay_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            None,
+            Some(&connectivity_config()),
+        )
+        .await
+        .expect("relay selections");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded_attempts = Arc::clone(&attempts);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            allocate_relay_selections(selections, Duration::from_millis(20), move |selection| {
+                let attempts = Arc::clone(&recorded_attempts);
+                let carrier = selection.settings.carrier;
+                async move {
+                    attempts.lock().expect("attempt log").push(carrier);
+                    pending::<Result<(), RuntimeError>>().await
+                }
+            }),
+        )
+        .await
+        .expect("bounded fallback")
+        .expect_err("all carriers time out");
+        match error {
+            RuntimeError::RelayCarrierTimeout { relay_id, carrier } => {
+                assert_eq!(relay_id, RelayId::from_bytes([0x52; 16]));
+                assert_eq!(carrier, ConnectivityCarrier::SecureWebSocket);
+            }
+            other => panic!("unexpected fallback error: {other}"),
+        }
+        assert_eq!(
+            *attempts.lock().expect("attempt log"),
+            [
+                RuntimeRelayCarrier::Udp,
+                RuntimeRelayCarrier::Tcp,
+                RuntimeRelayCarrier::Tls,
+                RuntimeRelayCarrier::Websocket,
+            ]
+        );
     }
 
     #[test]
