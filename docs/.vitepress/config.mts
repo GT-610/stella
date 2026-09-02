@@ -81,7 +81,8 @@ export default defineConfig({
                 { text: '0029：HTTP 代理隧道', link: '/zh/protocol/adr/0029-tunnel-websocket-through-http-proxy' },
                 { text: '0030：代理控制引导', link: '/zh/protocol/adr/0030-bootstrap-control-through-http-proxy' },
                 { text: '0031：Relay 建立期限', link: '/zh/protocol/adr/0031-bound-relay-carrier-establishment' },
-                { text: '0032：Relay DNS 期限', link: '/zh/protocol/adr/0032-bound-relay-dns-preparation' }
+                { text: '0032：Relay DNS 期限', link: '/zh/protocol/adr/0032-bound-relay-dns-preparation' },
+                { text: '0033：Relay 刷新', link: '/zh/protocol/adr/0033-preserve-relay-carrier-on-refresh' }
               ]
             }
           ],
@@ -195,7 +196,8 @@ export default defineConfig({
             { text: '0029: HTTP proxy tunnel', link: '/protocol/adr/0029-tunnel-websocket-through-http-proxy' },
             { text: '0030: Proxy control bootstrap', link: '/protocol/adr/0030-bootstrap-control-through-http-proxy' },
             { text: '0031: Relay establishment bounds', link: '/protocol/adr/0031-bound-relay-carrier-establishment' },
-            { text: '0032: Relay DNS bounds', link: '/protocol/adr/0032-bound-relay-dns-preparation' }
+            { text: '0032: Relay DNS bounds', link: '/protocol/adr/0032-bound-relay-dns-preparation' },
+            { text: '0033: Preserve relay carrier', link: '/protocol/adr/0033-preserve-relay-carrier-on-refresh' }
           ]
         }
       ],

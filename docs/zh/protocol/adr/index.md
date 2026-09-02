@@ -38,3 +38,4 @@ ADR 记录约束 Stella 协议或其参考实现的决策。已接受的记录�
 - [0030：通过本地 HTTP 代理引导控制器 TLS](./0030-bootstrap-control-through-http-proxy.md)
 - [0031：限制 Relay carrier 建立时间](./0031-bound-relay-carrier-establishment.md)
 - [0032：限制 Relay DNS 准备时间](./0032-bound-relay-dns-preparation.md)
+- [0033：刷新时保留可达的 Relay carrier](./0033-preserve-relay-carrier-on-refresh.md)
