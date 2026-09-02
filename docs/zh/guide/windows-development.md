@@ -60,12 +60,13 @@ cargo run -p stella-server -- --config $Config run
 
 控制器和 Windows 客户端现在可以组成实验性的虚拟局域网。请为每台客户端生成独立的
 注册和加入令牌，然后按 [Windows 客户端 CLI 指南](/zh/api/client-cli)初始化、加入并
-运行客户端。每台客户端需要一块独立、已安装的 TAP-Windows 适配器，一个在客户端配置中
-公布且可达的 UDP 端点，以及允许对等 UDP 流量通过的防火墙或 NAT 规则。活动客户端应在
-提升权限的 PowerShell 会话中运行，以便打开 TAP 适配器。
+运行客户端。每台客户端需要一块独立、已安装的 TAP-Windows 适配器。直连 ICE 发现和
+配置的 Relay 承载不要求客户端端口映射；可选的显式 HTTP 代理还能承载最后一级 Secure
+WebSocket 兜底。活动客户端应在提升权限的 PowerShell 会话中运行，以便打开 TAP 适配器。
 
-初始客户端配置的 `advertised_endpoints` 列表为空。运行客户端前，请将该列表替换为端口
-与 `udp_bind` 一致的端点，例如：
+初始客户端配置的 `advertised_endpoints` 列表为空。控制器已下发 STUN 和 Relay 服务时
+应保持为空。若确实拥有固定公网映射，可以额外公布一个端口与 `udp_bind` 一致的直连
+候选，例如：
 
 ```toml
 [[transport.advertised_endpoints]]

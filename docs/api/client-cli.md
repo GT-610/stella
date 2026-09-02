@@ -27,8 +27,11 @@ stella-client --config C:\Stella\client.toml init `
   --controller-id 0123456789abcdef0123456789abcdef `
   --spki-pin sha256/BASE64_SHA256_SPKI_DIGEST= `
   --display-name "Gaming PC" `
-  --udp-bind 0.0.0.0:45100
+  --udp-bind 0.0.0.0:45100 `
+  --secure-websocket-proxy 192.0.2.40:8080
 ```
+
+Omit `--secure-websocket-proxy` on networks that permit direct outbound TCP.
 
 `init` creates the configuration and `secrets/node.pk8` with create-new
 semantics. On Windows, identity inheritance is disabled and only the current
@@ -51,8 +54,21 @@ max_datagram_size = 1200
 
 Static endpoints improve direct-path discovery but are not a substitute for a
 real public mapping. Do not publish an unroutable private address as an Internet
-candidate. Secure WebSocket uses direct outbound TLS/WSS to the configured relay
-port; explicit HTTP proxy negotiation is not currently implemented.
+candidate. When `transport.secure_websocket_proxy` is present, the last relay
+fallback connects to that numeric proxy, sends a bounded HTTP CONNECT for the
+authenticated relay authority, and then performs the normal relay TLS and WSS
+handshakes inside the tunnel:
+
+```toml
+[transport]
+udp_bind = "0.0.0.0:45100"
+secure_websocket_proxy = "192.0.2.40:8080"
+```
+
+The proxy setting affects only secure WebSocket; UDP, TURN TCP, and direct TURN
+TLS retain their normal earlier attempts. The first profile supports proxies
+that do not require authentication. A `407` response fails closed, and Stella
+never sends relay credentials in the plaintext CONNECT request.
 
 Enrollment and join tokens are never accepted by `init` and are never written
 to disk.

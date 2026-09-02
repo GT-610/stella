@@ -146,7 +146,11 @@ the [server CLI reference](/api/server-cli#run-a-turn-relay).
 Windows clients try configured relay carriers in the order UDP, TCP, TLS, then
 secure WebSocket. Failure of an earlier carrier automatically advances to the
 next configured address without requiring port forwarding on the client.
-Explicit HTTP proxy negotiation is not currently implemented.
+On proxy-only networks, set the client's numeric
+`transport.secure_websocket_proxy` address. The client establishes HTTP CONNECT
+to the relay authority and then performs the unchanged Relay TLS and WSS
+handshakes inside that tunnel. The first profile does not support proxy
+authentication.
 
 ## Create a network and enrollment material
 

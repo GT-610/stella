@@ -65,14 +65,15 @@ active sessions and shut down cleanly.
 The controller and Windows client now form an experimental virtual LAN. Generate
 separate enrollment and join tokens for every client, then initialize, join, and
 run each client as described in the [Windows client CLI guide](/api/client-cli).
-Each client needs a distinct installed TAP-Windows adapter, a reachable UDP
-endpoint published in its client configuration, and firewall or NAT rules that
-allow peer UDP traffic. Run the active client from an elevated PowerShell
-session so it can open the TAP adapter.
+Each client needs a distinct installed TAP-Windows adapter. Direct ICE discovery
+and the configured relay carriers remove the need for client port forwarding;
+an optional explicit HTTP proxy can carry the secure WebSocket fallback. Run the
+active client from an elevated PowerShell session so it can open the TAP adapter.
 
-The initial client configuration has an empty `advertised_endpoints` list. Before
-running a client, replace that list with an endpoint whose port matches
-`udp_bind`; for example:
+The initial client configuration has an empty `advertised_endpoints` list. Leave
+it empty when the controller supplies STUN and relay services. A known static
+public mapping may still be published as an extra direct candidate; its port
+must match `udp_bind`:
 
 ```toml
 [[transport.advertised_endpoints]]

@@ -24,8 +24,11 @@ stella-client --config C:\Stella\client.toml init `
   --controller-id 0123456789abcdef0123456789abcdef `
   --spki-pin sha256/BASE64_SHA256_SPKI_DIGEST= `
   --display-name "Gaming PC" `
-  --udp-bind 0.0.0.0:45100
+  --udp-bind 0.0.0.0:45100 `
+  --secure-websocket-proxy 192.0.2.40:8080
 ```
+
+允许直接出站 TCP 的网络请省略 `--secure-websocket-proxy`。
 
 `init` 以仅创建语义生成配置和 `secrets/node.pk8`。在 Windows 上，它会禁用身份
 文件的继承权限，只允许当前账户和 `LocalSystem` 访问。已有目标不会被替换；初始化
@@ -43,8 +46,19 @@ priority = 10
 max_datagram_size = 1200
 ```
 
-静态端点可以改善直连发现，但不能把不可路由的私网地址变成公网候选。Secure WebSocket
-会直接向配置的 Relay 端口建立 TLS/WSS；当前尚未实现显式 HTTP 代理协商。
+静态端点可以改善直连发现，但不能把不可路由的私网地址变成公网候选。配置
+`transport.secure_websocket_proxy` 后，最后一级 Relay 兜底会先连接该数值代理地址，发送
+以已认证 Relay authority 为目标的有界 HTTP CONNECT，再在隧道内执行正常的 Relay TLS
+和 WSS 握手：
+
+```toml
+[transport]
+udp_bind = "0.0.0.0:45100"
+secure_websocket_proxy = "192.0.2.40:8080"
+```
+
+代理只影响 Secure WebSocket，UDP、TURN TCP 和直连 TURN TLS 仍按原顺序先行尝试。
+首个方案支持无需认证的代理；`407` 会失败关闭，明文 CONNECT 绝不携带 Relay 凭据。
 
 `init` 不接受注册或加入令牌，也不会将令牌写入磁盘。
 

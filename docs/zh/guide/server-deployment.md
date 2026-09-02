@@ -117,8 +117,10 @@ $Config = 'C:\Stella\server.toml'
 WebSocket 路径固定为 `/stella/turn/v1`，子协议固定为 `stella-turn.v1`，升级前验证短期
 凭据，并禁止压缩扩展。应直接监听公网 TCP 443；若同一端口还需承载网站，请使用独立 IP
 或主机名配合四层 TLS/SNI 透传，普通的明文 HTTP 上游并不是该监听器。Windows 客户端按
-UDP → TCP → TLS → Secure WebSocket 的顺序自动尝试，无需客户端端口映射；当前尚未实现
-显式 HTTP 代理协商。
+UDP → TCP → TLS → Secure WebSocket 的顺序自动尝试，无需客户端端口映射。只能通过
+代理出站的网络可设置客户端数值 `transport.secure_websocket_proxy`；客户端先向 Relay
+authority 建立 HTTP CONNECT，再在隧道内执行原有 Relay TLS 与 WSS 握手。首个方案暂不
+支持代理认证。
 
 ## 创建网络和注册材料
 

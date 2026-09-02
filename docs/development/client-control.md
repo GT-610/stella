@@ -44,6 +44,7 @@ display_name = "Gaming PC"
 
 [transport]
 udp_bind = "0.0.0.0:45100"
+secure_websocket_proxy = "192.0.2.40:8080"
 
 [[transport.advertised_endpoints]]
 address = "192.0.2.20:45100"
@@ -62,7 +63,9 @@ Relative paths are rooted beside the configuration file. Endpoint and network
 entries are normalized into protocol order, duplicate network IDs are rejected,
 and unknown keys, including any attempted inline enrollment or join token, make
 the complete file invalid. The `networks` array may be absent immediately after
-`init`; each successful `join` adds one durable entry.
+`init`; each successful `join` adds one durable entry. The proxy field is
+optional, numeric, and local to secure WebSocket fallback. It contains no
+credentials and is never distributed by the controller.
 
 ## Connection authentication
 
