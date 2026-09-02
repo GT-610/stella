@@ -2260,6 +2260,7 @@ fn unix_time() -> Result<u64, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeMap, VecDeque},
         future::pending,
         net::{IpAddr, SocketAddr},
         sync::{Arc, Mutex},
@@ -2267,6 +2268,7 @@ mod tests {
     };
 
     use stella_common::RelayId;
+    use stella_crypto::{IdentitySeed, IdentitySigningKey};
     use stella_proto::{
         encode_relay_service_list, encode_stun_server_list, ConnectivityCarrier, IceCandidate,
         IceCandidateClass, RelayAddress, RelayCarrierMask, RelayPorts, RelayServiceRef,
@@ -2275,11 +2277,45 @@ mod tests {
 
     use super::{
         allocate_relay_selections, effective_tap_mtu, matching_relay_selection,
-        next_relay_dns_result, preferred_relay_settings, random_ice_credential, relay_selections,
-        turn_bind_address, unix_time, ConnectivityConfigState, LocalConnectivityGeneration,
-        RelayDnsFuture, RuntimeError, RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH,
-        ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
+        next_relay_dns_result, preferred_relay_settings, random_ice_credential,
+        relay_reconnect_cap, relay_reconnect_delay, relay_selections, turn_bind_address, unix_time,
+        ClientDataRuntime, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
+        RuntimeError, RuntimeRelayCarrier, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
+        MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY,
+        TURN_UDP_MAX_DATAGRAM_SIZE,
     };
+    use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
+
+    async fn runtime_with_pending_relay_recovery() -> ClientDataRuntime {
+        let udp = UdpTransport::bind(UdpConfig {
+            bind_address: "127.0.0.1:0".parse().expect("loopback bind"),
+            max_datagram_size: DEFAULT_UDP_DATAGRAM_SIZE,
+        })
+        .await
+        .expect("bind runtime UDP");
+        let (tap_event_sender, tap_events) = tokio::sync::mpsc::channel(TAP_EVENT_QUEUE_CAPACITY);
+        ClientDataRuntime {
+            udp,
+            udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            deferred_udp: VecDeque::new(),
+            direct_candidates: Vec::new(),
+            https_proxy: None,
+            connectivity_revision: None,
+            connectivity: None,
+            relay: None,
+            relay_recovery: Some(tokio::spawn(pending())),
+            relay_retry_at: None,
+            relay_recovery_attempt: 0,
+            connectivity_changed: false,
+            relay_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            connectivity_generations: BTreeMap::new(),
+            ice_agents: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            tap_events,
+            tap_event_sender,
+            started_at: std::time::Instant::now(),
+        }
+    }
 
     fn connectivity_config() -> ConnectivityConfigState {
         let now = SystemTime::now()
@@ -2387,6 +2423,42 @@ mod tests {
             effective_tap_mtu(1_500, 9_000).expect("cap host MTU"),
             1_500
         );
+    }
+
+    #[test]
+    fn relay_reconnect_backoff_is_capped_and_jittered() {
+        assert_eq!(relay_reconnect_cap(0), MINIMUM_RELAY_RECONNECT_DELAY);
+        assert_eq!(relay_reconnect_cap(1), Duration::from_secs(2));
+        assert_eq!(relay_reconnect_cap(4), Duration::from_secs(16));
+        assert_eq!(relay_reconnect_cap(5), MAXIMUM_RELAY_RECONNECT_DELAY);
+        assert_eq!(relay_reconnect_cap(u32::MAX), MAXIMUM_RELAY_RECONNECT_DELAY);
+        for attempt in 0..10 {
+            let delay = relay_reconnect_delay(attempt).expect("relay reconnect jitter");
+            assert!(delay <= relay_reconnect_cap(attempt));
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_relay_recovery_does_not_block_udp_runtime_progress() {
+        let mut runtime = runtime_with_pending_relay_recovery().await;
+        runtime.connectivity_changed = true;
+        assert!(runtime.take_connectivity_changed());
+        assert!(!runtime.take_connectivity_changed());
+
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind test sender");
+        sender
+            .send_to(&[0xff], runtime.local_udp_address())
+            .await
+            .expect("send malformed datagram");
+        let identity = IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x44; 32]));
+        let error = tokio::time::timeout(Duration::from_secs(1), runtime.receive_next(&identity))
+            .await
+            .expect("runtime progress while relay recovery is pending")
+            .expect_err("malformed datagram is rejected");
+        assert!(matches!(error, RuntimeError::Codec(_)));
+        runtime.shutdown().await.expect("shutdown test runtime");
     }
 
     #[tokio::test]
