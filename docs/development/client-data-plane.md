@@ -78,9 +78,15 @@ stale epoch, expired grant, policy mismatch, and session collision diagnostics
 cannot authorize state and apply bounded retry delay only.
 
 Malformed, unauthenticated, replayed, wrong-session, or wrong-endpoint peer
-datagrams are dropped without restarting the controller connection. UDP socket,
-TAP device, worker, or control failures end the active owner, erase forwarding
-state, and enter the normal controller reconnect loop.
+datagrams are dropped without restarting the controller connection. A Relay
+actor or stream failure withdraws only the Relay candidate and starts one
+background replacement task. Direct sessions, TAP workers, the UDP socket, and
+the controller session continue running while replacement attempts use bounded
+DNS and carrier deadlines plus full-jitter backoff from one to 30 seconds. A
+successful replacement publishes a fresh local connectivity generation.
+
+UDP socket, TAP device, worker, or control failures still end the active owner,
+erase forwarding state, and enter the normal controller reconnect loop.
 
 ## Verification
 

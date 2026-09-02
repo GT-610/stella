@@ -31,6 +31,7 @@ use thiserror::Error;
 use tokio::{
     net::lookup_host,
     sync::mpsc,
+    task::JoinHandle as TokioJoinHandle,
     time::{timeout, timeout_at, Instant},
 };
 use zeroize::Zeroizing;
@@ -59,6 +60,8 @@ const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
 const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
 const RELAY_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_CARRIER_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const MINIMUM_RELAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MAXIMUM_RELAY_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
 /// Failure while owning the Windows client data-plane runtime.
 #[derive(Debug, Error)]
@@ -174,7 +177,12 @@ pub struct ClientDataRuntime {
     direct_candidates: Vec<IceCandidate>,
     https_proxy: Option<SocketAddr>,
     connectivity_revision: Option<u64>,
+    connectivity: Option<ConnectivityConfigState>,
     relay: Option<WarmRelay>,
+    relay_recovery: Option<RelayRecoveryTask>,
+    relay_retry_at: Option<Instant>,
+    relay_recovery_attempt: u32,
+    connectivity_changed: bool,
     relay_buffer: Vec<u8>,
     connectivity_generations: BTreeMap<NetworkId, LocalConnectivityGeneration>,
     ice_agents: BTreeMap<NetworkId, RuntimeIceAgent>,
@@ -269,7 +277,12 @@ impl ClientDataRuntime {
             direct_candidates,
             https_proxy: config.https_proxy,
             connectivity_revision: connectivity.map(ConnectivityConfigState::revision),
+            connectivity: connectivity.cloned(),
             relay,
+            relay_recovery: None,
+            relay_retry_at: None,
+            relay_recovery_attempt: 0,
+            connectivity_changed: false,
             relay_buffer: vec![0_u8; relay_buffer_size],
             connectivity_generations: BTreeMap::new(),
             ice_agents: BTreeMap::new(),
@@ -327,7 +340,9 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         enum Ready {
             Udp(stella_transport::ReceivedDatagram),
-            Relay(ReceivedDatagram),
+            Relay(Result<ReceivedDatagram, RuntimeError>),
+            RelayRecovery(Box<RelayRecoveryResult>),
+            RelayRetry,
             Tap(TapEvent),
         }
         if let Some(deferred) = self.deferred_udp.pop_front() {
@@ -338,15 +353,25 @@ impl ClientDataRuntime {
         let ready = tokio::select! {
             received = self.udp.receive(&mut self.udp_buffer) => Ready::Udp(received?),
             received = receive_relay(self.relay.as_ref(), &mut self.relay_buffer) => {
-                Ready::Relay(received?)
+                Ready::Relay(received)
             }
+            recovery = receive_relay_recovery(self.relay_recovery.as_mut()) => {
+                Ready::RelayRecovery(Box::new(recovery))
+            }
+            () = wait_for_relay_retry(self.relay_retry_at) => Ready::RelayRetry,
             event = self.tap_events.recv() => {
                 Ready::Tap(event.ok_or(RuntimeError::TapEventChannelClosed)?)
             }
         };
         match ready {
             Ready::Udp(received) => self.process_udp(received, signing_key).await,
-            Ready::Relay(received) => self.process_relay(received, signing_key).await,
+            Ready::Relay(Ok(received)) => self.process_relay(received, signing_key).await,
+            Ready::Relay(Err(error)) => self.handle_relay_failure(&error),
+            Ready::RelayRecovery(result) => self.handle_relay_recovery(*result),
+            Ready::RelayRetry => {
+                self.start_relay_recovery();
+                Ok(())
+            }
             Ready::Tap(event) => self.process_tap_event(event).await,
         }
     }
@@ -662,6 +687,12 @@ impl ClientDataRuntime {
         self.connectivity_revision
     }
 
+    /// Returns and clears whether local Relay recovery changed published connectivity.
+    #[must_use]
+    pub fn take_connectivity_changed(&mut self) -> bool {
+        std::mem::take(&mut self.connectivity_changed)
+    }
+
     /// Applies a replacement controller relay configuration without dropping a healthy allocation.
     ///
     /// Matching service parameters update only short-lived credentials and
@@ -681,6 +712,7 @@ impl ClientDataRuntime {
         if self.connectivity_revision == revision {
             return Ok(());
         }
+        self.cancel_relay_recovery().await;
         let selections =
             relay_selections(self.udp.local_address(), self.https_proxy, connectivity).await?;
         let refreshed = refresh_matching_relay(self.relay.as_mut(), &selections).await;
@@ -698,36 +730,12 @@ impl ClientDataRuntime {
                 None => self.relay.take(),
             }
         };
-        for network in self.networks.values_mut() {
-            for carrier in [
-                ConnectivityCarrier::TurnUdp,
-                ConnectivityCarrier::TurnTcp,
-                ConnectivityCarrier::TurnTls,
-                ConnectivityCarrier::SecureWebSocket,
-            ] {
-                let available = self
-                    .relay
-                    .as_ref()
-                    .is_some_and(|relay| relay.settings.carrier.connectivity_carrier() == carrier);
-                network
-                    .plane
-                    .set_relay_carrier_available(carrier, available)?;
-            }
-        }
-        self.relay_buffer.resize(
-            self.relay
-                .as_ref()
-                .map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
-                    relay.client.capabilities().max_datagram_size
-                }),
-            0,
-        );
-        self.replace_local_connectivity_generations(states)?;
-        self.reconcile_ice_agents(states, unix_time()?)?;
+        self.update_relay_dependent_state(states)?;
         self.prepare_relay_paths().await?;
         if let Some(previous) = previous {
             previous.client.shutdown().await?;
         }
+        self.connectivity = connectivity.cloned();
         self.connectivity_revision = revision;
         Ok(())
     }
@@ -738,6 +746,10 @@ impl ClientDataRuntime {
     ///
     /// Returns the first transport or TAP shutdown failure after attempting all cleanup.
     pub async fn shutdown(mut self) -> Result<(), RuntimeError> {
+        if let Some(recovery) = self.relay_recovery.take() {
+            recovery.abort();
+            let _recovery_result = recovery.await;
+        }
         let mut first_error = if let Some(relay) = self.relay.take() {
             relay.client.shutdown().await.err().map(RuntimeError::Turn)
         } else {
@@ -943,6 +955,14 @@ impl ClientDataRuntime {
         let Some(relay) = &self.relay else {
             return Ok(());
         };
+        self.prepare_relay_paths_for(relay).await
+    }
+
+    async fn prepare_relay_paths_for(&self, relay: &WarmRelay) -> Result<(), RuntimeError> {
+        prepare_relay_endpoints(relay, &self.relay_endpoints()).await
+    }
+
+    fn relay_endpoints(&self) -> Vec<TransportEndpoint> {
         let mut endpoints = self
             .networks
             .values()
@@ -950,10 +970,129 @@ impl ClientDataRuntime {
             .collect::<Vec<_>>();
         endpoints.sort_by_key(ToString::to_string);
         endpoints.dedup();
-        for endpoint in endpoints {
-            relay.client.prepare_peer(&endpoint).await?;
+        endpoints
+    }
+
+    fn update_relay_dependent_state(
+        &mut self,
+        states: &BTreeMap<NetworkId, NetworkState>,
+    ) -> Result<(), RuntimeError> {
+        for network in self.networks.values_mut() {
+            for carrier in [
+                ConnectivityCarrier::TurnUdp,
+                ConnectivityCarrier::TurnTcp,
+                ConnectivityCarrier::TurnTls,
+                ConnectivityCarrier::SecureWebSocket,
+            ] {
+                let available = self
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.settings.carrier.connectivity_carrier() == carrier);
+                network
+                    .plane
+                    .set_relay_carrier_available(carrier, available)?;
+            }
+        }
+        self.relay_buffer.resize(
+            self.relay
+                .as_ref()
+                .map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
+                    relay.client.capabilities().max_datagram_size
+                }),
+            0,
+        );
+        self.replace_local_connectivity_generations(states)?;
+        self.reconcile_ice_agents(states, unix_time()?)
+    }
+
+    fn current_network_states(&self) -> BTreeMap<NetworkId, NetworkState> {
+        self.networks
+            .iter()
+            .map(|(network_id, network)| (*network_id, network.state.clone()))
+            .collect()
+    }
+
+    fn handle_relay_failure(&mut self, error: &RuntimeError) -> Result<(), RuntimeError> {
+        tracing::warn!(%error, "relay failed; preserving direct sessions during recovery");
+        drop(self.relay.take());
+        let states = self.current_network_states();
+        self.update_relay_dependent_state(&states)?;
+        self.connectivity_changed = true;
+        self.start_relay_recovery();
+        Ok(())
+    }
+
+    fn start_relay_recovery(&mut self) {
+        if self.relay.is_some() || self.relay_recovery.is_some() {
+            return;
+        }
+        let Some(connectivity) = self.connectivity.clone() else {
+            return;
+        };
+        if connectivity.relay_services().is_empty() {
+            return;
+        }
+        let bind_address = self.udp.local_address();
+        let https_proxy = self.https_proxy;
+        let endpoints = self.relay_endpoints();
+        self.relay_retry_at = None;
+        self.relay_recovery = Some(tokio::spawn(async move {
+            let relay =
+                allocate_preferred_relay(bind_address, https_proxy, Some(&connectivity)).await?;
+            if let Some(relay) = &relay {
+                prepare_relay_endpoints(relay, &endpoints).await?;
+            }
+            Ok(relay)
+        }));
+        tracing::info!("started background relay recovery");
+    }
+
+    fn handle_relay_recovery(&mut self, result: RelayRecoveryResult) -> Result<(), RuntimeError> {
+        self.relay_recovery.take();
+        match result {
+            Ok(Ok(Some(replacement))) => {
+                self.relay = Some(replacement);
+                let states = self.current_network_states();
+                self.update_relay_dependent_state(&states)?;
+                self.relay_recovery_attempt = 0;
+                self.relay_retry_at = None;
+                self.connectivity_changed = true;
+                tracing::info!("background relay recovery succeeded");
+            }
+            Ok(Ok(None)) => {
+                tracing::warn!("relay recovery produced no usable selection");
+                self.schedule_relay_recovery()?;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "background relay recovery failed");
+                self.schedule_relay_recovery()?;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "background relay recovery task stopped");
+                self.schedule_relay_recovery()?;
+            }
         }
         Ok(())
+    }
+
+    fn schedule_relay_recovery(&mut self) -> Result<(), RuntimeError> {
+        let delay = relay_reconnect_delay(self.relay_recovery_attempt)?;
+        self.relay_recovery_attempt = self.relay_recovery_attempt.saturating_add(1);
+        self.relay_retry_at = Some(Instant::now() + delay);
+        tracing::info!(
+            delay_ms = delay.as_millis(),
+            "scheduled relay recovery retry"
+        );
+        Ok(())
+    }
+
+    async fn cancel_relay_recovery(&mut self) {
+        if let Some(recovery) = self.relay_recovery.take() {
+            recovery.abort();
+            let _recovery_result = recovery.await;
+        }
+        self.relay_retry_at = None;
+        self.relay_recovery_attempt = 0;
     }
 
     fn replace_local_connectivity_generations(
@@ -1100,6 +1239,9 @@ struct WarmRelay {
     credential_expires_at: u64,
     client: WarmRelayClient,
 }
+
+type RelayRecoveryTask = TokioJoinHandle<Result<Option<WarmRelay>, RuntimeError>>;
+type RelayRecoveryResult = Result<Result<Option<WarmRelay>, RuntimeError>, tokio::task::JoinError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RelaySettings {
@@ -2040,6 +2182,51 @@ async fn receive_relay(
             .map_err(RuntimeError::Turn),
         None => pending().await,
     }
+}
+
+async fn prepare_relay_endpoints(
+    relay: &WarmRelay,
+    endpoints: &[TransportEndpoint],
+) -> Result<(), RuntimeError> {
+    for endpoint in endpoints {
+        relay.client.prepare_peer(endpoint).await?;
+    }
+    Ok(())
+}
+
+async fn receive_relay_recovery(task: Option<&mut RelayRecoveryTask>) -> RelayRecoveryResult {
+    match task {
+        Some(task) => task.await,
+        None => pending().await,
+    }
+}
+
+async fn wait_for_relay_retry(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
+    }
+}
+
+fn relay_reconnect_cap(attempt: u32) -> Duration {
+    let exponent = attempt.min(5);
+    let multiplier = 1_u32 << exponent;
+    MINIMUM_RELAY_RECONNECT_DELAY
+        .checked_mul(multiplier)
+        .unwrap_or(MAXIMUM_RELAY_RECONNECT_DELAY)
+        .min(MAXIMUM_RELAY_RECONNECT_DELAY)
+}
+
+fn relay_reconnect_delay(attempt: u32) -> Result<Duration, RuntimeError> {
+    let cap = relay_reconnect_cap(attempt);
+    let maximum_milliseconds = cap
+        .as_secs()
+        .saturating_mul(1_000)
+        .saturating_add(u64::from(cap.subsec_millis()));
+    let mut random = [0_u8; 8];
+    getrandom::fill(&mut random).map_err(|_| RuntimeError::RandomnessUnavailable)?;
+    let milliseconds = u64::from_le_bytes(random) % maximum_milliseconds.saturating_add(1);
+    Ok(Duration::from_millis(milliseconds))
 }
 
 fn random_nonzero_u64() -> Result<u64, RuntimeError> {

@@ -360,7 +360,13 @@ async fn run_active_io(
             }
             result = data.receive_next(identity) => {
                 match result {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if data.take_connectivity_changed() {
+                            publish_current_connectivity(active, data)
+                                .await
+                                .context("could not publish recovered Relay connectivity")?;
+                        }
+                    }
                     Err(RuntimeError::Network(error)) => {
                         tracing::debug!(%error, "dropped invalid peer datagram");
                     }
