@@ -2,13 +2,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    future::{pending, Future},
+    future::{pending, poll_fn, Future},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{sync_channel, Receiver as SyncReceiver, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
+    task::Poll,
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,7 +31,7 @@ use thiserror::Error;
 use tokio::{
     net::lookup_host,
     sync::mpsc,
-    time::{timeout, timeout_at, Instant},
+    time::{timeout_at, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -1776,58 +1778,126 @@ async fn resolve_configured_relay_services(
     Vec<(&crate::RelayServiceState, Vec<IpAddr>)>,
     Option<RuntimeError>,
 ) {
-    let mut resolved_services = Vec::with_capacity(services.len());
-    let mut last_dns_error = None;
-    for service in services {
+    let mut resolutions = Vec::with_capacity(services.len());
+    let mut fallbacks = Vec::with_capacity(services.len());
+    let mut hostnames = Vec::with_capacity(services.len());
+    let mut queries = Vec::with_capacity(services.len());
+    for (index, service) in services.iter().enumerate() {
         let proxy_resolves_only_websocket = https_proxy.is_some()
             && service.carriers() == RelayCarrierMask::SECURE_WEBSOCKET
             && !service.hostname().is_empty();
-        let addresses = if proxy_resolves_only_websocket {
-            service
-                .addresses()
-                .iter()
-                .map(|address| address.address)
-                .collect()
+        let addresses = service
+            .addresses()
+            .iter()
+            .map(|address| address.address)
+            .collect::<Vec<_>>();
+        let hostname = service.hostname().to_owned();
+        fallbacks.push(addresses.clone());
+        if proxy_resolves_only_websocket
+            || hostname.is_empty()
+            || addresses.len() == usize::from(MAX_RELAY_ADDRESSES)
+        {
+            hostnames.push(None);
+            resolutions.push(Some(Ok(addresses)));
+            queries.push(None);
         } else {
-            match resolve_relay_addresses(service).await {
-                Ok(addresses) => addresses,
-                Err(error) => {
-                    last_dns_error = Some(error);
-                    Vec::new()
+            hostnames.push(Some(hostname.clone()));
+            resolutions.push(None);
+            queries.push(Some(Box::pin(async move {
+                (index, resolve_relay_address_set(hostname, addresses).await)
+            }) as RelayDnsFuture));
+        }
+    }
+
+    let deadline = Instant::now() + RELAY_DNS_TIMEOUT;
+    loop {
+        match timeout_at(deadline, next_relay_dns_result(&mut queries)).await {
+            Ok(Some((index, result))) => {
+                if let Some(resolution) = resolutions.get_mut(index) {
+                    *resolution = Some(result);
                 }
             }
-        };
-        resolved_services.push((service, addresses));
+            Ok(None) => break,
+            Err(_) => {
+                for (((query, resolution), fallback), hostname) in queries
+                    .iter_mut()
+                    .zip(&mut resolutions)
+                    .zip(&fallbacks)
+                    .zip(&hostnames)
+                {
+                    if query.take().is_none() {
+                        continue;
+                    }
+                    let Some(hostname) = hostname else {
+                        continue;
+                    };
+                    if fallback.is_empty() {
+                        *resolution = Some(Err(RuntimeError::RelayDnsTimeout {
+                            hostname: hostname.clone(),
+                        }));
+                    } else {
+                        tracing::warn!(hostname, "relay DNS augmentation timed out");
+                        *resolution = Some(Ok(fallback.clone()));
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    let mut resolved_services = Vec::with_capacity(services.len());
+    let mut last_dns_error = None;
+    for ((service, resolution), fallback) in services.iter().zip(resolutions).zip(fallbacks) {
+        match resolution {
+            Some(Ok(addresses)) => resolved_services.push((service, addresses)),
+            Some(Err(error)) => {
+                last_dns_error = Some(error);
+                resolved_services.push((service, Vec::new()));
+            }
+            None => {
+                resolved_services.push((service, fallback));
+            }
+        }
     }
     (resolved_services, last_dns_error)
 }
 
-async fn resolve_relay_addresses(
-    service: &crate::RelayServiceState,
+type RelayDnsResult = (usize, Result<Vec<IpAddr>, RuntimeError>);
+type RelayDnsFuture = Pin<Box<dyn Future<Output = RelayDnsResult> + Send>>;
+
+async fn next_relay_dns_result(queries: &mut [Option<RelayDnsFuture>]) -> Option<RelayDnsResult> {
+    poll_fn(|context| {
+        let mut has_pending = false;
+        for query in queries.iter_mut() {
+            let Some(future) = query else {
+                continue;
+            };
+            has_pending = true;
+            if let Poll::Ready(result) = future.as_mut().poll(context) {
+                *query = None;
+                return Poll::Ready(Some(result));
+            }
+        }
+        if has_pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
+    })
+    .await
+}
+
+async fn resolve_relay_address_set(
+    hostname: String,
+    mut addresses: Vec<IpAddr>,
 ) -> Result<Vec<IpAddr>, RuntimeError> {
-    let mut addresses = service
-        .addresses()
-        .iter()
-        .map(|address| address.address)
-        .collect::<Vec<_>>();
-    if service.hostname().is_empty() || addresses.len() == usize::from(MAX_RELAY_ADDRESSES) {
-        return Ok(addresses);
-    }
-    let hostname = service.hostname().to_owned();
-    let resolved = match timeout(RELAY_DNS_TIMEOUT, lookup_host((hostname.clone(), 1))).await {
-        Ok(Ok(resolved)) => resolved,
-        Ok(Err(source)) if addresses.is_empty() => {
+    let resolved = match lookup_host((hostname.clone(), 1)).await {
+        Ok(resolved) => resolved,
+        Err(source) if addresses.is_empty() => {
             return Err(RuntimeError::RelayDnsResolution { hostname, source });
         }
-        Ok(Err(source)) => {
+        Err(source) => {
             tracing::warn!(hostname, %source, "could not augment numeric relay addresses from DNS");
-            return Ok(addresses);
-        }
-        Err(_) if addresses.is_empty() => {
-            return Err(RuntimeError::RelayDnsTimeout { hostname });
-        }
-        Err(_) => {
-            tracing::warn!(hostname, "relay DNS augmentation timed out");
             return Ok(addresses);
         }
     };
