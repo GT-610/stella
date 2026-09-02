@@ -5,6 +5,7 @@
 mod error;
 mod turn_stream;
 mod udp;
+mod websocket_record;
 
 use std::{future::Future, net::SocketAddr, num::NonZeroU64, pin::Pin};
 
@@ -15,6 +16,10 @@ pub use turn_stream::{TurnStream, TurnStreamError, MAX_TURN_STREAM_RECORD_SIZE};
 pub use udp::{
     UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
     MIN_UDP_DATAGRAM_SIZE,
+};
+pub use websocket_record::{
+    read_websocket_record, turn_websocket_config, write_websocket_record, WebSocketRecordError,
+    STELLA_TURN_WEBSOCKET_PATH, STELLA_TURN_WEBSOCKET_SUBPROTOCOL,
 };
 
 /// Result type returned by transport operations.

@@ -8,11 +8,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+futures-util.workspace = true
 socket2 = { version = "0.6.5", default-features = false }
 stella-common = { path = "../stella-common" }
 stella-proto = { path = "../stella-proto" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "sync"] }
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "time"] }
