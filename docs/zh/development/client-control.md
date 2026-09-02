@@ -14,9 +14,11 @@ TOML。TLS 客户端只启用 TLS 1.3 并禁用 early data；它验证配置服�
 带新 nonce 的 `CLIENT_HELLO`，验证控制器证明，并发送节点证明；只有通过关联的
 `AUTH_RESULT` 后才接受活动状态。
 
-可选的数值 `transport.secure_websocket_proxy` 只用于最后一级 Secure WebSocket Relay
-兜底。客户端通过它建立有界 HTTP CONNECT 后仍验证 Relay 的 TLS 名称与 SPKI pin；该
-字段不包含代理凭据，也不会由控制器分发。首个方案遇到需要认证的代理时失败关闭。
+可选的数值 `transport.https_proxy` 同时用于控制器 TLS 引导和最后一级 Secure WebSocket
+Relay 兜底。客户端先向控制器 TLS 名称和端口建立严格有界的 HTTP CONNECT；明文请求不
+包含 Stella 记录、令牌、证明或 SPKI pin。隧道内仍验证控制器和 Relay 的 TLS 名称、
+SPKI pin 及 Stella 身份。该字段不包含代理凭据，也不会由控制器分发；首个方案遇到需要
+认证的代理时失败关闭。
 
 一个任务拥有分帧读写器、收发序列和关联追踪器。它在控制器消息、心跳期限、有界本地命令
 和进程关闭之间选择。候选快照会先解码为临时自有状态，所有记录都验证通过后才替换活动

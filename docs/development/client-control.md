@@ -14,7 +14,7 @@ accepted inline in the file. Persistent configuration includes:
 - the numeric controller TCP address and TLS server name;
 - the expected Stella controller ID and one or more `sha256/` SPKI pins;
 - the protected node PKCS#8 identity path and display name;
-- the UDP bind address and explicitly advertised numeric endpoints;
+- the UDP bind address, optional explicit HTTPS proxy, and advertised endpoints;
 - one TAP-Windows adapter selection and desired network ID per network entry.
 
 An explicit initialization command creates the node identity with create-new
@@ -44,7 +44,7 @@ display_name = "Gaming PC"
 
 [transport]
 udp_bind = "0.0.0.0:45100"
-secure_websocket_proxy = "192.0.2.40:8080"
+https_proxy = "192.0.2.40:8080"
 
 [[transport.advertised_endpoints]]
 address = "192.0.2.20:45100"
@@ -64,16 +64,20 @@ entries are normalized into protocol order, duplicate network IDs are rejected,
 and unknown keys, including any attempted inline enrollment or join token, make
 the complete file invalid. The `networks` array may be absent immediately after
 `init`; each successful `join` adds one durable entry. The proxy field is
-optional, numeric, and local to secure WebSocket fallback. It contains no
-credentials and is never distributed by the controller.
+optional, numeric, and local to controller TLS bootstrap and secure WebSocket
+relay fallback. It contains no credentials and is never distributed by the
+controller.
 
 ## Connection authentication
 
-The TLS client enables only TLS 1.3 and disables early data. Its certificate
-verifier checks the configured server name, certificate validity interval,
-server-auth usage, and a constant-time match against one configured SHA-256
-SPKI pin. Pin rotation is an explicit overlap in which both old and new pins
-are configured.
+With `transport.https_proxy`, the client first connects to that numeric address
+and sends a strictly bounded HTTP/1.1 CONNECT whose authority is the controller
+TLS name and port. The request contains no Stella record, token, proof, or pin.
+After a successful tunnel response, the TLS client enables only TLS 1.3 and
+disables early data. Its certificate verifier checks the configured server
+name, certificate validity interval, server-auth usage, and a constant-time
+match against one configured SHA-256 SPKI pin. Pin rotation is an explicit
+overlap in which both old and new pins are configured.
 
 After TLS completes, the client:
 

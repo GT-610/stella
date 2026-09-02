@@ -7,12 +7,13 @@ use `--config client.toml` unless another path is supplied.
 ## Prerequisites and reachability
 
 Each client needs its own pre-installed TAP-Windows Adapter V9. The controller
-must be reachable over its configured TLS/TCP address. The runtime gathers
-direct UDP candidates and uses controller-provided STUN and relay services. A
-manually forwarded client port is optional: if direct ICE checks fail, the
-client tries TURN UDP, TCP, TLS, then secure WebSocket. At least one direct or
-relay path must succeed. Run `run` from an elevated PowerShell session so the
-process can open its TAP adapter.
+must be reachable over its configured TLS/TCP address, either directly or
+through the optional explicit HTTPS proxy. The runtime gathers direct UDP
+candidates and uses controller-provided STUN and relay services. A manually
+forwarded client port is optional: if direct ICE checks fail, the client tries
+TURN UDP, TCP, TLS, then secure WebSocket. At least one direct or relay path
+must succeed. Run `run` from an elevated PowerShell session so the process can
+open its TAP adapter.
 
 Stella is a Layer-2 overlay: it does not assign IP addresses or provide DHCP.
 Configure addresses on the TAP adapters yourself, or provide DHCP inside the
@@ -28,10 +29,10 @@ stella-client --config C:\Stella\client.toml init `
   --spki-pin sha256/BASE64_SHA256_SPKI_DIGEST= `
   --display-name "Gaming PC" `
   --udp-bind 0.0.0.0:45100 `
-  --secure-websocket-proxy 192.0.2.40:8080
+  --https-proxy 192.0.2.40:8080
 ```
 
-Omit `--secure-websocket-proxy` on networks that permit direct outbound TCP.
+Omit `--https-proxy` on networks that permit direct outbound controller TCP.
 
 `init` creates the configuration and `secrets/node.pk8` with create-new
 semantics. On Windows, identity inheritance is disabled and only the current
@@ -54,21 +55,24 @@ max_datagram_size = 1200
 
 Static endpoints improve direct-path discovery but are not a substitute for a
 real public mapping. Do not publish an unroutable private address as an Internet
-candidate. When `transport.secure_websocket_proxy` is present, the last relay
-fallback connects to that numeric proxy, sends a bounded HTTP CONNECT for the
-authenticated relay authority, and then performs the normal relay TLS and WSS
-handshakes inside the tunnel:
+candidate. When `transport.https_proxy` is present, controller bootstrap first
+connects to that numeric proxy and sends a bounded HTTP CONNECT for the
+configured controller TLS name and port. After authentication, the same proxy
+is used for the last secure WebSocket relay fallback:
 
 ```toml
 [transport]
 udp_bind = "0.0.0.0:45100"
-secure_websocket_proxy = "192.0.2.40:8080"
+https_proxy = "192.0.2.40:8080"
 ```
 
-The proxy setting affects only secure WebSocket; UDP, TURN TCP, and direct TURN
-TLS retain their normal earlier attempts. The first profile supports proxies
-that do not require authentication. A `407` response fails closed, and Stella
-never sends relay credentials in the plaintext CONNECT request.
+TLS 1.3, server-name and SPKI verification, Stella controller authentication,
+and Relay TLS/WSS authentication remain end to end inside their tunnels. The
+proxy does not affect direct UDP, TURN UDP, TURN TCP, or direct TURN TLS, which
+retain their normal earlier attempts. The first profile supports proxies that
+do not require authentication. A `407` response fails closed, and Stella never
+sends enrollment, join, controller, or relay credentials in a plaintext
+CONNECT request.
 
 Enrollment and join tokens are never accepted by `init` and are never written
 to disk.
@@ -100,9 +104,9 @@ stella-client --config C:\Stella\client.toml status
 ```
 
 `status` is an offline command. It validates the configuration and protected
-identity, then prints the derived node ID, controller address/name/ID, UDP bind,
-and each desired network with its TAP adapter. It never prints SPKI pins,
-credentials, private key material, or the private-key path.
+identity, then prints the derived node ID, controller address/name/ID, optional
+HTTPS proxy, UDP bind, and each desired network with its TAP adapter. It never
+prints SPKI pins, credentials, private key material, or the private-key path.
 
 ## Leave
 
