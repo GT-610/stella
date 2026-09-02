@@ -9,6 +9,7 @@ mod control;
 mod data_plane;
 mod error;
 mod handshake;
+mod ice;
 mod identity;
 mod network;
 #[cfg(target_os = "windows")]
@@ -31,6 +32,7 @@ pub use handshake::{
     EstablishedPeerSession, HandshakeError, HandshakeEvent, HandshakeTransmission,
     InitiatorHandshake, PeerHandshakeConfig, PeerHandshakeManager, ResponderHandshake,
 };
+pub use ice::{IceAgent, IceError, IceNomination, IceOutput, IcePeerConfig, IceTransmission};
 pub use identity::{
     create_node_identity, load_node_identity, verify_node_identity_permissions,
     NodeIdentityFileError,
