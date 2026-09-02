@@ -14,14 +14,18 @@ use stella_common::RelayId;
 use stella_crypto::sha256_segments;
 use stella_proto::{
     decode_stun_xor_address, encode_stun_message, encode_stun_xor_address,
-    encode_turn_channel_data, CodecError, StunAttributeRef, StunAttributeType, StunClass,
-    StunErrorCodeView, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
-    StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
+    encode_turn_channel_data, encode_turn_channel_data_stream, CodecError, StunAttributeRef,
+    StunAttributeType, StunClass, StunErrorCodeView, StunMessageRef, StunMessageType,
+    StunMessageView, StunMethod, StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView,
+    TurnChannelNumber,
 };
-use stella_transport::{Endpoint as TransportEndpoint, ReceivedDatagram, TransportCapabilities};
+use stella_transport::{
+    Endpoint as TransportEndpoint, ReceivedDatagram, RelayCarrier, TransportCapabilities,
+    TurnStream, TurnStreamError, MAX_TURN_STREAM_RECORD_SIZE,
+};
 use thiserror::Error;
 use tokio::{
-    net::UdpSocket,
+    net::{TcpSocket, TcpStream, UdpSocket},
     sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
     time::{timeout_at, Instant},
@@ -81,6 +85,67 @@ impl TurnUdpClientConfig {
     }
 
     fn validate(self) -> Result<(), TurnUdpError> {
+        TurnClientConfig::from(self).validate()
+    }
+}
+
+/// Configuration for one authenticated TURN allocation reached over TCP.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurnTcpClientConfig {
+    /// Stable identity of the configured relay service.
+    pub relay_id: RelayId,
+    /// Numeric TURN TCP listener address.
+    pub server_address: SocketAddr,
+    /// Local client socket address; port zero requests an ephemeral port.
+    pub bind_address: SocketAddr,
+    /// Largest complete Stella datagram carried through this allocation.
+    pub max_datagram_size: usize,
+    /// Requested allocation lifetime, capped by the relay.
+    pub allocation_lifetime_seconds: u32,
+    /// Advertised allocation inactivity timeout.
+    pub idle_timeout_seconds: u32,
+    /// Complete reliable transaction deadline.
+    pub transaction_timeout: Duration,
+}
+
+impl TurnTcpClientConfig {
+    /// Creates a conservative TURN TCP client configuration.
+    #[must_use]
+    pub const fn new(
+        relay_id: RelayId,
+        server_address: SocketAddr,
+        bind_address: SocketAddr,
+    ) -> Self {
+        Self {
+            relay_id,
+            server_address,
+            bind_address,
+            max_datagram_size: 1_200,
+            allocation_lifetime_seconds: 600,
+            idle_timeout_seconds: 120,
+            transaction_timeout: DEFAULT_TRANSACTION_TIMEOUT,
+        }
+    }
+
+    fn validate(self) -> Result<(), TurnUdpError> {
+        TurnClientConfig::from(self).validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TurnClientConfig {
+    carrier: RelayCarrier,
+    relay_id: RelayId,
+    server_address: SocketAddr,
+    bind_address: SocketAddr,
+    max_datagram_size: usize,
+    allocation_lifetime_seconds: u32,
+    idle_timeout_seconds: u32,
+    transaction_timeout: Duration,
+}
+
+impl TurnClientConfig {
+    fn validate(self) -> Result<(), TurnUdpError> {
         if self.relay_id.is_zero() {
             return Err(TurnUdpError::InvalidConfig {
                 field: "relay ID",
@@ -124,6 +189,36 @@ impl TurnUdpClientConfig {
             });
         }
         Ok(())
+    }
+}
+
+impl From<TurnUdpClientConfig> for TurnClientConfig {
+    fn from(config: TurnUdpClientConfig) -> Self {
+        Self {
+            carrier: RelayCarrier::TurnUdp,
+            relay_id: config.relay_id,
+            server_address: config.server_address,
+            bind_address: config.bind_address,
+            max_datagram_size: config.max_datagram_size,
+            allocation_lifetime_seconds: config.allocation_lifetime_seconds,
+            idle_timeout_seconds: config.idle_timeout_seconds,
+            transaction_timeout: config.transaction_timeout,
+        }
+    }
+}
+
+impl From<TurnTcpClientConfig> for TurnClientConfig {
+    fn from(config: TurnTcpClientConfig) -> Self {
+        Self {
+            carrier: RelayCarrier::TurnTcp,
+            relay_id: config.relay_id,
+            server_address: config.server_address,
+            bind_address: config.bind_address,
+            max_datagram_size: config.max_datagram_size,
+            allocation_lifetime_seconds: config.allocation_lifetime_seconds,
+            idle_timeout_seconds: config.idle_timeout_seconds,
+            transaction_timeout: config.transaction_timeout,
+        }
     }
 }
 
@@ -199,12 +294,12 @@ impl fmt::Debug for TurnCredentials {
     }
 }
 
-/// Failure while creating or operating one TURN UDP allocation.
+/// Failure while creating or operating one TURN client allocation.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum TurnUdpError {
     /// A stable client configuration bound is invalid.
-    #[error("invalid TURN UDP configuration for {field}: {reason}")]
+    #[error("invalid TURN client configuration for {field}: {reason}")]
     InvalidConfig {
         /// Stable field name.
         field: &'static str,
@@ -223,7 +318,7 @@ pub enum TurnUdpError {
     #[error("operating-system randomness is unavailable for TURN transaction ID")]
     RandomnessUnavailable,
     /// A local socket operation failed.
-    #[error("TURN UDP {operation} failed")]
+    #[error("TURN {operation} failed")]
     Io {
         /// Stable operation name.
         operation: &'static str,
@@ -234,6 +329,9 @@ pub enum TurnUdpError {
     /// A STUN or TURN record was structurally invalid.
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// Reliable TURN record framing or byte-stream I/O failed.
+    #[error(transparent)]
+    Stream(#[from] TurnStreamError),
     /// A retransmitting request received no matching response before its deadline.
     #[error("TURN {method:?} transaction timed out")]
     TransactionTimeout {
@@ -286,16 +384,16 @@ pub enum TurnUdpError {
         remaining: usize,
     },
     /// A concrete client method received an endpoint for another carrier.
-    #[error("endpoint is not a TURN UDP relay candidate")]
+    #[error("endpoint does not match this TURN allocation carrier or relay")]
     UnsupportedEndpoint,
     /// The allocation actor stopped before completing an operation.
-    #[error("TURN UDP allocation actor stopped")]
+    #[error("TURN allocation actor stopped")]
     ActorStopped,
     /// The allocation actor task panicked or was cancelled unexpectedly.
-    #[error("TURN UDP allocation actor task failed")]
+    #[error("TURN allocation actor task failed")]
     TaskFailed,
     /// Time arithmetic overflowed a monotonic deadline.
-    #[error("TURN UDP deadline overflowed for {field}")]
+    #[error("TURN deadline overflowed for {field}")]
     DeadlineOverflow {
         /// Stable deadline field name.
         field: &'static str,
@@ -305,8 +403,84 @@ pub enum TurnUdpError {
     ChannelSpaceExhausted,
 }
 
+/// TURN TCP client error type shared with the carrier-neutral TURN state machine.
+pub type TurnTcpError = TurnUdpError;
+
+enum ClientIo {
+    Udp {
+        socket: UdpSocket,
+        receive_buffer: Vec<u8>,
+    },
+    Tcp(TurnStream<TcpStream>),
+}
+
+impl ClientIo {
+    const fn carrier(&self) -> RelayCarrier {
+        match self {
+            Self::Udp { .. } => RelayCarrier::TurnUdp,
+            Self::Tcp(_) => RelayCarrier::TurnTcp,
+        }
+    }
+
+    const fn is_reliable(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
+
+    async fn send_record(&mut self, record: &[u8]) -> Result<(), TurnUdpError> {
+        match self {
+            Self::Udp { socket, .. } => {
+                socket
+                    .send(record)
+                    .await
+                    .map_err(|source| TurnUdpError::Io {
+                        operation: "send record",
+                        source,
+                    })?;
+                Ok(())
+            }
+            Self::Tcp(stream) => stream.write_record(record).await.map_err(Into::into),
+        }
+    }
+
+    async fn send_channel_data(
+        &mut self,
+        channel: TurnChannelNumber,
+        datagram: &[u8],
+    ) -> Result<(), TurnUdpError> {
+        let padding = usize::from(self.is_reliable()) * 3;
+        let mut encoded = vec![0_u8; datagram.len().saturating_add(4).saturating_add(padding)];
+        let length = if self.is_reliable() {
+            encode_turn_channel_data_stream(channel, datagram, &mut encoded)?
+        } else {
+            encode_turn_channel_data(channel, datagram, &mut encoded)?
+        };
+        self.send_record(&encoded[..length]).await
+    }
+
+    async fn receive_record(&mut self) -> Result<Vec<u8>, TurnUdpError> {
+        match self {
+            Self::Udp {
+                socket,
+                receive_buffer,
+            } => {
+                let length =
+                    socket
+                        .recv(receive_buffer)
+                        .await
+                        .map_err(|source| TurnUdpError::Io {
+                            operation: "receive record",
+                            source,
+                        })?;
+                Ok(receive_buffer[..length].to_vec())
+            }
+            Self::Tcp(stream) => stream.read_record().await.map_err(Into::into),
+        }
+    }
+}
+
 /// One live authenticated TURN UDP allocation with bounded command and receive queues.
 pub struct TurnUdpClient {
+    carrier: RelayCarrier,
     relay_id: RelayId,
     relayed_address: SocketAddr,
     mapped_address: SocketAddr,
@@ -348,9 +522,23 @@ impl TurnUdpClient {
             operation: "query local address",
             source,
         })?;
+        let config = TurnClientConfig::from(config);
+        let io = ClientIo::Udp {
+            socket,
+            receive_buffer: vec![0_u8; TURN_UDP_RECEIVE_BUFFER_SIZE],
+        };
+        Self::allocate_connected(config, credentials, io, local_address).await
+    }
+
+    async fn allocate_connected(
+        config: TurnClientConfig,
+        credentials: TurnCredentials,
+        mut io: ClientIo,
+        local_address: SocketAddr,
+    ) -> Result<Self, TurnUdpError> {
         let expected_realm = format!("stella-relay:{}", config.relay_id).into_bytes();
-        let challenge = initial_challenge(&socket, config, &expected_realm).await?;
-        let mut actor = Actor::new(socket, config, credentials, challenge)?;
+        let challenge = initial_challenge(&mut io, config, &expected_realm).await?;
+        let mut actor = Actor::new(io, config, credentials, challenge)?;
         let allocation = actor.allocate().await?;
         let relayed_address = allocation.relayed_address;
         let mapped_address = allocation.mapped_address;
@@ -361,6 +549,7 @@ impl TurnUdpClient {
         actor.inbound = Some(inbound_sender);
         let task = tokio::spawn(actor.run());
         Ok(Self {
+            carrier: config.carrier,
             relay_id: config.relay_id,
             relayed_address,
             mapped_address,
@@ -408,9 +597,23 @@ impl TurnUdpClient {
     /// Returns the local relay candidate published to authorized peers.
     #[must_use]
     pub const fn local_endpoint(&self) -> TransportEndpoint {
-        TransportEndpoint::TurnUdp {
-            relay_id: self.relay_id,
-            address: self.relayed_address,
+        match self.carrier {
+            RelayCarrier::TurnUdp => TransportEndpoint::TurnUdp {
+                relay_id: self.relay_id,
+                address: self.relayed_address,
+            },
+            RelayCarrier::TurnTcp => TransportEndpoint::TurnTcp {
+                relay_id: self.relay_id,
+                address: self.relayed_address,
+            },
+            RelayCarrier::TurnTls => TransportEndpoint::TurnTls {
+                relay_id: self.relay_id,
+                address: self.relayed_address,
+            },
+            RelayCarrier::SecureWebSocket => TransportEndpoint::SecureWebSocket {
+                relay_id: self.relay_id,
+                address: self.relayed_address,
+            },
         }
     }
 
@@ -596,6 +799,7 @@ impl fmt::Debug for TurnUdpClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TurnUdpClient")
+            .field("carrier", &self.carrier)
             .field("relay_id", &self.relay_id)
             .field("relayed_address", &self.relayed_address)
             .field("mapped_address", &self.mapped_address)
@@ -612,6 +816,194 @@ impl Drop for TurnUdpClient {
         if let Some(task) = self.task.get_mut().take() {
             task.abort();
         }
+    }
+}
+
+/// One live authenticated TURN TCP allocation with bounded command and receive queues.
+pub struct TurnTcpClient {
+    inner: TurnUdpClient,
+}
+
+impl TurnTcpClient {
+    /// Connects, authenticates, allocates a relayed UDP address, and starts the stream actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] for configuration, credentials, TCP I/O,
+    /// framing, authentication, transaction, integrity, or allocation failures.
+    pub async fn allocate(
+        config: TurnTcpClientConfig,
+        credentials: TurnCredentials,
+    ) -> Result<Self, TurnTcpError> {
+        config.validate()?;
+        credentials.validate_time(unix_time()?)?;
+        let socket = if config.server_address.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+        .map_err(|source| TurnUdpError::Io {
+            operation: "create TCP socket",
+            source,
+        })?;
+        socket
+            .bind(config.bind_address)
+            .map_err(|source| TurnUdpError::Io {
+                operation: "bind TCP socket",
+                source,
+            })?;
+        let stream = socket
+            .connect(config.server_address)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "connect TCP socket",
+                source,
+            })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|source| TurnUdpError::Io {
+                operation: "configure TCP no-delay",
+                source,
+            })?;
+        let local_address = stream.local_addr().map_err(|source| TurnUdpError::Io {
+            operation: "query local TCP address",
+            source,
+        })?;
+        let io = ClientIo::Tcp(TurnStream::new(stream, MAX_TURN_STREAM_RECORD_SIZE)?);
+        let inner = TurnUdpClient::allocate_connected(
+            TurnClientConfig::from(config),
+            credentials,
+            io,
+            local_address,
+        )
+        .await?;
+        Ok(Self { inner })
+    }
+
+    /// Returns the relay identity attached to this local allocation.
+    #[must_use]
+    pub const fn relay_id(&self) -> RelayId {
+        self.inner.relay_id()
+    }
+
+    /// Returns the public relayed candidate address.
+    #[must_use]
+    pub const fn relayed_address(&self) -> SocketAddr {
+        self.inner.relayed_address()
+    }
+
+    /// Returns the client TCP address observed by the TURN server.
+    #[must_use]
+    pub const fn mapped_address(&self) -> SocketAddr {
+        self.inner.mapped_address()
+    }
+
+    /// Returns the local TCP socket address used for the allocation.
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.inner.local_address()
+    }
+
+    /// Returns the enforced complete Stella datagram limit.
+    #[must_use]
+    pub const fn capabilities(&self) -> TransportCapabilities {
+        self.inner.capabilities()
+    }
+
+    /// Returns the local TURN TCP relay candidate published to authorized peers.
+    #[must_use]
+    pub const fn local_endpoint(&self) -> TransportEndpoint {
+        self.inner.local_endpoint()
+    }
+
+    /// Creates or refreshes a peer permission and channel binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn prepare_peer(&self, endpoint: &TransportEndpoint) -> Result<(), TurnTcpError> {
+        self.inner.prepare_peer(endpoint).await
+    }
+
+    /// Creates or refreshes only the TURN permission for a peer candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn permit_peer(&self, endpoint: &TransportEndpoint) -> Result<(), TurnTcpError> {
+        self.inner.permit_peer(endpoint).await
+    }
+
+    /// Sends one complete datagram through a prepared TURN TCP path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] for endpoint mismatch, size, permission,
+    /// channel binding, actor, framing, or stream failure.
+    pub async fn send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnTcpError> {
+        self.inner.send_to(endpoint, datagram).await
+    }
+
+    /// Sends one complete datagram as a TURN Send indication over TCP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] for endpoint mismatch, size, permission,
+    /// actor, codec, framing, or stream failure.
+    pub async fn send_indication_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnTcpError> {
+        self.inner.send_indication_to(endpoint, datagram).await
+    }
+
+    /// Replaces short-lived credentials and verifies them with an allocation refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] when credentials are expired or the refresh fails.
+    pub async fn replace_credentials(
+        &self,
+        credentials: TurnCredentials,
+    ) -> Result<(), TurnTcpError> {
+        self.inner.replace_credentials(credentials).await
+    }
+
+    /// Receives one complete relayed datagram without exposing partial data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] for insufficient output, actor failure, or shutdown.
+    pub async fn receive(&self, output: &mut [u8]) -> Result<ReceivedDatagram, TurnTcpError> {
+        self.inner.receive(output).await
+    }
+
+    /// Deletes the allocation, stops the actor, and cancels pending receives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] when deletion or actor joining fails.
+    pub async fn shutdown(&self) -> Result<(), TurnTcpError> {
+        self.inner.shutdown().await
+    }
+}
+
+impl fmt::Debug for TurnTcpClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnTcpClient")
+            .field("relay_id", &self.inner.relay_id)
+            .field("relayed_address", &self.inner.relayed_address)
+            .field("mapped_address", &self.inner.mapped_address)
+            .field("local_address", &self.inner.local_address)
+            .field("capabilities", &self.inner.capabilities)
+            .field("shutdown", &self.inner.shutdown.load(Ordering::Acquire))
+            .finish_non_exhaustive()
     }
 }
 
@@ -679,11 +1071,10 @@ struct ChannelBinding {
 }
 
 struct Actor {
-    socket: UdpSocket,
-    config: TurnUdpClientConfig,
+    io: ClientIo,
+    config: TurnClientConfig,
     credentials: TurnCredentials,
     auth: AuthContext,
-    receive_buffer: Vec<u8>,
     commands: Option<mpsc::Receiver<Command>>,
     inbound: Option<mpsc::Sender<InboundEvent>>,
     allocation_refresh_at: Instant,
@@ -696,17 +1087,22 @@ struct Actor {
 
 impl Actor {
     fn new(
-        socket: UdpSocket,
-        config: TurnUdpClientConfig,
+        io: ClientIo,
+        config: TurnClientConfig,
         credentials: TurnCredentials,
         auth: AuthContext,
     ) -> Result<Self, TurnUdpError> {
+        if io.carrier() != config.carrier {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN carrier",
+                reason: "I/O carrier does not match client configuration",
+            });
+        }
         Ok(Self {
-            socket,
+            io,
             config,
             credentials,
             auth,
-            receive_buffer: vec![0_u8; TURN_UDP_RECEIVE_BUFFER_SIZE],
             commands: None,
             inbound: None,
             allocation_refresh_at: deadline_after(MIN_REFRESH_INTERVAL, "initial refresh")?,
@@ -768,14 +1164,11 @@ impl Actor {
                         break;
                     }
                 }
-                received = self.socket.recv(&mut self.receive_buffer) => {
+                received = self.io.receive_record() => {
                     match received {
-                        Ok(length) => self.handle_inbound_record(length),
-                        Err(source) => {
-                            self.fail(TurnUdpError::Io {
-                                operation: "receive",
-                                source,
-                            }).await;
+                        Ok(record) => self.handle_inbound_record(&record),
+                        Err(error) => {
+                            self.fail(error).await;
                             break;
                         }
                     }
@@ -840,18 +1233,14 @@ impl Actor {
     }
 
     async fn prepare_peer(&mut self, endpoint: &TransportEndpoint) -> Result<(), TurnUdpError> {
-        let (_relay_id, peer) = endpoint
-            .as_turn_udp()
-            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        let peer = self.peer_address(endpoint)?;
         self.ensure_permission(endpoint, peer).await?;
         self.ensure_channel(endpoint, peer).await?;
         Ok(())
     }
 
     async fn permit_peer(&mut self, endpoint: &TransportEndpoint) -> Result<(), TurnUdpError> {
-        let (_relay_id, peer) = endpoint
-            .as_turn_udp()
-            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        let peer = self.peer_address(endpoint)?;
         self.ensure_permission(endpoint, peer).await
     }
 
@@ -866,9 +1255,7 @@ impl Actor {
                 maximum: self.config.max_datagram_size,
             });
         }
-        let (_relay_id, peer) = endpoint
-            .as_turn_udp()
-            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        let peer = self.peer_address(endpoint)?;
         self.prepare_peer(endpoint).await?;
         let channel = self
             .channels
@@ -877,16 +1264,7 @@ impl Actor {
             .ok_or(TurnUdpError::InvalidAttribute {
                 detail: "prepared peer has no channel binding",
             })?;
-        let mut encoded = vec![0_u8; datagram.len().saturating_add(4)];
-        let length = encode_turn_channel_data(channel, datagram, &mut encoded)?;
-        self.socket
-            .send(&encoded[..length])
-            .await
-            .map_err(|source| TurnUdpError::Io {
-                operation: "send ChannelData",
-                source,
-            })?;
-        Ok(())
+        self.io.send_channel_data(channel, datagram).await
     }
 
     async fn send_indication_to_peer(
@@ -900,9 +1278,7 @@ impl Actor {
                 maximum: self.config.max_datagram_size,
             });
         }
-        let (_relay_id, peer) = endpoint
-            .as_turn_udp()
-            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        let peer = self.peer_address(endpoint)?;
         self.ensure_permission(endpoint, peer).await?;
         let transaction_id = random_transaction_id()?;
         let encoded = encode_message(
@@ -917,14 +1293,17 @@ impl Actor {
                 OwnedAttribute::new(StunAttributeType::DATA, datagram.to_vec()),
             ],
         )?;
-        self.socket
-            .send(&encoded)
-            .await
-            .map_err(|source| TurnUdpError::Io {
-                operation: "send indication",
-                source,
-            })?;
-        Ok(())
+        self.io.send_record(&encoded).await
+    }
+
+    fn peer_address(&self, endpoint: &TransportEndpoint) -> Result<SocketAddr, TurnUdpError> {
+        let (carrier, relay_id, peer) = endpoint
+            .as_relay()
+            .ok_or(TurnUdpError::UnsupportedEndpoint)?;
+        if carrier != self.config.carrier || relay_id != self.config.relay_id {
+            return Err(TurnUdpError::UnsupportedEndpoint);
+        }
+        Ok(peer)
     }
 
     async fn ensure_permission(
@@ -1127,51 +1506,45 @@ impl Actor {
     ) -> Result<Vec<u8>, TurnUdpError> {
         let deadline = deadline_after(self.config.transaction_timeout, "transaction timeout")?;
         let mut retransmit = INITIAL_RETRANSMIT_TIMEOUT;
+        let reliable = self.io.is_reliable();
         loop {
-            self.socket
-                .send(request)
-                .await
-                .map_err(|source| TurnUdpError::Io {
-                    operation: "send request",
-                    source,
-                })?;
-            let attempt_deadline = deadline.min(Instant::now().checked_add(retransmit).ok_or(
-                TurnUdpError::DeadlineOverflow {
-                    field: "retransmission timeout",
-                },
-            )?);
+            self.io.send_record(request).await?;
+            let attempt_deadline = if reliable {
+                deadline
+            } else {
+                deadline.min(Instant::now().checked_add(retransmit).ok_or(
+                    TurnUdpError::DeadlineOverflow {
+                        field: "retransmission timeout",
+                    },
+                )?)
+            };
             loop {
-                match timeout_at(attempt_deadline, self.socket.recv(&mut self.receive_buffer)).await
-                {
-                    Ok(Ok(length)) => {
-                        if response_matches(&self.receive_buffer[..length], method, transaction_id)
-                        {
-                            return Ok(self.receive_buffer[..length].to_vec());
+                match timeout_at(attempt_deadline, self.io.receive_record()).await {
+                    Ok(Ok(record)) => {
+                        if response_matches(&record, method, transaction_id) {
+                            return Ok(record);
                         }
-                        self.handle_inbound_record(length);
+                        self.handle_inbound_record(&record);
                     }
-                    Ok(Err(source)) => {
-                        return Err(TurnUdpError::Io {
-                            operation: "receive response",
-                            source,
-                        });
-                    }
+                    Ok(Err(error)) => return Err(error),
                     Err(_elapsed) => break,
                 }
             }
-            if Instant::now() >= deadline {
+            if reliable || Instant::now() >= deadline {
                 return Err(TurnUdpError::TransactionTimeout { method });
             }
             retransmit = retransmit.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
         }
     }
 
-    fn handle_inbound_record(&mut self, length: usize) {
-        let Some(record) = self.receive_buffer.get(..length) else {
-            return;
-        };
+    fn handle_inbound_record(&mut self, record: &[u8]) {
         if record.first().is_some_and(|byte| byte & 0xc0 == 0x40) {
-            let Ok(channel_data) = TurnChannelDataView::decode_datagram(record) else {
+            let channel_data = if self.io.is_reliable() {
+                TurnChannelDataView::decode_stream(record)
+            } else {
+                TurnChannelDataView::decode_datagram(record)
+            };
+            let Ok(channel_data) = channel_data else {
                 return;
             };
             let Some(peer) = self.channel_peers.get(&channel_data.channel()).copied() else {
@@ -1241,8 +1614,8 @@ impl OwnedAttribute {
 }
 
 async fn initial_challenge(
-    socket: &UdpSocket,
-    config: TurnUdpClientConfig,
+    io: &mut ClientIo,
+    config: TurnClientConfig,
     expected_realm: &[u8],
 ) -> Result<AuthContext, TurnUdpError> {
     let transaction_id = random_transaction_id()?;
@@ -1260,7 +1633,7 @@ async fn initial_challenge(
         ],
     )?;
     let response = transact_initial(
-        socket,
+        io,
         StunMethod::Allocate,
         transaction_id,
         &request,
@@ -1277,7 +1650,7 @@ async fn initial_challenge(
 }
 
 async fn transact_initial(
-    socket: &UdpSocket,
+    io: &mut ClientIo,
     method: StunMethod,
     transaction_id: StunTransactionId,
     request: &[u8],
@@ -1285,38 +1658,30 @@ async fn transact_initial(
 ) -> Result<Vec<u8>, TurnUdpError> {
     let deadline = deadline_after(transaction_timeout, "initial transaction timeout")?;
     let mut retransmit = INITIAL_RETRANSMIT_TIMEOUT;
-    let mut receive_buffer = vec![0_u8; TURN_UDP_RECEIVE_BUFFER_SIZE];
+    let reliable = io.is_reliable();
     loop {
-        socket
-            .send(request)
-            .await
-            .map_err(|source| TurnUdpError::Io {
-                operation: "send initial Allocate",
-                source,
-            })?;
-        let attempt_deadline = deadline.min(Instant::now().checked_add(retransmit).ok_or(
-            TurnUdpError::DeadlineOverflow {
-                field: "initial retransmission timeout",
-            },
-        )?);
+        io.send_record(request).await?;
+        let attempt_deadline = if reliable {
+            deadline
+        } else {
+            deadline.min(Instant::now().checked_add(retransmit).ok_or(
+                TurnUdpError::DeadlineOverflow {
+                    field: "initial retransmission timeout",
+                },
+            )?)
+        };
         loop {
-            match timeout_at(attempt_deadline, socket.recv(&mut receive_buffer)).await {
-                Ok(Ok(length)) => {
-                    if response_matches(&receive_buffer[..length], method, transaction_id) {
-                        receive_buffer.truncate(length);
-                        return Ok(receive_buffer);
+            match timeout_at(attempt_deadline, io.receive_record()).await {
+                Ok(Ok(record)) => {
+                    if response_matches(&record, method, transaction_id) {
+                        return Ok(record);
                     }
                 }
-                Ok(Err(source)) => {
-                    return Err(TurnUdpError::Io {
-                        operation: "receive initial Allocate",
-                        source,
-                    });
-                }
+                Ok(Err(error)) => return Err(error),
                 Err(_elapsed) => break,
             }
         }
-        if Instant::now() >= deadline {
+        if reliable || Instant::now() >= deadline {
             return Err(TurnUdpError::TransactionTimeout { method });
         }
         retransmit = retransmit.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
@@ -1588,10 +1953,75 @@ mod tests {
         relay_credentials::RelayCredentialAuthority,
         turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
     };
-    use stella_transport::Endpoint as TransportEndpoint;
-    use tokio::{sync::oneshot, time::timeout};
+    use stella_transport::{
+        Endpoint as TransportEndpoint, TurnStream, MAX_TURN_STREAM_RECORD_SIZE,
+    };
+    use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
-    use super::{TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError};
+    use super::{
+        encode_message, transact_initial, ClientIo, TurnCredentials, TurnTcpClientConfig,
+        TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+    };
+
+    #[tokio::test]
+    async fn reliable_transactions_use_one_complete_framed_exchange() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind TCP listener");
+        let server_address = listener.local_addr().expect("TCP listener address");
+        let transaction_id = stella_proto::StunTransactionId::from_bytes([0x33; 12]);
+        let request = encode_message(
+            stella_proto::StunMethod::Binding,
+            stella_proto::StunClass::Request,
+            transaction_id,
+            &[],
+        )
+        .expect("encode request");
+        let response = encode_message(
+            stella_proto::StunMethod::Binding,
+            stella_proto::StunClass::SuccessResponse,
+            transaction_id,
+            &[],
+        )
+        .expect("encode response");
+        let expected_request = request.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _client) = listener.accept().await.expect("accept TCP client");
+            let mut stream =
+                TurnStream::new(stream, MAX_TURN_STREAM_RECORD_SIZE).expect("frame server stream");
+            assert_eq!(
+                stream.read_record().await.expect("read request"),
+                expected_request
+            );
+            stream
+                .write_record(&response)
+                .await
+                .expect("write response");
+        });
+        let config = TurnTcpClientConfig::new(
+            RelayId::from_bytes([0x44; 16]),
+            server_address,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        );
+        config.validate().expect("validate TCP client config");
+        let stream = tokio::net::TcpStream::connect(server_address)
+            .await
+            .expect("connect TCP client");
+        let mut io = ClientIo::Tcp(
+            TurnStream::new(stream, MAX_TURN_STREAM_RECORD_SIZE).expect("frame client stream"),
+        );
+        let received = transact_initial(
+            &mut io,
+            stella_proto::StunMethod::Binding,
+            transaction_id,
+            &request,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("complete reliable transaction");
+        assert_eq!(received.len(), 20);
+        server.await.expect("server task");
+    }
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]

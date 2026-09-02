@@ -49,4 +49,7 @@ pub use state::{
 pub use stun::StunDiscoveryError;
 pub use switch::{FloodClass, L2Switch, PeerIngress, SwitchError, TapForwarding};
 pub use tls::{SpkiPin, SpkiPinParseError};
-pub use turn::{TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError};
+pub use turn::{
+    TurnCredentials, TurnTcpClient, TurnTcpClientConfig, TurnTcpError, TurnUdpClient,
+    TurnUdpClientConfig, TurnUdpError,
+};

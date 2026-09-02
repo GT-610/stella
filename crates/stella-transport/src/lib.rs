@@ -46,7 +46,6 @@ impl PathId {
 
 /// Client-to-relay carrier attached to one relayed endpoint.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
 pub enum RelayCarrier {
     /// TURN records carried over UDP.
     TurnUdp,
