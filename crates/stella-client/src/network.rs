@@ -159,6 +159,7 @@ struct InstalledSession {
 struct RetiredSession {
     data: PeerDataSession,
     path_id: PathId,
+    expires_at: u64,
     remove_at: Duration,
 }
 
@@ -396,15 +397,23 @@ impl NetworkDataPlane {
         wall_time: u64,
         monotonic_now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
+        if !grant_is_valid(self.state.local_grant(), wall_time) {
+            return Ok(NetworkOutput::default());
+        }
         let peers: Vec<NodeId> = self
             .state
             .peers()
             .keys()
             .copied()
             .filter(|peer| {
-                self.sessions
+                self.state
+                    .peers()
                     .get(peer)
-                    .is_none_or(|session| session.rekeying)
+                    .is_some_and(|state| grant_is_valid(state.grant(), wall_time))
+                    && self
+                        .sessions
+                        .get(peer)
+                        .is_none_or(|session| session.rekeying)
                     && !self.handshakes.has_outgoing(*peer)
                     && self.handshakes.can_initiate(*peer, monotonic_now)
                     && self.select_peer_path(*peer).is_some()
@@ -441,6 +450,11 @@ impl NetworkDataPlane {
         wall_time: u64,
         monotonic_now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
+        if !self.expire_authorization(wall_time) {
+            return Ok(NetworkOutput::default());
+        }
+        self.expire_sessions(wall_time);
+        self.expire_retired_sessions(wall_time, monotonic_now);
         let rekey: Vec<NodeId> = self
             .sessions
             .iter()
@@ -456,7 +470,6 @@ impl NetworkDataPlane {
                 session.rekeying = true;
             }
         }
-        self.expire_retired_sessions(monotonic_now);
         let mut output = NetworkOutput::default();
         let keepalive_due: Vec<NodeId> = self
             .sessions
@@ -555,6 +568,9 @@ impl NetworkDataPlane {
         if common.network_id != self.state.network_id() {
             return Err(NetworkDataError::WrongNetwork);
         }
+        self.expire_authorization(wall_time);
+        self.expire_sessions(wall_time);
+        self.expire_retired_sessions(wall_time, monotonic_now);
         match common.packet_type {
             PacketType::Data => self.accept_data(source, datagram, monotonic_now),
             PacketType::SessionInit
@@ -775,6 +791,7 @@ impl NetworkDataPlane {
                             RetiredSession {
                                 data: previous.data,
                                 path_id: previous.path_id,
+                                expires_at: previous.expires_at,
                                 remove_at: now.saturating_add(OLD_SESSION_RECEIVE_GRACE),
                             },
                         );
@@ -1047,17 +1064,51 @@ impl NetworkDataPlane {
         self.switch.remove_peer(peer);
     }
 
-    fn expire_retired_sessions(&mut self, now: Duration) {
+    fn expire_authorization(&mut self, wall_time: u64) -> bool {
+        let local_valid = grant_is_valid(self.state.local_grant(), wall_time);
+        let expired = self
+            .state
+            .peers()
+            .iter()
+            .filter_map(|(peer, state)| {
+                (!local_valid || !grant_is_valid(state.grant(), wall_time)).then_some(*peer)
+            })
+            .collect::<Vec<_>>();
+        for peer in expired {
+            self.remove_session(peer);
+            self.handshakes.remove_peer(peer);
+        }
+        local_valid
+    }
+
+    fn expire_sessions(&mut self, wall_time: u64) {
+        let expired = self
+            .sessions
+            .iter()
+            .filter_map(|(peer, session)| (wall_time >= session.expires_at).then_some(*peer))
+            .collect::<Vec<_>>();
+        for peer in expired {
+            self.remove_session(peer);
+        }
+    }
+
+    fn expire_retired_sessions(&mut self, wall_time: u64, now: Duration) {
         let expired: Vec<(NodeId, u64)> = self
             .retired_sessions
             .iter()
-            .filter_map(|(key, session)| (now >= session.remove_at).then_some(*key))
+            .filter_map(|(key, session)| {
+                (wall_time >= session.expires_at || now >= session.remove_at).then_some(*key)
+            })
             .collect();
         for key @ (peer, session_id) in expired {
             self.retired_sessions.remove(&key);
             self.handshakes.retire_session(peer, session_id);
         }
     }
+}
+
+const fn grant_is_valid(grant: stella_proto::MembershipGrant, wall_time: u64) -> bool {
+    grant.not_before <= wall_time && wall_time < grant.not_after
 }
 
 const fn relay_carrier_bit(carrier: ConnectivityCarrier) -> Option<u16> {
@@ -1806,6 +1857,79 @@ mod tests {
             from_alice = !from_alice;
         }
         panic!("handshake did not converge within eight flights");
+    }
+
+    #[test]
+    fn expired_peer_sessions_stop_forwarding_and_reject_late_packets() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_address: SocketAddr = "127.0.0.1:46001".parse().expect("alice address");
+        let bob_address: SocketAddr = "127.0.0.1:46002".parse().expect("bob address");
+        let alice_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 1, 1]);
+        let bob_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 1, 2]);
+        let bob_id = derive_node_id(bob_key.public_key());
+        let mut alice = NetworkDataPlane::new(
+            state(&store, &controller, &alice_key, network_id),
+            alice_mac,
+            alice_address,
+            1_200,
+            &alice_key,
+            Duration::ZERO,
+        )
+        .expect("alice data plane");
+        let mut bob = NetworkDataPlane::new(
+            state(&store, &controller, &bob_key, network_id),
+            bob_mac,
+            bob_address,
+            1_200,
+            &bob_key,
+            Duration::ZERO,
+        )
+        .expect("bob data plane");
+        establish(
+            &mut alice,
+            &mut bob,
+            &alice_key,
+            &bob_key,
+            alice_address,
+            bob_address,
+            WALL_TIME,
+            Duration::ZERO,
+        );
+        let expires_at = alice
+            .sessions
+            .get(&bob_id)
+            .expect("installed Alice session")
+            .expires_at;
+        let frame = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xe1);
+        let late_packet = alice
+            .accept_tap_frame(&frame, Duration::from_secs(1))
+            .expect("protect frame before expiry")
+            .into_parts()
+            .0
+            .remove(0);
+
+        alice
+            .maintain(&alice_key, expires_at, Duration::from_secs(2))
+            .expect("expire Alice session without failing the network");
+        assert!(alice.established_peers().is_empty());
+        assert!(alice
+            .accept_tap_frame(&frame, Duration::from_secs(2))
+            .expect("drop local frame after expiry")
+            .datagrams()
+            .is_empty());
+        assert!(matches!(
+            bob.accept_udp_datagram(
+                alice_address,
+                late_packet.bytes(),
+                &bob_key,
+                expires_at,
+                Duration::from_secs(2),
+            ),
+            Err(NetworkDataError::NoPeerSession { .. })
+        ));
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     #[test]
