@@ -30,13 +30,14 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::{
+    ice::looks_like_stun,
     stun::{
         discover_server_reflexive, gather_host_candidates, server_reflexive_candidate,
         DeferredUdpDatagram, StunDiscovery,
     },
-    ClientConfig, ConnectivityConfigState, NetworkDataError, NetworkDataPlane, NetworkOutput,
-    NetworkState, StunDiscoveryError, TurnCredentials, TurnUdpClient, TurnUdpClientConfig,
-    TurnUdpError,
+    ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
+    NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState, StunDiscoveryError,
+    TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
 };
 
 const TAP_WRITE_QUEUE_CAPACITY: usize = 64;
@@ -111,6 +112,9 @@ pub enum RuntimeError {
     /// Per-network authenticated routing failed.
     #[error(transparent)]
     Network(#[from] NetworkDataError),
+    /// Per-network ICE configuration, checking, or nomination failed.
+    #[error(transparent)]
+    Ice(#[from] IceError),
     /// A Stella datagram header was structurally malformed.
     #[error(transparent)]
     Codec(#[from] stella_proto::CodecError),
@@ -132,6 +136,7 @@ pub struct ClientDataRuntime {
     relay: Option<WarmRelay>,
     relay_buffer: Vec<u8>,
     connectivity_generations: BTreeMap<NetworkId, LocalConnectivityGeneration>,
+    ice_agents: BTreeMap<NetworkId, RuntimeIceAgent>,
     networks: BTreeMap<NetworkId, ActiveNetwork>,
     tap_events: mpsc::Receiver<TapEvent>,
     tap_event_sender: mpsc::Sender<TapEvent>,
@@ -225,6 +230,7 @@ impl ClientDataRuntime {
             relay,
             relay_buffer: vec![0_u8; relay_buffer_size],
             connectivity_generations: BTreeMap::new(),
+            ice_agents: BTreeMap::new(),
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
@@ -236,6 +242,7 @@ impl ClientDataRuntime {
         runtime.replace_local_connectivity_generations(states)?;
         runtime.prepare_relay_paths().await?;
         let wall_time = unix_time()?;
+        runtime.reconcile_ice_agents(states, wall_time)?;
         let monotonic_now = runtime.monotonic_now();
         let network_ids: Vec<NetworkId> = runtime.networks.keys().copied().collect();
         for network_id in network_ids {
@@ -261,33 +268,7 @@ impl ClientDataRuntime {
         signing_key: &IdentitySigningKey,
     ) -> Result<(), RuntimeError> {
         let received = self.udp.receive(&mut self.udp_buffer).await?;
-        let datagram = self
-            .udp_buffer
-            .get(..received.length)
-            .ok_or(TransportError::ReceiveTruncated {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "validated UDP length exceeds receive buffer",
-                ),
-            })?
-            .to_vec();
-        let common = CommonHeader::decode(&datagram)?;
-        let network_id = common.network_id;
-        let wall_time = unix_time()?;
-        let monotonic_now = self.monotonic_now();
-        let output = self
-            .networks
-            .get_mut(&network_id)
-            .ok_or(NetworkDataError::WrongNetwork)?
-            .plane
-            .accept_datagram(
-                &received.source,
-                &datagram,
-                signing_key,
-                wall_time,
-                monotonic_now,
-            )?;
-        self.apply_output(network_id, output).await
+        self.process_udp(received, signing_key).await
     }
 
     /// Waits for and processes whichever UDP datagram or TAP event arrives first.
@@ -390,6 +371,13 @@ impl ClientDataRuntime {
         datagram: &[u8],
         signing_key: &IdentitySigningKey,
     ) -> Result<(), RuntimeError> {
+        if let TransportEndpoint::Udp(address) = &source {
+            if looks_like_stun(datagram) {
+                self.process_ice_udp(*address, datagram, signing_key)
+                    .await?;
+                return Ok(());
+            }
+        }
         let common = CommonHeader::decode(datagram)?;
         let network_id = common.network_id;
         let wall_time = unix_time()?;
@@ -401,6 +389,36 @@ impl ClientDataRuntime {
             .plane
             .accept_datagram(&source, datagram, signing_key, wall_time, monotonic_now)?;
         self.apply_output(network_id, output).await
+    }
+
+    async fn process_ice_udp(
+        &mut self,
+        source: SocketAddr,
+        datagram: &[u8],
+        signing_key: &IdentitySigningKey,
+    ) -> Result<(), RuntimeError> {
+        let now = self.monotonic_now();
+        let network_ids = self.ice_agents.keys().copied().collect::<Vec<_>>();
+        for network_id in network_ids {
+            let Some(runtime_agent) = self.ice_agents.get_mut(&network_id) else {
+                continue;
+            };
+            let accepted = runtime_agent.agent.accept(source, datagram, now);
+            match accepted {
+                Ok(Some(output)) => {
+                    self.apply_ice_output(network_id, output, signing_key)
+                        .await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(%source, %error, "dropping invalid ICE STUN datagram");
+                    return Ok(());
+                }
+            }
+        }
+        tracing::trace!(%source, "dropping unassociated STUN datagram");
+        Ok(())
     }
 
     async fn process_relay(
@@ -445,6 +463,15 @@ impl ClientDataRuntime {
     pub async fn maintain(&mut self, signing_key: &IdentitySigningKey) -> Result<(), RuntimeError> {
         let wall_time = unix_time()?;
         let now = self.monotonic_now();
+        let ice_network_ids = self.ice_agents.keys().copied().collect::<Vec<_>>();
+        for network_id in ice_network_ids {
+            let Some(runtime_agent) = self.ice_agents.get_mut(&network_id) else {
+                continue;
+            };
+            let output = runtime_agent.agent.poll(now)?;
+            self.apply_ice_output(network_id, output, signing_key)
+                .await?;
+        }
         let network_ids: Vec<NetworkId> = self.networks.keys().copied().collect();
         for network_id in network_ids {
             let output = self
@@ -512,6 +539,7 @@ impl ClientDataRuntime {
             }
         }
         self.reconcile_local_connectivity_generations(states)?;
+        self.reconcile_ice_agents(states, unix_time()?)?;
         self.prepare_relay_paths().await?;
         Ok(())
     }
@@ -593,6 +621,7 @@ impl ClientDataRuntime {
             0,
         );
         self.replace_local_connectivity_generations(states)?;
+        self.reconcile_ice_agents(states, unix_time()?)?;
         self.prepare_relay_paths().await?;
         self.connectivity_revision = revision;
         Ok(())
@@ -692,6 +721,48 @@ impl ClientDataRuntime {
             },
         );
         Ok(())
+    }
+
+    async fn apply_ice_output(
+        &mut self,
+        network_id: NetworkId,
+        output: IceOutput,
+        signing_key: &IdentitySigningKey,
+    ) -> Result<(), RuntimeError> {
+        let (transmissions, nominations) = output.into_parts();
+        for transmission in transmissions {
+            self.udp
+                .send_to(
+                    &TransportEndpoint::Udp(transmission.target()),
+                    transmission.bytes(),
+                )
+                .await?;
+        }
+        if nominations.is_empty() {
+            return Ok(());
+        }
+        for nomination in nominations {
+            self.networks
+                .get_mut(&network_id)
+                .ok_or(RuntimeError::TapWorkerStopped { network_id })?
+                .plane
+                .nominate_direct_path(nomination.peer_node_id, nomination.address)?;
+            tracing::info!(
+                %network_id,
+                peer_node_id = %nomination.peer_node_id,
+                address = %nomination.address,
+                "nominated direct UDP path"
+            );
+        }
+        let wall_time = unix_time()?;
+        let monotonic_now = self.monotonic_now();
+        let handshakes = self
+            .networks
+            .get_mut(&network_id)
+            .ok_or(RuntimeError::TapWorkerStopped { network_id })?
+            .plane
+            .start_handshakes(signing_key, wall_time, monotonic_now)?;
+        self.apply_output(network_id, handshakes).await
     }
 
     async fn apply_output(
@@ -795,6 +866,77 @@ impl ClientDataRuntime {
         }
         Ok(())
     }
+
+    fn reconcile_ice_agents(
+        &mut self,
+        states: &BTreeMap<NetworkId, NetworkState>,
+        wall_time: u64,
+    ) -> Result<(), RuntimeError> {
+        let generations = &self.connectivity_generations;
+        self.ice_agents.retain(|network_id, current| {
+            states.contains_key(network_id)
+                && generations.get(network_id).is_some_and(|generation| {
+                    generation.generation_id == current.generation_id
+                        && generation.expires_at > wall_time
+                        && generation
+                            .candidates
+                            .iter()
+                            .any(|candidate| candidate.carrier == ConnectivityCarrier::DirectUdp)
+                })
+        });
+        for (network_id, state) in states {
+            let Some(generation) = self.connectivity_generations.get(network_id) else {
+                continue;
+            };
+            let direct_available = generation
+                .candidates
+                .iter()
+                .any(|candidate| candidate.carrier == ConnectivityCarrier::DirectUdp);
+            if generation.expires_at <= wall_time || !direct_available {
+                self.ice_agents.remove(network_id);
+                continue;
+            }
+            if !self.ice_agents.contains_key(network_id) {
+                let agent = IceAgent::new(
+                    state.local_grant().node_id,
+                    generation.tie_breaker,
+                    &generation.username_fragment,
+                    &generation.password,
+                    &generation.candidates,
+                )?;
+                self.ice_agents.insert(
+                    *network_id,
+                    RuntimeIceAgent {
+                        generation_id: generation.generation_id,
+                        agent,
+                    },
+                );
+            }
+            let Some(runtime_agent) = self.ice_agents.get_mut(network_id) else {
+                continue;
+            };
+            let mut authorized = BTreeSet::new();
+            for (peer_node_id, peer) in state.peers() {
+                let Some(connectivity) = peer.connectivity() else {
+                    continue;
+                };
+                if connectivity.expires_at() <= wall_time {
+                    continue;
+                }
+                runtime_agent.agent.upsert_peer(IcePeerConfig {
+                    node_id: *peer_node_id,
+                    generation_id: connectivity.generation_id(),
+                    tie_breaker: connectivity.tie_breaker(),
+                    username_fragment: connectivity.username_fragment(),
+                    password: connectivity.password(),
+                    candidates: connectivity.candidates(),
+                })?;
+                authorized.insert(*peer_node_id);
+            }
+            runtime_agent.agent.retain_peers(&authorized);
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for ClientDataRuntime {
@@ -806,6 +948,7 @@ impl std::fmt::Debug for ClientDataRuntime {
                 "relay_id",
                 &self.relay.as_ref().map(|relay| relay.client.relay_id()),
             )
+            .field("ice_agents", &self.ice_agents.len())
             .field("networks", &self.networks.len())
             .finish_non_exhaustive()
     }
@@ -816,6 +959,11 @@ struct ActiveNetwork {
     primary_mac: MacAddress,
     plane: NetworkDataPlane,
     tap: TapWorker,
+}
+
+struct RuntimeIceAgent {
+    generation_id: u64,
+    agent: IceAgent,
 }
 
 struct WarmRelay {

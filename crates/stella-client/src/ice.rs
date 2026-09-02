@@ -332,8 +332,10 @@ impl IceAgent {
 
     /// Processes one UDP datagram when it is a STUN Binding record.
     ///
-    /// `Ok(None)` means the datagram is not STUN and should continue to the
-    /// Stella packet decoder. Invalid matching ICE records fail closed.
+    /// `Ok(None)` means the datagram is not associated with this ICE component.
+    /// A shared UDP socket can therefore try other network-scoped agents before
+    /// continuing to the Stella packet decoder. Invalid matching ICE records
+    /// fail closed.
     ///
     /// # Errors
     ///
@@ -353,8 +355,8 @@ impl IceAgent {
             return Ok(Some(IceOutput::default()));
         }
         match message.message_type().class {
-            StunClass::Request => self.accept_request(source, &message, now).map(Some),
-            StunClass::SuccessResponse => self.accept_response(source, &message, now).map(Some),
+            StunClass::Request => self.accept_request(source, &message, now),
+            StunClass::SuccessResponse => self.accept_response(source, &message, now),
             StunClass::ErrorResponse | StunClass::Indication => Ok(Some(IceOutput::default())),
         }
     }
@@ -364,9 +366,11 @@ impl IceAgent {
         source: SocketAddr,
         message: &StunMessageView<'_>,
         now: Duration,
-    ) -> Result<IceOutput, IceError> {
+    ) -> Result<Option<IceOutput>, IceError> {
         let username = required_attribute(message, StunAttributeType::USERNAME, "USERNAME")?;
-        let peer_node_id = self.peer_for_username(username)?;
+        let Some(peer_node_id) = self.peer_for_username(username)? else {
+            return Ok(None);
+        };
         let peer = self
             .peers
             .get(&peer_node_id)
@@ -429,7 +433,7 @@ impl IceAgent {
                 transaction.next_send = now.saturating_add(transaction.retransmit);
             }
         }
-        Ok(output)
+        Ok(Some(output))
     }
 
     fn accept_response(
@@ -437,21 +441,21 @@ impl IceAgent {
         source: SocketAddr,
         message: &StunMessageView<'_>,
         now: Duration,
-    ) -> Result<IceOutput, IceError> {
-        let Some(transaction) = self.transactions.remove(&message.transaction_id()) else {
-            return Ok(IceOutput::default());
+    ) -> Result<Option<IceOutput>, IceError> {
+        let Some(transaction) = self.transactions.get(&message.transaction_id()) else {
+            return Ok(None);
         };
         if transaction.target != source {
-            self.transactions
-                .insert(message.transaction_id(), transaction);
             return Err(IceError::InvalidAttribute {
                 field: "response source",
             });
         }
+        let peer_node_id = transaction.peer_node_id;
+        let nomination = transaction.nomination;
         let peer_tie_breaker = {
             let peer = self
                 .peers
-                .get(&transaction.peer_node_id)
+                .get(&peer_node_id)
                 .ok_or(IceError::InvalidAttribute { field: "peer" })?;
             verify_integrity(message, &peer.password)?;
             peer.tie_breaker
@@ -462,37 +466,40 @@ impl IceAgent {
             "XOR-MAPPED-ADDRESS",
         )?;
         let _local_mapping = decode_stun_xor_address(mapped, message.transaction_id())?;
-        if let Some(peer) = self.peers.get_mut(&transaction.peer_node_id) {
+        self.transactions.remove(&message.transaction_id());
+        if let Some(peer) = self.peers.get_mut(&peer_node_id) {
             peer.active_transaction = None;
             peer.succeeded = Some(source);
         }
         let mut output = IceOutput::default();
-        if transaction.nomination {
-            if let Some(peer) = self.peers.get_mut(&transaction.peer_node_id) {
+        if nomination {
+            if let Some(peer) = self.peers.get_mut(&peer_node_id) {
                 peer.nominated = Some(source);
             }
             output.nominations.push(IceNomination {
-                peer_node_id: transaction.peer_node_id,
+                peer_node_id,
                 address: source,
             });
-        } else if self.local_controlling(transaction.peer_node_id, peer_tie_breaker) {
-            let transaction_id =
-                self.create_transaction(transaction.peer_node_id, source, true, now)?;
+        } else if self.local_controlling(peer_node_id, peer_tie_breaker) {
+            let transaction_id = self.create_transaction(peer_node_id, source, true, now)?;
             if let Some(transaction) = self.transactions.get_mut(&transaction_id) {
                 output.transmissions.push(transaction.transmission());
                 transaction.next_send = now.saturating_add(transaction.retransmit);
             }
         }
-        Ok(output)
+        Ok(Some(output))
     }
 
-    fn peer_for_username(&self, username: &[u8]) -> Result<NodeId, IceError> {
+    fn peer_for_username(&self, username: &[u8]) -> Result<Option<NodeId>, IceError> {
         let Some(separator) = username.iter().position(|byte| *byte == b':') else {
             return Err(IceError::InvalidAttribute { field: "USERNAME" });
         };
         let (local, peer_with_separator) = username.split_at(separator);
         let peer = &peer_with_separator[1..];
-        if local != self.username_fragment.as_slice() || peer.is_empty() {
+        if local != self.username_fragment.as_slice() {
+            return Ok(None);
+        }
+        if peer.is_empty() {
             return Err(IceError::InvalidAttribute { field: "USERNAME" });
         }
         self.peers
@@ -500,6 +507,7 @@ impl IceAgent {
             .find_map(|(node_id, state)| {
                 (state.username_fragment.as_slice() == peer).then_some(*node_id)
             })
+            .map(Some)
             .ok_or(IceError::InvalidAttribute { field: "USERNAME" })
     }
 
@@ -836,7 +844,7 @@ fn validate_source(source: SocketAddr) -> Result<(), IceError> {
     }
 }
 
-fn looks_like_stun(datagram: &[u8]) -> bool {
+pub(crate) fn looks_like_stun(datagram: &[u8]) -> bool {
     datagram.len() >= 20
         && datagram[0] & 0xc0 == 0
         && datagram.get(4..8) == Some(stella_proto::STUN_MAGIC_COOKIE.to_be_bytes().as_slice())
@@ -853,9 +861,12 @@ mod tests {
     use std::{collections::VecDeque, time::Duration};
 
     use stella_common::NodeId;
-    use stella_proto::{ConnectivityCarrier, IceCandidate, IceCandidateClass};
+    use stella_proto::{
+        encode_stun_xor_address, ConnectivityCarrier, IceCandidate, IceCandidateClass,
+        StunAttributeType, StunClass, StunMessageView,
+    };
 
-    use super::{IceAgent, IcePeerConfig};
+    use super::{encode_signed_binding, IceAgent, IcePeerConfig, OwnedAttribute};
 
     fn candidate(address: &str, priority: u32) -> IceCandidate {
         IceCandidate {
@@ -868,6 +879,82 @@ mod tests {
             related_address: None,
             relay_id: None,
         }
+    }
+
+    #[test]
+    fn unrelated_component_ignores_request_and_invalid_response_keeps_retry() {
+        let alice_id = NodeId::from_bytes([0x11; 16]);
+        let bob_id = NodeId::from_bytes([0x22; 16]);
+        let alice_candidate = candidate("192.0.2.10:40000", 2_130_706_431);
+        let bob_candidate = candidate("192.0.2.20:40001", 2_130_706_431);
+        let mut alice = IceAgent::new(
+            alice_id,
+            10,
+            b"AliceUfr",
+            b"AlicePassword123456789",
+            &[alice_candidate],
+        )
+        .expect("Alice agent");
+        alice
+            .upsert_peer(IcePeerConfig {
+                node_id: bob_id,
+                generation_id: 2,
+                tie_breaker: 20,
+                username_fragment: b"BobUfrag",
+                password: b"BobPassword12345678901",
+                candidates: &[bob_candidate],
+            })
+            .expect("configure Bob");
+        let request = alice
+            .poll(Duration::ZERO)
+            .expect("initial check")
+            .into_parts()
+            .0
+            .remove(0);
+
+        let mut unrelated = IceAgent::new(
+            NodeId::from_bytes([0x33; 16]),
+            30,
+            b"OtherUfr",
+            b"OtherPassword123456789",
+            &[candidate("192.0.2.30:40002", 2_130_706_431)],
+        )
+        .expect("unrelated agent");
+        assert!(unrelated
+            .accept(alice_candidate.address, request.bytes(), Duration::ZERO)
+            .expect("ignore unrelated request")
+            .is_none());
+
+        let request_view = StunMessageView::decode(request.bytes()).expect("decode request");
+        let mut mapped = [0_u8; 20];
+        let mapped_length = encode_stun_xor_address(
+            alice_candidate.address,
+            request_view.transaction_id(),
+            &mut mapped,
+        )
+        .expect("mapped address");
+        let mut response = encode_signed_binding(
+            StunClass::SuccessResponse,
+            request_view.transaction_id(),
+            &[OwnedAttribute::new(
+                StunAttributeType::XOR_MAPPED_ADDRESS,
+                mapped[..mapped_length].to_vec(),
+            )],
+            b"BobPassword12345678901",
+        )
+        .expect("signed response");
+        let last = response.len() - 1;
+        response[last] ^= 1;
+        assert!(alice
+            .accept(bob_candidate.address, &response, Duration::ZERO)
+            .is_err());
+        let retry = alice
+            .poll(Duration::from_millis(250))
+            .expect("retry after invalid response")
+            .into_parts()
+            .0;
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].bytes(), request.bytes());
     }
 
     #[test]
