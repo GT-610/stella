@@ -19,11 +19,13 @@ use stella_proto::{
 use stella_transport::{TurnStream, MAX_TURN_STREAM_RECORD_SIZE};
 use thiserror::Error;
 use tokio::{
-    net::{TcpListener, TcpStream, UdpSocket},
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, UdpSocket},
     sync::{mpsc, oneshot, Mutex},
     task::JoinSet,
-    time::MissedTickBehavior,
+    time::{timeout, MissedTickBehavior},
 };
+use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
 use crate::{
     relay_credentials::{RelayCredentialAuthority, TurnNonceStatus},
@@ -38,6 +40,7 @@ const RECEIVE_BUFFER_LENGTH: usize = u16::MAX as usize;
 const ALLOCATION_COMMAND_CAPACITY: usize = 256;
 const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
 const CHANNEL_BINDING_LIFETIME: Duration = Duration::from_secs(600);
+const MAX_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runtime limits and addresses for one TURN UDP listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,7 +293,7 @@ enum ClientSink {
         control: Arc<UdpSocket>,
         client: SocketAddr,
     },
-    Tcp {
+    Stream {
         client: SocketAddr,
         sender: mpsc::Sender<Vec<u8>>,
     },
@@ -303,7 +306,7 @@ struct ClientConnection {
 
 impl ClientSink {
     const fn is_stream(&self) -> bool {
-        matches!(self, Self::Tcp { .. })
+        matches!(self, Self::Stream { .. })
     }
 
     async fn send(&self, record: Vec<u8>) -> Result<(), TurnRelayError> {
@@ -317,7 +320,7 @@ impl ClientSink {
                 })?;
                 Ok(())
             }
-            Self::Tcp { client, sender } => sender
+            Self::Stream { client, sender } => sender
                 .send(record)
                 .await
                 .map_err(|_| TurnRelayError::ClientStreamClosed { client: *client }),
@@ -329,7 +332,7 @@ impl ClientSink {
             Self::Udp { control, client } => {
                 let _result = control.send_to(&record, *client).await;
             }
-            Self::Tcp { sender, .. } => {
+            Self::Stream { sender, .. } => {
                 let _result = sender.try_send(record);
             }
         }
@@ -497,7 +500,7 @@ impl TurnTcpRelay {
                     })?;
                     let core = Arc::clone(&self.core);
                     sessions.spawn(async move {
-                        (client, run_tcp_client(stream, client, core).await)
+                        (client, run_stream_client(stream, client, core).await)
                     });
                 }
                 joined = sessions.join_next(), if !sessions.is_empty() => {
@@ -531,16 +534,157 @@ impl fmt::Debug for TurnTcpRelay {
     }
 }
 
-async fn run_tcp_client(
-    stream: TcpStream,
+/// One bound TURN TLS relay ready to serve authenticated TLS 1.3 sessions.
+pub struct TurnTlsRelay {
+    config: TurnTcpRelayConfig,
+    listener: TcpListener,
+    core: Arc<Mutex<TurnRelayCore>>,
+    acceptor: TlsAcceptor,
+    handshake_timeout: Duration,
+}
+
+impl TurnTlsRelay {
+    /// Validates stream limits, binds the TCP listener, and installs one TLS identity.
+    ///
+    /// The shared [`TurnTcpRelayConfig`] describes the identical reliable TURN
+    /// stream and UDP allocation limits. `tls_config` must disable early data;
+    /// callers normally obtain it from [`crate::tls::load_tls_server_config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] for invalid limits, TLS policy, credential
+    /// scope, handshake deadline, or an operating-system bind failure.
+    pub async fn bind(
+        config: TurnTcpRelayConfig,
+        credentials: RelayCredentialAuthority,
+        tls_config: Arc<ServerConfig>,
+        handshake_timeout: Duration,
+    ) -> Result<Self, TurnRelayError> {
+        config.validate()?;
+        if handshake_timeout.is_zero() || handshake_timeout > MAX_TLS_HANDSHAKE_TIMEOUT {
+            return Err(invalid_config(
+                "TLS handshake timeout must be between one nanosecond and 60 seconds",
+            ));
+        }
+        if tls_config.max_early_data_size != 0 {
+            return Err(invalid_config("TURN TLS early data must be disabled"));
+        }
+        let listener = TcpListener::bind(config.listen_address)
+            .await
+            .map_err(|source| TurnRelayError::BindTcp {
+                address: config.listen_address,
+                source,
+            })?;
+        let core = TurnRelayCore::new(config.into(), credentials)?;
+        Ok(Self {
+            config,
+            listener,
+            core: Arc::new(Mutex::new(core)),
+            acceptor: TlsAcceptor::from(tls_config),
+            handshake_timeout,
+        })
+    }
+
+    /// Returns the actual TCP listener address, including an assigned port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] if the operating system cannot report the
+    /// bound listener address.
+    pub fn local_address(&self) -> Result<SocketAddr, TurnRelayError> {
+        self.listener
+            .local_addr()
+            .map_err(|source| TurnRelayError::TcpLocalAddress { source })
+    }
+
+    /// Serves framed TURN TLS sessions until `shutdown` resolves.
+    ///
+    /// TCP and TLS handshake failures close only their client session. Listener
+    /// failure or an internal task panic terminates the runtime for restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnRelayError`] for listener, clock, or task failures.
+    pub async fn run<F>(self, shutdown: F) -> Result<(), TurnRelayError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let mut shutdown = std::pin::pin!(shutdown);
+        let mut cleanup = tokio::time::interval(Duration::from_secs(1));
+        cleanup.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut sessions = JoinSet::new();
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                _ = cleanup.tick() => {
+                    self.core.lock().await.remove_expired(Instant::now());
+                }
+                accepted = self.listener.accept() => {
+                    let (stream, client) = accepted.map_err(|source| TurnRelayError::AcceptTcp { source })?;
+                    stream.set_nodelay(true).map_err(|source| TurnRelayError::ConfigureTcp {
+                        client,
+                        source,
+                    })?;
+                    let core = Arc::clone(&self.core);
+                    let acceptor = self.acceptor.clone();
+                    let handshake_timeout = self.handshake_timeout;
+                    sessions.spawn(async move {
+                        let session = async {
+                            let stream = timeout(handshake_timeout, acceptor.accept(stream))
+                                .await
+                                .map_err(|_| TurnRelayError::TlsHandshakeTimeout { client })?
+                                .map_err(|source| TurnRelayError::TlsHandshake { client, source })?;
+                            run_stream_client(stream, client, core).await
+                        }
+                        .await;
+                        (client, session)
+                    });
+                }
+                joined = sessions.join_next(), if !sessions.is_empty() => {
+                    if let Some(result) = joined {
+                        let (client, session) = result.map_err(|source| TurnRelayError::ClientTaskJoin { source })?;
+                        if let Err(error) = session {
+                            tracing::debug!(%client, %error, "TURN TLS client session closed");
+                        }
+                    }
+                }
+            }
+        }
+        sessions.abort_all();
+        while let Some(result) = sessions.join_next().await {
+            if let Err(source) = result {
+                if !source.is_cancelled() {
+                    return Err(TurnRelayError::ClientTaskJoin { source });
+                }
+            }
+        }
+        self.core.lock().await.shutdown().await
+    }
+}
+
+impl fmt::Debug for TurnTlsRelay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnTlsRelay")
+            .field("config", &self.config)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+async fn run_stream_client<S>(
+    stream: S,
     client: SocketAddr,
     core: Arc<Mutex<TurnRelayCore>>,
-) -> Result<(), TurnRelayError> {
-    let (reader, writer) = stream.into_split();
+) -> Result<(), TurnRelayError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = TurnStream::new(reader, MAX_TURN_STREAM_RECORD_SIZE)?;
     let mut writer = TurnStream::new(writer, MAX_TURN_STREAM_RECORD_SIZE)?;
     let (sender, mut outbound) = mpsc::channel(256);
-    let sink = ClientSink::Tcp { client, sender };
+    let sink = ClientSink::Stream { client, sender };
     let mut writer_task = tokio::spawn(async move {
         while let Some(record) = outbound.recv().await {
             writer.write_record(&record).await?;
@@ -1968,6 +2112,21 @@ pub enum TurnRelayError {
         /// Connected client transport address.
         client: SocketAddr,
         /// Underlying socket failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A TURN TLS client did not complete its handshake before the configured deadline.
+    #[error("TURN TLS handshake with {client} timed out")]
+    TlsHandshakeTimeout {
+        /// Connected client transport address.
+        client: SocketAddr,
+    },
+    /// A TURN TLS client failed certificate-independent server-side negotiation.
+    #[error("TURN TLS handshake with {client} failed")]
+    TlsHandshake {
+        /// Connected client transport address.
+        client: SocketAddr,
+        /// Underlying TLS I/O or protocol failure.
         #[source]
         source: std::io::Error,
     },

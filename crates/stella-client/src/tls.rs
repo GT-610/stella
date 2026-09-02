@@ -4,6 +4,7 @@ use std::{fmt, str::FromStr, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use stella_crypto::sha256_segments;
+use stella_proto::RelayTrustRequirements;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio_rustls::{
@@ -100,6 +101,7 @@ pub enum SpkiPinParseError {
 #[derive(Debug)]
 struct PinnedServerVerifier {
     pins: Vec<SpkiPin>,
+    web_pki: Option<Arc<WebPkiServerVerifier>>,
     provider: Arc<rustls::crypto::CryptoProvider>,
     supported: WebPkiSupportedAlgorithms,
 }
@@ -113,20 +115,31 @@ impl ServerCertVerifier for PinnedServerVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let (remaining, certificate) = parse_x509_certificate(end_entity.as_ref())
-            .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
-        if !remaining.is_empty() {
-            return Err(rustls::Error::InvalidCertificate(
-                CertificateError::BadEncoding,
-            ));
-        }
-        let digest = sha256_segments(&[certificate.public_key().raw]);
-        if !self.pins.iter().any(|pin| pin.matches(&digest)) {
-            return Err(rustls::Error::InvalidCertificate(
-                CertificateError::ApplicationVerificationFailure,
-            ));
+        if !self.pins.is_empty() {
+            let (remaining, certificate) = parse_x509_certificate(end_entity.as_ref())
+                .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+            if !remaining.is_empty() {
+                return Err(rustls::Error::InvalidCertificate(
+                    CertificateError::BadEncoding,
+                ));
+            }
+            let digest = sha256_segments(&[certificate.public_key().raw]);
+            if !self.pins.iter().any(|pin| pin.matches(&digest)) {
+                return Err(rustls::Error::InvalidCertificate(
+                    CertificateError::ApplicationVerificationFailure,
+                ));
+            }
         }
 
+        if let Some(verifier) = &self.web_pki {
+            return verifier.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            );
+        }
         let mut roots = RootCertStore::empty();
         roots.add(end_entity.clone())?;
         let verifier = WebPkiServerVerifier::builder_with_provider(
@@ -167,15 +180,55 @@ pub(crate) fn connector(pins: &[SpkiPin]) -> Result<TlsConnector, ClientError> {
     if pins.is_empty() {
         return Err(ClientError::NoSpkiPins);
     }
+    build_connector(false, pins.to_vec()).map_err(ClientError::Tls)
+}
+
+pub(crate) fn relay_connector(
+    trust: RelayTrustRequirements,
+    pins: &[[u8; 32]],
+) -> Result<TlsConnector, std::io::Error> {
+    let require_web_pki = trust.contains(RelayTrustRequirements::WEB_PKI);
+    let pins = pins
+        .iter()
+        .copied()
+        .map(SpkiPin::from_digest)
+        .collect::<Vec<_>>();
+    if !require_web_pki && pins.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TURN TLS requires Web PKI validation or an SPKI pin",
+        ));
+    }
+    build_connector(require_web_pki, pins)
+}
+
+fn build_connector(
+    require_web_pki: bool,
+    pins: Vec<SpkiPin>,
+) -> Result<TlsConnector, std::io::Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let web_pki = if require_web_pki {
+        let roots = webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .cloned()
+            .collect::<RootCertStore>();
+        Some(
+            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+                .build()
+                .map_err(std::io::Error::other)?,
+        )
+    } else {
+        None
+    };
     let verifier = PinnedServerVerifier {
-        pins: pins.to_vec(),
+        pins,
+        web_pki,
         supported: provider.signature_verification_algorithms,
         provider: Arc::clone(&provider),
     };
     let config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&TLS13])
-        .map_err(|source| ClientError::Tls(std::io::Error::other(source)))?
+        .map_err(std::io::Error::other)?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();

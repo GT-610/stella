@@ -30,6 +30,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signa
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+webpki-roots = "=1.0.9"
 x509-parser = { version = "=0.18.1", default-features = false }
 zeroize = { version = "1.9.0", features = ["derive"] }
 

@@ -14,10 +14,10 @@ use stella_common::RelayId;
 use stella_crypto::sha256_segments;
 use stella_proto::{
     decode_stun_xor_address, encode_stun_message, encode_stun_xor_address,
-    encode_turn_channel_data, encode_turn_channel_data_stream, CodecError, StunAttributeRef,
-    StunAttributeType, StunClass, StunErrorCodeView, StunMessageRef, StunMessageType,
-    StunMessageView, StunMethod, StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView,
-    TurnChannelNumber,
+    encode_turn_channel_data, encode_turn_channel_data_stream, CodecError, RelayTrustRequirements,
+    StunAttributeRef, StunAttributeType, StunClass, StunErrorCodeView, StunMessageRef,
+    StunMessageType, StunMessageView, StunMethod, StunPasswordAlgorithm, StunTransactionId,
+    TurnChannelDataView, TurnChannelNumber, MAX_RELAY_SPKI_PINS,
 };
 use stella_transport::{
     Endpoint as TransportEndpoint, ReceivedDatagram, RelayCarrier, TransportCapabilities,
@@ -30,7 +30,10 @@ use tokio::{
     task::JoinHandle,
     time::{timeout_at, Instant},
 };
+use tokio_rustls::{client::TlsStream, rustls::pki_types::ServerName};
 use zeroize::Zeroizing;
+
+use crate::tls;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -132,6 +135,105 @@ impl TurnTcpClientConfig {
     }
 }
 
+/// Configuration for one authenticated TURN allocation reached over TLS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TurnTlsClientConfig {
+    /// Stable identity of the configured relay service.
+    pub relay_id: RelayId,
+    /// Numeric TURN TLS listener address.
+    pub server_address: SocketAddr,
+    /// Local client socket address; port zero requests an ephemeral port.
+    pub bind_address: SocketAddr,
+    /// Canonical certificate server name, or empty for a pin-only numeric address.
+    pub tls_server_name: String,
+    /// Certificate checks required by the authenticated controller configuration.
+    pub trust: RelayTrustRequirements,
+    /// Canonically ordered accepted SHA-256 `SubjectPublicKeyInfo` digests.
+    pub spki_pins: Vec<[u8; 32]>,
+    /// Largest complete Stella datagram carried through this allocation.
+    pub max_datagram_size: usize,
+    /// Requested allocation lifetime, capped by the relay.
+    pub allocation_lifetime_seconds: u32,
+    /// Advertised allocation inactivity timeout.
+    pub idle_timeout_seconds: u32,
+    /// Complete reliable transaction deadline.
+    pub transaction_timeout: Duration,
+}
+
+impl TurnTlsClientConfig {
+    /// Creates a conservative TURN TLS client configuration.
+    #[must_use]
+    pub fn new(
+        relay_id: RelayId,
+        server_address: SocketAddr,
+        bind_address: SocketAddr,
+        tls_server_name: String,
+        trust: RelayTrustRequirements,
+        spki_pins: Vec<[u8; 32]>,
+    ) -> Self {
+        Self {
+            relay_id,
+            server_address,
+            bind_address,
+            tls_server_name,
+            trust,
+            spki_pins,
+            max_datagram_size: 1_200,
+            allocation_lifetime_seconds: 600,
+            idle_timeout_seconds: 120,
+            transaction_timeout: DEFAULT_TRANSACTION_TIMEOUT,
+        }
+    }
+
+    fn validate(&self) -> Result<(), TurnUdpError> {
+        TurnClientConfig::from(self).validate()?;
+        if self.trust.is_empty() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN TLS trust",
+                reason: "must require Web PKI validation or an SPKI pin",
+            });
+        }
+        if self.trust.contains(RelayTrustRequirements::WEB_PKI) && self.tls_server_name.is_empty() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN TLS server name",
+                reason: "must be present when Web PKI validation is required",
+            });
+        }
+        if self.trust.contains(RelayTrustRequirements::SPKI_PIN) == self.spki_pins.is_empty() {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN TLS SPKI pins",
+                reason: "must be present exactly when SPKI validation is required",
+            });
+        }
+        if self.spki_pins.len() > usize::from(MAX_RELAY_SPKI_PINS) {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN TLS SPKI pins",
+                reason: "exceeds the protocol maximum",
+            });
+        }
+        if self.spki_pins.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN TLS SPKI pins",
+                reason: "must be unique and in canonical order",
+            });
+        }
+        let _server_name = self.server_name()?;
+        Ok(())
+    }
+
+    fn server_name(&self) -> Result<ServerName<'static>, TurnUdpError> {
+        if self.tls_server_name.is_empty() {
+            return Ok(ServerName::IpAddress(self.server_address.ip().into()));
+        }
+        ServerName::try_from(self.tls_server_name.clone()).map_err(|_| {
+            TurnUdpError::InvalidConfig {
+                field: "TURN TLS server name",
+                reason: "must be a valid DNS name or IP address",
+            }
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TurnClientConfig {
     carrier: RelayCarrier,
@@ -211,6 +313,21 @@ impl From<TurnTcpClientConfig> for TurnClientConfig {
     fn from(config: TurnTcpClientConfig) -> Self {
         Self {
             carrier: RelayCarrier::TurnTcp,
+            relay_id: config.relay_id,
+            server_address: config.server_address,
+            bind_address: config.bind_address,
+            max_datagram_size: config.max_datagram_size,
+            allocation_lifetime_seconds: config.allocation_lifetime_seconds,
+            idle_timeout_seconds: config.idle_timeout_seconds,
+            transaction_timeout: config.transaction_timeout,
+        }
+    }
+}
+
+impl From<&TurnTlsClientConfig> for TurnClientConfig {
+    fn from(config: &TurnTlsClientConfig) -> Self {
+        Self {
+            carrier: RelayCarrier::TurnTls,
             relay_id: config.relay_id,
             server_address: config.server_address,
             bind_address: config.bind_address,
@@ -406,12 +523,16 @@ pub enum TurnUdpError {
 /// TURN TCP client error type shared with the carrier-neutral TURN state machine.
 pub type TurnTcpError = TurnUdpError;
 
+/// TURN TLS client error type shared with the carrier-neutral TURN state machine.
+pub type TurnTlsError = TurnUdpError;
+
 enum ClientIo {
     Udp {
         socket: UdpSocket,
         receive_buffer: Vec<u8>,
     },
     Tcp(TurnStream<TcpStream>),
+    Tls(Box<TurnStream<TlsStream<TcpStream>>>),
 }
 
 impl ClientIo {
@@ -419,11 +540,12 @@ impl ClientIo {
         match self {
             Self::Udp { .. } => RelayCarrier::TurnUdp,
             Self::Tcp(_) => RelayCarrier::TurnTcp,
+            Self::Tls(_) => RelayCarrier::TurnTls,
         }
     }
 
     const fn is_reliable(&self) -> bool {
-        matches!(self, Self::Tcp(_))
+        matches!(self, Self::Tcp(_) | Self::Tls(_))
     }
 
     async fn send_record(&mut self, record: &[u8]) -> Result<(), TurnUdpError> {
@@ -439,6 +561,7 @@ impl ClientIo {
                 Ok(())
             }
             Self::Tcp(stream) => stream.write_record(record).await.map_err(Into::into),
+            Self::Tls(stream) => stream.write_record(record).await.map_err(Into::into),
         }
     }
 
@@ -474,6 +597,7 @@ impl ClientIo {
                 Ok(receive_buffer[..length].to_vec())
             }
             Self::Tcp(stream) => stream.read_record().await.map_err(Into::into),
+            Self::Tls(stream) => stream.read_record().await.map_err(Into::into),
         }
     }
 }
@@ -997,6 +1121,213 @@ impl fmt::Debug for TurnTcpClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TurnTcpClient")
+            .field("relay_id", &self.inner.relay_id)
+            .field("relayed_address", &self.inner.relayed_address)
+            .field("mapped_address", &self.inner.mapped_address)
+            .field("local_address", &self.inner.local_address)
+            .field("capabilities", &self.inner.capabilities)
+            .field("shutdown", &self.inner.shutdown.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+/// One live authenticated TURN TLS allocation with bounded command and receive queues.
+pub struct TurnTlsClient {
+    inner: TurnUdpClient,
+}
+
+impl TurnTlsClient {
+    /// Connects with TLS 1.3, authenticates, allocates a relayed UDP address, and starts the actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] for configuration, credentials, TCP or TLS I/O,
+    /// certificate validation, framing, authentication, transaction, integrity,
+    /// or allocation failures.
+    pub async fn allocate(
+        config: TurnTlsClientConfig,
+        credentials: TurnCredentials,
+    ) -> Result<Self, TurnTlsError> {
+        config.validate()?;
+        credentials.validate_time(unix_time()?)?;
+        let socket = if config.server_address.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+        .map_err(|source| TurnUdpError::Io {
+            operation: "create TURN TLS socket",
+            source,
+        })?;
+        socket
+            .bind(config.bind_address)
+            .map_err(|source| TurnUdpError::Io {
+                operation: "bind TURN TLS socket",
+                source,
+            })?;
+        let stream = socket
+            .connect(config.server_address)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "connect TURN TLS socket",
+                source,
+            })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|source| TurnUdpError::Io {
+                operation: "configure TURN TLS no-delay",
+                source,
+            })?;
+        let local_address = stream.local_addr().map_err(|source| TurnUdpError::Io {
+            operation: "query local TURN TLS address",
+            source,
+        })?;
+        let server_name = config.server_name()?;
+        let connector =
+            tls::relay_connector(config.trust, &config.spki_pins).map_err(|source| {
+                TurnUdpError::Io {
+                    operation: "configure TURN TLS trust",
+                    source,
+                }
+            })?;
+        let stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|source| TurnUdpError::Io {
+                operation: "complete TURN TLS handshake",
+                source,
+            })?;
+        let io = ClientIo::Tls(Box::new(TurnStream::new(
+            stream,
+            MAX_TURN_STREAM_RECORD_SIZE,
+        )?));
+        let inner = TurnUdpClient::allocate_connected(
+            TurnClientConfig::from(&config),
+            credentials,
+            io,
+            local_address,
+        )
+        .await?;
+        Ok(Self { inner })
+    }
+
+    /// Returns the relay identity attached to this local allocation.
+    #[must_use]
+    pub const fn relay_id(&self) -> RelayId {
+        self.inner.relay_id()
+    }
+
+    /// Returns the public relayed candidate address.
+    #[must_use]
+    pub const fn relayed_address(&self) -> SocketAddr {
+        self.inner.relayed_address()
+    }
+
+    /// Returns the client TCP address observed beneath TLS by the TURN server.
+    #[must_use]
+    pub const fn mapped_address(&self) -> SocketAddr {
+        self.inner.mapped_address()
+    }
+
+    /// Returns the local TCP socket address used for the TLS allocation.
+    #[must_use]
+    pub const fn local_address(&self) -> SocketAddr {
+        self.inner.local_address()
+    }
+
+    /// Returns the enforced complete Stella datagram limit.
+    #[must_use]
+    pub const fn capabilities(&self) -> TransportCapabilities {
+        self.inner.capabilities()
+    }
+
+    /// Returns the local TURN TLS relay candidate published to authorized peers.
+    #[must_use]
+    pub const fn local_endpoint(&self) -> TransportEndpoint {
+        self.inner.local_endpoint()
+    }
+
+    /// Creates or refreshes a peer permission and channel binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn prepare_peer(&self, endpoint: &TransportEndpoint) -> Result<(), TurnTlsError> {
+        self.inner.prepare_peer(endpoint).await
+    }
+
+    /// Creates or refreshes only the TURN permission for a peer candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] for endpoint, transaction, rejection, actor, or I/O failure.
+    pub async fn permit_peer(&self, endpoint: &TransportEndpoint) -> Result<(), TurnTlsError> {
+        self.inner.permit_peer(endpoint).await
+    }
+
+    /// Sends one complete datagram through a prepared TURN TLS path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] for endpoint mismatch, size, permission,
+    /// channel binding, actor, framing, or stream failure.
+    pub async fn send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnTlsError> {
+        self.inner.send_to(endpoint, datagram).await
+    }
+
+    /// Sends one complete datagram as a TURN Send indication over TLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] for endpoint mismatch, size, permission,
+    /// actor, codec, framing, or stream failure.
+    pub async fn send_indication_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnTlsError> {
+        self.inner.send_indication_to(endpoint, datagram).await
+    }
+
+    /// Replaces short-lived credentials and verifies them with an allocation refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] when credentials are expired or the refresh fails.
+    pub async fn replace_credentials(
+        &self,
+        credentials: TurnCredentials,
+    ) -> Result<(), TurnTlsError> {
+        self.inner.replace_credentials(credentials).await
+    }
+
+    /// Receives one complete relayed datagram without exposing partial data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] for insufficient output, actor failure, or shutdown.
+    pub async fn receive(&self, output: &mut [u8]) -> Result<ReceivedDatagram, TurnTlsError> {
+        self.inner.receive(output).await
+    }
+
+    /// Deletes the allocation, stops the actor, and cancels pending receives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] when deletion or actor joining fails.
+    pub async fn shutdown(&self) -> Result<(), TurnTlsError> {
+        self.inner.shutdown().await
+    }
+}
+
+impl fmt::Debug for TurnTlsClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnTlsClient")
             .field("relay_id", &self.inner.relay_id)
             .field("relayed_address", &self.inner.relayed_address)
             .field("mapped_address", &self.inner.mapped_address)
@@ -1948,10 +2279,23 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    #[cfg(windows)]
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use stella_common::{NodeId, RelayId};
+    #[cfg(windows)]
+    use stella_proto::RelayTrustRequirements;
     use stella_server::{
         relay_credentials::RelayCredentialAuthority,
         turn_relay::{TurnTcpRelay, TurnTcpRelayConfig, TurnUdpRelay, TurnUdpRelayConfig},
+    };
+    #[cfg(windows)]
+    use stella_server::{
+        tls::{create_self_signed_tls_identity, load_tls_server_config, DEFAULT_TLS_VALIDITY_DAYS},
+        turn_relay::TurnTlsRelay,
     };
     use stella_transport::{
         Endpoint as TransportEndpoint, TurnStream, MAX_TURN_STREAM_RECORD_SIZE,
@@ -1962,6 +2306,11 @@ mod tests {
         encode_message, transact_initial, ClientIo, TurnCredentials, TurnTcpClient,
         TurnTcpClientConfig, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
     };
+    #[cfg(windows)]
+    use super::{TurnTlsClient, TurnTlsClientConfig};
+
+    #[cfg(windows)]
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[tokio::test]
     async fn reliable_transactions_use_one_complete_framed_exchange() {
@@ -2275,6 +2624,131 @@ mod tests {
             .expect("relay run");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn tls_allocations_validate_pins_and_preserve_datagrams() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create TLS test directory");
+        let certificate = directory.join("relay-cert.pem");
+        let private_key = directory.join("relay-key.pem");
+        let identity = create_self_signed_tls_identity(
+            &certificate,
+            &private_key,
+            &[],
+            DEFAULT_TLS_VALIDITY_DAYS,
+        )
+        .expect("create relay TLS identity");
+        let tls_config =
+            load_tls_server_config(&certificate, &private_key).expect("load relay TLS identity");
+
+        let relay_id = RelayId::from_bytes([0x61; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x62; 32], 300).expect("credential authority");
+        let now = unix_time_for_test();
+        let credential_a = authority
+            .issue(relay_id, NodeId::from_bytes([0x63; 16]), now)
+            .expect("issue A credential");
+        let credential_b = authority
+            .issue(relay_id, NodeId::from_bytes([0x64; 16]), now)
+            .expect("issue B credential");
+        let mut relay_config = TurnTcpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        relay_config.max_datagram_size = 1_200;
+        let relay = TurnTlsRelay::bind(relay_config, authority, tls_config, Duration::from_secs(2))
+            .await
+            .expect("bind TLS relay");
+        let relay_address = relay.local_address().expect("TLS relay address");
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let relay_task = tokio::spawn(relay.run(async move {
+            let _result = shutdown_receiver.await;
+        }));
+
+        let client_config = TurnTlsClientConfig::new(
+            relay_id,
+            relay_address,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            "localhost".to_owned(),
+            RelayTrustRequirements::SPKI_PIN,
+            vec![identity.spki_sha256],
+        );
+        let client_a = TurnTlsClient::allocate(
+            client_config.clone(),
+            TurnCredentials::new(
+                credential_a.username().to_vec(),
+                credential_a.secret().to_vec(),
+                credential_a.expires_at(),
+            )
+            .expect("A credentials"),
+        )
+        .await
+        .expect("allocate A over TLS");
+        let client_b = TurnTlsClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential_b.username().to_vec(),
+                credential_b.secret().to_vec(),
+                credential_b.expires_at(),
+            )
+            .expect("B credentials"),
+        )
+        .await
+        .expect("allocate B over TLS");
+        let endpoint_a = TransportEndpoint::TurnTls {
+            relay_id,
+            address: client_a.relayed_address(),
+        };
+        let endpoint_b = TransportEndpoint::TurnTls {
+            relay_id,
+            address: client_b.relayed_address(),
+        };
+        client_a
+            .prepare_peer(&endpoint_b)
+            .await
+            .expect("prepare B from A");
+        client_b
+            .prepare_peer(&endpoint_a)
+            .await
+            .expect("prepare A from B");
+
+        let mut received = [0_u8; 64];
+        client_a
+            .send_to(&endpoint_b, b"A to B over TLS")
+            .await
+            .expect("relay A to B");
+        let metadata = timeout(Duration::from_secs(2), client_b.receive(&mut received))
+            .await
+            .expect("B receive timeout")
+            .expect("B receive");
+        assert_eq!(metadata.source, endpoint_a);
+        assert_eq!(&received[..metadata.length], b"A to B over TLS");
+
+        client_b
+            .send_to(&endpoint_a, b"B to A over TLS")
+            .await
+            .expect("relay B to A");
+        let metadata = timeout(Duration::from_secs(2), client_a.receive(&mut received))
+            .await
+            .expect("A receive timeout")
+            .expect("A receive");
+        assert_eq!(metadata.source, endpoint_b);
+        assert_eq!(&received[..metadata.length], b"B to A over TLS");
+
+        client_a.shutdown().await.expect("shutdown A");
+        client_b.shutdown().await.expect("shutdown B");
+        let _result = shutdown_sender.send(());
+        timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect("relay shutdown timeout")
+            .expect("relay task join")
+            .expect("relay run");
+        std::fs::remove_dir_all(&directory).expect("remove TLS test directory");
+    }
+
     #[test]
     fn credentials_and_client_errors_do_not_expose_secrets() {
         let credentials =
@@ -2297,5 +2771,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("test clock")
             .as_secs()
+    }
+
+    #[cfg(windows)]
+    fn temp_directory() -> PathBuf {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("stella-turn-tls-{}-{sequence}", std::process::id()))
     }
 }
