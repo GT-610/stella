@@ -31,7 +31,7 @@ use thiserror::Error;
 use tokio::{
     net::lookup_host,
     sync::mpsc,
-    time::{timeout_at, Instant},
+    time::{timeout, timeout_at, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -681,31 +681,23 @@ impl ClientDataRuntime {
         if self.connectivity_revision == revision {
             return Ok(());
         }
-        let selected =
-            preferred_relay_settings(self.udp.local_address(), self.https_proxy, connectivity)
-                .await?;
-        match (self.relay.as_mut(), selected) {
-            (Some(current), Some(selected)) if current.settings == selected.settings => {
-                current
-                    .client
-                    .replace_credentials(selected.credentials)
-                    .await?;
-                current.credential_expires_at = selected.credential_expires_at;
+        let selections =
+            relay_selections(self.udp.local_address(), self.https_proxy, connectivity).await?;
+        let refreshed = refresh_matching_relay(self.relay.as_mut(), &selections).await;
+        let previous = if refreshed {
+            None
+        } else {
+            match allocate_relay_selections(
+                selections,
+                RELAY_CARRIER_ESTABLISHMENT_TIMEOUT,
+                allocate_relay,
+            )
+            .await?
+            {
+                Some(replacement) => self.relay.replace(replacement),
+                None => self.relay.take(),
             }
-            (_, Some(selected)) => {
-                let replacement = allocate_relay(selected).await?;
-                let previous = self.relay.replace(replacement);
-                if let Some(previous) = previous {
-                    previous.client.shutdown().await?;
-                }
-            }
-            (Some(_), None) => {
-                if let Some(previous) = self.relay.take() {
-                    previous.client.shutdown().await?;
-                }
-            }
-            (None, None) => {}
-        }
+        };
         for network in self.networks.values_mut() {
             for carrier in [
                 ConnectivityCarrier::TurnUdp,
@@ -733,6 +725,9 @@ impl ClientDataRuntime {
         self.replace_local_connectivity_generations(states)?;
         self.reconcile_ice_agents(states, unix_time()?)?;
         self.prepare_relay_paths().await?;
+        if let Some(previous) = previous {
+            previous.client.shutdown().await?;
+        }
         self.connectivity_revision = revision;
         Ok(())
     }
@@ -1674,6 +1669,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn preferred_relay_settings(
     bind_address: SocketAddr,
     https_proxy: Option<SocketAddr>,
@@ -1683,6 +1679,59 @@ async fn preferred_relay_settings(
         .await?
         .into_iter()
         .next())
+}
+
+async fn refresh_matching_relay(
+    current: Option<&mut WarmRelay>,
+    selections: &[SelectedRelay],
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    let Some(selected) = matching_relay_selection(&current.settings, selections) else {
+        return false;
+    };
+    let relay_id = current.settings.relay_id;
+    let carrier = current.settings.carrier.connectivity_carrier();
+    match timeout(
+        RELAY_CARRIER_ESTABLISHMENT_TIMEOUT,
+        current
+            .client
+            .replace_credentials(selected.credentials.clone()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            current.credential_expires_at = selected.credential_expires_at;
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %relay_id,
+                ?carrier,
+                %error,
+                "could not refresh matching relay allocation; attempting replacement"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                %relay_id,
+                ?carrier,
+                "matching relay allocation refresh timed out; attempting replacement"
+            );
+            false
+        }
+    }
+}
+
+fn matching_relay_selection<'a>(
+    current: &RelaySettings,
+    selections: &'a [SelectedRelay],
+) -> Option<&'a SelectedRelay> {
+    selections
+        .iter()
+        .find(|selected| selected.settings == *current)
 }
 
 async fn relay_selections(
