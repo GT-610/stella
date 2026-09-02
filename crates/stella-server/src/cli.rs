@@ -18,7 +18,10 @@ use stella_server::{
     active::serve_control_session,
     authority::{AuthorityHandle, AuthorityThread},
     bootstrap::{initialize_controller, BootstrapOptions},
-    config::{ServerConfig, TurnTcpRelaySettings, TurnTlsRelaySettings, TurnUdpRelaySettings},
+    config::{
+        ServerConfig, TurnTcpRelaySettings, TurnTlsRelaySettings, TurnUdpRelaySettings,
+        TurnWebSocketRelaySettings,
+    },
     identity::load_controller_identity,
     relay_credentials::{create_relay_credential_key, load_relay_credential_authority},
     runtime::{run_controller, SessionError, SessionHandler},
@@ -26,6 +29,7 @@ use stella_server::{
     tls::load_tls_server_config,
     turn_relay::{
         TurnTcpRelay, TurnTcpRelayConfig, TurnTlsRelay, TurnUdpRelay, TurnUdpRelayConfig,
+        TurnWebSocketRelay,
     },
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -202,6 +206,7 @@ enum RelayCarrierArg {
     Udp,
     Tcp,
     Tls,
+    Websocket,
 }
 
 #[derive(Clone, Copy, Debug, Args)]
@@ -266,6 +271,20 @@ impl From<TurnTcpRelaySettings> for RelayRunSettings {
 
 impl From<TurnTlsRelaySettings> for RelayRunSettings {
     fn from(settings: TurnTlsRelaySettings) -> Self {
+        Self {
+            relay_id: settings.relay_id,
+            credential_key_path: settings.credential_key_path,
+            credential_lifetime_seconds: settings.credential_lifetime_seconds,
+            port: settings.port,
+            max_datagram_size: settings.max_datagram_size,
+            allocation_lifetime_seconds: settings.allocation_lifetime_seconds,
+            idle_timeout_seconds: settings.idle_timeout_seconds,
+        }
+    }
+}
+
+impl From<TurnWebSocketRelaySettings> for RelayRunSettings {
+    fn from(settings: TurnWebSocketRelaySettings) -> Self {
         Self {
             relay_id: settings.relay_id,
             credential_key_path: settings.credential_key_path,
@@ -386,6 +405,10 @@ async fn execute_relay(config_path: &Path, command: RelayCommand) -> Result<()> 
             .turn_tls_relay_settings(args.id)
             .context("could not resolve configured TURN TLS relay")?
             .into(),
+        RelayCarrierArg::Websocket => config
+            .turn_websocket_relay_settings(args.id)
+            .context("could not resolve configured secure WebSocket TURN relay")?
+            .into(),
     };
     if args.listen.port() != settings.port {
         return Err(anyhow!(
@@ -416,6 +439,9 @@ async fn execute_relay(config_path: &Path, command: RelayCommand) -> Result<()> 
         RelayCarrierArg::Udp => run_turn_udp(args, settings, credentials).await,
         RelayCarrierArg::Tcp => run_turn_tcp(args, settings, credentials).await,
         RelayCarrierArg::Tls => run_turn_tls(args, settings, credentials, &config).await,
+        RelayCarrierArg::Websocket => {
+            run_turn_websocket(args, settings, credentials, &config).await
+        }
     }
 }
 
@@ -425,6 +451,7 @@ impl RelayCarrierArg {
             Self::Udp => "UDP",
             Self::Tcp => "TCP",
             Self::Tls => "TLS",
+            Self::Websocket => "secure WebSocket",
         }
     }
 }
@@ -505,6 +532,36 @@ async fn run_turn_tls(
         .run(ctrl_c_shutdown())
         .await
         .context("TURN TLS relay runtime failed")
+}
+
+async fn run_turn_websocket(
+    args: RelayRunArgs,
+    settings: RelayRunSettings,
+    credentials: stella_server::relay_credentials::RelayCredentialAuthority,
+    server: &ServerConfig,
+) -> Result<()> {
+    let relay_config = stream_relay_config(args, &settings);
+    let tls_config =
+        load_tls_server_config(&server.tls_certificate_path, &server.tls_private_key_path)
+            .context("could not load secure WebSocket TURN identity")?;
+    let relay = TurnWebSocketRelay::bind(
+        relay_config,
+        credentials,
+        tls_config,
+        Duration::from_secs(server.limits.tls_handshake_timeout_seconds),
+    )
+    .await
+    .context("could not bind secure WebSocket TURN relay")?;
+    tracing::info!(
+        relay_id = %settings.relay_id,
+        listen = %relay.local_address().context("could not query secure WebSocket TURN listener")?,
+        advertise = %args.advertise,
+        "starting secure WebSocket TURN relay"
+    );
+    relay
+        .run(ctrl_c_shutdown())
+        .await
+        .context("secure WebSocket TURN relay runtime failed")
 }
 
 fn stream_relay_config(args: RelayRunArgs, settings: &RelayRunSettings) -> TurnTcpRelayConfig {
@@ -1087,6 +1144,20 @@ mod tests {
             "01010101010101010101010101010101",
             "--carrier",
             "tls",
+            "--listen",
+            "0.0.0.0:443",
+            "--advertise",
+            "192.0.2.30",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "stella-server",
+            "relay",
+            "run",
+            "--id",
+            "01010101010101010101010101010101",
+            "--carrier",
+            "websocket",
             "--listen",
             "0.0.0.0:443",
             "--advertise",
