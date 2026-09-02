@@ -2281,22 +2281,27 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use stella_common::RelayId;
+    use stella_common::{NodeId, RelayId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
     use stella_proto::{
         encode_relay_service_list, encode_stun_server_list, ConnectivityCarrier, IceCandidate,
         IceCandidateClass, RelayAddress, RelayCarrierMask, RelayPorts, RelayServiceRef,
         RelayTrustRequirements, StunServer, MAX_RELAY_ADDRESSES,
     };
+    use stella_server::{
+        relay_credentials::{RelayCredential, RelayCredentialAuthority},
+        turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
+    };
 
     use super::{
-        allocate_relay_selections, effective_tap_mtu, matching_relay_selection,
-        next_relay_dns_result, preferred_relay_settings, random_ice_credential,
-        relay_reconnect_cap, relay_reconnect_delay, relay_selections, turn_bind_address, unix_time,
-        ClientDataRuntime, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
-        RuntimeError, RuntimeRelayCarrier, TurnUdpError, ICE_PASSWORD_RANDOM_LENGTH,
-        ICE_USERNAME_RANDOM_LENGTH, MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY,
-        TAP_EVENT_QUEUE_CAPACITY, TURN_UDP_MAX_DATAGRAM_SIZE,
+        allocate_preferred_relay, allocate_relay_selections, effective_tap_mtu,
+        matching_relay_selection, next_relay_dns_result, preferred_relay_settings,
+        random_ice_credential, relay_reconnect_cap, relay_reconnect_delay, relay_selections,
+        turn_bind_address, unix_time, ClientDataRuntime, ConnectivityConfigState,
+        LocalConnectivityGeneration, RelayDnsFuture, RuntimeError, RuntimeRelayCarrier,
+        TurnUdpError, WarmRelay, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
+        MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY,
+        TURN_UDP_MAX_DATAGRAM_SIZE,
     };
     use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
 
@@ -2329,6 +2334,121 @@ mod tests {
             tap_event_sender,
             started_at: std::time::Instant::now(),
         }
+    }
+
+    async fn runtime_with_live_relay(
+        connectivity: ConnectivityConfigState,
+        relay: WarmRelay,
+    ) -> ClientDataRuntime {
+        let udp = UdpTransport::bind(UdpConfig {
+            bind_address: "127.0.0.1:0".parse().expect("loopback bind"),
+            max_datagram_size: DEFAULT_UDP_DATAGRAM_SIZE,
+        })
+        .await
+        .expect("bind runtime UDP");
+        let relay_buffer_size = relay.client.capabilities().max_datagram_size;
+        let (tap_event_sender, tap_events) = tokio::sync::mpsc::channel(TAP_EVENT_QUEUE_CAPACITY);
+        ClientDataRuntime {
+            udp,
+            udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            deferred_udp: VecDeque::new(),
+            direct_candidates: Vec::new(),
+            https_proxy: None,
+            connectivity_revision: Some(connectivity.revision()),
+            connectivity: Some(connectivity),
+            relay: Some(relay),
+            relay_recovery: None,
+            relay_retry_at: None,
+            relay_recovery_attempt: 0,
+            connectivity_changed: false,
+            relay_buffer: vec![0_u8; relay_buffer_size],
+            connectivity_generations: BTreeMap::new(),
+            ice_agents: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            tap_events,
+            tap_event_sender,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    async fn start_live_udp_relay(
+        relay_id: RelayId,
+        listen_address: SocketAddr,
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let authority = RelayCredentialAuthority::new([0x67; 32], 300)
+            .expect("live relay credential authority");
+        let mut config = TurnUdpRelayConfig::new(
+            relay_id,
+            listen_address,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        );
+        config.max_datagram_size = 1_200;
+        config.allocation_lifetime_seconds = 60;
+        config.idle_timeout_seconds = 30;
+        let relay = TurnUdpRelay::bind(config, authority)
+            .await
+            .expect("bind live UDP relay");
+        let local_address = relay.local_address().expect("live UDP relay address");
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            relay
+                .run(async move {
+                    let _result = shutdown_receiver.await;
+                })
+                .await
+                .expect("run live UDP relay");
+        });
+        (local_address, shutdown_sender, task)
+    }
+
+    fn live_udp_relay_connectivity_config(
+        relay_id: RelayId,
+        relay_address: SocketAddr,
+        credential: &RelayCredential,
+    ) -> ConnectivityConfigState {
+        let stun_servers = [StunServer {
+            priority: 0,
+            address: "192.0.2.10:3478".parse().expect("test STUN address"),
+        }];
+        let mut stun_bytes = vec![0_u8; 28];
+        encode_stun_server_list(&stun_servers, &mut stun_bytes).expect("encode live STUN list");
+        let addresses = [RelayAddress {
+            priority: 0,
+            address: relay_address.ip(),
+        }];
+        let service = RelayServiceRef {
+            relay_id,
+            carriers: RelayCarrierMask::TURN_UDP,
+            priority: 0,
+            max_datagram_size: 1_200,
+            allocation_lifetime_seconds: 60,
+            idle_timeout_seconds: 30,
+            credential_issued_at: credential.issued_at(),
+            credential_expires_at: credential.expires_at(),
+            hostname: "",
+            tls_server_name: "",
+            credential_username: credential.username(),
+            credential_secret: credential.secret(),
+            region: "test",
+            trust: RelayTrustRequirements::NONE,
+            ports: RelayPorts {
+                turn_udp: relay_address.port(),
+                turn_tcp: 0,
+                turn_tls: 0,
+                secure_websocket: 0,
+            },
+            addresses: &addresses,
+            spki_pins: &[],
+        };
+        let mut relay_bytes = vec![0_u8; 4 + service.encoded_len().expect("service length")];
+        encode_relay_service_list(&[service], &mut relay_bytes).expect("encode live relay list");
+        ConnectivityConfigState::from_wire(11, &stun_bytes, &relay_bytes, credential.issued_at())
+            .expect("decode live relay connectivity config")
     }
 
     fn connectivity_config() -> ConnectivityConfigState {
@@ -2489,6 +2609,80 @@ mod tests {
         assert!(runtime.take_connectivity_changed());
         assert!(runtime.relay.is_none());
         runtime.shutdown().await.expect("shutdown test runtime");
+    }
+
+    #[tokio::test]
+    async fn live_relay_restart_installs_replacement_allocation() {
+        let relay_id = RelayId::from_bytes([0x67; 16]);
+        let issuer =
+            RelayCredentialAuthority::new([0x67; 32], 300).expect("live relay credential issuer");
+        let credential = issuer
+            .issue(
+                relay_id,
+                NodeId::from_bytes([0x68; 16]),
+                unix_time().expect("test clock"),
+            )
+            .expect("issue live relay credential");
+        let (relay_address, first_shutdown, first_task) = start_live_udp_relay(
+            relay_id,
+            "127.0.0.1:0".parse().expect("ephemeral relay bind"),
+        )
+        .await;
+        let connectivity = live_udp_relay_connectivity_config(relay_id, relay_address, &credential);
+        let initial = allocate_preferred_relay(
+            "127.0.0.1:0".parse().expect("initial relay client bind"),
+            None,
+            Some(&connectivity),
+        )
+        .await
+        .expect("allocate initial live relay")
+        .expect("configured initial relay");
+        let mut runtime = runtime_with_live_relay(connectivity, initial).await;
+
+        first_shutdown.send(()).expect("stop first live relay");
+        tokio::time::timeout(Duration::from_secs(2), first_task)
+            .await
+            .expect("first live relay stops")
+            .expect("join first live relay");
+        let (restarted_address, restarted_shutdown, restarted_task) =
+            start_live_udp_relay(relay_id, relay_address).await;
+        assert_eq!(restarted_address, relay_address);
+
+        runtime
+            .handle_relay_failure(&RuntimeError::Turn(TurnUdpError::ActorStopped))
+            .expect("start live relay recovery");
+        assert!(runtime.relay.is_none());
+        assert!(runtime.take_connectivity_changed());
+        let recovery = runtime
+            .relay_recovery
+            .take()
+            .expect("live relay recovery task");
+        let recovery_result = tokio::time::timeout(Duration::from_secs(5), recovery)
+            .await
+            .expect("live relay recovery completes");
+        runtime
+            .handle_relay_recovery(recovery_result)
+            .expect("install replacement relay allocation");
+
+        let replacement = runtime.relay.as_ref().expect("replacement live relay");
+        assert_eq!(replacement.client.relay_id(), relay_id);
+        assert_eq!(replacement.client.carrier(), ConnectivityCarrier::TurnUdp);
+        assert_eq!(replacement.settings.server_address, relay_address);
+        assert!(replacement.client.relayed_address().ip().is_loopback());
+        assert!(runtime.take_connectivity_changed());
+        assert!(!runtime.take_connectivity_changed());
+        assert!(runtime.relay_retry_at.is_none());
+        assert_eq!(runtime.relay_recovery_attempt, 0);
+
+        runtime
+            .shutdown()
+            .await
+            .expect("shutdown recovered runtime");
+        restarted_shutdown.send(()).expect("stop restarted relay");
+        tokio::time::timeout(Duration::from_secs(2), restarted_task)
+            .await
+            .expect("restarted relay stops")
+            .expect("join restarted relay");
     }
 
     #[tokio::test]
