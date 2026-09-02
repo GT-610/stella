@@ -45,8 +45,8 @@ and upstream firewalls.
 
 This optional version 0.2 section lets the controller distribute STUN servers,
 Relay locations, TLS trust, and short-lived node-scoped Relay credentials. The
-built-in server can run the configured TURN UDP, TURN TCP, and TURN TLS
-services; STUN and secure WebSocket still require separately deployed services.
+built-in server can run the configured TURN UDP, TURN TCP, TURN TLS, and secure
+WebSocket services. STUN still requires a separately deployed service.
 
 Create the shared credential authority key without exposing it on stdout:
 
@@ -73,7 +73,8 @@ tls_server_name = "relay.example.net"
 require_web_pki = true
 turn_udp = 3478
 turn_tcp = 3479
-turn_tls = 443
+turn_tls = 5349
+secure_websocket = 443
 addresses = ["192.0.2.30", "2001:db8::30"]
 ```
 
@@ -90,7 +91,9 @@ Relay processes. Clients receive only short-lived credentials bound to their
 node identity and a specific Relay ID. The controller refreshes them halfway
 through their remaining lifetime over the authenticated control channel.
 
-Start the built-in TURN UDP, TCP, and TLS carriers in separate processes:
+Start the four built-in carriers in separate processes. This example reserves
+public TCP 443 for secure WebSocket so clients on networks that permit direct
+outbound HTTPS/WSS retain their final fallback:
 
 ```powershell
 $Server = 'C:\Stella\stella-server.exe'
@@ -111,11 +114,17 @@ $Config = 'C:\Stella\server.toml'
 & $Server --config $Config relay run `
   --id 01010101010101010101010101010101 `
   --carrier tls `
+  --listen 0.0.0.0:5349 `
+  --advertise 192.0.2.30
+
+& $Server --config $Config relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier websocket `
   --listen 0.0.0.0:443 `
   --advertise 192.0.2.30
 ```
 
-Allow inbound UDP 3478 and TCP 3479 and 443 through the host and upstream
+Allow inbound UDP 3478 and TCP 3479, 5349, and 443 through the host and upstream
 firewalls. The advertised IP must be reachable by every client. All carriers ask Windows for a
 dynamic UDP port for each allocation, so those sockets must also be allowed by
 the host firewall. If the relay is behind NAT, forward the Windows UDP dynamic
@@ -123,11 +132,21 @@ port range as well as 3478; a directly assigned public IP is preferable. You
 can inspect the current range with `netsh int ipv4 show dynamicport udp`.
 
 Each process refuses a listener port that differs from the selected relay's
-matching `turn_udp`, `turn_tcp`, or `turn_tls` value and exits cleanly on Ctrl+C.
-The TLS process reuses the certificate and protected key from `[tls]`; that
-certificate must cover `tls_server_name`. Use `--allocation-bind` for a
-specific local allocation address. Capacity flags and current carrier limits
-are documented in the [server CLI reference](/api/server-cli#run-a-turn-relay).
+matching `turn_udp`, `turn_tcp`, `turn_tls`, or `secure_websocket` value and exits
+cleanly on Ctrl+C. TLS and secure WebSocket reuse the certificate and protected
+key from `[tls]`; that certificate must cover `tls_server_name`. The WebSocket
+endpoint is fixed at `/stella/turn/v1`, requires subprotocol `stella-turn.v1`,
+authenticates before upgrade, and does not negotiate compression. Run it
+directly on public TCP 443. Sharing that port with a website requires a distinct
+IP or hostname and an L4 TLS/SNI passthrough proxy; an ordinary plaintext HTTP
+upstream is not this listener. Use `--allocation-bind` for a specific local
+allocation address. Capacity flags and current carrier limits are documented in
+the [server CLI reference](/api/server-cli#run-a-turn-relay).
+
+Windows clients try configured relay carriers in the order UDP, TCP, TLS, then
+secure WebSocket. Failure of an earlier carrier automatically advances to the
+next configured address without requiring port forwarding on the client.
+Explicit HTTP proxy negotiation is not currently implemented.
 
 ## Create a network and enrollment material
 

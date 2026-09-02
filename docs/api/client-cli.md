@@ -7,10 +7,12 @@ use `--config client.toml` unless another path is supplied.
 ## Prerequisites and reachability
 
 Each client needs its own pre-installed TAP-Windows Adapter V9. The controller
-must be reachable over its configured TLS/TCP address. Each client must publish
-at least one UDP endpoint reachable by its peers, and host firewalls and any
-NAT must allow that peer UDP traffic. Run `run` from an elevated PowerShell
-session so the process can open its TAP adapter.
+must be reachable over its configured TLS/TCP address. The runtime gathers
+direct UDP candidates and uses controller-provided STUN and relay services. A
+manually forwarded client port is optional: if direct ICE checks fail, the
+client tries TURN UDP, TCP, TLS, then secure WebSocket. At least one direct or
+relay path must succeed. Run `run` from an elevated PowerShell session so the
+process can open its TAP adapter.
 
 Stella is a Layer-2 overlay: it does not assign IP addresses or provide DHCP.
 Configure addresses on the TAP adapters yourself, or provide DHCP inside the
@@ -35,8 +37,10 @@ failed initialization removes only targets created by that invocation.
 
 Successful output contains the lowercase node ID and configuration path. The
 configuration initially has no network entries and an empty
-`transport.advertised_endpoints` list. Before running the client, replace that
-empty list with a reachable endpoint whose port matches `udp_bind`:
+`transport.advertised_endpoints` list. It is valid to leave this list empty when
+the controller supplies usable STUN or relay services. Add an endpoint only
+when the deployment has a known externally reachable mapping whose port matches
+`udp_bind`:
 
 ```toml
 [[transport.advertised_endpoints]]
@@ -44,6 +48,11 @@ address = "192.0.2.20:45100"
 priority = 10
 max_datagram_size = 1200
 ```
+
+Static endpoints improve direct-path discovery but are not a substitute for a
+real public mapping. Do not publish an unroutable private address as an Internet
+candidate. Secure WebSocket uses direct outbound TLS/WSS to the configured relay
+port; explicit HTTP proxy negotiation is not currently implemented.
 
 Enrollment and join tokens are never accepted by `init` and are never written
 to disk.

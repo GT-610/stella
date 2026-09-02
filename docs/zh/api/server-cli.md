@@ -1,6 +1,6 @@
 # 服务器管理 CLI
 
-`stella-server` 初始化控制器部署、运行 TLS 控制平面和 TURN UDP/TCP/TLS 服务，
+`stella-server` 初始化控制器部署、运行 TLS 控制平面和 TURN UDP/TCP/TLS/Secure WebSocket 服务，
 创建受保护的 Relay 凭据密钥，并提供授权管理命令。每个
 命令都会加载 `--config` 指定的严格 TOML 配置（默认为 `server.toml`）。访问授权状态
 的命令会从受保护的控制器身份推导控制器 ID，打开配置的 redb 数据库，并在串行化授权
@@ -63,11 +63,11 @@ stella-server --config C:\Stella\server.toml relay run `
 ```
 
 `relay run` 从 `[connectivity]` 按 ID 选择 Relay，加载受保护的凭据密钥，并运行
-`--carrier udp|tcp|tls` 指定的承载直到 Ctrl+C；默认仍为 UDP。监听端口必须分别等于
-配置中的 `turn_udp`、`turn_tcp` 或 `turn_tls`。`--advertise` 是返回给远端节点的可达
+`--carrier udp|tcp|tls|websocket` 指定的承载直到 Ctrl+C；默认仍为 UDP。监听端口必须
+等于配置中的 `turn_udp`、`turn_tcp`、`turn_tls` 或 `secure_websocket`。`--advertise` 是返回给远端节点的可达
 中继地址；本地分配 socket 需要绑定其他 IP 时使用 `--allocation-bind`。
 
-TCP 和 TLS 应各自在独立进程中运行：
+TCP、TLS 和 Secure WebSocket 应各自在独立进程中运行：
 
 ```powershell
 stella-server --config C:\Stella\server.toml relay run `
@@ -79,18 +79,31 @@ stella-server --config C:\Stella\server.toml relay run `
 stella-server --config C:\Stella\server.toml relay run `
   --id 01010101010101010101010101010101 `
   --carrier tls `
+  --listen 0.0.0.0:5349 `
+  --advertise 192.0.2.30
+
+stella-server --config C:\Stella\server.toml relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier websocket `
   --listen 0.0.0.0:443 `
   --advertise 192.0.2.30
 ```
 
-TLS 承载复用顶层 `[tls]` 中的证书和受保护 PKCS#8 私钥，只允许 TLS 1.3、禁用 early
-data，并使用 `limits.tls_handshake_timeout_seconds` 限制握手。证书必须覆盖控制器下发的
-Relay TLS 名称，并满足相应 Web PKI、SPKI 固定或两者同时校验。
+TLS 和 Secure WebSocket 复用顶层 `[tls]` 中的证书和受保护 PKCS#8 私钥，只允许 TLS
+1.3、禁用 early data，并使用 `limits.tls_handshake_timeout_seconds` 限制握手。证书必须
+覆盖控制器下发的 Relay TLS 名称，并满足相应 Web PKI、SPKI 固定或两者同时校验。
 
-默认全局最多 1024 个分配、每节点 4 个，每个分配最多 128 个权限和 Channel。三个承载
-都创建 UDP 中继分配；TCP 和 TLS 只改变客户端到 Relay 的控制与数据承载。每个分配当前
-使用操作系统选择的动态 UDP 端口，因此主机防火墙必须允许这些 socket。Secure WebSocket
-和有界分配端口池仍待后续实现。
+Secure WebSocket 只接受 `GET /stella/turn/v1`、子协议 `stella-turn.v1`、唯一且规范的
+`Authorization: Stella ...` 凭据，并拒绝 WebSocket 扩展。HTTP 升级前先完成认证，升级后
+仍执行完整 TURN challenge 和消息完整性校验；每个二进制消息恰好包含一个有界 TURN
+record。该进程自行终止 TLS；若 TCP 443 还需承载网站，应使用独立 IP 或主机名配合四层
+TLS/SNI 透传。
+
+默认全局最多 1024 个分配、每节点 4 个，每个分配最多 128 个权限和 Channel。四个承载
+都创建 UDP 中继分配；TCP、TLS 和 Secure WebSocket 只改变客户端到 Relay 的控制与数据
+承载。Windows 客户端按 UDP → TCP → TLS → Secure WebSocket 自动回退。每个分配当前使用
+操作系统选择的动态 UDP 端口，因此主机防火墙必须允许这些 socket；有界分配端口池仍待
+后续实现。
 
 ## 运行控制器
 

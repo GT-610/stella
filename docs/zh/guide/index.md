@@ -10,7 +10,8 @@ Stella 仍处于标准化前的活跃开发阶段。在第一个可互操作草�
 
 Linux 和 macOS 仍是架构要求，但其设备后端不在第一个功能里程碑范围内。
 
-`stella-server` 与已配置的 Windows 客户端可以组成实验性的虚拟局域网。每个客户端
-需要已安装的 TAP-Windows 适配器和可达、已公布的 UDP 端点；控制器需要可达的
-TLS/TCP 服务。Stella 不分配 IP 地址，也不提供 DHCP。请按 Windows 部署和客户端 CLI
-指南完成配置，且不要将此里程碑视为生产网络发布。
+`stella-server` 与已配置的 Windows 客户端可以组成实验性的虚拟局域网。每个客户端需要
+已安装的 TAP-Windows 适配器，控制器和至少一种已配置 Relay 承载必须可达。客户端会自动
+收集直连 UDP 候选，并依次回退到 TURN UDP、TCP、TLS 和 Secure WebSocket；只要 Relay
+成功，就不要求用户为客户端手工映射端口。Stella 不分配 IP 地址，也不提供 DHCP。请按
+Windows 部署和客户端 CLI 指南完成配置，且不要将此里程碑视为生产网络发布。

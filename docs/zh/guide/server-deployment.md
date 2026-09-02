@@ -39,8 +39,8 @@ C:\Stella\stella-server.exe --config C:\Stella\server.toml init `
 ## 配置连接服务
 
 可选的 0.2 `[connectivity]` 配置让控制器下发 STUN、Relay 位置、TLS 信任材料和绑定节点
-的短期 Relay 凭据。内置服务端可以运行 TURN UDP、TURN TCP 和 TURN TLS；STUN 与 Secure
-WebSocket 仍需单独部署。
+的短期 Relay 凭据。内置服务端可以运行 TURN UDP、TURN TCP、TURN TLS 和 Secure
+WebSocket；STUN 仍需单独部署。
 
 先创建共享凭据签发密钥：
 
@@ -67,7 +67,8 @@ tls_server_name = "relay.example.net"
 require_web_pki = true
 turn_udp = 3478
 turn_tcp = 3479
-turn_tls = 443
+turn_tls = 5349
+secure_websocket = 443
 addresses = ["192.0.2.30", "2001:db8::30"]
 ```
 
@@ -75,7 +76,8 @@ addresses = ["192.0.2.30", "2001:db8::30"]
 `sha256/<standard-base64>` SPKI 固定值。服务定义变化后必须递增 `revision`。凭据密钥只应
 由控制器和 Relay 进程读取；客户端只接收绑定其节点身份与 Relay ID 的短期凭据。
 
-分别启动三个承载：
+分别启动四个承载。以下示例把公网 TCP 443 留给 Secure WebSocket，使允许直接出站
+HTTPS/WSS 的网络仍有最终兜底路径：
 
 ```powershell
 $Server = 'C:\Stella\stella-server.exe'
@@ -96,15 +98,27 @@ $Config = 'C:\Stella\server.toml'
 & $Server --config $Config relay run `
   --id 01010101010101010101010101010101 `
   --carrier tls `
+  --listen 0.0.0.0:5349 `
+  --advertise 192.0.2.30
+
+& $Server --config $Config relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier websocket `
   --listen 0.0.0.0:443 `
   --advertise 192.0.2.30
 ```
 
-在主机与上游防火墙中放行 UDP 3478、TCP 3479 和 443。三个承载都会为每个分配创建动态
-UDP socket，这些端口同样必须可用；Relay 位于 NAT 后时还需转发 Windows UDP 动态端口
-范围，直接使用公网 IP 更合适。TLS 进程复用 `[tls]` 的证书与私钥，证书必须覆盖
-`tls_server_name`。每个进程都会拒绝与 `turn_udp`、`turn_tcp` 或 `turn_tls` 不一致的
-监听端口，并在 Ctrl+C 后有序退出。
+在主机与上游防火墙中放行 UDP 3478、TCP 3479、5349 和 443。四个承载都会为每个分配
+创建动态 UDP socket，这些端口同样必须可用；Relay 位于 NAT 后时还需转发 Windows UDP
+动态端口范围，直接使用公网 IP 更合适。TLS 与 Secure WebSocket 进程复用 `[tls]` 的
+证书与私钥，证书必须覆盖 `tls_server_name`。每个进程都会拒绝与 `turn_udp`、
+`turn_tcp`、`turn_tls` 或 `secure_websocket` 不一致的监听端口，并在 Ctrl+C 后有序退出。
+
+WebSocket 路径固定为 `/stella/turn/v1`，子协议固定为 `stella-turn.v1`，升级前验证短期
+凭据，并禁止压缩扩展。应直接监听公网 TCP 443；若同一端口还需承载网站，请使用独立 IP
+或主机名配合四层 TLS/SNI 透传，普通的明文 HTTP 上游并不是该监听器。Windows 客户端按
+UDP → TCP → TLS → Secure WebSocket 的顺序自动尝试，无需客户端端口映射；当前尚未实现
+显式 HTTP 代理协商。
 
 ## 创建网络和注册材料
 

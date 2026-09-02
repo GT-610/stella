@@ -14,8 +14,10 @@ Linux and macOS remain architectural requirements, but their device backends
 are not part of the first functional milestone.
 
 `stella-server` and configured Windows clients can form an experimental virtual
-LAN. Each client needs an installed TAP-Windows adapter and a reachable
-published UDP endpoint; the controller needs reachable TLS/TCP service. Stella
-does not allocate IP addresses or provide DHCP. Follow the Windows deployment
-and client CLI guides for setup, and do not treat this milestone as a production
-networking release.
+LAN. Each client needs an installed TAP-Windows adapter, while the controller
+and at least one configured relay carrier must be reachable. Clients gather
+direct UDP candidates automatically and fall back through TURN UDP, TCP, TLS,
+and secure WebSocket; a manually forwarded client port is not required when a
+relay succeeds. Stella does not allocate IP addresses or provide DHCP. Follow
+the Windows deployment and client CLI guides for setup, and do not treat this
+milestone as a production networking release.

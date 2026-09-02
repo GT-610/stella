@@ -1,8 +1,8 @@
 # Server administration CLI
 
 `stella-server` initializes a controller deployment, runs its TLS control-plane
-service and TURN UDP/TCP/TLS relays, creates protected relay credential keys, and
-provides authority administration commands. Commands that use deployment state
+service and TURN UDP/TCP/TLS/secure-WebSocket relays, creates protected relay
+credential keys, and provides authority administration commands. Commands that use deployment state
 load the strict TOML configuration named by `--config` (default: `server.toml`). Commands that
 access authority state derive the controller ID from the protected controller
 identity, open the configured redb database, and perform database work on the
@@ -74,9 +74,9 @@ stella-server --config C:\Stella\server.toml relay run `
 
 `relay run` selects the relay with the matching ID from `[connectivity]`, loads
 the configured protected credential key, and serves the carrier selected by
-`--carrier udp|tcp|tls` until Ctrl+C. UDP remains the default for command
+`--carrier udp|tcp|tls|websocket` until Ctrl+C. UDP remains the default for command
 compatibility. The listener port must equal the selected relay's advertised
-`turn_udp`, `turn_tcp`, or `turn_tls` port. The
+`turn_udp`, `turn_tcp`, `turn_tls`, or `secure_websocket` port. The
 advertised address is returned as the relayed address and therefore must be an
 address that remote peers can actually reach. Use `--allocation-bind` when the
 allocation sockets should bind a different local IP from the listener.
@@ -91,21 +91,39 @@ stella-server --config C:\Stella\server.toml relay run `
   --advertise 192.0.2.30
 ```
 
-Run TLS, normally on TCP 443, in another process:
+Run TLS on its configured port, commonly TCP 5349, in another process:
 
 ```powershell
 stella-server --config C:\Stella\server.toml relay run `
   --id 01010101010101010101010101010101 `
   --carrier tls `
+  --listen 0.0.0.0:5349 `
+  --advertise 192.0.2.30
+```
+
+Run secure WebSocket on public TCP 443 as the final strict-firewall fallback:
+
+```powershell
+stella-server --config C:\Stella\server.toml relay run `
+  --id 01010101010101010101010101010101 `
+  --carrier websocket `
   --listen 0.0.0.0:443 `
   --advertise 192.0.2.30
 ```
 
-The TLS carrier loads the certificate and protected PKCS#8 private key from the
-top-level `[tls]` configuration, permits TLS 1.3 only, disables early data, and
-uses `limits.tls_handshake_timeout_seconds` for each accepted connection. The
-certificate must cover the advertised Relay TLS name and match the Web PKI or
-SPKI trust material distributed by the controller.
+TLS and secure WebSocket load the certificate and protected PKCS#8 private key
+from the top-level `[tls]` configuration, permit TLS 1.3 only, disable early
+data, and use `limits.tls_handshake_timeout_seconds` for each accepted
+connection. The certificate must cover the advertised Relay TLS name and match
+the Web PKI or SPKI trust material distributed by the controller.
+
+Secure WebSocket accepts only `GET /stella/turn/v1` with subprotocol
+`stella-turn.v1`, one canonical `Authorization: Stella ...` credential, and no
+WebSocket extensions. Authentication completes before the HTTP upgrade, after
+which the normal TURN challenge and message-integrity checks still apply. Each
+binary message contains exactly one bounded TURN record. The listener terminates
+TLS itself; use a distinct IP or hostname plus L4 TLS/SNI passthrough if TCP 443
+must also serve a website.
 
 The default capacity is 1024 concurrent allocations globally, four per node,
 and 128 permissions and channels per allocation. The corresponding
@@ -115,15 +133,16 @@ bound memory and socket use. Datagram size, allocation lifetime, idle timeout,
 credential lifetime, and credential key path come from the selected configured
 relay service.
 
-The built-in relay supports TURN UDP, TURN TCP, and TURN TLS. All three create a
-UDP relayed allocation because Stella carries datagrams; TCP and TLS only
-change the client-to-relay control and data carrier. Each allocation uses an
+The built-in relay supports TURN UDP, TURN TCP, TURN TLS, and secure WebSocket.
+All four create a UDP relayed allocation because Stella carries datagrams; TCP,
+TLS, and WebSocket only change the client-to-relay control and data carrier.
+Windows clients try them in the order UDP, TCP, TLS, then secure WebSocket. Each allocation uses an
 operating-system-selected UDP port rather than a configurable allocation port
 pool. A public deployment must permit those sockets through the host firewall;
 if the relay host is behind NAT, the public address and the operating system's
 UDP dynamic port range must also be forwarded. Running the relay directly on a
-public address is strongly preferred. Secure WebSocket and a bounded allocation
-port pool remain future work.
+public address is strongly preferred. A bounded allocation port pool remains
+future work.
 
 ## Run the controller
 

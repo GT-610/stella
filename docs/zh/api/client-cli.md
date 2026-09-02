@@ -7,9 +7,10 @@
 ## 前置条件与可达性
 
 每台客户端都需要自己预先安装的 TAP-Windows Adapter V9。控制器必须能通过配置的
-TLS/TCP 地址访问。每台客户端必须公布至少一个对等节点可达的 UDP 端点，且主机防火墙
-和任何 NAT 都必须允许该对等 UDP 流量。请在提升权限的 PowerShell 会话中运行 `run`，
-以便进程打开 TAP 适配器。
+TLS/TCP 地址访问。运行时会收集直连 UDP 候选，并使用控制器下发的 STUN 和 Relay。
+客户端端口映射是可选的：直连 ICE 检查失败后，客户端依次尝试 TURN UDP、TCP、TLS 和
+Secure WebSocket；至少一种直连或 Relay 路径必须成功。请在提升权限的 PowerShell 会话
+中运行 `run`，以便进程打开 TAP 适配器。
 
 Stella 是二层覆盖网络：它不分配 IP 地址，也不提供 DHCP。请自行在 TAP 适配器上配置
 地址，或在虚拟局域网内提供 DHCP。
@@ -31,8 +32,9 @@ stella-client --config C:\Stella\client.toml init `
 失败时只会删除本次调用创建的目标。
 
 成功输出包含小写节点 ID 和配置路径。初始配置没有网络条目，且
-`transport.advertised_endpoints` 列表为空。运行客户端前，请将这个空列表替换为一个
-对等节点可达、端口与 `udp_bind` 一致的端点：
+`transport.advertised_endpoints` 列表为空。当控制器下发了可用的 STUN 或 Relay 服务时，
+可以保持为空。只有部署确实拥有一个外部可达、且端口与 `udp_bind` 一致的固定映射时，
+才需要添加端点：
 
 ```toml
 [[transport.advertised_endpoints]]
@@ -40,6 +42,9 @@ address = "192.0.2.20:45100"
 priority = 10
 max_datagram_size = 1200
 ```
+
+静态端点可以改善直连发现，但不能把不可路由的私网地址变成公网候选。Secure WebSocket
+会直接向配置的 Relay 端口建立 TLS/WSS；当前尚未实现显式 HTTP 代理协商。
 
 `init` 不接受注册或加入令牌，也不会将令牌写入磁盘。
 
