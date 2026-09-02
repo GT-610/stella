@@ -3417,9 +3417,12 @@ mod tests {
         let authority =
             RelayCredentialAuthority::new([0x76; 32], 300).expect("credential authority");
         let now = unix_time_for_test();
-        let credential = authority
+        let credential_a = authority
             .issue(relay_id, NodeId::from_bytes([0x77; 16]), now)
-            .expect("issue proxied credential");
+            .expect("issue proxied A credential");
+        let credential_b = authority
+            .issue(relay_id, NodeId::from_bytes([0x78; 16]), now)
+            .expect("issue proxied B credential");
         let mut relay_config = TurnTcpRelayConfig::new(
             relay_id,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -3447,34 +3450,43 @@ mod tests {
             relay_address.port()
         );
         let proxy_task = tokio::spawn(async move {
-            let (mut downstream, _client) = proxy_listener
-                .accept()
-                .await
-                .expect("accept proxied client");
-            let mut request = Vec::new();
-            loop {
-                let mut byte = [0_u8; 1];
-                downstream
-                    .read_exact(&mut byte)
+            let mut tunnels = Vec::new();
+            for _connection in 0..2 {
+                let (mut downstream, _client) = proxy_listener
+                    .accept()
                     .await
-                    .expect("read proxied CONNECT request");
-                request.push(byte[0]);
-                assert!(request.len() <= 1_024);
-                if request.ends_with(b"\r\n\r\n") {
-                    break;
-                }
+                    .expect("accept proxied client");
+                let expected_request = expected_request.clone();
+                tunnels.push(tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut byte = [0_u8; 1];
+                        downstream
+                            .read_exact(&mut byte)
+                            .await
+                            .expect("read proxied CONNECT request");
+                        request.push(byte[0]);
+                        assert!(request.len() <= 1_024);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    assert_eq!(request, expected_request.as_bytes());
+                    let mut upstream = TcpStream::connect(relay_address)
+                        .await
+                        .expect("connect proxy to WebSocket relay");
+                    downstream
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .expect("write proxy success response");
+                    tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
+                        .await
+                        .expect("forward proxied WebSocket tunnel");
+                }));
             }
-            assert_eq!(request, expected_request.as_bytes());
-            let mut upstream = TcpStream::connect(relay_address)
-                .await
-                .expect("connect proxy to WebSocket relay");
-            downstream
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .expect("write proxy success response");
-            tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
-                .await
-                .expect("forward proxied WebSocket tunnel");
+            for tunnel in tunnels {
+                tunnel.await.expect("proxied WebSocket tunnel task");
+            }
         });
 
         let mut client_config = TurnWebSocketClientConfig::new(
@@ -3486,25 +3498,78 @@ mod tests {
             vec![identity.spki_sha256],
         );
         client_config.proxy_address = Some(proxy_address);
-        let client = TurnWebSocketClient::allocate(
-            client_config,
+        let client_a = TurnWebSocketClient::allocate(
+            client_config.clone(),
             TurnCredentials::new(
-                credential.username().to_vec(),
-                credential.secret().to_vec(),
-                credential.expires_at(),
+                credential_a.username().to_vec(),
+                credential_a.secret().to_vec(),
+                credential_a.expires_at(),
             )
-            .expect("proxied credentials"),
+            .expect("proxied A credentials"),
         )
         .await
-        .expect("allocate through HTTP CONNECT proxy");
+        .expect("allocate A through HTTP CONNECT proxy");
+        let client_b = TurnWebSocketClient::allocate(
+            client_config,
+            TurnCredentials::new(
+                credential_b.username().to_vec(),
+                credential_b.secret().to_vec(),
+                credential_b.expires_at(),
+            )
+            .expect("proxied B credentials"),
+        )
+        .await
+        .expect("allocate B through HTTP CONNECT proxy");
+        let endpoint_a = client_a.local_endpoint();
+        let endpoint_b = client_b.local_endpoint();
         assert!(matches!(
-            client.local_endpoint(),
+            endpoint_a,
             TransportEndpoint::SecureWebSocket { .. }
         ));
-        client
+        assert!(matches!(
+            endpoint_b,
+            TransportEndpoint::SecureWebSocket { .. }
+        ));
+        client_a
+            .prepare_peer(&endpoint_b)
+            .await
+            .expect("prepare proxied B from A");
+        client_b
+            .prepare_peer(&endpoint_a)
+            .await
+            .expect("prepare proxied A from B");
+
+        let mut received = [0_u8; 64];
+        client_a
+            .send_to(&endpoint_b, b"A to B through CONNECT")
+            .await
+            .expect("relay proxied A to B");
+        let metadata = timeout(Duration::from_secs(2), client_b.receive(&mut received))
+            .await
+            .expect("proxied B receive timeout")
+            .expect("proxied B receive");
+        assert_eq!(metadata.source, endpoint_a);
+        assert_eq!(&received[..metadata.length], b"A to B through CONNECT");
+
+        client_b
+            .send_to(&endpoint_a, b"B to A through CONNECT")
+            .await
+            .expect("relay proxied B to A");
+        let metadata = timeout(Duration::from_secs(2), client_a.receive(&mut received))
+            .await
+            .expect("proxied A receive timeout")
+            .expect("proxied A receive");
+        assert_eq!(metadata.source, endpoint_b);
+        assert_eq!(&received[..metadata.length], b"B to A through CONNECT");
+
+        client_a
             .shutdown()
             .await
-            .expect("shutdown proxied allocation");
+            .expect("shutdown proxied A allocation");
+        client_b
+            .shutdown()
+            .await
+            .expect("shutdown proxied B allocation");
         timeout(Duration::from_secs(2), proxy_task)
             .await
             .expect("proxy shutdown timeout")
