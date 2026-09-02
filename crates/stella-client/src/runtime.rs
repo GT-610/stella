@@ -1,7 +1,7 @@
 //! Windows UDP and TAP execution runtime for active network data planes.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::pending,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
@@ -30,8 +30,13 @@ use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
 use crate::{
+    stun::{
+        discover_server_reflexive, gather_host_candidates, server_reflexive_candidate,
+        DeferredUdpDatagram, StunDiscovery,
+    },
     ClientConfig, ConnectivityConfigState, NetworkDataError, NetworkDataPlane, NetworkOutput,
-    NetworkState, TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+    NetworkState, StunDiscoveryError, TurnCredentials, TurnUdpClient, TurnUdpClientConfig,
+    TurnUdpError,
 };
 
 const TAP_WRITE_QUEUE_CAPACITY: usize = 64;
@@ -100,6 +105,9 @@ pub enum RuntimeError {
     /// TURN allocation, authentication, refresh, or relay delivery failed.
     #[error(transparent)]
     Turn(#[from] TurnUdpError),
+    /// Host-interface enumeration or same-socket STUN discovery failed.
+    #[error(transparent)]
+    Stun(#[from] StunDiscoveryError),
     /// Per-network authenticated routing failed.
     #[error(transparent)]
     Network(#[from] NetworkDataError),
@@ -118,6 +126,8 @@ pub enum RuntimeError {
 pub struct ClientDataRuntime {
     udp: UdpTransport,
     udp_buffer: Vec<u8>,
+    deferred_udp: VecDeque<DeferredUdpDatagram>,
+    direct_candidates: Vec<IceCandidate>,
     connectivity_revision: Option<u64>,
     relay: Option<WarmRelay>,
     relay_buffer: Vec<u8>,
@@ -162,7 +172,45 @@ impl ClientDataRuntime {
             max_datagram_size,
         })
         .await?;
-        let relay = allocate_preferred_turn_udp(config.udp_bind, connectivity).await?;
+        let excluded_interfaces = config
+            .networks
+            .iter()
+            .map(|network| network.tap_adapter.clone())
+            .collect::<BTreeSet<_>>();
+        let candidate_datagram_size = u32::try_from(max_datagram_size).unwrap_or(65_507);
+        let host_candidates = match gather_host_candidates(
+            udp.local_address(),
+            &excluded_interfaces,
+            candidate_datagram_size,
+        ) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(%error, "could not enumerate host ICE candidates");
+                Vec::new()
+            }
+        };
+        let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
+        let (discovery, relay) = tokio::join!(
+            discover_server_reflexive(&udp, stun_servers),
+            allocate_preferred_turn_udp(config.udp_bind, connectivity),
+        );
+        let discovery = match discovery {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                tracing::warn!(%error, "same-socket STUN discovery failed");
+                StunDiscovery {
+                    mapped_address: None,
+                    base_address: None,
+                    deferred: Vec::new(),
+                }
+            }
+        };
+        let relay = relay?;
+        let mut direct_candidates = host_candidates;
+        if let Some(candidate) = server_reflexive_candidate(&discovery, candidate_datagram_size) {
+            direct_candidates.push(candidate);
+        }
+        direct_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
         let relay_buffer_size = relay.as_ref().map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
             relay.client.capabilities().max_datagram_size
         });
@@ -171,6 +219,8 @@ impl ClientDataRuntime {
         let mut runtime = Self {
             udp,
             udp_buffer: vec![0_u8; max_datagram_size],
+            deferred_udp: discovery.deferred.into(),
+            direct_candidates,
             connectivity_revision: connectivity.map(ConnectivityConfigState::revision),
             relay,
             relay_buffer: vec![0_u8; relay_buffer_size],
@@ -257,6 +307,11 @@ impl ClientDataRuntime {
             Relay(ReceivedDatagram),
             Tap(TapEvent),
         }
+        if let Some(deferred) = self.deferred_udp.pop_front() {
+            return self
+                .process_udp_bytes(deferred.source, &deferred.bytes, signing_key)
+                .await;
+        }
         let ready = tokio::select! {
             received = self.udp.receive(&mut self.udp_buffer) => Ready::Udp(received?),
             received = receive_relay(self.relay.as_ref(), &mut self.relay_buffer) => {
@@ -325,7 +380,17 @@ impl ClientDataRuntime {
                 ),
             })?
             .to_vec();
-        let common = CommonHeader::decode(&datagram)?;
+        self.process_udp_bytes(received.source, &datagram, signing_key)
+            .await
+    }
+
+    async fn process_udp_bytes(
+        &mut self,
+        source: TransportEndpoint,
+        datagram: &[u8],
+        signing_key: &IdentitySigningKey,
+    ) -> Result<(), RuntimeError> {
+        let common = CommonHeader::decode(datagram)?;
         let network_id = common.network_id;
         let wall_time = unix_time()?;
         let monotonic_now = self.monotonic_now();
@@ -334,13 +399,7 @@ impl ClientDataRuntime {
             .get_mut(&network_id)
             .ok_or(NetworkDataError::WrongNetwork)?
             .plane
-            .accept_datagram(
-                &received.source,
-                &datagram,
-                signing_key,
-                wall_time,
-                monotonic_now,
-            )?;
+            .accept_datagram(&source, datagram, signing_key, wall_time, monotonic_now)?;
         self.apply_output(network_id, output).await
     }
 
@@ -702,12 +761,14 @@ impl ClientDataRuntime {
         states: &BTreeMap<NetworkId, NetworkState>,
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations.clear();
-        let Some(relay) = &self.relay else {
+        if self.relay.is_none() && self.direct_candidates.is_empty() {
             return Ok(());
-        };
+        }
         for network_id in states.keys().copied() {
-            self.connectivity_generations
-                .insert(network_id, LocalConnectivityGeneration::new(relay)?);
+            self.connectivity_generations.insert(
+                network_id,
+                LocalConnectivityGeneration::new(self.relay.as_ref(), &self.direct_candidates)?,
+            );
         }
         Ok(())
     }
@@ -718,15 +779,18 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations
             .retain(|network_id, _| states.contains_key(network_id));
-        let Some(relay) = &self.relay else {
+        if self.relay.is_none() && self.direct_candidates.is_empty() {
             self.connectivity_generations.clear();
             return Ok(());
-        };
+        }
         for network_id in states.keys().copied() {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 self.connectivity_generations.entry(network_id)
             {
-                entry.insert(LocalConnectivityGeneration::new(relay)?);
+                entry.insert(LocalConnectivityGeneration::new(
+                    self.relay.as_ref(),
+                    &self.direct_candidates,
+                )?);
             }
         }
         Ok(())
@@ -798,43 +862,53 @@ struct LocalConnectivityGeneration {
 }
 
 impl LocalConnectivityGeneration {
-    fn new(relay: &WarmRelay) -> Result<Self, RuntimeError> {
+    fn new(
+        relay: Option<&WarmRelay>,
+        direct_candidates: &[IceCandidate],
+    ) -> Result<Self, RuntimeError> {
         let created_at = unix_time()?;
-        if relay.credential_expires_at <= created_at {
-            return Err(TurnUdpError::CredentialExpired {
-                expires_at: relay.credential_expires_at,
-                now: created_at,
-            }
-            .into());
-        }
         let maximum_expiry = created_at
             .checked_add(ICE_GENERATION_MAX_LIFETIME)
             .ok_or(RuntimeError::ConnectivityExpiryOverflow)?;
-        let expires_at = relay.credential_expires_at.min(maximum_expiry);
+        let expires_at = if let Some(relay) = relay {
+            if relay.credential_expires_at <= created_at {
+                return Err(TurnUdpError::CredentialExpired {
+                    expires_at: relay.credential_expires_at,
+                    now: created_at,
+                }
+                .into());
+            }
+            relay.credential_expires_at.min(maximum_expiry)
+        } else {
+            maximum_expiry
+        };
         let generation_id = random_nonzero_u64()?;
         let tie_breaker = random_nonzero_u64()?;
         let username_fragment = random_ice_credential(ICE_USERNAME_RANDOM_LENGTH)?;
         let password = random_ice_credential(ICE_PASSWORD_RANDOM_LENGTH)?;
-        let relay_id = relay.client.relay_id();
-        let relay_bytes = relay_id.into_bytes();
-        let foundation = u32::from_be_bytes([
-            relay_bytes[0],
-            relay_bytes[1],
-            relay_bytes[2],
-            relay_bytes[3],
-        ])
-        .max(1);
-        let candidates = vec![IceCandidate {
-            class: IceCandidateClass::Relay,
-            carrier: ConnectivityCarrier::TurnUdp,
-            priority: RELAY_CANDIDATE_PRIORITY,
-            foundation,
-            max_datagram_size: u32::try_from(relay.client.capabilities().max_datagram_size)
-                .unwrap_or(65_503),
-            address: relay.client.relayed_address(),
-            related_address: Some(relay.client.mapped_address()),
-            relay_id: Some(relay_id),
-        }];
+        let mut candidates = direct_candidates.to_vec();
+        if let Some(relay) = relay {
+            let relay_id = relay.client.relay_id();
+            let relay_bytes = relay_id.into_bytes();
+            let foundation = u32::from_be_bytes([
+                relay_bytes[0],
+                relay_bytes[1],
+                relay_bytes[2],
+                relay_bytes[3],
+            ])
+            .max(1);
+            candidates.push(IceCandidate {
+                class: IceCandidateClass::Relay,
+                carrier: ConnectivityCarrier::TurnUdp,
+                priority: RELAY_CANDIDATE_PRIORITY,
+                foundation,
+                max_datagram_size: u32::try_from(relay.client.capabilities().max_datagram_size)
+                    .unwrap_or(65_503),
+                address: relay.client.relayed_address(),
+                related_address: Some(relay.client.mapped_address()),
+                relay_id: Some(relay_id),
+            });
+        }
         let generation = Self {
             generation_id,
             tie_breaker,
@@ -1204,14 +1278,15 @@ mod tests {
 
     use stella_common::RelayId;
     use stella_proto::{
-        encode_relay_service_list, encode_stun_server_list, RelayAddress, RelayCarrierMask,
-        RelayPorts, RelayServiceRef, RelayTrustRequirements, StunServer,
+        encode_relay_service_list, encode_stun_server_list, ConnectivityCarrier, IceCandidate,
+        IceCandidateClass, RelayAddress, RelayCarrierMask, RelayPorts, RelayServiceRef,
+        RelayTrustRequirements, StunServer,
     };
 
     use super::{
         effective_tap_mtu, preferred_turn_udp_settings, random_ice_credential, turn_bind_address,
-        turn_udp_selections, ConnectivityConfigState, ICE_PASSWORD_RANDOM_LENGTH,
-        ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
+        turn_udp_selections, ConnectivityConfigState, LocalConnectivityGeneration,
+        ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
 
     fn connectivity_config() -> ConnectivityConfigState {
@@ -1339,5 +1414,24 @@ mod tests {
             .iter()
             .chain(password.iter())
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')));
+    }
+
+    #[test]
+    fn direct_candidates_form_a_generation_without_a_relay() {
+        let candidate = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let generation =
+            LocalConnectivityGeneration::new(None, &[candidate]).expect("direct-only generation");
+        let generation = generation.as_ref().expect("validated generation");
+        assert_eq!(generation.candidates(), &[candidate]);
+        assert!(generation.expires_at() > generation.created_at());
     }
 }

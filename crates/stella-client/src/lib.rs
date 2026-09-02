@@ -14,6 +14,7 @@ mod network;
 #[cfg(target_os = "windows")]
 mod runtime;
 mod state;
+mod stun;
 mod switch;
 mod tls;
 mod turn;
@@ -41,6 +42,7 @@ pub use state::{
     GrantRefreshInput, NetworkState, PeerConnectivityState, PeerDeltaInput, PeerDeltaOperation,
     PeerState, SnapshotInput, StateError,
 };
+pub use stun::StunDiscoveryError;
 pub use switch::{FloodClass, L2Switch, PeerIngress, SwitchError, TapForwarding};
 pub use tls::{SpkiPin, SpkiPinParseError};
 pub use turn::{TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError};
