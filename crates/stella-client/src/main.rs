@@ -8,7 +8,7 @@ use std::{io::Write, process::ExitCode};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match cli::run().await {
+    match Box::pin(cli::run()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let mut stderr = std::io::stderr().lock();

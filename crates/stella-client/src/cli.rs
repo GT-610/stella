@@ -43,6 +43,13 @@ struct ControlSessionFailure {
 enum ActiveRuntimeFailure {
     Control(ControlSessionFailure),
     Data(anyhow::Error),
+    Shutdown(Result<()>),
+}
+
+#[cfg(target_os = "windows")]
+enum DataDriveOutcome<T> {
+    Operation(T),
+    Shutdown(Result<()>),
 }
 
 #[cfg(target_os = "windows")]
@@ -186,7 +193,7 @@ pub(crate) async fn run() -> Result<()> {
         Command::Leave(args) => {
             leave_network(&cli.config, &args, &mut std::io::stdout().lock()).await
         }
-        Command::Run => run_client(&cli.config).await,
+        Command::Run => Box::pin(run_client(&cli.config)).await,
         Command::Status => status(&cli.config, &mut std::io::stdout().lock()),
     }
 }
@@ -207,12 +214,19 @@ async fn run_client(config_path: &Path) -> Result<()> {
         .try_init()
         .context("could not initialize client logging")?;
     tracing::info!(config = %config_path.display(), "starting client runtime");
-    tokio::select! {
-        result = supervise_control(&config, &identity) => result,
-        result = tokio::signal::ctrl_c() => {
-            result.context("could not wait for Ctrl+C")?;
-            tracing::info!("Ctrl+C received; client forwarding state is withdrawn");
-            Ok(())
+    #[cfg(target_os = "windows")]
+    {
+        supervise_control(&config, &identity, tokio::spawn(tokio::signal::ctrl_c())).await
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio::select! {
+            result = supervise_control(&config, &identity) => result,
+            result = tokio::signal::ctrl_c() => {
+                result.context("could not wait for Ctrl+C")?;
+                tracing::info!("Ctrl+C received; client forwarding state is withdrawn");
+                Ok(())
+            }
         }
     }
 }
@@ -221,6 +235,7 @@ async fn run_client(config_path: &Path) -> Result<()> {
 async fn supervise_control(
     config: &ClientConfig,
     identity: &stella_crypto::IdentitySigningKey,
+    mut shutdown: tokio::task::JoinHandle<std::io::Result<()>>,
 ) -> Result<()> {
     let mut attempt = 0_u32;
     let mut data = None;
@@ -233,20 +248,41 @@ async fn supervise_control(
                 "waiting before controller reconnect"
             );
             if let Some(runtime) = data.as_mut() {
-                if let Err(error) =
-                    drive_data_until(runtime, identity, tokio::time::sleep(delay)).await
+                match drive_data_until(runtime, identity, tokio::time::sleep(delay), &mut shutdown)
+                    .await
                 {
-                    tracing::warn!(%error, "data plane failed during controller reconnect wait");
-                    shutdown_data_runtime(&mut data).await;
+                    Ok(DataDriveOutcome::Operation(())) => {}
+                    Ok(DataDriveOutcome::Shutdown(result)) => {
+                        return finish_client_shutdown(&mut data, result).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "data plane failed during controller reconnect wait");
+                        shutdown_data_runtime(&mut data).await;
+                    }
                 }
             } else {
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    result = &mut shutdown => {
+                        return finish_client_shutdown(&mut data, decode_shutdown_result(result)).await;
+                    }
+                }
             }
         }
 
         let activation = if let Some(runtime) = data.as_mut() {
-            match drive_data_until(runtime, identity, activate_control(config, identity)).await {
-                Ok(result) => result,
+            match drive_data_until(
+                runtime,
+                identity,
+                activate_control(config, identity),
+                &mut shutdown,
+            )
+            .await
+            {
+                Ok(DataDriveOutcome::Operation(result)) => result,
+                Ok(DataDriveOutcome::Shutdown(result)) => {
+                    return finish_client_shutdown(&mut data, result).await;
+                }
                 Err(error) => {
                     tracing::warn!(%error, "data plane failed during controller activation");
                     shutdown_data_runtime(&mut data).await;
@@ -254,7 +290,12 @@ async fn supervise_control(
                 }
             }
         } else {
-            activate_control(config, identity).await
+            tokio::select! {
+                result = activate_control(config, identity) => result,
+                result = &mut shutdown => {
+                    return finish_client_shutdown(&mut data, decode_shutdown_result(result)).await;
+                }
+            }
         };
         let active = match activation {
             Ok(active) => {
@@ -268,29 +309,27 @@ async fn supervise_control(
             }
             Err(error) => {
                 tracing::warn!(error = ?error, "controller activation failed");
-                reconnect_delay = Some(full_jitter(reconnect_cap(attempt))?);
-                attempt = attempt.saturating_add(1);
+                reconnect_delay = Some(next_reconnect_delay(&mut attempt, None)?);
                 continue;
             }
         };
 
-        match run_active_control(config, identity, active, &mut data).await {
+        match run_active_control(config, identity, active, &mut data, &mut shutdown).await {
             Ok(()) => {}
             Err(ActiveRuntimeFailure::Control(failure)) => {
                 tracing::warn!(error = ?failure.error, "active controller session ended");
-                let jitter = full_jitter(reconnect_cap(attempt))?;
-                reconnect_delay = Some(
-                    failure
-                        .minimum_reconnect_delay
-                        .map_or(jitter, |minimum| minimum.max(jitter)),
-                );
-                attempt = attempt.saturating_add(1);
+                reconnect_delay = Some(next_reconnect_delay(
+                    &mut attempt,
+                    failure.minimum_reconnect_delay,
+                )?);
             }
             Err(ActiveRuntimeFailure::Data(error)) => {
                 tracing::warn!(error = ?error, "active data plane ended");
                 shutdown_data_runtime(&mut data).await;
-                reconnect_delay = Some(full_jitter(reconnect_cap(attempt))?);
-                attempt = attempt.saturating_add(1);
+                reconnect_delay = Some(next_reconnect_delay(&mut attempt, None)?);
+            }
+            Err(ActiveRuntimeFailure::Shutdown(result)) => {
+                return finish_client_shutdown(&mut data, result).await;
             }
         }
     }
@@ -383,6 +422,7 @@ async fn run_active_control(
     identity: &stella_crypto::IdentitySigningKey,
     mut active: ActiveControl,
     data: &mut Option<ClientDataRuntime>,
+    shutdown: &mut tokio::task::JoinHandle<std::io::Result<()>>,
 ) -> std::result::Result<(), ActiveRuntimeFailure> {
     if data.is_none() {
         let runtime = ClientDataRuntime::start_with_connectivity(
@@ -412,7 +452,7 @@ async fn run_active_control(
         networks = active.networks().len(),
         "Windows data plane is active"
     );
-    run_active_io(config, identity, &mut active, data).await
+    run_active_io(config, identity, &mut active, data, shutdown).await
 }
 
 #[cfg(target_os = "windows")]
@@ -421,6 +461,7 @@ async fn run_active_io(
     identity: &stella_crypto::IdentitySigningKey,
     active: &mut ActiveControl,
     data: &mut ClientDataRuntime,
+    shutdown: &mut tokio::task::JoinHandle<std::io::Result<()>>,
 ) -> std::result::Result<(), ActiveRuntimeFailure> {
     let heartbeat_sleep = tokio::time::sleep(heartbeat_interval(active));
     tokio::pin!(heartbeat_sleep);
@@ -428,6 +469,9 @@ async fn run_active_io(
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            result = &mut *shutdown => {
+                return Err(ActiveRuntimeFailure::Shutdown(decode_shutdown_result(result)));
+            }
             update = active.receive_update() => {
                 let update = update
                     .context("could not receive controller update")
@@ -585,7 +629,8 @@ async fn drive_data_until<F, T>(
     data: &mut ClientDataRuntime,
     identity: &stella_crypto::IdentitySigningKey,
     operation: F,
-) -> std::result::Result<T, RuntimeError>
+    shutdown: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+) -> std::result::Result<DataDriveOutcome<T>, RuntimeError>
 where
     F: Future<Output = T>,
 {
@@ -594,7 +639,10 @@ where
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            output = &mut operation => return Ok(output),
+            output = &mut operation => return Ok(DataDriveOutcome::Operation(output)),
+            result = &mut *shutdown => {
+                return Ok(DataDriveOutcome::Shutdown(decode_shutdown_result(result)));
+            }
             _ = maintenance.tick() => data.maintain(identity).await?,
             result = data.receive_next(identity) => handle_data_runtime_result(result)?,
         }
@@ -634,6 +682,27 @@ async fn shutdown_data_runtime(data: &mut Option<ClientDataRuntime>) {
 }
 
 #[cfg(target_os = "windows")]
+async fn finish_client_shutdown(
+    data: &mut Option<ClientDataRuntime>,
+    signal: Result<()>,
+) -> Result<()> {
+    if signal.is_ok() {
+        tracing::info!("Ctrl+C received; withdrawing client forwarding state");
+    }
+    shutdown_data_runtime(data).await;
+    signal
+}
+
+#[cfg(target_os = "windows")]
+fn decode_shutdown_result(
+    result: std::result::Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result
+        .context("Ctrl+C signal task stopped")?
+        .context("could not wait for Ctrl+C")
+}
+
+#[cfg(target_os = "windows")]
 fn reconnect_delay_until(deadline: u64) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -644,6 +713,13 @@ fn reconnect_delay_until(deadline: u64) -> Duration {
 #[cfg(target_os = "windows")]
 const fn reconnect_delay_from(deadline: u64, now: u64) -> Duration {
     Duration::from_secs(deadline.saturating_sub(now))
+}
+
+#[cfg(target_os = "windows")]
+fn next_reconnect_delay(attempt: &mut u32, minimum: Option<Duration>) -> Result<Duration> {
+    let jitter = full_jitter(reconnect_cap(*attempt))?;
+    *attempt = attempt.saturating_add(1);
+    Ok(minimum.map_or(jitter, |delay| delay.max(jitter)))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1147,7 +1223,7 @@ mod tests {
         remove_network_intent, status, CliCredential, InitArgs, MAXIMUM_RECONNECT_DELAY,
     };
     #[cfg(windows)]
-    use super::{drive_data_until, reconnect_delay_from};
+    use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1170,6 +1246,20 @@ mod tests {
             https_proxy: None,
             identity: PathBuf::from("secrets/node.pk8"),
         }
+    }
+
+    #[cfg(windows)]
+    async fn data_runtime_without_tap() -> (ClientDataRuntime, IdentitySigningKey) {
+        let mut args = init_args();
+        args.udp_bind = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let document = configuration_document(&args).expect("encode test configuration");
+        let config = ClientConfig::parse(&document, std::path::Path::new("."))
+            .expect("parse test configuration");
+        let identity = IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x63; 32]));
+        let data = ClientDataRuntime::start(&config, &BTreeMap::new(), &identity)
+            .await
+            .expect("start data runtime without TAP networks");
+        (data, identity)
     }
 
     #[test]
@@ -1197,15 +1287,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn pending_control_operation_keeps_data_runtime_progressing() {
-        let mut args = init_args();
-        args.udp_bind = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let document = configuration_document(&args).expect("encode test configuration");
-        let config = ClientConfig::parse(&document, std::path::Path::new("."))
-            .expect("parse test configuration");
-        let identity = IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x63; 32]));
-        let mut data = ClientDataRuntime::start(&config, &BTreeMap::new(), &identity)
-            .await
-            .expect("start data runtime without TAP networks");
+        let (mut data, identity) = data_runtime_without_tap().await;
         let target = data.local_udp_address();
         let operation = async move {
             let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -1218,21 +1300,47 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             0x63_u8
         };
+        let mut shutdown = tokio::spawn(std::future::pending::<std::io::Result<()>>());
         let output = tokio::time::timeout(
             Duration::from_secs(1),
-            drive_data_until(&mut data, &identity, operation),
+            drive_data_until(&mut data, &identity, operation, &mut shutdown),
         )
         .await
         .expect("control operation wait remains bounded")
         .expect("data runtime remains healthy");
-        assert_eq!(output, 0x63);
+        assert!(matches!(output, DataDriveOutcome::Operation(0x63)));
         assert!(
             tokio::time::timeout(Duration::from_millis(25), data.receive_next(&identity))
                 .await
                 .is_err(),
             "the reconnect driver should have consumed the queued UDP datagram"
         );
+        shutdown.abort();
+        let _shutdown_result = shutdown.await;
         data.shutdown().await.expect("shutdown test data runtime");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shutdown_signal_interrupts_control_wait_and_closes_data_runtime() {
+        let (runtime, identity) = data_runtime_without_tap().await;
+        let mut data = Some(runtime);
+        let mut shutdown = tokio::spawn(async { Ok(()) });
+        let outcome = drive_data_until(
+            data.as_mut().expect("active data runtime"),
+            &identity,
+            std::future::pending::<()>(),
+            &mut shutdown,
+        )
+        .await
+        .expect("data runtime stays healthy until shutdown");
+        let DataDriveOutcome::Shutdown(result) = outcome else {
+            panic!("shutdown must interrupt the pending control operation");
+        };
+        finish_client_shutdown(&mut data, result)
+            .await
+            .expect("finish graceful client shutdown");
+        assert!(data.is_none());
     }
 
     #[cfg(windows)]
