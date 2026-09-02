@@ -82,6 +82,9 @@ pub fn turn_websocket_config(
 ) -> Result<WebSocketConfig, WebSocketRecordError> {
     validate_limit(max_record_size)?;
     let mut config = WebSocketConfig::default();
+    config.read_buffer_size = 4_096;
+    config.write_buffer_size = 0;
+    config.max_write_buffer_size = max_record_size.saturating_mul(2);
     config.max_message_size = Some(max_record_size);
     config.max_frame_size = Some(max_record_size);
     config.accept_unmasked_frames = false;
@@ -233,6 +236,14 @@ mod tests {
 
     #[test]
     fn records_require_exact_lengths_limits_and_zero_padding() {
+        let config = turn_websocket_config(64).expect("bounded WebSocket config");
+        assert_eq!(config.read_buffer_size, 4_096);
+        assert_eq!(config.write_buffer_size, 0);
+        assert_eq!(config.max_write_buffer_size, 128);
+        assert_eq!(config.max_message_size, Some(64));
+        assert_eq!(config.max_frame_size, Some(64));
+        assert!(!config.accept_unmasked_frames);
+
         let stun = binding_request();
         validate_record(&stun, 64).expect("valid STUN record");
         let channel = channel_data();
