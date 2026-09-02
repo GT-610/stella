@@ -2,6 +2,8 @@
 
 use std::{
     collections::BTreeMap,
+    future::pending,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{sync_channel, Receiver as SyncReceiver, SyncSender, TryRecvError, TrySendError},
@@ -11,22 +13,35 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use stella_common::{MacAddress, NetworkId};
 use stella_crypto::IdentitySigningKey;
-use stella_proto::CommonHeader;
+use stella_proto::{
+    CommonHeader, ConnectivityCarrier, ConnectivityGenerationRef, IceCandidate, IceCandidateClass,
+    RelayCarrierMask,
+};
 use stella_tap::{TapCancellationHandle, TapConfig, TapDevice, TapError, WindowsTapDevice};
 use stella_transport::{
-    DatagramTransport, TransportError, UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE,
-    MAX_UDP_DATAGRAM_SIZE,
+    DatagramTransport, Endpoint as TransportEndpoint, ReceivedDatagram, TransportError, UdpConfig,
+    UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
+use zeroize::Zeroizing;
 
-use crate::{ClientConfig, NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState};
+use crate::{
+    ClientConfig, ConnectivityConfigState, NetworkDataError, NetworkDataPlane, NetworkOutput,
+    NetworkState, TurnCredentials, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+};
 
 const TAP_WRITE_QUEUE_CAPACITY: usize = 64;
 const TAP_EVENT_QUEUE_CAPACITY: usize = 256;
 const ETHERNET_HEADER_LENGTH: u16 = 14;
+const TURN_UDP_MAX_DATAGRAM_SIZE: usize = 65_503;
+const ICE_GENERATION_MAX_LIFETIME: u64 = 600;
+const ICE_USERNAME_RANDOM_LENGTH: usize = 6;
+const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
+const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
 
 /// Failure while owning the Windows client data-plane runtime.
 #[derive(Debug, Error)]
@@ -70,24 +85,43 @@ pub enum RuntimeError {
     /// System wall time cannot be represented as Unix seconds.
     #[error("system time is before the Unix epoch")]
     SystemTimeBeforeUnixEpoch,
+    /// Operating-system randomness was unavailable for a local ICE generation.
+    #[error("operating-system randomness is unavailable for connectivity generation")]
+    RandomnessUnavailable,
+    /// Connectivity generation expiry arithmetic overflowed.
+    #[error("connectivity generation expiry overflowed")]
+    ConnectivityExpiryOverflow,
     /// TAP device creation, I/O, cancellation, or cleanup failed.
     #[error(transparent)]
     Tap(#[from] TapError),
     /// UDP bind, send, receive, or shutdown failed.
     #[error(transparent)]
     Transport(#[from] TransportError),
+    /// TURN allocation, authentication, refresh, or relay delivery failed.
+    #[error(transparent)]
+    Turn(#[from] TurnUdpError),
     /// Per-network authenticated routing failed.
     #[error(transparent)]
     Network(#[from] NetworkDataError),
     /// A Stella datagram header was structurally malformed.
     #[error(transparent)]
     Codec(#[from] stella_proto::CodecError),
+    /// The network selected a transport endpoint this runtime does not implement.
+    #[error("unsupported data-plane transport endpoint {endpoint}")]
+    UnsupportedTransportEndpoint {
+        /// Endpoint variant not implemented by this runtime version.
+        endpoint: TransportEndpoint,
+    },
 }
 
 /// A complete Windows client data plane sharing one bounded UDP socket.
 pub struct ClientDataRuntime {
     udp: UdpTransport,
     udp_buffer: Vec<u8>,
+    connectivity_revision: Option<u64>,
+    relay: Option<WarmRelay>,
+    relay_buffer: Vec<u8>,
+    connectivity_generations: BTreeMap<NetworkId, LocalConnectivityGeneration>,
     networks: BTreeMap<NetworkId, ActiveNetwork>,
     tap_events: mpsc::Receiver<TapEvent>,
     tap_event_sender: mpsc::Sender<TapEvent>,
@@ -106,17 +140,41 @@ impl ClientDataRuntime {
         states: &BTreeMap<NetworkId, NetworkState>,
         signing_key: &IdentitySigningKey,
     ) -> Result<Self, RuntimeError> {
+        Self::start_with_connectivity(config, states, signing_key, None).await
+    }
+
+    /// Binds UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] for invalid local configuration, UDP or TURN
+    /// allocation, TAP setup, network construction, or initial handshake
+    /// transmission failure.
+    pub async fn start_with_connectivity(
+        config: &ClientConfig,
+        states: &BTreeMap<NetworkId, NetworkState>,
+        signing_key: &IdentitySigningKey,
+        connectivity: Option<&ConnectivityConfigState>,
+    ) -> Result<Self, RuntimeError> {
         let max_datagram_size = configured_datagram_size(config);
         let udp = UdpTransport::bind(UdpConfig {
             bind_address: config.udp_bind,
             max_datagram_size,
         })
         .await?;
+        let relay = allocate_preferred_turn_udp(config.udp_bind, connectivity).await?;
+        let relay_buffer_size = relay.as_ref().map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
+            relay.client.capabilities().max_datagram_size
+        });
         let (tap_event_sender, tap_events) = mpsc::channel(TAP_EVENT_QUEUE_CAPACITY);
         let started_at = std::time::Instant::now();
         let mut runtime = Self {
             udp,
             udp_buffer: vec![0_u8; max_datagram_size],
+            connectivity_revision: connectivity.map(ConnectivityConfigState::revision),
+            relay,
+            relay_buffer: vec![0_u8; relay_buffer_size],
+            connectivity_generations: BTreeMap::new(),
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
@@ -125,6 +183,8 @@ impl ClientDataRuntime {
         for state in states.values().cloned() {
             runtime.insert_network(config, state, signing_key)?;
         }
+        runtime.replace_local_connectivity_generations(states)?;
+        runtime.prepare_relay_paths().await?;
         let wall_time = unix_time()?;
         let monotonic_now = runtime.monotonic_now();
         let network_ids: Vec<NetworkId> = runtime.networks.keys().copied().collect();
@@ -194,16 +254,21 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         enum Ready {
             Udp(stella_transport::ReceivedDatagram),
+            Relay(ReceivedDatagram),
             Tap(TapEvent),
         }
         let ready = tokio::select! {
             received = self.udp.receive(&mut self.udp_buffer) => Ready::Udp(received?),
+            received = receive_relay(self.relay.as_ref(), &mut self.relay_buffer) => {
+                Ready::Relay(received?)
+            }
             event = self.tap_events.recv() => {
                 Ready::Tap(event.ok_or(RuntimeError::TapEventChannelClosed)?)
             }
         };
         match ready {
             Ready::Udp(received) => self.process_udp(received, signing_key).await,
+            Ready::Relay(received) => self.process_relay(received, signing_key).await,
             Ready::Tap(event) => self.process_tap_event(event).await,
         }
     }
@@ -257,6 +322,40 @@ impl ClientDataRuntime {
                 source: std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "validated UDP length exceeds receive buffer",
+                ),
+            })?
+            .to_vec();
+        let common = CommonHeader::decode(&datagram)?;
+        let network_id = common.network_id;
+        let wall_time = unix_time()?;
+        let monotonic_now = self.monotonic_now();
+        let output = self
+            .networks
+            .get_mut(&network_id)
+            .ok_or(NetworkDataError::WrongNetwork)?
+            .plane
+            .accept_datagram(
+                &received.source,
+                &datagram,
+                signing_key,
+                wall_time,
+                monotonic_now,
+            )?;
+        self.apply_output(network_id, output).await
+    }
+
+    async fn process_relay(
+        &mut self,
+        received: ReceivedDatagram,
+        signing_key: &IdentitySigningKey,
+    ) -> Result<(), RuntimeError> {
+        let datagram = self
+            .relay_buffer
+            .get(..received.length)
+            .ok_or(TransportError::ReceiveTruncated {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "validated TURN length exceeds receive buffer",
                 ),
             })?
             .to_vec();
@@ -353,6 +452,90 @@ impl ClientDataRuntime {
                 active.state = state.clone();
             }
         }
+        self.reconcile_local_connectivity_generations(states)?;
+        self.prepare_relay_paths().await?;
+        Ok(())
+    }
+
+    /// Returns the current local automatic-connectivity generation for one network.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Codec`] if the private generation invariant is violated.
+    pub fn connectivity_generation(
+        &self,
+        network_id: NetworkId,
+    ) -> Result<Option<ConnectivityGenerationRef<'_>>, RuntimeError> {
+        self.connectivity_generations
+            .get(&network_id)
+            .map(LocalConnectivityGeneration::as_ref)
+            .transpose()
+            .map_err(RuntimeError::Codec)
+    }
+
+    /// Returns the deployment connectivity revision currently applied locally.
+    #[must_use]
+    pub const fn connectivity_revision(&self) -> Option<u64> {
+        self.connectivity_revision
+    }
+
+    /// Applies a replacement controller relay configuration without dropping a healthy allocation.
+    ///
+    /// Matching service parameters update only short-lived credentials and
+    /// refresh the allocation. Service removal or material endpoint changes
+    /// create a replacement allocation before retiring the old one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] for allocation, credential, generation, path,
+    /// or shutdown failure.
+    pub async fn replace_connectivity_config(
+        &mut self,
+        connectivity: Option<&ConnectivityConfigState>,
+        states: &BTreeMap<NetworkId, NetworkState>,
+    ) -> Result<(), RuntimeError> {
+        let revision = connectivity.map(ConnectivityConfigState::revision);
+        if self.connectivity_revision == revision {
+            return Ok(());
+        }
+        let selected = preferred_turn_udp_settings(self.udp.local_address(), connectivity)?;
+        match (self.relay.as_mut(), selected) {
+            (Some(current), Some(selected)) if current.settings == selected.settings => {
+                current
+                    .client
+                    .replace_credentials(selected.credentials)
+                    .await?;
+                current.credential_expires_at = selected.credential_expires_at;
+            }
+            (_, Some(selected)) => {
+                let replacement = allocate_turn_udp(selected).await?;
+                let previous = self.relay.replace(replacement);
+                if let Some(previous) = previous {
+                    previous.client.shutdown().await?;
+                }
+            }
+            (Some(_), None) => {
+                if let Some(previous) = self.relay.take() {
+                    previous.client.shutdown().await?;
+                }
+            }
+            (None, None) => {}
+        }
+        let available = self.relay.is_some();
+        for network in self.networks.values_mut() {
+            network.plane.set_turn_udp_available(available)?;
+        }
+        self.relay_buffer.resize(
+            self.relay
+                .as_ref()
+                .map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
+                    relay.client.capabilities().max_datagram_size
+                }),
+            0,
+        );
+        self.replace_local_connectivity_generations(states)?;
+        self.prepare_relay_paths().await?;
+        self.connectivity_revision = revision;
         Ok(())
     }
 
@@ -362,7 +545,16 @@ impl ClientDataRuntime {
     ///
     /// Returns the first transport or TAP shutdown failure after attempting all cleanup.
     pub async fn shutdown(mut self) -> Result<(), RuntimeError> {
-        let mut first_error = self.udp.shutdown().await.err().map(RuntimeError::Transport);
+        let mut first_error = if let Some(relay) = self.relay.take() {
+            relay.client.shutdown().await.err().map(RuntimeError::Turn)
+        } else {
+            None
+        };
+        if let Err(error) = self.udp.shutdown().await {
+            if first_error.is_none() {
+                first_error = Some(RuntimeError::Transport(error));
+            }
+        }
         let networks = std::mem::take(&mut self.networks);
         for network in networks.into_values() {
             if let Err(error) = network.tap.shutdown().await {
@@ -422,7 +614,7 @@ impl ClientDataRuntime {
         };
         let tap = TapWorker::spawn(network_id, &tap_config, self.tap_event_sender.clone())?;
         let primary_mac = tap.primary_mac();
-        let plane = NetworkDataPlane::new(
+        let mut plane = NetworkDataPlane::new(
             state.clone(),
             primary_mac,
             self.udp.local_address(),
@@ -430,6 +622,7 @@ impl ClientDataRuntime {
             signing_key,
             self.monotonic_now(),
         )?;
+        plane.set_turn_udp_available(self.relay.is_some())?;
         self.networks.insert(
             network_id,
             ActiveNetwork {
@@ -456,7 +649,22 @@ impl ClientDataRuntime {
                 .plane
                 .transport_endpoint(datagram.path_id())?
                 .clone();
-            self.udp.send_to(&endpoint, datagram.bytes()).await?;
+            match &endpoint {
+                TransportEndpoint::Udp(_) => {
+                    self.udp.send_to(&endpoint, datagram.bytes()).await?;
+                }
+                TransportEndpoint::TurnUdp { .. } => {
+                    self.relay
+                        .as_ref()
+                        .ok_or(TurnUdpError::ActorStopped)?
+                        .client
+                        .send_to(&endpoint, datagram.bytes())
+                        .await?;
+                }
+                _ => {
+                    return Err(RuntimeError::UnsupportedTransportEndpoint { endpoint });
+                }
+            }
         }
         if let Some(frame) = tap_frame {
             self.networks
@@ -471,6 +679,58 @@ impl ClientDataRuntime {
     fn monotonic_now(&self) -> Duration {
         self.started_at.elapsed()
     }
+
+    async fn prepare_relay_paths(&self) -> Result<(), RuntimeError> {
+        let Some(relay) = &self.relay else {
+            return Ok(());
+        };
+        let mut endpoints = self
+            .networks
+            .values()
+            .flat_map(|network| network.plane.relay_endpoints())
+            .collect::<Vec<_>>();
+        endpoints.sort_by_key(ToString::to_string);
+        endpoints.dedup();
+        for endpoint in endpoints {
+            relay.client.prepare_peer(&endpoint).await?;
+        }
+        Ok(())
+    }
+
+    fn replace_local_connectivity_generations(
+        &mut self,
+        states: &BTreeMap<NetworkId, NetworkState>,
+    ) -> Result<(), RuntimeError> {
+        self.connectivity_generations.clear();
+        let Some(relay) = &self.relay else {
+            return Ok(());
+        };
+        for network_id in states.keys().copied() {
+            self.connectivity_generations
+                .insert(network_id, LocalConnectivityGeneration::new(relay)?);
+        }
+        Ok(())
+    }
+
+    fn reconcile_local_connectivity_generations(
+        &mut self,
+        states: &BTreeMap<NetworkId, NetworkState>,
+    ) -> Result<(), RuntimeError> {
+        self.connectivity_generations
+            .retain(|network_id, _| states.contains_key(network_id));
+        let Some(relay) = &self.relay else {
+            self.connectivity_generations.clear();
+            return Ok(());
+        };
+        for network_id in states.keys().copied() {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.connectivity_generations.entry(network_id)
+            {
+                entry.insert(LocalConnectivityGeneration::new(relay)?);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for ClientDataRuntime {
@@ -478,6 +738,10 @@ impl std::fmt::Debug for ClientDataRuntime {
         formatter
             .debug_struct("ClientDataRuntime")
             .field("local_udp_address", &self.udp.local_address())
+            .field(
+                "relay_id",
+                &self.relay.as_ref().map(|relay| relay.client.relay_id()),
+            )
             .field("networks", &self.networks.len())
             .finish_non_exhaustive()
     }
@@ -488,6 +752,113 @@ struct ActiveNetwork {
     primary_mac: MacAddress,
     plane: NetworkDataPlane,
     tap: TapWorker,
+}
+
+struct WarmRelay {
+    settings: TurnUdpSettings,
+    credential_expires_at: u64,
+    client: TurnUdpClient,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TurnUdpSettings {
+    relay_id: stella_common::RelayId,
+    server_address: SocketAddr,
+    bind_address: SocketAddr,
+    max_datagram_size: usize,
+    allocation_lifetime_seconds: u32,
+    idle_timeout_seconds: u32,
+}
+
+impl TurnUdpSettings {
+    const fn client_config(self) -> TurnUdpClientConfig {
+        let mut config =
+            TurnUdpClientConfig::new(self.relay_id, self.server_address, self.bind_address);
+        config.max_datagram_size = self.max_datagram_size;
+        config.allocation_lifetime_seconds = self.allocation_lifetime_seconds;
+        config.idle_timeout_seconds = self.idle_timeout_seconds;
+        config
+    }
+}
+
+struct SelectedTurnUdp {
+    settings: TurnUdpSettings,
+    credentials: TurnCredentials,
+    credential_expires_at: u64,
+}
+
+struct LocalConnectivityGeneration {
+    generation_id: u64,
+    tie_breaker: u64,
+    created_at: u64,
+    expires_at: u64,
+    username_fragment: Zeroizing<Vec<u8>>,
+    password: Zeroizing<Vec<u8>>,
+    candidates: Vec<IceCandidate>,
+}
+
+impl LocalConnectivityGeneration {
+    fn new(relay: &WarmRelay) -> Result<Self, RuntimeError> {
+        let created_at = unix_time()?;
+        if relay.credential_expires_at <= created_at {
+            return Err(TurnUdpError::CredentialExpired {
+                expires_at: relay.credential_expires_at,
+                now: created_at,
+            }
+            .into());
+        }
+        let maximum_expiry = created_at
+            .checked_add(ICE_GENERATION_MAX_LIFETIME)
+            .ok_or(RuntimeError::ConnectivityExpiryOverflow)?;
+        let expires_at = relay.credential_expires_at.min(maximum_expiry);
+        let generation_id = random_nonzero_u64()?;
+        let tie_breaker = random_nonzero_u64()?;
+        let username_fragment = random_ice_credential(ICE_USERNAME_RANDOM_LENGTH)?;
+        let password = random_ice_credential(ICE_PASSWORD_RANDOM_LENGTH)?;
+        let relay_id = relay.client.relay_id();
+        let relay_bytes = relay_id.into_bytes();
+        let foundation = u32::from_be_bytes([
+            relay_bytes[0],
+            relay_bytes[1],
+            relay_bytes[2],
+            relay_bytes[3],
+        ])
+        .max(1);
+        let candidates = vec![IceCandidate {
+            class: IceCandidateClass::Relay,
+            carrier: ConnectivityCarrier::TurnUdp,
+            priority: RELAY_CANDIDATE_PRIORITY,
+            foundation,
+            max_datagram_size: u32::try_from(relay.client.capabilities().max_datagram_size)
+                .unwrap_or(65_503),
+            address: relay.client.relayed_address(),
+            related_address: Some(relay.client.mapped_address()),
+            relay_id: Some(relay_id),
+        }];
+        let generation = Self {
+            generation_id,
+            tie_breaker,
+            created_at,
+            expires_at,
+            username_fragment,
+            password,
+            candidates,
+        };
+        generation.as_ref()?;
+        Ok(generation)
+    }
+
+    fn as_ref(&self) -> Result<ConnectivityGenerationRef<'_>, stella_proto::CodecError> {
+        ConnectivityGenerationRef::new(
+            self.generation_id,
+            self.tie_breaker,
+            self.created_at,
+            self.expires_at,
+            &self.username_fragment,
+            &self.password,
+            &self.candidates,
+        )
+    }
 }
 
 struct TapWorker {
@@ -689,6 +1060,130 @@ fn configured_datagram_size(config: &ClientConfig) -> usize {
         .min(MAX_UDP_DATAGRAM_SIZE)
 }
 
+async fn allocate_preferred_turn_udp(
+    bind_address: SocketAddr,
+    connectivity: Option<&ConnectivityConfigState>,
+) -> Result<Option<WarmRelay>, RuntimeError> {
+    let selections = turn_udp_selections(bind_address, connectivity)?;
+    let mut last_error = None;
+    for selected in selections {
+        match allocate_turn_udp(selected).await {
+            Ok(relay) => return Ok(Some(relay)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+fn preferred_turn_udp_settings(
+    bind_address: SocketAddr,
+    connectivity: Option<&ConnectivityConfigState>,
+) -> Result<Option<SelectedTurnUdp>, RuntimeError> {
+    Ok(turn_udp_selections(bind_address, connectivity)?
+        .into_iter()
+        .next())
+}
+
+fn turn_udp_selections(
+    bind_address: SocketAddr,
+    connectivity: Option<&ConnectivityConfigState>,
+) -> Result<Vec<SelectedTurnUdp>, RuntimeError> {
+    let Some(connectivity) = connectivity else {
+        return Ok(Vec::new());
+    };
+    let mut selections = Vec::new();
+    for service in connectivity.relay_services().iter().filter(|service| {
+        service.carriers().contains(RelayCarrierMask::TURN_UDP) && service.ports().turn_udp != 0
+    }) {
+        for relay_address in service.addresses() {
+            let Some(turn_bind) = turn_bind_address(bind_address, relay_address.address) else {
+                continue;
+            };
+            selections.push(SelectedTurnUdp {
+                settings: TurnUdpSettings {
+                    relay_id: service.relay_id(),
+                    server_address: SocketAddr::new(
+                        relay_address.address,
+                        service.ports().turn_udp,
+                    ),
+                    bind_address: turn_bind,
+                    max_datagram_size: usize::try_from(service.max_datagram_size())
+                        .unwrap_or(TURN_UDP_MAX_DATAGRAM_SIZE)
+                        .min(TURN_UDP_MAX_DATAGRAM_SIZE),
+                    allocation_lifetime_seconds: service.allocation_lifetime_seconds(),
+                    idle_timeout_seconds: service.idle_timeout_seconds(),
+                },
+                credentials: TurnCredentials::new(
+                    service.credential_username().to_vec(),
+                    service.credential_secret().to_vec(),
+                    service.credential_expires_at(),
+                )?,
+                credential_expires_at: service.credential_expires_at(),
+            });
+        }
+    }
+    Ok(selections)
+}
+
+async fn allocate_turn_udp(selected: SelectedTurnUdp) -> Result<WarmRelay, RuntimeError> {
+    let client =
+        TurnUdpClient::allocate(selected.settings.client_config(), selected.credentials).await?;
+    Ok(WarmRelay {
+        settings: selected.settings,
+        credential_expires_at: selected.credential_expires_at,
+        client,
+    })
+}
+
+const fn turn_bind_address(configured: SocketAddr, relay: IpAddr) -> Option<SocketAddr> {
+    match (configured.ip(), relay) {
+        (IpAddr::V4(configured_ip), IpAddr::V4(_)) => {
+            Some(SocketAddr::new(IpAddr::V4(configured_ip), 0))
+        }
+        (IpAddr::V6(configured_ip), IpAddr::V6(_)) => {
+            Some(SocketAddr::new(IpAddr::V6(configured_ip), 0))
+        }
+        (IpAddr::V4(configured_ip), IpAddr::V6(_)) if configured_ip.is_unspecified() => {
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+        }
+        (IpAddr::V6(configured_ip), IpAddr::V4(_)) if configured_ip.is_unspecified() => {
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        }
+        _ => None,
+    }
+}
+
+async fn receive_relay(
+    relay: Option<&WarmRelay>,
+    output: &mut [u8],
+) -> Result<ReceivedDatagram, RuntimeError> {
+    match relay {
+        Some(relay) => relay
+            .client
+            .receive(output)
+            .await
+            .map_err(RuntimeError::Turn),
+        None => pending().await,
+    }
+}
+
+fn random_nonzero_u64() -> Result<u64, RuntimeError> {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes).map_err(|_| RuntimeError::RandomnessUnavailable)?;
+    Ok(u64::from_le_bytes(bytes).max(1))
+}
+
+fn random_ice_credential(random_length: usize) -> Result<Zeroizing<Vec<u8>>, RuntimeError> {
+    let mut random = Zeroizing::new(vec![0_u8; random_length]);
+    getrandom::fill(&mut random).map_err(|_| RuntimeError::RandomnessUnavailable)?;
+    Ok(Zeroizing::new(
+        STANDARD_NO_PAD.encode(&*random).into_bytes(),
+    ))
+}
+
 fn effective_tap_mtu(policy_mtu: u16, installed_mtu: u32) -> Result<u16, TapError> {
     u16::try_from(u32::from(policy_mtu).min(installed_mtu)).map_err(|_| TapError::InvalidConfig {
         field: "mtu",
@@ -705,7 +1200,70 @@ fn unix_time() -> Result<u64, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::effective_tap_mtu;
+    use std::{net::SocketAddr, time::SystemTime};
+
+    use stella_common::RelayId;
+    use stella_proto::{
+        encode_relay_service_list, encode_stun_server_list, RelayAddress, RelayCarrierMask,
+        RelayPorts, RelayServiceRef, RelayTrustRequirements, StunServer,
+    };
+
+    use super::{
+        effective_tap_mtu, preferred_turn_udp_settings, random_ice_credential, turn_bind_address,
+        turn_udp_selections, ConnectivityConfigState, ICE_PASSWORD_RANDOM_LENGTH,
+        ICE_USERNAME_RANDOM_LENGTH, TURN_UDP_MAX_DATAGRAM_SIZE,
+    };
+
+    fn connectivity_config() -> ConnectivityConfigState {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_secs();
+        let stun_servers = [StunServer {
+            priority: 0,
+            address: "192.0.2.10:3478".parse().expect("STUN address"),
+        }];
+        let mut stun_bytes = vec![0_u8; 28];
+        encode_stun_server_list(&stun_servers, &mut stun_bytes).expect("encode STUN list");
+        let addresses = [
+            RelayAddress {
+                priority: 0,
+                address: "192.0.2.20".parse().expect("IPv4 relay address"),
+            },
+            RelayAddress {
+                priority: 1,
+                address: "2001:db8::20".parse().expect("IPv6 relay address"),
+            },
+        ];
+        let service = RelayServiceRef {
+            relay_id: RelayId::from_bytes([0x52; 16]),
+            carriers: RelayCarrierMask::TURN_UDP,
+            priority: 4,
+            max_datagram_size: 65_507,
+            allocation_lifetime_seconds: 600,
+            idle_timeout_seconds: 120,
+            credential_issued_at: now,
+            credential_expires_at: now + 600,
+            hostname: "",
+            tls_server_name: "",
+            credential_username: b"node-runtime-test",
+            credential_secret: b"0123456789abcdef0123456789abcdef",
+            region: "test",
+            trust: RelayTrustRequirements::NONE,
+            ports: RelayPorts {
+                turn_udp: 3_478,
+                turn_tcp: 0,
+                turn_tls: 0,
+                secure_websocket: 0,
+            },
+            addresses: &addresses,
+            spki_pins: &[],
+        };
+        let mut relay_bytes = vec![0_u8; 4 + service.encoded_len().expect("service length")];
+        encode_relay_service_list(&[service], &mut relay_bytes).expect("encode relay list");
+        ConnectivityConfigState::from_wire(9, &stun_bytes, &relay_bytes, now)
+            .expect("decode connectivity config")
+    }
 
     #[test]
     fn effective_mtu_preserves_lower_host_setting_and_caps_higher_setting() {
@@ -718,5 +1276,68 @@ mod tests {
             effective_tap_mtu(1_500, 9_000).expect("cap host MTU"),
             1_500
         );
+    }
+
+    #[test]
+    fn turn_udp_selection_preserves_controller_order_and_uses_ephemeral_family_binds() {
+        let config = connectivity_config();
+        let selections = turn_udp_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            Some(&config),
+        )
+        .expect("TURN UDP selections");
+        assert_eq!(selections.len(), 2);
+        assert_eq!(
+            selections[0].settings.server_address,
+            "192.0.2.20:3478"
+                .parse::<SocketAddr>()
+                .expect("IPv4 server")
+        );
+        assert_eq!(
+            selections[0].settings.bind_address,
+            "0.0.0.0:0".parse::<SocketAddr>().expect("IPv4 bind")
+        );
+        assert_eq!(
+            selections[1].settings.bind_address,
+            "[::]:0".parse::<SocketAddr>().expect("IPv6 bind")
+        );
+        assert_eq!(
+            selections[0].settings.max_datagram_size,
+            TURN_UDP_MAX_DATAGRAM_SIZE
+        );
+        let preferred = preferred_turn_udp_settings(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            Some(&config),
+        )
+        .expect("preferred selection")
+        .expect("configured TURN UDP service");
+        assert_eq!(preferred.settings, selections[0].settings);
+    }
+
+    #[test]
+    fn turn_udp_family_selection_respects_specific_local_bind() {
+        let configured = "192.0.2.5:45000"
+            .parse::<SocketAddr>()
+            .expect("specific bind");
+        assert_eq!(
+            turn_bind_address(configured, "198.51.100.10".parse().expect("IPv4 relay")),
+            Some("192.0.2.5:0".parse().expect("ephemeral IPv4 bind"))
+        );
+        assert_eq!(
+            turn_bind_address(configured, "2001:db8::10".parse().expect("IPv6 relay")),
+            None
+        );
+    }
+
+    #[test]
+    fn generated_ice_credentials_are_canonical_and_secret_owned() {
+        let username = random_ice_credential(ICE_USERNAME_RANDOM_LENGTH).expect("ICE username");
+        let password = random_ice_credential(ICE_PASSWORD_RANDOM_LENGTH).expect("ICE password");
+        assert_eq!(username.len(), 8);
+        assert_eq!(password.len(), 24);
+        assert!(username
+            .iter()
+            .chain(password.iter())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')));
     }
 }
