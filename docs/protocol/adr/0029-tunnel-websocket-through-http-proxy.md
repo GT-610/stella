@@ -1,6 +1,6 @@
 # ADR 0029: Tunnel secure WebSocket relay through an explicit HTTP proxy
 
-- Status: Accepted
+- Status: Superseded by ADR 0030
 - Date: 2026-09-02
 
 ## Context

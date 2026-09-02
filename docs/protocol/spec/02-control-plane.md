@@ -2,7 +2,7 @@
 
 - Status: Draft
 - Protocol version: 0.1
-- Last updated: 2026-08-29
+- Last updated: 2026-09-02
 
 ## 1. Scope
 
@@ -36,6 +36,15 @@ neither side processes join, endpoint, peer, heartbeat, or grant messages.
 
 A TLS connection authenticates one node ID. Sharing one connection between
 node identities is forbidden.
+
+An implementation may reach the controller through a locally configured
+explicit HTTP proxy. It first sends the bounded HTTP/1.1 CONNECT profile from
+`12-relay.md` section 4.1, using the configured controller TLS name and port as
+the authority. The CONNECT request contains no Stella record, bearer token,
+identity proof, or trust anchor. After a 2xx response, the ordinary TLS 1.3
+handshake and every control rule in this document apply unchanged inside the
+tunnel. Proxy selection is local configuration and is never sent over the
+control plane.
 
 ## 3. Outer framing
 
