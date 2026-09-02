@@ -1,8 +1,9 @@
-//! Relay-only encrypted L2 data-plane coverage over the real TURN UDP runtime.
+//! Relay-first encrypted L2 coverage with ICE-driven direct-path upgrade.
 
 #![cfg(windows)]
 
 use std::{
+    collections::VecDeque,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
@@ -10,8 +11,8 @@ use std::{
 };
 
 use stella_client::{
-    NetworkDataPlane, NetworkState, RoutedDatagram, SnapshotInput, TurnCredentials, TurnUdpClient,
-    TurnUdpClientConfig,
+    IceAgent, IceNomination, IcePeerConfig, NetworkDataError, NetworkDataPlane, NetworkState,
+    RoutedDatagram, SnapshotInput, TurnCredentials, TurnUdpClient, TurnUdpClientConfig,
 };
 use stella_common::{MacAddress, NetworkId, RelayId};
 use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
@@ -207,12 +208,167 @@ fn ethernet_frame(source: MacAddress, destination: MacAddress, marker: u8) -> Ve
     frame
 }
 
+fn direct_candidate(address: SocketAddr, foundation: u32) -> IceCandidate {
+    IceCandidate {
+        class: IceCandidateClass::Host,
+        carrier: ConnectivityCarrier::DirectUdp,
+        priority: 2_130_706_431,
+        foundation,
+        max_datagram_size: 1_200,
+        address,
+        related_address: None,
+        relay_id: None,
+    }
+}
+
+fn converge_ice(
+    alice_id: stella_common::NodeId,
+    bob_id: stella_common::NodeId,
+    alice_candidate: IceCandidate,
+    bob_candidate: IceCandidate,
+) -> (IceNomination, IceNomination) {
+    let mut alice = IceAgent::new(
+        alice_id,
+        10,
+        b"AliceUfr",
+        b"AlicePassword123456789",
+        &[alice_candidate],
+    )
+    .expect("Alice ICE agent");
+    let mut bob = IceAgent::new(
+        bob_id,
+        20,
+        b"BobUfrag",
+        b"BobPassword12345678901",
+        &[bob_candidate],
+    )
+    .expect("Bob ICE agent");
+    alice
+        .upsert_peer(IcePeerConfig {
+            node_id: bob_id,
+            generation_id: 2,
+            tie_breaker: 20,
+            username_fragment: b"BobUfrag",
+            password: b"BobPassword12345678901",
+            candidates: &[bob_candidate],
+        })
+        .expect("configure Bob ICE generation");
+    bob.upsert_peer(IcePeerConfig {
+        node_id: alice_id,
+        generation_id: 1,
+        tie_breaker: 10,
+        username_fragment: b"AliceUfr",
+        password: b"AlicePassword123456789",
+        candidates: &[alice_candidate],
+    })
+    .expect("configure Alice ICE generation");
+
+    let mut queue = VecDeque::new();
+    for transmission in alice
+        .poll(Duration::ZERO)
+        .expect("poll Alice ICE")
+        .into_parts()
+        .0
+    {
+        queue.push_back((true, transmission));
+    }
+    for transmission in bob
+        .poll(Duration::ZERO)
+        .expect("poll Bob ICE")
+        .into_parts()
+        .0
+    {
+        queue.push_back((false, transmission));
+    }
+    let mut alice_nomination = None;
+    let mut bob_nomination = None;
+    for step in 0..32 {
+        let Some((from_alice, transmission)) = queue.pop_front() else {
+            break;
+        };
+        let now = Duration::from_millis(step);
+        let output = if from_alice {
+            bob.accept(alice_candidate.address, transmission.bytes(), now)
+                .expect("Bob accepts ICE datagram")
+                .expect("Bob ICE component")
+        } else {
+            alice
+                .accept(bob_candidate.address, transmission.bytes(), now)
+                .expect("Alice accepts ICE datagram")
+                .expect("Alice ICE component")
+        };
+        let (responses, nominations) = output.into_parts();
+        for nomination in nominations {
+            if from_alice {
+                bob_nomination = Some(nomination);
+            } else {
+                alice_nomination = Some(nomination);
+            }
+        }
+        for response in responses {
+            queue.push_back((!from_alice, response));
+        }
+        for transmission in alice.poll(now).expect("repoll Alice ICE").into_parts().0 {
+            queue.push_back((true, transmission));
+        }
+        for transmission in bob.poll(now).expect("repoll Bob ICE").into_parts().0 {
+            queue.push_back((false, transmission));
+        }
+        if alice_nomination.is_some() && bob_nomination.is_some() {
+            break;
+        }
+    }
+    (
+        alice_nomination.expect("Alice direct nomination"),
+        bob_nomination.expect("Bob direct nomination"),
+    )
+}
+
+fn direct_flight(
+    sender_plane: &NetworkDataPlane,
+    sender_address: SocketAddr,
+    receiver_plane: &mut NetworkDataPlane,
+    receiver_address: SocketAddr,
+    receiver_key: &IdentitySigningKey,
+    datagrams: Vec<RoutedDatagram>,
+    now: Duration,
+) -> (Vec<RoutedDatagram>, Option<Vec<u8>>) {
+    let expected_target = TransportEndpoint::Udp(receiver_address);
+    let expected_source = TransportEndpoint::Udp(sender_address);
+    let mut responses = Vec::new();
+    let mut tap_frame = None;
+    for datagram in datagrams {
+        assert_eq!(
+            sender_plane
+                .transport_endpoint(datagram.path_id())
+                .expect("resolve direct path"),
+            &expected_target
+        );
+        let output = receiver_plane
+            .accept_datagram(
+                &expected_source,
+                datagram.bytes(),
+                receiver_key,
+                CONTROL_TIME,
+                now,
+            )
+            .expect("accept direct Stella datagram");
+        let (next, delivered) = output.into_parts();
+        responses.extend(next);
+        if delivered.is_some() {
+            assert!(tap_frame.is_none());
+            tap_frame = delivered;
+        }
+    }
+    (responses, tap_frame)
+}
+
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "the complete relay-only handshake and encrypted L2 exchange is one scenario"
+    reason = "the complete relay-first handshake, ICE upgrade, and grace window are one scenario"
 )]
-async fn relay_only_candidates_establish_and_carry_encrypted_l2_frames() {
+async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
     let directory = temp_directory();
     std::fs::create_dir(&directory).expect("create test directory");
     let controller = signing_key(0x61);
@@ -312,10 +468,13 @@ async fn relay_only_candidates_establish_and_carry_encrypted_l2_frames() {
 
     let alice_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 2, 1]);
     let bob_mac = MacAddress::from_bytes([0x02, 0, 0, 0, 2, 2]);
+    let alice_direct_address: SocketAddr =
+        "192.0.2.61:47001".parse().expect("Alice direct address");
+    let bob_direct_address: SocketAddr = "192.0.2.62:47002".parse().expect("Bob direct address");
     let mut alice = NetworkDataPlane::new(
         state(&store, &controller, &alice_key, network_id),
         alice_mac,
-        "127.0.0.1:47001".parse().expect("Alice direct address"),
+        alice_direct_address,
         1_200,
         &alice_key,
         Duration::ZERO,
@@ -324,7 +483,7 @@ async fn relay_only_candidates_establish_and_carry_encrypted_l2_frames() {
     let mut bob = NetworkDataPlane::new(
         state(&store, &controller, &bob_key, network_id),
         bob_mac,
-        "127.0.0.1:47002".parse().expect("Bob direct address"),
+        bob_direct_address,
         1_200,
         &bob_key,
         Duration::ZERO,
@@ -440,6 +599,156 @@ async fn relay_only_candidates_establish_and_carry_encrypted_l2_frames() {
     .await;
     assert!(responses.is_empty());
     assert_eq!(delivered.as_deref(), Some(unicast.as_slice()));
+
+    let delayed_old_first = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xc3);
+    let delayed_old_first_datagrams = alice
+        .accept_tap_frame(&delayed_old_first, Duration::from_secs(3))
+        .expect("protect first delayed relay frame")
+        .into_parts()
+        .0;
+    let delayed_old_second = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xd4);
+    let mut delayed_old_second_datagrams = alice
+        .accept_tap_frame(&delayed_old_second, Duration::from_secs(4))
+        .expect("protect second delayed relay frame")
+        .into_parts()
+        .0;
+
+    let alice_direct_candidate = direct_candidate(alice_direct_address, 11);
+    let bob_direct_candidate = direct_candidate(bob_direct_address, 12);
+    let (alice_nomination, bob_nomination) = converge_ice(
+        alice_id,
+        bob_id,
+        alice_direct_candidate,
+        bob_direct_candidate,
+    );
+    assert_eq!(alice_nomination.peer_node_id, bob_id);
+    assert_eq!(alice_nomination.address, bob_direct_address);
+    assert_eq!(bob_nomination.peer_node_id, alice_id);
+    assert_eq!(bob_nomination.address, alice_direct_address);
+    alice
+        .nominate_direct_path(alice_nomination.peer_node_id, alice_nomination.address)
+        .expect("install Alice direct path");
+    bob.nominate_direct_path(bob_nomination.peer_node_id, bob_nomination.address)
+        .expect("install Bob direct path");
+
+    let upgrade_start = Duration::from_secs(10);
+    let mut pending = alice
+        .start_handshakes(&alice_key, CONTROL_TIME, upgrade_start)
+        .expect("start Alice direct handshake")
+        .into_parts()
+        .0;
+    let mut from_alice = true;
+    if pending.is_empty() {
+        pending = bob
+            .start_handshakes(&bob_key, CONTROL_TIME, upgrade_start)
+            .expect("start Bob direct handshake")
+            .into_parts()
+            .0;
+        from_alice = false;
+    }
+    for flight in 0..8 {
+        if pending.is_empty() {
+            break;
+        }
+        let now = upgrade_start.saturating_add(Duration::from_millis(flight));
+        let (next, delivered) = if from_alice {
+            direct_flight(
+                &alice,
+                alice_direct_address,
+                &mut bob,
+                bob_direct_address,
+                &bob_key,
+                pending,
+                now,
+            )
+        } else {
+            direct_flight(
+                &bob,
+                bob_direct_address,
+                &mut alice,
+                alice_direct_address,
+                &alice_key,
+                pending,
+                now,
+            )
+        };
+        assert!(delivered.is_none());
+        pending = next;
+        from_alice = !from_alice;
+    }
+    assert!(pending.is_empty(), "direct handshake did not converge");
+
+    let direct_broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xe5);
+    let outbound = alice
+        .accept_tap_frame(&direct_broadcast, Duration::from_secs(11))
+        .expect("route direct broadcast")
+        .into_parts()
+        .0;
+    let (responses, delivered) = direct_flight(
+        &alice,
+        alice_direct_address,
+        &mut bob,
+        bob_direct_address,
+        &bob_key,
+        outbound,
+        Duration::from_secs(11),
+    );
+    assert!(responses.is_empty());
+    assert_eq!(delivered.as_deref(), Some(direct_broadcast.as_slice()));
+
+    let (responses, delivered) = relay_flight(
+        &alice,
+        &alice_turn,
+        &mut bob,
+        &bob_turn,
+        &bob_key,
+        delayed_old_first_datagrams,
+        Duration::from_secs(12),
+    )
+    .await;
+    assert!(responses.is_empty());
+    assert_eq!(delivered.as_deref(), Some(delayed_old_first.as_slice()));
+
+    let maintenance = bob
+        .maintain(&bob_key, CONTROL_TIME + 41, Duration::from_secs(41))
+        .expect("expire Bob retired relay session");
+    assert!(maintenance.tap_frame().is_none());
+    assert_eq!(delayed_old_second_datagrams.len(), 1);
+    let delayed_old_second_datagram = delayed_old_second_datagrams.remove(0);
+    assert_eq!(
+        alice
+            .transport_endpoint(delayed_old_second_datagram.path_id())
+            .expect("resolve retired relay path"),
+        &advertised_endpoint(&bob_turn)
+    );
+    alice_turn
+        .send_to(
+            &loopback_endpoint(&bob_turn),
+            delayed_old_second_datagram.bytes(),
+        )
+        .await
+        .expect("send expired relay-session datagram");
+    let mut received_bytes = vec![0_u8; 1_200];
+    let metadata = timeout(
+        Duration::from_secs(2),
+        bob_turn.receive(&mut received_bytes),
+    )
+    .await
+    .expect("expired relay receive timeout")
+    .expect("receive expired relay-session datagram");
+    let error = bob
+        .accept_datagram(
+            &advertised_endpoint(&alice_turn),
+            &received_bytes[..metadata.length],
+            &bob_key,
+            CONTROL_TIME + 41,
+            Duration::from_secs(41),
+        )
+        .expect_err("expired relay session must be rejected");
+    assert!(matches!(
+        error,
+        NetworkDataError::NoPeerSession { peer_node_id } if peer_node_id == alice_id
+    ));
 
     alice_turn.shutdown().await.expect("shutdown Alice TURN");
     bob_turn.shutdown().await.expect("shutdown Bob TURN");
