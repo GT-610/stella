@@ -174,6 +174,7 @@ pub struct NetworkDataPlane {
     max_datagram_size: usize,
     switch: L2Switch,
     handshakes: PeerHandshakeManager,
+    turn_udp_available: bool,
     paths: BTreeMap<PathId, PeerPath>,
     peer_paths: BTreeMap<NodeId, Vec<PathId>>,
     next_path_id: u64,
@@ -213,6 +214,7 @@ impl NetworkDataPlane {
             max_datagram_size,
             switch,
             handshakes,
+            turn_udp_available: false,
             paths: BTreeMap::new(),
             peer_paths: BTreeMap::new(),
             next_path_id: 1,
@@ -239,6 +241,29 @@ impl NetworkDataPlane {
             .iter()
             .filter_map(|(peer, session)| (!session.rekeying).then_some(*peer))
             .collect()
+    }
+
+    /// Enables or disables local TURN UDP delivery and rebuilds affected paths.
+    ///
+    /// Existing sessions are withdrawn because changing local carrier
+    /// availability changes which exact `PathId` can send and receive packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] if rebuilding the current peer path set
+    /// exhausts local path identifiers.
+    pub fn set_turn_udp_available(&mut self, available: bool) -> Result<(), NetworkDataError> {
+        if self.turn_udp_available == available {
+            return Ok(());
+        }
+        self.turn_udp_available = available;
+        let peers = self.state.peers().keys().copied().collect::<Vec<_>>();
+        for peer in peers {
+            self.remove_session(peer);
+            self.remove_peer_paths(peer);
+            self.install_peer_paths(peer)?;
+        }
+        Ok(())
     }
 
     /// Starts preferred-initiator handshakes for peers without a session.
@@ -772,7 +797,8 @@ impl NetworkDataPlane {
             .into_iter()
             .flat_map(|connectivity| connectivity.candidates().iter().copied())
             .filter(|candidate| {
-                candidate.class == IceCandidateClass::Relay
+                self.turn_udp_available
+                    && candidate.class == IceCandidateClass::Relay
                     && candidate.carrier == ConnectivityCarrier::TurnUdp
             })
             .filter_map(|candidate| {
@@ -1233,7 +1259,7 @@ mod tests {
             .publish_connectivity(alice_id, network_id, Some(&encoded), 130)
             .expect("publish relay connectivity");
 
-        let plane = NetworkDataPlane::new(
+        let mut plane = NetworkDataPlane::new(
             state_for_version(
                 &store,
                 &controller,
@@ -1248,6 +1274,9 @@ mod tests {
             Duration::ZERO,
         )
         .expect("relay-aware data plane");
+        plane
+            .set_turn_udp_available(true)
+            .expect("enable TURN UDP paths");
         let relay_endpoint = TransportEndpoint::TurnUdp {
             relay_id,
             address: relay_address,
