@@ -6,6 +6,7 @@ mod active;
 mod config;
 mod connectivity;
 mod control;
+mod control_field;
 mod data_plane;
 mod error;
 mod handshake;
@@ -36,10 +37,7 @@ pub use handshake::{
 pub use ice::{
     IceAgent, IceError, IceNomination, IceOutput, IcePathFailure, IcePeerConfig, IceTransmission,
 };
-pub use identity::{
-    create_node_identity, load_node_identity, verify_node_identity_permissions,
-    NodeIdentityFileError,
-};
+pub use identity::{create_node_identity, load_node_identity, NodeIdentityFileError};
 pub use network::{NetworkDataError, NetworkDataPlane, NetworkOutput, RoutedDatagram};
 #[cfg(target_os = "windows")]
 pub use runtime::{ClientDataRuntime, RuntimeError};

@@ -15,6 +15,13 @@ end-to-end Windows interoperability validation has passed on one host with two
 real TAP-Windows adapters, covering ARP, bidirectional IPv4 unicast, IPv4
 broadcast and multicast, and LAN discovery.
 
+## Release Compatibility
+
+Version 0.2.0 removes the public `stella_control::CorrelationTracker` type and
+`stella_control::MAX_CORRELATIONS` constant. They were unused within the
+workspace and are no longer supported; downstream consumers must maintain any
+request-correlation limits themselves.
+
 ## Workspace checks
 
 ```powershell

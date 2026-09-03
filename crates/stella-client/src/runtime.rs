@@ -256,9 +256,17 @@ impl ClientDataRuntime {
                     mapped_address: None,
                     base_address: None,
                     deferred: Vec::new(),
+                    dropped_datagrams: 0,
                 }
             }
         };
+        if discovery.dropped_datagrams > 0 {
+            tracing::warn!(
+                dropped = discovery.dropped_datagrams,
+                retained = discovery.deferred.len(),
+                "dropped UDP datagrams while the STUN discovery queue was full"
+            );
+        }
         let relay = relay?;
         let mut direct_candidates = host_candidates;
         if let Some(candidate) = server_reflexive_candidate(&discovery, candidate_datagram_size) {
@@ -310,20 +318,6 @@ impl ClientDataRuntime {
             runtime.apply_output(network_id, output).await?;
         }
         Ok(runtime)
-    }
-
-    /// Receives and processes one complete UDP datagram.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError`] for UDP receive, malformed network dispatch,
-    /// authenticated routing, response send, or TAP delivery failure.
-    pub async fn receive_udp(
-        &mut self,
-        signing_key: &IdentitySigningKey,
-    ) -> Result<(), RuntimeError> {
-        let received = self.udp.receive(&mut self.udp_buffer).await?;
-        self.process_udp(received, signing_key).await
     }
 
     /// Waits for and processes whichever UDP datagram or TAP event arrives first.
@@ -388,20 +382,6 @@ impl ClientDataRuntime {
             }
             result => result,
         }
-    }
-
-    /// Receives and processes one complete frame or fatal event from any TAP worker.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError`] for stopped TAP workers, frame routing, or UDP send failure.
-    pub async fn receive_tap(&mut self) -> Result<(), RuntimeError> {
-        let event = self
-            .tap_events
-            .recv()
-            .await
-            .ok_or(RuntimeError::TapEventChannelClosed)?;
-        self.process_tap_event(event).await
     }
 
     async fn process_tap_event(&mut self, event: TapEvent) -> Result<(), RuntimeError> {

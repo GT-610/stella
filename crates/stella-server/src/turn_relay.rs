@@ -304,6 +304,7 @@ struct TurnRelayCore {
     config: TurnRelayRuntimeConfig,
     authenticator: TurnAuthenticator,
     allocations: HashMap<SocketAddr, Allocation>,
+    allocation_counts: HashMap<NodeId, usize>,
     allocation_tasks: JoinSet<()>,
     response_cache: HashMap<ResponseCacheKey, CachedResponse>,
     response_cache_order: VecDeque<ResponseCacheKey>,
@@ -521,8 +522,9 @@ impl TurnTcpRelay {
                         source,
                     })?;
                     let core = Arc::clone(&self.core);
+                    let idle_timeout = Duration::from_secs(u64::from(self.config.idle_timeout_seconds));
                     sessions.spawn(async move {
-                        (client, run_stream_client(stream, client, core).await)
+                        (client, run_stream_client(stream, client, core, idle_timeout).await)
                     });
                 }
                 joined = sessions.join_next(), if !sessions.is_empty() => {
@@ -650,13 +652,14 @@ impl TurnTlsRelay {
                     let core = Arc::clone(&self.core);
                     let acceptor = self.acceptor.clone();
                     let handshake_timeout = self.handshake_timeout;
+                    let idle_timeout = Duration::from_secs(u64::from(self.config.idle_timeout_seconds));
                     sessions.spawn(async move {
                         let session = async {
                             let stream = timeout(handshake_timeout, acceptor.accept(stream))
                                 .await
                                 .map_err(|_| TurnRelayError::TlsHandshakeTimeout { client })?
                                 .map_err(|source| TurnRelayError::TlsHandshake { client, source })?;
-                            run_stream_client(stream, client, core).await
+                            run_stream_client(stream, client, core, idle_timeout).await
                         }
                         .await;
                         (client, session)
@@ -800,6 +803,7 @@ impl TurnWebSocketRelay {
                     let relay_id = self.config.relay_id;
                     let websocket_config = self.websocket_config;
                     let handshake_timeout = self.handshake_timeout;
+                    let idle_timeout = Duration::from_secs(u64::from(self.config.idle_timeout_seconds));
                     sessions.spawn(async move {
                         let handshake = timeout(handshake_timeout, async {
                             let stream = acceptor
@@ -818,7 +822,9 @@ impl TurnWebSocketRelay {
                         .await
                         .map_err(|_| TurnRelayError::WebSocketHandshakeTimeout { client });
                         let session = match handshake {
-                            Ok(Ok(stream)) => run_websocket_client(stream, client, core).await,
+                            Ok(Ok(stream)) => {
+                                run_websocket_client(stream, client, core, idle_timeout).await
+                            }
                             Ok(Err(error)) | Err(error) => Err(error),
                         };
                         (client, session)
@@ -966,6 +972,7 @@ async fn run_stream_client<S>(
     stream: S,
     client: SocketAddr,
     core: Arc<Mutex<TurnRelayCore>>,
+    idle_timeout: Duration,
 ) -> Result<(), TurnRelayError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -988,10 +995,11 @@ where
                 writer_joined = true;
                 break joined.map_err(|source| TurnRelayError::ClientWriterTaskJoin { source })?;
             }
-            record = reader.read_record() => {
+            record = timeout(idle_timeout, reader.read_record()) => {
                 let record = match record {
-                    Ok(record) => record,
-                    Err(error) => break Err(error.into()),
+                    Ok(Ok(record)) => record,
+                    Ok(Err(error)) => break Err(error.into()),
+                    Err(_) => break Err(TurnRelayError::ClientReadTimeout),
                 };
                 let now_unix = unix_time()?;
                 let now = Instant::now();
@@ -1019,6 +1027,7 @@ async fn run_websocket_client<S>(
     stream: WebSocketStream<S>,
     client: SocketAddr,
     core: Arc<Mutex<TurnRelayCore>>,
+    idle_timeout: Duration,
 ) -> Result<(), TurnRelayError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1039,10 +1048,14 @@ where
                 writer_joined = true;
                 break joined.map_err(|source| TurnRelayError::ClientWriterTaskJoin { source })?;
             }
-            record = read_websocket_record(&mut reader, MAX_TURN_STREAM_RECORD_SIZE) => {
+            record = timeout(
+                idle_timeout,
+                read_websocket_record(&mut reader, MAX_TURN_STREAM_RECORD_SIZE),
+            ) => {
                 let record = match record {
-                    Ok(record) => record,
-                    Err(error) => break Err(error.into()),
+                    Ok(Ok(record)) => record,
+                    Ok(Err(error)) => break Err(error.into()),
+                    Err(_) => break Err(TurnRelayError::ClientReadTimeout),
                 };
                 let now_unix = unix_time()?;
                 let now = Instant::now();
@@ -1083,6 +1096,7 @@ impl TurnRelayCore {
             config,
             authenticator,
             allocations: HashMap::new(),
+            allocation_counts: HashMap::new(),
             allocation_tasks: JoinSet::new(),
             response_cache: HashMap::new(),
             response_cache_order: VecDeque::new(),
@@ -1091,6 +1105,7 @@ impl TurnRelayCore {
 
     async fn shutdown(&mut self) -> Result<(), TurnRelayError> {
         self.allocations.clear();
+        self.allocation_counts.clear();
         while let Some(result) = self.allocation_tasks.join_next().await {
             result.map_err(|source| TurnRelayError::AllocationTaskJoin { source })?;
         }
@@ -1098,7 +1113,7 @@ impl TurnRelayCore {
     }
 
     fn remove_client(&mut self, client: SocketAddr) {
-        self.allocations.remove(&client);
+        self.remove_allocation(client);
         self.response_cache
             .retain(|key, _response| key.client != client);
         self.response_cache_order.retain(|key| key.client != client);
@@ -1255,11 +1270,7 @@ impl TurnRelayCore {
         }
         let node_id = authenticated.node_id();
         if self.allocations.len() >= self.config.max_allocations
-            || self
-                .allocations
-                .values()
-                .filter(|allocation| allocation.node_id == node_id)
-                .count()
+            || self.allocation_counts.get(&node_id).copied().unwrap_or(0)
                 >= self.config.max_allocations_per_node
         {
             return Self::error_response(
@@ -1283,7 +1294,7 @@ impl TurnRelayCore {
                 &authenticated,
             )
             .await?;
-        self.allocations.insert(client, allocation);
+        self.insert_allocation(client, allocation);
         Ok(response)
     }
 
@@ -1395,7 +1406,7 @@ impl TurnRelayCore {
             );
         }
         if lifetime == 0 {
-            self.allocations.remove(&client);
+            self.remove_allocation(client);
         } else {
             allocation.expires_at = checked_deadline(now, lifetime, "allocation lifetime")?;
             allocation.idle_deadline = checked_deadline(
@@ -1486,7 +1497,7 @@ impl TurnRelayCore {
             .await
             .is_err()
         {
-            self.allocations.remove(&client);
+            self.remove_allocation(client);
             return Self::error_response(
                 message,
                 437,
@@ -1522,7 +1533,7 @@ impl TurnRelayCore {
                 })
             }
             Err(_closed) => {
-                self.allocations.remove(&client);
+                self.remove_allocation(client);
                 Self::error_response(
                     message,
                     437,
@@ -1609,7 +1620,7 @@ impl TurnRelayCore {
             .await
             .is_err()
         {
-            self.allocations.remove(&client);
+            self.remove_allocation(client);
             return Self::error_response(
                 message,
                 437,
@@ -1645,7 +1656,7 @@ impl TurnRelayCore {
                 })
             }
             Err(_closed) => {
-                self.allocations.remove(&client);
+                self.remove_allocation(client);
                 Self::error_response(
                     message,
                     437,
@@ -1881,9 +1892,16 @@ impl TurnRelayCore {
     }
 
     fn remove_expired(&mut self, now: Instant) {
-        self.allocations.retain(|_client, allocation| {
-            allocation.expires_at > now && allocation.idle_deadline > now
-        });
+        let expired = self
+            .allocations
+            .iter()
+            .filter_map(|(client, allocation)| {
+                (allocation.expires_at <= now || allocation.idle_deadline <= now).then_some(*client)
+            })
+            .collect::<Vec<_>>();
+        for client in expired {
+            self.remove_allocation(client);
+        }
         self.response_cache
             .retain(|_key, response| response.expires_at > now);
         while self
@@ -1892,6 +1910,28 @@ impl TurnRelayCore {
             .is_some_and(|key| !self.response_cache.contains_key(key))
         {
             self.response_cache_order.pop_front();
+        }
+    }
+
+    fn insert_allocation(&mut self, client: SocketAddr, allocation: Allocation) {
+        let node_id = allocation.node_id;
+        let previous = self.allocations.insert(client, allocation);
+        assert!(previous.is_none(), "allocation already exists for client");
+        let count = self.allocation_counts.entry(node_id).or_default();
+        *count = count.checked_add(1).expect("allocation count overflow");
+    }
+
+    fn remove_allocation(&mut self, client: SocketAddr) {
+        let Some(allocation) = self.allocations.remove(&client) else {
+            return;
+        };
+        let count = self
+            .allocation_counts
+            .get_mut(&allocation.node_id)
+            .expect("allocation count is missing");
+        *count = count.checked_sub(1).expect("allocation count is zero");
+        if *count == 0 {
+            self.allocation_counts.remove(&allocation.node_id);
         }
     }
 }
@@ -2531,6 +2571,9 @@ pub enum TurnRelayError {
         /// Connected client transport address.
         client: SocketAddr,
     },
+    /// A reliable client did not complete another TURN record before its idle deadline.
+    #[error("TURN reliable client stream timed out")]
+    ClientReadTimeout,
     /// A TURN TCP session task panicked or was cancelled unexpectedly.
     #[error("TURN TCP client session task failed")]
     ClientTaskJoin {
@@ -2591,7 +2634,8 @@ pub enum TurnRelayError {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::Duration,
+        sync::Arc,
+        time::{Duration, Instant},
     };
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -2604,17 +2648,29 @@ mod tests {
         StunErrorCodeView, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
         StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
     };
-    use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
-    use tokio_tungstenite::tungstenite::{
-        handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
-        http::{
-            header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
-            StatusCode,
+    use tokio::{
+        io::{duplex, AsyncWriteExt},
+        net::UdpSocket,
+        sync::{mpsc, oneshot, Mutex},
+        time::timeout,
+    };
+    use tokio_tungstenite::{
+        tungstenite::{
+            handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
+            http::{
+                header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
+                StatusCode,
+            },
+            protocol::Role,
         },
+        WebSocketStream,
     };
     use zeroize::Zeroizing;
 
-    use super::{authorize_websocket_upgrade, TurnUdpRelay, TurnUdpRelayConfig};
+    use super::{
+        authorize_websocket_upgrade, run_stream_client, run_websocket_client, Allocation,
+        TurnRelayCore, TurnRelayError, TurnUdpRelay, TurnUdpRelayConfig,
+    };
     use crate::relay_credentials::RelayCredentialAuthority;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -2623,6 +2679,109 @@ mod tests {
         realm: Vec<u8>,
         nonce: Vec<u8>,
         relayed_address: SocketAddr,
+    }
+
+    #[test]
+    fn allocation_counts_follow_allocation_lifecycle() {
+        let relay_id = RelayId::from_bytes([0x31; 16]);
+        let config = TurnUdpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let authority =
+            RelayCredentialAuthority::new([0x32; 32], 300).expect("credential authority");
+        let mut core =
+            TurnRelayCore::new(config.into(), authority).expect("create TURN relay core");
+        let node_a = NodeId::from_bytes([0x33; 16]);
+        let node_b = NodeId::from_bytes([0x34; 16]);
+        let client_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_001);
+        let client_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_002);
+        let client_c = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_003);
+        let now = Instant::now();
+        let future = now + Duration::from_secs(60);
+        let (command_sender, _command_receiver) = mpsc::channel(1);
+        let allocation = |node_id, expires_at| Allocation {
+            node_id,
+            command_sender: command_sender.clone(),
+            relayed_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50_000),
+            expires_at,
+            idle_deadline: future,
+        };
+
+        core.insert_allocation(client_a, allocation(node_a, future));
+        core.insert_allocation(client_b, allocation(node_a, now));
+        core.insert_allocation(client_c, allocation(node_b, future));
+        assert_eq!(core.allocations.len(), 3);
+        assert_eq!(core.allocation_counts.get(&node_a), Some(&2));
+        assert_eq!(core.allocation_counts.get(&node_b), Some(&1));
+
+        core.remove_allocation(client_a);
+        core.remove_allocation(client_a);
+        assert_eq!(core.allocations.len(), 2);
+        assert_eq!(core.allocation_counts.get(&node_a), Some(&1));
+
+        core.remove_expired(now);
+        assert_eq!(core.allocations.len(), 1);
+        assert!(!core.allocation_counts.contains_key(&node_a));
+        assert_eq!(core.allocation_counts.get(&node_b), Some(&1));
+
+        core.remove_client(client_c);
+        assert!(core.allocations.is_empty());
+        assert!(core.allocation_counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reliable_clients_time_out_incomplete_records() {
+        let relay_id = RelayId::from_bytes([0x41; 16]);
+        let config = TurnUdpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45_100);
+        let idle_timeout = Duration::from_millis(25);
+
+        let authority = RelayCredentialAuthority::new([0x42; 32], 300)
+            .expect("create stream credential authority");
+        let core = Arc::new(Mutex::new(
+            TurnRelayCore::new(config.into(), authority).expect("create stream relay core"),
+        ));
+        let (mut raw_client, relay_stream) = duplex(64);
+        raw_client
+            .write_all(&[0, 1])
+            .await
+            .expect("write partial TURN prefix");
+        let error = timeout(
+            Duration::from_secs(1),
+            run_stream_client(relay_stream, client, core, idle_timeout),
+        )
+        .await
+        .expect("stream client reaches its idle deadline")
+        .expect_err("partial TURN prefix times out");
+        assert!(matches!(error, TurnRelayError::ClientReadTimeout));
+
+        let authority = RelayCredentialAuthority::new([0x43; 32], 300)
+            .expect("create WebSocket credential authority");
+        let core = Arc::new(Mutex::new(
+            TurnRelayCore::new(config.into(), authority).expect("create WebSocket relay core"),
+        ));
+        let (mut raw_client, relay_stream) = duplex(64);
+        let websocket = WebSocketStream::from_raw_socket(relay_stream, Role::Server, None).await;
+        raw_client
+            .write_all(&[0x82, 0x80])
+            .await
+            .expect("write partial masked WebSocket frame");
+        let error = timeout(
+            Duration::from_secs(1),
+            run_websocket_client(websocket, client, core, idle_timeout),
+        )
+        .await
+        .expect("WebSocket client reaches its idle deadline")
+        .expect_err("partial WebSocket frame times out");
+        assert!(matches!(error, TurnRelayError::ClientReadTimeout));
     }
 
     #[test]
@@ -2843,6 +3002,108 @@ mod tests {
             required_attribute(&deleted, StunAttributeType::LIFETIME),
             zero_lifetime
         );
+
+        let _result = shutdown_tx.send(());
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("relay shutdown deadline")
+            .expect("relay task join")
+            .expect("relay runtime");
+    }
+
+    #[tokio::test]
+    async fn per_node_allocation_quota_is_released_on_delete() {
+        let relay_id = RelayId::from_bytes([0x65; 16]);
+        let node_id = NodeId::from_bytes([0x66; 16]);
+        let authority =
+            RelayCredentialAuthority::new([0x67; 32], 300).expect("credential authority");
+        let credential = authority
+            .issue(relay_id, node_id, unix_time_for_test())
+            .expect("issue credential");
+        let mut config = TurnUdpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        config.max_allocations = 2;
+        config.max_allocations_per_node = 1;
+        let relay = TurnUdpRelay::bind(config, authority)
+            .await
+            .expect("bind TURN relay");
+        let relay_address = relay.local_address().expect("relay address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(relay.run(async move {
+            let _result = shutdown_rx.await;
+        }));
+        let client_a = bind_test_client().await;
+        let client_b = bind_test_client().await;
+        let allocation_a = allocate_test_client(
+            &client_a,
+            relay_address,
+            credential.username(),
+            credential.secret(),
+            10,
+        )
+        .await;
+
+        let requested_transport = [17, 0, 0, 0];
+        let rejected_request = signed_request(
+            StunMethod::Allocate,
+            StunTransactionId::from_bytes([20; 12]),
+            credential.username(),
+            &allocation_a.realm,
+            &allocation_a.nonce,
+            credential.secret(),
+            &[StunAttributeRef {
+                attribute_type: StunAttributeType::REQUESTED_TRANSPORT,
+                value: &requested_transport,
+            }],
+        );
+        client_b
+            .send_to(&rejected_request, relay_address)
+            .await
+            .expect("send allocation above per-node quota");
+        let rejected = receive_owned_message(&client_b).await;
+        assert_error(
+            &StunMessageView::decode(&rejected).expect("decode quota response"),
+            486,
+        );
+
+        let zero_lifetime = 0_u32.to_be_bytes();
+        let delete_request = signed_request(
+            StunMethod::Refresh,
+            StunTransactionId::from_bytes([21; 12]),
+            credential.username(),
+            &allocation_a.realm,
+            &allocation_a.nonce,
+            credential.secret(),
+            &[StunAttributeRef {
+                attribute_type: StunAttributeType::LIFETIME,
+                value: &zero_lifetime,
+            }],
+        );
+        client_a
+            .send_to(&delete_request, relay_address)
+            .await
+            .expect("delete first allocation");
+        let deleted = receive_owned_message(&client_a).await;
+        assert_eq!(
+            StunMessageView::decode(&deleted)
+                .expect("decode delete response")
+                .message_type()
+                .class,
+            StunClass::SuccessResponse
+        );
+
+        let _allocation_b = allocate_test_client(
+            &client_b,
+            relay_address,
+            credential.username(),
+            credential.secret(),
+            30,
+        )
+        .await;
 
         let _result = shutdown_tx.send(());
         timeout(Duration::from_secs(2), task)

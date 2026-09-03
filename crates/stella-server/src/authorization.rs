@@ -2,9 +2,8 @@
 
 use stella_crypto::{derive_controller_id, sha256_segments, CryptoError, IdentitySigningKey};
 use stella_proto::{
-    encode_membership_grant, CodecError, MembershipGrant, MembershipGrantView,
-    MEMBERSHIP_GRANT_LENGTH, MEMBERSHIP_GRANT_SIGNATURE_DOMAIN,
-    MEMBERSHIP_GRANT_SIGNED_BODY_LENGTH, NETWORK_POLICY_LENGTH,
+    encode_membership_grant, CodecError, MembershipGrant, MEMBERSHIP_GRANT_LENGTH,
+    MEMBERSHIP_GRANT_SIGNATURE_DOMAIN, MEMBERSHIP_GRANT_SIGNED_BODY_LENGTH, NETWORK_POLICY_LENGTH,
 };
 use thiserror::Error;
 
@@ -59,12 +58,6 @@ pub fn issue_membership_grant(
         controller_signing_key.sign_segments(MEMBERSHIP_GRANT_SIGNATURE_DOMAIN, &[&signed_body])?;
     let mut encoded = [0_u8; MEMBERSHIP_GRANT_LENGTH];
     encode_membership_grant(grant, &signature, &mut encoded)?;
-    let view = MembershipGrantView::decode(&encoded)?;
-    controller_signing_key.public_key().verify_segments(
-        MEMBERSHIP_GRANT_SIGNATURE_DOMAIN,
-        &[view.signed_body()],
-        view.signature(),
-    )?;
     Ok(encoded)
 }
 

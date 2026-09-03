@@ -29,6 +29,7 @@ use tokio_rustls::{client::TlsStream, rustls::pki_types::ServerName};
 use zeroize::Zeroizing;
 
 use crate::{
+    control_field::{decode_u16, decode_u64, field_value, fixed_array},
     http_proxy::{negotiate_http_connect, HttpConnectError},
     tls, ClientError, ConnectivityConfigState, SpkiPin,
 };
@@ -578,22 +579,6 @@ async fn write_built(
     Ok(message_id)
 }
 
-fn field_value(
-    message: &OwnedControlMessage,
-    field: ControlFieldType,
-) -> Result<&[u8], ClientError> {
-    let view = message.view()?;
-    for candidate in view.fields() {
-        if candidate.field_type() == Some(field) {
-            return Ok(candidate.value());
-        }
-    }
-    Err(ClientError::MissingField {
-        message_type: view.header().message_type,
-        field,
-    })
-}
-
 fn message_id(message: &OwnedControlMessage) -> Result<u64, ClientError> {
     Ok(message.header()?.message_id)
 }
@@ -615,20 +600,6 @@ fn require_protocol_version(
         return Err(ClientError::ProtocolVersionMismatch { expected, actual });
     }
     Ok(())
-}
-
-fn fixed_array<const N: usize>(value: &[u8], field: &'static str) -> Result<[u8; N], ClientError> {
-    value
-        .try_into()
-        .map_err(|_| ClientError::InvalidFieldWidth { field })
-}
-
-fn decode_u16(value: &[u8], field: &'static str) -> Result<u16, ClientError> {
-    Ok(u16::from_be_bytes(fixed_array(value, field)?))
-}
-
-fn decode_u64(value: &[u8], field: &'static str) -> Result<u64, ClientError> {
-    Ok(u64::from_be_bytes(fixed_array(value, field)?))
 }
 
 fn optional_u64(

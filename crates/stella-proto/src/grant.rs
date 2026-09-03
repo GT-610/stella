@@ -5,6 +5,7 @@ use std::ops::{BitOr, BitOrAssign};
 use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
 
 use crate::{
+    bounds::validate_range,
     common::validate_record_length,
     cursor::{ReadCursor, WriteCursor},
     CodecError, ConfidentialityPolicy, NetworkPolicy, MAX_ETHERNET_FRAME_LENGTH,
@@ -439,23 +440,6 @@ pub fn encode_membership_grant(
         grant_output.split_at_mut(MEMBERSHIP_GRANT_SIGNED_BODY_LENGTH);
     grant.encode_signed_body(signed_body)?;
     signature_output.copy_from_slice(signature);
-    Ok(())
-}
-
-fn validate_range(
-    actual: u64,
-    minimum: u64,
-    maximum: u64,
-    field: &'static str,
-) -> Result<(), CodecError> {
-    if !(minimum..=maximum).contains(&actual) {
-        return Err(CodecError::ValueOutOfRange {
-            field,
-            actual,
-            minimum,
-            maximum,
-        });
-    }
     Ok(())
 }
 

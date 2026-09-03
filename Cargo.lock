@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "stella-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "atomic-write-file",
@@ -1207,14 +1207,14 @@ dependencies = [
 
 [[package]]
 name = "stella-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "stella-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "stella-common",
  "stella-crypto",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "stella-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "stella-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "stella-common",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "stella-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "stella-tap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
  "windows",
@@ -1293,7 +1293,7 @@ dependencies = [
 
 [[package]]
 name = "stella-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "socket2",

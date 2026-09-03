@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bounds;
 mod common;
 mod connectivity;
 mod control;

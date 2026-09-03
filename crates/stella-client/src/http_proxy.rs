@@ -11,6 +11,8 @@ use tokio::{
 
 const MAX_HTTP_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_HTTP_CONNECT_FIELDS: usize = 64;
+const HTTP_CONNECT_READ_CHUNK_BYTES: usize = 1024;
+const HTTP_HEADER_TERMINATOR: &[u8; 4] = b"\r\n\r\n";
 
 #[derive(Debug, Error)]
 pub(crate) enum HttpConnectError {
@@ -47,23 +49,43 @@ pub(crate) async fn negotiate_http_connect(
             source,
         })?;
 
-    let mut response = Vec::with_capacity(1_024);
+    let mut response = Vec::with_capacity(HTTP_CONNECT_READ_CHUNK_BYTES);
+    let mut chunk = [0_u8; HTTP_CONNECT_READ_CHUNK_BYTES];
     loop {
         if response.len() == MAX_HTTP_CONNECT_RESPONSE_BYTES {
             return Err(HttpConnectError::Invalid {
                 detail: "header exceeds 16 KiB",
             });
         }
-        let mut byte = [0_u8; 1];
-        timeout_at(deadline, stream.read_exact(&mut byte))
+        let remaining = MAX_HTTP_CONNECT_RESPONSE_BYTES - response.len();
+        let peek_capacity = remaining.min(chunk.len());
+        let available = timeout_at(deadline, stream.peek(&mut chunk[..peek_capacity]))
             .await
             .map_err(|_| HttpConnectError::Timeout)?
             .map_err(|source| HttpConnectError::Io {
                 operation: "read HTTP proxy CONNECT response",
                 source,
             })?;
-        response.push(byte[0]);
-        if response.ends_with(b"\r\n\r\n") {
+        if available == 0 {
+            return Err(HttpConnectError::Io {
+                operation: "read HTTP proxy CONNECT response",
+                source: std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "proxy closed before completing the CONNECT response",
+                ),
+            });
+        }
+        let response_end = http_header_end(&response, &chunk[..available]);
+        let consume = response_end.map_or(available, |end| end - response.len());
+        timeout_at(deadline, stream.read_exact(&mut chunk[..consume]))
+            .await
+            .map_err(|_| HttpConnectError::Timeout)?
+            .map_err(|source| HttpConnectError::Io {
+                operation: "read HTTP proxy CONNECT response",
+                source,
+            })?;
+        response.extend_from_slice(&chunk[..consume]);
+        if response_end.is_some() {
             break;
         }
     }
@@ -83,6 +105,20 @@ pub(crate) async fn negotiate_http_connect(
             source,
         }),
     }
+}
+
+fn http_header_end(response: &[u8], available: &[u8]) -> Option<usize> {
+    for prefix_length in (1..HTTP_HEADER_TERMINATOR.len()).rev() {
+        if response.ends_with(&HTTP_HEADER_TERMINATOR[..prefix_length])
+            && available.starts_with(&HTTP_HEADER_TERMINATOR[prefix_length..])
+        {
+            return Some(response.len() + HTTP_HEADER_TERMINATOR.len() - prefix_length);
+        }
+    }
+    available
+        .windows(HTTP_HEADER_TERMINATOR.len())
+        .position(|window| window == HTTP_HEADER_TERMINATOR)
+        .map(|position| response.len() + position + HTTP_HEADER_TERMINATOR.len())
 }
 
 fn validate_http_connect_response(response: &[u8]) -> Result<(), HttpConnectError> {
@@ -202,7 +238,10 @@ mod tests {
         sync::oneshot,
     };
 
-    use super::{negotiate_http_connect, validate_http_connect_response, HttpConnectError};
+    use super::{
+        negotiate_http_connect, validate_http_connect_response, HttpConnectError,
+        HTTP_CONNECT_READ_CHUNK_BYTES,
+    };
 
     #[test]
     fn response_is_strict_bounded_and_redacted() {
@@ -275,6 +314,55 @@ mod tests {
         .await
         .expect("establish CONNECT tunnel");
         release_sender.send(()).expect("release proxy");
+        proxy.await.expect("proxy task");
+    }
+
+    #[tokio::test]
+    async fn response_read_stops_at_the_header_boundary() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = listener.local_addr().expect("proxy listener address");
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _client) = listener.accept().await.expect("accept proxy client");
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                stream
+                    .read_exact(&mut byte)
+                    .await
+                    .expect("read CONNECT request");
+                request.push(byte[0]);
+                assert!(request.len() <= 1_024);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let mut response = b"HTTP/1.1 200 Connection Established\r\nX-Padding: ".to_vec();
+            response.extend(std::iter::repeat_n(b'a', HTTP_CONNECT_READ_CHUNK_BYTES));
+            response.extend_from_slice(b"\r\n\r\ntunnel data");
+            stream
+                .write_all(&response)
+                .await
+                .expect("write CONNECT response and tunnel data");
+        });
+        let mut stream = TcpStream::connect(proxy_address)
+            .await
+            .expect("connect proxy client");
+        let error = negotiate_http_connect(
+            &mut stream,
+            "service.example.test:443",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("reject bytes following the response header");
+        assert!(matches!(
+            error,
+            HttpConnectError::Invalid {
+                detail: "bytes follow the CONNECT response header"
+            }
+        ));
         proxy.await.expect("proxy task");
     }
 }

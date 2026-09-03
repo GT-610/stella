@@ -58,6 +58,7 @@ pub(crate) struct StunDiscovery {
     pub(crate) mapped_address: Option<SocketAddr>,
     pub(crate) base_address: Option<SocketAddr>,
     pub(crate) deferred: Vec<DeferredUdpDatagram>,
+    pub(crate) dropped_datagrams: usize,
 }
 
 /// Enumerates bounded host candidates for the socket family and port.
@@ -112,18 +113,25 @@ pub(crate) async fn discover_server_reflexive(
     servers: &[StunServer],
 ) -> Result<StunDiscovery, StunDiscoveryError> {
     let mut deferred = Vec::new();
+    let mut dropped_datagrams = 0;
     for server in servers
         .iter()
         .copied()
         .filter(|server| server.address.is_ipv4() == transport.local_address().is_ipv4())
     {
-        if let Some(mapped_address) =
-            binding_transaction(transport, server.address, &mut deferred).await?
+        if let Some(mapped_address) = binding_transaction(
+            transport,
+            server.address,
+            &mut deferred,
+            &mut dropped_datagrams,
+        )
+        .await?
         {
             return Ok(StunDiscovery {
                 mapped_address: Some(mapped_address),
                 base_address: routed_base_address(transport.local_address(), server.address),
                 deferred,
+                dropped_datagrams,
             });
         }
     }
@@ -131,6 +139,7 @@ pub(crate) async fn discover_server_reflexive(
         mapped_address: None,
         base_address: None,
         deferred,
+        dropped_datagrams,
     })
 }
 
@@ -158,6 +167,7 @@ async fn binding_transaction(
     transport: &UdpTransport,
     server: SocketAddr,
     deferred: &mut Vec<DeferredUdpDatagram>,
+    dropped_datagrams: &mut usize,
 ) -> Result<Option<SocketAddr>, StunDiscoveryError> {
     let transaction_id = random_transaction_id()?;
     let request = StunMessageRef {
@@ -189,7 +199,7 @@ async fn binding_transaction(
                 };
             let bytes = receive_buffer[..received.length].to_vec();
             if received.source != endpoint {
-                defer_datagram(deferred, received.source, bytes);
+                defer_datagram(deferred, received.source, bytes, dropped_datagrams);
                 continue;
             }
             let Ok(message) = StunMessageView::decode(&bytes) else {
@@ -219,9 +229,16 @@ async fn binding_transaction(
     }
 }
 
-fn defer_datagram(deferred: &mut Vec<DeferredUdpDatagram>, source: Endpoint, bytes: Vec<u8>) {
+fn defer_datagram(
+    deferred: &mut Vec<DeferredUdpDatagram>,
+    source: Endpoint,
+    bytes: Vec<u8>,
+    dropped_datagrams: &mut usize,
+) {
     if deferred.len() < MAX_DEFERRED_DATAGRAMS {
         deferred.push(DeferredUdpDatagram { source, bytes });
+    } else {
+        *dropped_datagrams = dropped_datagrams.saturating_add(1);
     }
 }
 
@@ -323,10 +340,13 @@ mod tests {
         relay_credentials::RelayCredentialAuthority,
         turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
     };
-    use stella_transport::{DatagramTransport, UdpConfig, UdpTransport};
+    use stella_transport::{DatagramTransport, Endpoint, UdpConfig, UdpTransport};
     use tokio::{sync::oneshot, time::timeout};
 
-    use super::{discover_server_reflexive, gather_host_candidates, server_reflexive_candidate};
+    use super::{
+        defer_datagram, discover_server_reflexive, gather_host_candidates,
+        server_reflexive_candidate, MAX_DEFERRED_DATAGRAMS,
+    };
 
     #[test]
     fn specified_host_candidate_is_valid_and_tap_exclusions_are_case_insensitive() {
@@ -343,6 +363,29 @@ mod tests {
             "192.0.2.50:47000".parse().expect("candidate address")
         );
         candidates[0].validate().expect("valid host candidate");
+    }
+
+    #[test]
+    fn deferred_datagram_queue_counts_overflow() {
+        let source = Endpoint::Udp("127.0.0.1:47001".parse().expect("source address"));
+        let mut deferred = Vec::new();
+        let mut dropped_datagrams = 0;
+        for index in 0..MAX_DEFERRED_DATAGRAMS + 3 {
+            defer_datagram(
+                &mut deferred,
+                source.clone(),
+                vec![u8::try_from(index).expect("test index fits u8")],
+                &mut dropped_datagrams,
+            );
+        }
+
+        assert_eq!(deferred.len(), MAX_DEFERRED_DATAGRAMS);
+        assert_eq!(deferred[0].bytes, [0]);
+        assert_eq!(
+            deferred[MAX_DEFERRED_DATAGRAMS - 1].bytes,
+            [u8::try_from(MAX_DEFERRED_DATAGRAMS - 1).expect("capacity fits u8")]
+        );
+        assert_eq!(dropped_datagrams, 3);
     }
 
     #[tokio::test]
@@ -383,6 +426,7 @@ mod tests {
         assert_eq!(discovery.mapped_address, Some(transport.local_address()));
         assert_eq!(discovery.base_address, Some(transport.local_address()));
         assert!(discovery.deferred.is_empty());
+        assert_eq!(discovery.dropped_datagrams, 0);
         assert!(server_reflexive_candidate(&discovery, 1_200).is_none());
 
         transport.shutdown().await.expect("shutdown transport");

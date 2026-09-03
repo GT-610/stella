@@ -229,7 +229,6 @@ struct ConnectivityUpdate {
 
 struct SnapshotRequest {
     network_id: NetworkId,
-    _last_revision: u64,
 }
 
 struct HeartbeatRequest {
@@ -349,7 +348,7 @@ fn parse_snapshot_request(
 ) -> Result<SnapshotRequest, ActiveSessionError> {
     let view = message.view()?;
     let mut network_id = None;
-    let mut last_revision = None;
+    let mut has_last_revision = false;
     for field in view.fields() {
         match field.field_type() {
             Some(ControlFieldType::NetworkId) => {
@@ -359,20 +358,21 @@ fn parse_snapshot_request(
                 )?));
             }
             Some(ControlFieldType::SnapshotRevision) => {
-                last_revision = Some(u64::from_be_bytes(fixed_array(
-                    field.value(),
-                    "snapshot revision",
-                )?));
+                let _last_revision =
+                    u64::from_be_bytes(fixed_array(field.value(), "snapshot revision")?);
+                has_last_revision = true;
             }
             _ => {}
         }
     }
+    if !has_last_revision {
+        return Err(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::SnapshotRevision,
+        });
+    }
     Ok(SnapshotRequest {
         network_id: network_id.ok_or(ActiveSessionError::ValidatedFieldMissing {
             field: ControlFieldType::NetworkId,
-        })?,
-        _last_revision: last_revision.ok_or(ActiveSessionError::ValidatedFieldMissing {
-            field: ControlFieldType::SnapshotRevision,
         })?,
     })
 }
@@ -1208,7 +1208,7 @@ fn grant_refresh_delay(encoded: &EncodedNetworkState) -> Result<Duration, Active
         .not_after
         .checked_sub(grant.not_before)
         .ok_or(ActiveSessionError::GrantLifetimeInvalid)?;
-    Ok(Duration::from_secs(lifetime / 2))
+    Ok(half_lifetime(lifetime))
 }
 
 fn connectivity_refresh_deadline(expires_at: u64, now: u64) -> Result<Instant, ActiveSessionError> {
@@ -1218,7 +1218,11 @@ fn connectivity_refresh_deadline(expires_at: u64, now: u64) -> Result<Instant, A
 }
 
 fn connectivity_refresh_delay(expires_at: u64, now: u64) -> Duration {
-    Duration::from_secs(expires_at.saturating_sub(now) / 2)
+    half_lifetime(expires_at.saturating_sub(now))
+}
+
+fn half_lifetime(seconds: u64) -> Duration {
+    Duration::from_secs(seconds) / 2
 }
 
 async fn send_leave_result(
@@ -1424,10 +1428,10 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        connectivity_refresh_delay, grant_refresh_delay, resolve_connectivity_update,
-        resolve_endpoint_update, resolve_join, resolve_leave, ConnectivityDecision,
-        ConnectivityUpdate, EndpointDecision, EndpointUpdate, JoinDecision, JoinRequest,
-        LeaveDecision,
+        connectivity_refresh_delay, grant_refresh_delay, half_lifetime,
+        resolve_connectivity_update, resolve_endpoint_update, resolve_join, resolve_leave,
+        ConnectivityDecision, ConnectivityUpdate, EndpointDecision, EndpointUpdate, JoinDecision,
+        JoinRequest, LeaveDecision,
     };
     use crate::{
         authority::AuthorityThread,
@@ -1485,11 +1489,15 @@ mod tests {
 
     #[test]
     fn connectivity_credentials_refresh_halfway_through_remaining_lifetime() {
+        assert_eq!(half_lifetime(1), Duration::from_millis(500));
         assert_eq!(
             connectivity_refresh_delay(1_300, 1_000),
             Duration::from_secs(150)
         );
-        assert_eq!(connectivity_refresh_delay(1_001, 1_000), Duration::ZERO);
+        assert_eq!(
+            connectivity_refresh_delay(1_001, 1_000),
+            Duration::from_millis(500)
+        );
         assert_eq!(connectivity_refresh_delay(999, 1_000), Duration::ZERO);
     }
 

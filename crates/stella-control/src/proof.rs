@@ -5,6 +5,7 @@ use std::fmt;
 use stella_common::{ControllerId, NodeId};
 use stella_crypto::{CryptoError, IdentityPublicKey, IdentitySigningKey, ED25519_SIGNATURE_LENGTH};
 use stella_proto::VersionEntry;
+use zeroize::Zeroizing;
 
 /// TLS exporter label used by Stella version 0.1 control authentication.
 pub const CONTROL_EXPORTER_LABEL: &[u8] = b"EXPORTER-Stella-Control-v1";
@@ -93,7 +94,7 @@ impl<'a> NodeProofContext<'a> {
 
 /// Owned proof input whose diagnostics do not expose TLS exporter material.
 #[derive(Eq, PartialEq)]
-pub struct ProofTranscript(Vec<u8>);
+pub struct ProofTranscript(Zeroizing<Vec<u8>>);
 
 impl ProofTranscript {
     /// Borrows the exact bytes that are signed or verified.
@@ -132,7 +133,7 @@ pub fn controller_proof_transcript(
     append_version(&mut transcript, context.selected);
     transcript.extend_from_slice(context.controller_id.as_bytes());
     transcript.extend_from_slice(controller_public_key.as_bytes());
-    ProofTranscript(transcript)
+    ProofTranscript(Zeroizing::new(transcript))
 }
 
 /// Builds the canonical node proof input from typed fixed-size values.
@@ -158,7 +159,7 @@ pub fn node_proof_transcript(
     transcript.extend_from_slice(context.controller_id.as_bytes());
     transcript.extend_from_slice(context.node_id.as_bytes());
     transcript.extend_from_slice(node_public_key.as_bytes());
-    ProofTranscript(transcript)
+    ProofTranscript(Zeroizing::new(transcript))
 }
 
 /// Signs the exact controller proof transcript with the controller identity.
