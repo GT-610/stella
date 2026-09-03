@@ -6,6 +6,7 @@ mod active;
 mod config;
 mod connectivity;
 mod control;
+mod control_field;
 mod data_plane;
 mod error;
 mod handshake;

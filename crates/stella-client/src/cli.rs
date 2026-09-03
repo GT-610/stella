@@ -877,77 +877,73 @@ fn validate_intent_compatibility(config: &ClientConfig, args: &JoinArgs) -> Resu
 }
 
 fn persist_network_intent(config_path: &Path, network_id: NetworkId, tap: &str) -> Result<()> {
+    mutate_network_intents(config_path, "network persistence", |networks| {
+        let id = network_id.to_string();
+        for entry in networks.iter() {
+            let table = entry
+                .as_table()
+                .ok_or_else(|| anyhow::anyhow!("configuration network entry is not a table"))?;
+            if table.get("id").and_then(toml::Value::as_str) == Some(id.as_str()) {
+                if table.get("tap_adapter").and_then(toml::Value::as_str) == Some(tap) {
+                    return Ok(false);
+                }
+                anyhow::bail!("network {network_id} has a conflicting TAP adapter");
+            }
+        }
+        let mut entry = toml::Table::new();
+        entry.insert("id".to_owned(), toml::Value::String(id));
+        entry.insert(
+            "tap_adapter".to_owned(),
+            toml::Value::String(tap.to_owned()),
+        );
+        networks.push(toml::Value::Table(entry));
+        Ok(true)
+    })
+}
+
+fn remove_network_intent(config_path: &Path, network_id: NetworkId) -> Result<()> {
+    mutate_network_intents(config_path, "network removal", |networks| {
+        let id = network_id.to_string();
+        let original_length = networks.len();
+        networks.retain(|entry| entry.get("id").and_then(toml::Value::as_str) != Some(id.as_str()));
+        if networks.len() == original_length {
+            anyhow::bail!("network {network_id} is not configured");
+        }
+        Ok(true)
+    })
+}
+
+fn mutate_network_intents(
+    config_path: &Path,
+    operation: &'static str,
+    mutate: impl FnOnce(&mut Vec<toml::Value>) -> Result<bool>,
+) -> Result<()> {
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("could not reread {}", config_path.display()))?;
     let mut document = text
         .parse::<toml::Table>()
-        .context("could not decode configuration for network persistence")?;
+        .with_context(|| format!("could not decode configuration for {operation}"))?;
     let networks = document
         .entry("networks")
         .or_insert_with(|| toml::Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("configuration networks field is not an array"))?;
-    let id = network_id.to_string();
-    for entry in networks.iter() {
-        let table = entry
-            .as_table()
-            .ok_or_else(|| anyhow::anyhow!("configuration network entry is not a table"))?;
-        if table.get("id").and_then(toml::Value::as_str) == Some(id.as_str()) {
-            if table.get("tap_adapter").and_then(toml::Value::as_str) == Some(tap) {
-                return Ok(());
-            }
-            anyhow::bail!("network {network_id} has a conflicting TAP adapter");
-        }
+    if !mutate(networks)? {
+        return Ok(());
     }
-    let mut entry = toml::Table::new();
-    entry.insert("id".to_owned(), toml::Value::String(id));
-    entry.insert(
-        "tap_adapter".to_owned(),
-        toml::Value::String(tap.to_owned()),
-    );
-    networks.push(toml::Value::Table(entry));
     networks.sort_by(|left, right| {
         left.get("id")
             .and_then(toml::Value::as_str)
             .cmp(&right.get("id").and_then(toml::Value::as_str))
     });
     let encoded = toml::to_string_pretty(&document)
-        .context("could not encode configuration with joined network")?;
+        .with_context(|| format!("could not encode configuration after {operation}"))?;
     let base = config_path.parent().unwrap_or_else(|| Path::new("."));
     ClientConfig::parse(&encoded, base).context("updated client configuration is invalid")?;
     let mut file = AtomicWriteFile::open(config_path)
         .with_context(|| format!("could not open {} for atomic update", config_path.display()))?;
     file.write_all(encoded.as_bytes())
-        .context("could not write updated client configuration")?;
-    file.commit()
-        .context("could not atomically commit updated client configuration")?;
-    Ok(())
-}
-
-fn remove_network_intent(config_path: &Path, network_id: NetworkId) -> Result<()> {
-    let text = std::fs::read_to_string(config_path)
-        .with_context(|| format!("could not reread {}", config_path.display()))?;
-    let mut document = text
-        .parse::<toml::Table>()
-        .context("could not decode configuration for network removal")?;
-    let networks = document
-        .get_mut("networks")
-        .and_then(toml::Value::as_array_mut)
-        .ok_or_else(|| anyhow::anyhow!("configuration networks field is not an array"))?;
-    let id = network_id.to_string();
-    let original_length = networks.len();
-    networks.retain(|entry| entry.get("id").and_then(toml::Value::as_str) != Some(id.as_str()));
-    if networks.len() == original_length {
-        anyhow::bail!("network {network_id} is not configured");
-    }
-    let encoded = toml::to_string_pretty(&document)
-        .context("could not encode configuration after network removal")?;
-    let base = config_path.parent().unwrap_or_else(|| Path::new("."));
-    ClientConfig::parse(&encoded, base).context("updated client configuration is invalid")?;
-    let mut file = AtomicWriteFile::open(config_path)
-        .with_context(|| format!("could not open {} for atomic update", config_path.display()))?;
-    file.write_all(encoded.as_bytes())
-        .context("could not write updated client configuration")?;
+        .with_context(|| format!("could not write client configuration after {operation}"))?;
     file.commit()
         .context("could not atomically commit updated client configuration")?;
     Ok(())

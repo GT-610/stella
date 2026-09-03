@@ -16,6 +16,7 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::{
+    control_field::{decode_u16, decode_u64, field_value, fixed_array, optional_field_value},
     AuthenticatedControl, BearerCredential, ClientError, ConnectivityConfigState,
     GrantRefreshInput, NetworkState, PeerDeltaInput, PeerDeltaOperation, SnapshotInput,
 };
@@ -1090,51 +1091,11 @@ fn decode_delta_operation(
     }
 }
 
-fn field_value(
-    message: &OwnedControlMessage,
-    field: ControlFieldType,
-) -> Result<&[u8], ClientError> {
-    let view = message.view()?;
-    for candidate in view.fields() {
-        if candidate.field_type() == Some(field) {
-            return Ok(candidate.value());
-        }
-    }
-    Err(ClientError::MissingField {
-        message_type: view.header().message_type,
-        field,
-    })
-}
-
-fn optional_field_value(
-    message: &OwnedControlMessage,
-    field: ControlFieldType,
-) -> Result<Option<&[u8]>, ClientError> {
-    let view = message.view()?;
-    Ok(view
-        .fields()
-        .find_map(|candidate| (candidate.field_type() == Some(field)).then(|| candidate.value())))
-}
-
 fn decode_network_id(message: &OwnedControlMessage) -> Result<NetworkId, ClientError> {
     Ok(NetworkId::from_bytes(fixed_array(
         field_value(message, ControlFieldType::NetworkId)?,
         "network ID",
     )?))
-}
-
-fn fixed_array<const N: usize>(value: &[u8], field: &'static str) -> Result<[u8; N], ClientError> {
-    value
-        .try_into()
-        .map_err(|_| ClientError::InvalidFieldWidth { field })
-}
-
-fn decode_u16(value: &[u8], field: &'static str) -> Result<u16, ClientError> {
-    Ok(u16::from_be_bytes(fixed_array(value, field)?))
-}
-
-fn decode_u64(value: &[u8], field: &'static str) -> Result<u64, ClientError> {
-    Ok(u64::from_be_bytes(fixed_array(value, field)?))
 }
 
 fn optional_u32(
