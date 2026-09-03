@@ -16,7 +16,7 @@ use stella_crypto::{derive_controller_id, IdentitySigningKey};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    sync::{watch, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     task::JoinSet,
     time::{interval, timeout, MissedTickBehavior},
 };
@@ -274,9 +274,12 @@ async fn serve_listener(
                 }
             }
             admitted = accept_with_permit(&listener, Arc::clone(&semaphore)) => {
-                let (stream, peer_addr, permit) = match admitted {
+                let admitted = match admitted {
                     Ok(admitted) => admitted,
                     Err(error) => break Err(error),
+                };
+                let Some((stream, peer_addr, permit)) = admitted else {
+                    continue;
                 };
                 spawn_connection(
                     &mut tasks,
@@ -304,16 +307,19 @@ async fn serve_listener(
 async fn accept_with_permit(
     listener: &TcpListener,
     semaphore: Arc<Semaphore>,
-) -> Result<(TcpStream, SocketAddr, OwnedSemaphorePermit), RuntimeError> {
+) -> Result<Option<(TcpStream, SocketAddr, OwnedSemaphorePermit)>, RuntimeError> {
     let (stream, peer_addr) = listener
         .accept()
         .await
         .map_err(|source| RuntimeError::Accept { source })?;
-    let permit = semaphore
-        .acquire_owned()
-        .await
-        .map_err(|_| RuntimeError::ConnectionSemaphoreClosed)?;
-    Ok((stream, peer_addr, permit))
+    match semaphore.try_acquire_owned() {
+        Ok(permit) => Ok(Some((stream, peer_addr, permit))),
+        Err(TryAcquireError::NoPermits) => {
+            tracing::debug!(peer = %peer_addr, "controller connection rejected at capacity");
+            Ok(None)
+        }
+        Err(TryAcquireError::Closed) => Err(RuntimeError::ConnectionSemaphoreClosed),
+    }
 }
 
 fn spawn_connection(
@@ -445,16 +451,16 @@ mod tests {
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
-        sync::oneshot,
-        time::sleep,
+        net::{TcpListener, TcpStream},
+        sync::{oneshot, Semaphore},
+        time::{sleep, timeout},
     };
     use tokio_rustls::{
         rustls::{self, pki_types::ServerName, version::TLS13, ClientConfig, RootCertStore},
         TlsConnector,
     };
 
-    use super::{run_controller, SessionHandler};
+    use super::{accept_with_permit, run_controller, SessionHandler};
     use crate::{
         bootstrap::{initialize_controller, BootstrapOptions},
         config::ServerConfig,
@@ -505,6 +511,50 @@ mod tests {
         TcpStream::connect(address)
             .await
             .expect("controller listener becomes ready")
+    }
+
+    #[tokio::test]
+    async fn saturated_listener_rejects_without_blocking_accepts() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind capacity test listener");
+        let address = listener.local_addr().expect("capacity test address");
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let first_client = TcpStream::connect(address);
+        let (first_client, first_admitted) = tokio::join!(
+            first_client,
+            accept_with_permit(&listener, Arc::clone(&semaphore))
+        );
+        let _first_client = first_client.expect("connect first client");
+        let (_first_stream, _first_peer, first_permit) = first_admitted
+            .expect("accept first client")
+            .expect("first client obtains capacity");
+
+        let second_client = TcpStream::connect(address);
+        let (second_client, second_admitted) = tokio::join!(
+            second_client,
+            accept_with_permit(&listener, Arc::clone(&semaphore))
+        );
+        let mut second_client = second_client.expect("connect second client");
+        assert!(second_admitted.expect("accept saturated client").is_none());
+        let mut closed = [0_u8; 1];
+        assert_eq!(
+            timeout(Duration::from_secs(1), second_client.read(&mut closed))
+                .await
+                .expect("saturated connection closes promptly")
+                .expect("read saturated connection closure"),
+            0
+        );
+
+        drop(first_permit);
+        let third_client = TcpStream::connect(address);
+        let (third_client, third_admitted) = tokio::join!(
+            third_client,
+            accept_with_permit(&listener, Arc::clone(&semaphore))
+        );
+        let _third_client = third_client.expect("connect third client");
+        assert!(third_admitted.expect("accept third client").is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
