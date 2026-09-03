@@ -4,6 +4,8 @@
 
 mod config;
 mod error;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -14,6 +16,8 @@ pub use config::{
     MIN_ETHERNET_FRAME_LENGTH, MIN_TAP_MTU,
 };
 pub use error::{AddressFamily, TapError, TapOperation};
+#[cfg(target_os = "macos")]
+pub use macos::{MacosTapCancellation, MacosTapDevice};
 #[cfg(target_os = "windows")]
 pub use windows::{
     WindowsTapAdapter, WindowsTapCancellation, WindowsTapDevice, WindowsTapDriverVersion,
@@ -22,6 +26,10 @@ pub use windows::{
 /// Native TAP implementation selected for this Windows build.
 #[cfg(target_os = "windows")]
 pub type PlatformTapDevice = WindowsTapDevice;
+
+/// Native TAP implementation selected for this macOS build.
+#[cfg(target_os = "macos")]
+pub type PlatformTapDevice = MacosTapDevice;
 
 /// Result type returned by TAP operations.
 pub type Result<T> = std::result::Result<T, TapError>;

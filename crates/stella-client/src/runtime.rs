@@ -794,6 +794,7 @@ impl ClientDataRuntime {
         let mtu = effective_tap_mtu(mtu, installed_mtu)?;
         let tap_config = TapConfig {
             name: Some(configured.tap_adapter.clone()),
+            peer_name: None,
             mtu,
             max_frame_size: state.policy().max_frame_size,
         };

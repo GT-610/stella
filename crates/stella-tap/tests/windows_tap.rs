@@ -1,6 +1,6 @@
-#![cfg(target_os = "windows")]
-
 //! Opt-in integration coverage for an installed TAP-Windows Adapter V9.
+
+#![cfg(target_os = "windows")]
 
 use std::{
     sync::mpsc,
@@ -28,6 +28,7 @@ fn installed_adapter_supports_lifecycle_frame_write_and_cancellation() {
 
     let config = TapConfig {
         name: Some(selector),
+        peer_name: None,
         mtu,
         max_frame_size: DEFAULT_MAX_FRAME_SIZE.max(mtu + 14),
     };

@@ -25,6 +25,12 @@ impl fmt::Display for AddressFamily {
 /// Stable operating-system operation attached to a TAP I/O error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TapOperation {
+    /// Acquiring exclusive ownership of a platform TAP pair.
+    AcquireDeviceLock,
+    /// Creating or reusing a platform TAP device.
+    CreateDevice,
+    /// Configuring blocking behavior for frame I/O.
+    ConfigureBlockingMode,
     /// Enumerating installed Windows network adapters.
     EnumerateAdapters,
     /// Opening the TAP userspace device path.
@@ -33,6 +39,8 @@ pub enum TapOperation {
     QueryVersion,
     /// Querying the TAP driver MAC address.
     QueryMac,
+    /// Querying a platform interface MTU.
+    QueryMtu,
     /// Querying the TAP driver MTU ceiling.
     QueryDriverMtu,
     /// Changing the TAP driver's logical media state.
@@ -45,6 +53,10 @@ pub enum TapOperation {
     WriteFrame,
     /// Cancelling pending frame I/O.
     CancelIo,
+    /// Enabling or disabling a platform TAP interface.
+    SetDeviceState,
+    /// Setting a platform interface MTU.
+    SetMtu,
     /// Querying a Windows IP interface MTU.
     QueryInterfaceMtu,
     /// Setting a Windows IP interface MTU.
@@ -56,16 +68,22 @@ pub enum TapOperation {
 impl fmt::Display for TapOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            Self::AcquireDeviceLock => "acquire device lock",
+            Self::CreateDevice => "create device",
+            Self::ConfigureBlockingMode => "configure blocking mode",
             Self::EnumerateAdapters => "enumerate adapters",
             Self::OpenDevice => "open device",
             Self::QueryVersion => "query driver version",
             Self::QueryMac => "query MAC",
+            Self::QueryMtu => "query MTU",
             Self::QueryDriverMtu => "query driver MTU",
             Self::SetMediaStatus => "set media status",
             Self::ConfigurePriority => "configure 802.1Q priority behavior",
             Self::ReadFrame => "read frame",
             Self::WriteFrame => "write frame",
             Self::CancelIo => "cancel I/O",
+            Self::SetDeviceState => "set device state",
+            Self::SetMtu => "set MTU",
             Self::QueryInterfaceMtu => "query interface MTU",
             Self::SetInterfaceMtu => "set interface MTU",
             Self::RollbackInterfaceMtu => "roll back interface MTU",
@@ -103,6 +121,14 @@ pub enum TapError {
         /// Number of candidates that require an explicit selector.
         count: usize,
     },
+    /// Another process already owns the selected platform TAP pair.
+    #[error("TAP interface pair {name:?}/{peer_name:?} is already in use")]
+    DeviceBusy {
+        /// Host-visible interface name.
+        name: String,
+        /// Packet-I/O peer interface name.
+        peer_name: String,
+    },
     /// The opened device reports an unsupported TAP-Windows driver version.
     #[error("unsupported TAP-Windows driver version {major}.{minor}")]
     UnsupportedDriverVersion {
@@ -111,8 +137,8 @@ pub enum TapError {
         /// Driver minor version.
         minor: u32,
     },
-    /// The TAP driver returned an all-zero or group MAC address.
-    #[error("TAP-Windows adapter reported an invalid MAC address")]
+    /// The TAP backend returned an all-zero or group MAC address.
+    #[error("TAP device reported an invalid MAC address")]
     InvalidMacAddress,
     /// Requested runtime MTU exceeds the miniport's startup-time ceiling.
     #[error("requested TAP MTU {requested} exceeds driver ceiling {available}")]

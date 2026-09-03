@@ -10,6 +10,10 @@ version.workspace = true
 [dependencies]
 thiserror.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+fs2 = "=0.4.3"
+tun-rs = { version = "=2.8.8", default-features = false, features = ["interruptible"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Foundation",
