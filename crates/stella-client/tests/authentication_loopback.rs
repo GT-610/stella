@@ -14,8 +14,8 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use stella_client::{
-    authenticate_controller, ActiveControl, BearerCredential, ClientError, ControllerTrust,
-    Enrollment, SpkiPin,
+    authenticate_controller, ActiveControl, BearerCredential, ClientError, ControlUpdate,
+    ControllerTrust, Enrollment, SpkiPin,
 };
 use stella_common::{ControllerId, NetworkId};
 use stella_crypto::{derive_node_id, IdentitySigningKey};
@@ -377,7 +377,20 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     ));
     drop(third);
 
+    let shutdown_connection = authenticate_controller(&trust, &node_key, None)
+        .await
+        .expect("known node authenticates before controller shutdown");
+    let mut shutdown_control = ActiveControl::new(shutdown_connection);
     shutdown_sender.send(()).expect("request server shutdown");
+    let ControlUpdate::ServerShutdown { deadline } = shutdown_control
+        .receive_update()
+        .await
+        .expect("receive controller shutdown notice")
+    else {
+        panic!("controller shutdown must produce a shutdown update");
+    };
+    assert!((now()..=now().saturating_add(60)).contains(&deadline));
+    drop(shutdown_control);
     server
         .await
         .expect("join server task")
