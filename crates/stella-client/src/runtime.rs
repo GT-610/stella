@@ -256,9 +256,17 @@ impl ClientDataRuntime {
                     mapped_address: None,
                     base_address: None,
                     deferred: Vec::new(),
+                    dropped_datagrams: 0,
                 }
             }
         };
+        if discovery.dropped_datagrams > 0 {
+            tracing::warn!(
+                dropped = discovery.dropped_datagrams,
+                retained = discovery.deferred.len(),
+                "dropped UDP datagrams while the STUN discovery queue was full"
+            );
+        }
         let relay = relay?;
         let mut direct_candidates = host_candidates;
         if let Some(candidate) = server_reflexive_candidate(&discovery, candidate_datagram_size) {
