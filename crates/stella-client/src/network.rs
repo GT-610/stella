@@ -338,12 +338,15 @@ impl NetworkDataPlane {
         let peer_paths = self.peer_paths.entry(peer).or_default();
         peer_paths.retain(|existing| *existing != path_id);
         peer_paths.insert(0, path_id);
+        if let Some(previous) = self.pending_path_upgrades.get(&peer).copied() {
+            if previous != path_id {
+                self.remove_pending_direct_path(peer, previous);
+                self.handshakes.cancel_outgoing(peer);
+            }
+        }
         self.nominated_direct_paths.insert(peer, address);
         match self.sessions.get(&peer) {
             Some(session) if session.path_id != path_id => {
-                if self.pending_path_upgrades.get(&peer) != Some(&path_id) {
-                    self.handshakes.cancel_outgoing(peer);
-                }
                 self.pending_path_upgrades.insert(peer, path_id);
             }
             Some(_) | None => {
@@ -1058,6 +1061,28 @@ impl NetworkDataPlane {
         }
     }
 
+    fn remove_pending_direct_path(&mut self, peer: NodeId, path_id: PathId) {
+        let authoritative = self.paths.get(&path_id).is_some_and(|path| {
+            path.peer_node_id == peer
+                && matches!(path.endpoint, TransportEndpoint::Udp(address) if self
+                .state
+                .peers()
+                .get(&peer)
+                .is_some_and(|state| state.endpoints().iter().copied().any(|endpoint| {
+                    endpoint_socket_address(endpoint) == address
+                })))
+        });
+        let Some(peer_paths) = self.peer_paths.get_mut(&peer) else {
+            return;
+        };
+        peer_paths.retain(|candidate| *candidate != path_id);
+        if authoritative {
+            peer_paths.push(path_id);
+        } else {
+            self.paths.remove(&path_id);
+        }
+    }
+
     fn allocate_path_id(&mut self) -> Result<PathId, NetworkDataError> {
         let value = self.next_path_id;
         let path_id = PathId::new(value).ok_or(NetworkDataError::PathIdExhausted)?;
@@ -1631,6 +1656,176 @@ mod tests {
             Err(NetworkDataError::UnknownPath { path_id }) if path_id == direct_path
         ));
         assert!(!plane.withdraw_direct_path(alice_id, direct_address));
+
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the relay fallback scenario retains each path upgrade transition"
+    )]
+    fn superseded_direct_upgrade_falls_back_to_relay_after_withdrawal() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let alice_id = derive_node_id(alice_key.public_key());
+        let bob_id = derive_node_id(bob_key.public_key());
+        let (local_key, remote_key, remote_id, local_address, remote_address) = if alice_id < bob_id
+        {
+            (
+                &alice_key,
+                &bob_key,
+                bob_id,
+                "127.0.0.1:46001"
+                    .parse::<SocketAddr>()
+                    .expect("alice address"),
+                "127.0.0.1:46002"
+                    .parse::<SocketAddr>()
+                    .expect("bob address"),
+            )
+        } else {
+            (
+                &bob_key,
+                &alice_key,
+                alice_id,
+                "127.0.0.1:46002"
+                    .parse::<SocketAddr>()
+                    .expect("bob address"),
+                "127.0.0.1:46001"
+                    .parse::<SocketAddr>()
+                    .expect("alice address"),
+            )
+        };
+        let relay_id = RelayId::from_bytes([0x56; 16]);
+        let relay_address: SocketAddr = "192.0.2.56:50000".parse().expect("relay address");
+        let direct_a: SocketAddr = "192.0.2.58:47001".parse().expect("direct path A");
+        let direct_b: SocketAddr = "192.0.2.59:47002".parse().expect("direct path B");
+        store
+            .publish_endpoints(
+                remote_id,
+                network_id,
+                &[
+                    Endpoint::UdpIpv4 {
+                        priority: 0,
+                        port: direct_a.port(),
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::new(192, 0, 2, 58),
+                    },
+                    Endpoint::UdpIpv4 {
+                        priority: 1,
+                        port: remote_address.port(),
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::LOCALHOST,
+                    },
+                ],
+                130,
+            )
+            .expect("publish authoritative direct endpoint");
+        let relay_candidate = IceCandidate {
+            class: IceCandidateClass::Relay,
+            carrier: ConnectivityCarrier::TurnUdp,
+            priority: 100,
+            foundation: 1,
+            max_datagram_size: 1_200,
+            address: relay_address,
+            related_address: Some("192.0.2.57:45000".parse().expect("related address")),
+            relay_id: Some(relay_id),
+        };
+        let relay_candidates = [relay_candidate];
+        let generation = ConnectivityGenerationRef::new(
+            10,
+            11,
+            130,
+            600,
+            b"Abcd1234",
+            b"Abcdefghijklmnopqrstuv",
+            &relay_candidates,
+        )
+        .expect("relay connectivity generation");
+        let mut encoded = vec![0_u8; generation.encoded_len().expect("generation length")];
+        encode_connectivity_generation(generation, &mut encoded).expect("encode generation");
+        store
+            .publish_connectivity(remote_id, network_id, Some(&encoded), 130)
+            .expect("publish remote relay candidate");
+
+        let mut local = NetworkDataPlane::new(
+            state_for_version(
+                &store,
+                &controller,
+                local_key,
+                network_id,
+                ProtocolVersion::V0_2,
+            ),
+            MacAddress::from_bytes([0x02, 0, 0, 0, 1, 10]),
+            local_address,
+            1_200,
+            local_key,
+            Duration::ZERO,
+        )
+        .expect("local data plane");
+        let mut remote = NetworkDataPlane::new(
+            state_for_version(
+                &store,
+                &controller,
+                remote_key,
+                network_id,
+                ProtocolVersion::V0_2,
+            ),
+            MacAddress::from_bytes([0x02, 0, 0, 0, 1, 11]),
+            remote_address,
+            1_200,
+            remote_key,
+            Duration::ZERO,
+        )
+        .expect("remote data plane");
+        local
+            .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, true)
+            .expect("enable TURN UDP path");
+        let relay_endpoint = TransportEndpoint::TurnUdp {
+            relay_id,
+            address: relay_address,
+        };
+        assert_eq!(
+            local
+                .transport_endpoint(local.select_peer_path(remote_id).expect("relay path"))
+                .expect("resolve relay path"),
+            &relay_endpoint
+        );
+        establish(
+            &mut local,
+            &mut remote,
+            local_key,
+            remote_key,
+            local_address,
+            remote_address,
+            WALL_TIME,
+            Duration::ZERO,
+        );
+        assert!(local.established_peers().contains(&remote_id));
+
+        local
+            .nominate_direct_path(remote_id, direct_a)
+            .expect("nominate direct path A");
+        local
+            .nominate_direct_path(remote_id, direct_b)
+            .expect("nominate direct path B");
+        assert!(local.withdraw_direct_path(remote_id, direct_b));
+        assert!(local
+            .resolve_peer_path(remote_id, &TransportEndpoint::Udp(direct_a))
+            .is_ok());
+
+        local.remove_session(remote_id);
+        let output = local
+            .start_handshakes(local_key, WALL_TIME, Duration::from_secs(1))
+            .expect("start relay fallback handshake");
+        let datagram = output.datagrams().first().expect("relay handshake");
+        assert_eq!(datagram.peer_node_id(), remote_id);
+        assert_eq!(
+            local
+                .transport_endpoint(datagram.path_id())
+                .expect("resolve handshake path"),
+            &relay_endpoint
+        );
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
