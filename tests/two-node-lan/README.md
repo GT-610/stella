@@ -52,6 +52,10 @@ The scenario verifies:
 - IPv4 multicast;
 - a broadcast LAN-discovery query and directed response.
 
+Each check injects one frame only after capture is active. A pass requires exactly
+one frame with the expected Ethernet, ARP or IPv4/UDP tuple, and payload; a marker
+match alone is not sufficient.
+
 `summary.md`, `l2-report.json`, and process logs remain in the reported artifact
 directory. Bearer tokens are cleared after join and are not written to those
 reports or logs.

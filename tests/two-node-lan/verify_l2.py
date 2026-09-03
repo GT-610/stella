@@ -6,8 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import secrets
-import time
+from threading import Event
 from pathlib import Path
+from typing import Callable
 
 from scapy.all import ARP, Ether, IP, UDP, AsyncSniffer, Raw, sendp
 
@@ -31,25 +32,71 @@ def transfer(
     source_interface: str,
     destination_interface: str,
     packet,
-    predicate,
+    predicate: Callable[[Ether], bool],
     timeout: float,
 ) -> bool:
+    ready = Event()
     sniffer = AsyncSniffer(
         iface=destination_interface,
         store=True,
         lfilter=predicate,
         timeout=timeout,
+        started_callback=ready.set,
     )
     sniffer.start()
-    time.sleep(0.4)
-    sendp(packet, iface=source_interface, count=3, inter=0.15, verbose=False)
+    if not ready.wait(timeout):
+        sniffer.join()
+        return False
+    sendp(packet, iface=source_interface, verbose=False)
     sniffer.join()
-    packets = sniffer.results
-    return any(predicate(candidate) for candidate in packets)
+    return sum(predicate(candidate) for candidate in sniffer.results) == 1
 
 
-def raw_marker(marker: bytes):
-    return lambda packet: packet.haslayer(Raw) and bytes(packet[Raw].load) == marker
+def arp_predicate(
+    ethernet_source: str,
+    ethernet_destination: str,
+    operation: int,
+    hardware_source: str,
+    hardware_destination: str,
+    protocol_source: str,
+    protocol_destination: str,
+) -> Callable[[Ether], bool]:
+    return lambda packet: (
+        packet.haslayer(Ether)
+        and packet.haslayer(ARP)
+        and packet[Ether].src.lower() == ethernet_source
+        and packet[Ether].dst.lower() == ethernet_destination
+        and packet[ARP].op == operation
+        and packet[ARP].hwsrc.lower() == hardware_source
+        and packet[ARP].hwdst.lower() == hardware_destination
+        and packet[ARP].psrc == protocol_source
+        and packet[ARP].pdst == protocol_destination
+    )
+
+
+def ipv4_udp_predicate(
+    ethernet_source: str,
+    ethernet_destination: str,
+    source: str,
+    destination: str,
+    source_port: int,
+    destination_port: int,
+    marker: bytes,
+) -> Callable[[Ether], bool]:
+    return lambda packet: (
+        packet.haslayer(Ether)
+        and packet[Ether].type == 0x0800
+        and packet.haslayer(IP)
+        and packet.haslayer(UDP)
+        and packet.haslayer(Raw)
+        and packet[Ether].src.lower() == ethernet_source
+        and packet[Ether].dst.lower() == ethernet_destination
+        and packet[IP].src == source
+        and packet[IP].dst == destination
+        and packet[UDP].sport == source_port
+        and packet[UDP].dport == destination_port
+        and bytes(packet[Raw].load) == marker
+    )
 
 
 def main() -> int:
@@ -75,10 +122,15 @@ def main() -> int:
             args.left_interface,
             args.right_interface,
             arp_request,
-            lambda packet: packet.haslayer(ARP)
-            and packet[ARP].op == 1
-            and packet[ARP].psrc == "10.77.0.1"
-            and packet[ARP].pdst == "10.77.0.2",
+            arp_predicate(
+                left_mac,
+                "ff:ff:ff:ff:ff:ff",
+                1,
+                left_mac,
+                "00:00:00:00:00:00",
+                "10.77.0.1",
+                "10.77.0.2",
+            ),
             args.timeout,
         ),
         "Ethernet broadcast ARP request crossed the encrypted peer path",
@@ -97,10 +149,15 @@ def main() -> int:
             args.right_interface,
             args.left_interface,
             arp_reply,
-            lambda packet: packet.haslayer(ARP)
-            and packet[ARP].op == 2
-            and packet[ARP].psrc == "10.77.0.2"
-            and packet[ARP].pdst == "10.77.0.1",
+            arp_predicate(
+                right_mac,
+                left_mac,
+                2,
+                right_mac,
+                left_mac,
+                "10.77.0.2",
+                "10.77.0.1",
+            ),
             args.timeout,
         ),
         "Directed ARP reply crossed the reverse peer path",
@@ -116,7 +173,15 @@ def main() -> int:
             / IP(src="10.77.0.1", dst="10.77.0.2")
             / UDP(sport=31001, dport=31002)
             / Raw(unicast_ab),
-            raw_marker(unicast_ab),
+            ipv4_udp_predicate(
+                left_mac,
+                right_mac,
+                "10.77.0.1",
+                "10.77.0.2",
+                31001,
+                31002,
+                unicast_ab,
+            ),
             args.timeout,
         ),
         "Directed IPv4 payload crossed from A to B",
@@ -132,7 +197,15 @@ def main() -> int:
             / IP(src="10.77.0.2", dst="10.77.0.1")
             / UDP(sport=31002, dport=31001)
             / Raw(unicast_ba),
-            raw_marker(unicast_ba),
+            ipv4_udp_predicate(
+                right_mac,
+                left_mac,
+                "10.77.0.2",
+                "10.77.0.1",
+                31002,
+                31001,
+                unicast_ba,
+            ),
             args.timeout,
         ),
         "Directed IPv4 payload crossed from B to A",
@@ -148,7 +221,15 @@ def main() -> int:
             / IP(src="10.77.0.1", dst="10.77.0.255")
             / UDP(sport=31100, dport=31100)
             / Raw(broadcast),
-            raw_marker(broadcast),
+            ipv4_udp_predicate(
+                left_mac,
+                "ff:ff:ff:ff:ff:ff",
+                "10.77.0.1",
+                "10.77.0.255",
+                31100,
+                31100,
+                broadcast,
+            ),
             args.timeout,
         ),
         "Limited LAN broadcast reached the other TAP",
@@ -164,7 +245,15 @@ def main() -> int:
             / IP(src="10.77.0.1", dst="239.1.2.3")
             / UDP(sport=31200, dport=31200)
             / Raw(multicast),
-            raw_marker(multicast),
+            ipv4_udp_predicate(
+                left_mac,
+                "01:00:5e:01:02:03",
+                "10.77.0.1",
+                "239.1.2.3",
+                31200,
+                31200,
+                multicast,
+            ),
             args.timeout,
         ),
         "IPv4 multicast Ethernet frame reached the other TAP",
@@ -178,7 +267,15 @@ def main() -> int:
         / IP(src="10.77.0.1", dst="255.255.255.255")
         / UDP(sport=31301, dport=31300)
         / Raw(discovery_query),
-        raw_marker(discovery_query),
+        ipv4_udp_predicate(
+            left_mac,
+            "ff:ff:ff:ff:ff:ff",
+            "10.77.0.1",
+            "255.255.255.255",
+            31301,
+            31300,
+            discovery_query,
+        ),
         args.timeout,
     )
     discovery_reply = b"STELLA_LAN_DISCOVER_REPLY_" + nonce
@@ -189,7 +286,15 @@ def main() -> int:
         / IP(src="10.77.0.2", dst="10.77.0.1")
         / UDP(sport=31300, dport=31301)
         / Raw(discovery_reply),
-        raw_marker(discovery_reply),
+        ipv4_udp_predicate(
+            right_mac,
+            left_mac,
+            "10.77.0.2",
+            "10.77.0.1",
+            31300,
+            31301,
+            discovery_reply,
+        ),
         args.timeout,
     )
     record(
