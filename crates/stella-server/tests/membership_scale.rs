@@ -3,7 +3,7 @@
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use stella_common::NetworkId;
@@ -98,7 +98,9 @@ fn run_scale_profile(node_count: usize) {
         store.add_member(overflow.node_id(), network_id, TEST_TIME),
         Err(StoreError::NetworkFull { network_id: full }) if full == network_id
     ));
+    let setup_elapsed = started.elapsed();
 
+    let verify_started = Instant::now();
     store.verify().expect("verify populated authority store");
     assert_eq!(
         store
@@ -107,14 +109,19 @@ fn run_scale_profile(node_count: usize) {
             .len(),
         node_count
     );
+    let verify_elapsed = verify_started.elapsed();
 
     let mut aggregate_bytes = 0_usize;
     let mut maximum_snapshot_bytes = 0_usize;
     let mut validated_relationships = 0_usize;
+    let mut view_elapsed = Duration::ZERO;
+    let mut encode_elapsed = Duration::ZERO;
     for node_id in &node_ids {
+        let view_started = Instant::now();
         let view = store
             .network_session_view(*node_id, network_id)
             .expect("read coherent scale view");
+        view_elapsed = view_elapsed.saturating_add(view_started.elapsed());
         assert_eq!(view.peers().len(), node_count.saturating_sub(1));
         assert!(view
             .peers()
@@ -125,8 +132,10 @@ fn run_scale_profile(node_count: usize) {
             .windows(2)
             .all(|pair| pair[0].node().node_id() < pair[1].node().node_id()));
 
+        let encode_started = Instant::now();
         let encoded = encode_network_state(&controller, &view, TEST_TIME, ProtocolVersion::V0_2)
             .expect("encode complete scale snapshot");
+        encode_elapsed = encode_elapsed.saturating_add(encode_started.elapsed());
         assert_eq!(encoded.network_id(), network_id);
         let peers = PeerListView::decode(encoded.peer_list()).expect("decode scale peer list");
         assert_eq!(peers.len(), node_count.saturating_sub(1));
@@ -155,7 +164,11 @@ fn run_scale_profile(node_count: usize) {
     );
 
     eprintln!(
-        "membership scale: nodes={node_count} receiver_views={node_count} relationships={validated_relationships} max_snapshot_bytes={maximum_snapshot_bytes} aggregate_bytes={aggregate_bytes} elapsed_ms={}",
+        "membership scale: nodes={node_count} receiver_views={node_count} relationships={validated_relationships} max_snapshot_bytes={maximum_snapshot_bytes} aggregate_bytes={aggregate_bytes} setup_ms={} verify_ms={} view_ms={} encode_ms={} total_ms={}",
+        setup_elapsed.as_millis(),
+        verify_elapsed.as_millis(),
+        view_elapsed.as_millis(),
+        encode_elapsed.as_millis(),
         started.elapsed().as_millis()
     );
 
