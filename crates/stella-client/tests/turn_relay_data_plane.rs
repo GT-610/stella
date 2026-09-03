@@ -631,6 +631,37 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
     bob.nominate_direct_path(bob_nomination.peer_node_id, bob_nomination.address)
         .expect("install Bob direct path");
 
+    assert!(alice.established_peers().contains(&bob_id));
+    assert!(bob.established_peers().contains(&alice_id));
+    let pending_upgrade_frame = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xd5);
+    let pending_upgrade = alice
+        .accept_tap_frame(&pending_upgrade_frame, Duration::from_secs(5))
+        .expect("keep forwarding during direct upgrade")
+        .into_parts()
+        .0;
+    let (responses, delivered) = relay_flight(
+        &alice,
+        &alice_turn,
+        &mut bob,
+        &bob_turn,
+        &bob_key,
+        pending_upgrade,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(responses.is_empty());
+    assert_eq!(delivered.as_deref(), Some(pending_upgrade_frame.as_slice()));
+
+    assert!(alice.withdraw_direct_path(bob_id, bob_direct_address));
+    assert!(bob.withdraw_direct_path(alice_id, alice_direct_address));
+    assert!(alice.established_peers().contains(&bob_id));
+    assert!(bob.established_peers().contains(&alice_id));
+    alice
+        .nominate_direct_path(bob_id, bob_direct_address)
+        .expect("renominate Alice direct path");
+    bob.nominate_direct_path(alice_id, alice_direct_address)
+        .expect("renominate Bob direct path");
+
     let upgrade_start = Duration::from_secs(10);
     let mut pending = alice
         .start_handshakes(&alice_key, CONTROL_TIME, upgrade_start)

@@ -853,6 +853,10 @@ impl PeerHandshakeManager {
         self.outgoing.contains_key(&peer_node_id)
     }
 
+    pub(crate) fn cancel_outgoing(&mut self, peer_node_id: NodeId) {
+        self.outgoing.remove(&peer_node_id);
+    }
+
     /// Returns whether rejection backoff permits a new initiation now.
     #[must_use]
     pub fn can_initiate(&self, peer_node_id: NodeId, now: Duration) -> bool {

@@ -178,6 +178,7 @@ pub struct NetworkDataPlane {
     handshakes: PeerHandshakeManager,
     available_relay_carriers: u16,
     nominated_direct_paths: BTreeMap<NodeId, SocketAddr>,
+    pending_path_upgrades: BTreeMap<NodeId, PathId>,
     paths: BTreeMap<PathId, PeerPath>,
     peer_paths: BTreeMap<NodeId, Vec<PathId>>,
     next_path_id: u64,
@@ -219,6 +220,7 @@ impl NetworkDataPlane {
             handshakes,
             available_relay_carriers: 0,
             nominated_direct_paths: BTreeMap::new(),
+            pending_path_upgrades: BTreeMap::new(),
             paths: BTreeMap::new(),
             peer_paths: BTreeMap::new(),
             next_path_id: 1,
@@ -284,9 +286,9 @@ impl NetworkDataPlane {
 
     /// Installs and prefers one direct UDP path after connectivity-layer nomination.
     ///
-    /// An existing session on another path is marked for a fresh Stella
-    /// handshake. The old session is retained only if that new handshake
-    /// succeeds, using the normal receive-only grace period.
+    /// An existing session on another path remains active while a fresh Stella
+    /// handshake tries the nominated path. It becomes receive-only only after
+    /// the replacement handshake succeeds.
     ///
     /// # Errors
     ///
@@ -337,9 +339,15 @@ impl NetworkDataPlane {
         peer_paths.retain(|existing| *existing != path_id);
         peer_paths.insert(0, path_id);
         self.nominated_direct_paths.insert(peer, address);
-        if let Some(session) = self.sessions.get_mut(&peer) {
-            if session.path_id != path_id {
-                session.rekeying = true;
+        match self.sessions.get(&peer) {
+            Some(session) if session.path_id != path_id => {
+                if self.pending_path_upgrades.get(&peer) != Some(&path_id) {
+                    self.handshakes.cancel_outgoing(peer);
+                }
+                self.pending_path_upgrades.insert(peer, path_id);
+            }
+            Some(_) | None => {
+                self.pending_path_upgrades.remove(&peer);
             }
         }
         Ok(())
@@ -371,6 +379,10 @@ impl NetworkDataPlane {
         let Some(path_id) = path_id else {
             return true;
         };
+        if self.pending_path_upgrades.get(&peer) == Some(&path_id) {
+            self.pending_path_upgrades.remove(&peer);
+            self.handshakes.cancel_outgoing(peer);
+        }
         if self
             .sessions
             .get(&peer)
@@ -410,10 +422,9 @@ impl NetworkDataPlane {
                     .peers()
                     .get(peer)
                     .is_some_and(|state| grant_is_valid(state.grant(), wall_time))
-                    && self
-                        .sessions
-                        .get(peer)
-                        .is_none_or(|session| session.rekeying)
+                    && self.sessions.get(peer).is_none_or(|session| {
+                        session.rekeying || self.pending_path_upgrades.contains_key(peer)
+                    })
                     && !self.handshakes.has_outgoing(*peer)
                     && self.handshakes.can_initiate(*peer, monotonic_now)
                     && self.select_peer_path(*peer).is_some()
@@ -648,6 +659,7 @@ impl NetworkDataPlane {
             self.switch = L2Switch::new(replacement.policy(), primary_mac, now)?;
             self.handshakes = PeerHandshakeManager::new(replacement.local_grant().node_id);
             self.nominated_direct_paths.clear();
+            self.pending_path_upgrades.clear();
         }
         self.state = replacement;
         let current_peers: Vec<NodeId> = self.state.peers().keys().copied().collect();
@@ -657,6 +669,7 @@ impl NetworkDataPlane {
                 self.remove_peer_paths(peer);
                 self.handshakes.remove_peer(peer);
                 self.nominated_direct_paths.remove(&peer);
+                self.pending_path_upgrades.remove(&peer);
             }
         }
         for peer in current_peers {
@@ -679,6 +692,7 @@ impl NetworkDataPlane {
             }
             if endpoints_changed {
                 self.nominated_direct_paths.remove(&peer);
+                self.pending_path_upgrades.remove(&peer);
                 self.remove_peer_paths(peer);
                 self.install_peer_paths(peer)?;
             }
@@ -771,6 +785,9 @@ impl NetworkDataPlane {
                 let established_at = session.established_at();
                 let expires_at = session.expires_at();
                 let data = session.into_data_session()?;
+                if self.pending_path_upgrades.get(&peer_node_id) == Some(&path_id) {
+                    self.pending_path_upgrades.remove(&peer_node_id);
+                }
                 if let Some(previous) = self.sessions.insert(
                     peer_node_id,
                     InstalledSession {
@@ -1033,6 +1050,7 @@ impl NetworkDataPlane {
     }
 
     fn remove_peer_paths(&mut self, peer: NodeId) {
+        self.pending_path_upgrades.remove(&peer);
         if let Some(path_ids) = self.peer_paths.remove(&peer) {
             for path_id in path_ids {
                 self.paths.remove(&path_id);
