@@ -1239,9 +1239,10 @@ mod tests {
         let config = ClientConfig::parse(&document, std::path::Path::new("."))
             .expect("parse test configuration");
         let identity = IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x63; 32]));
-        let data = ClientDataRuntime::start(&config, &BTreeMap::new(), &identity)
-            .await
-            .expect("start data runtime without TAP networks");
+        let data =
+            ClientDataRuntime::start_with_connectivity(&config, &BTreeMap::new(), &identity, None)
+                .await
+                .expect("start data runtime without TAP networks");
         (data, identity)
     }
 
