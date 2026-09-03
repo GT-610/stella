@@ -521,8 +521,9 @@ impl TurnTcpRelay {
                         source,
                     })?;
                     let core = Arc::clone(&self.core);
+                    let idle_timeout = Duration::from_secs(u64::from(self.config.idle_timeout_seconds));
                     sessions.spawn(async move {
-                        (client, run_stream_client(stream, client, core).await)
+                        (client, run_stream_client(stream, client, core, idle_timeout).await)
                     });
                 }
                 joined = sessions.join_next(), if !sessions.is_empty() => {
@@ -650,13 +651,14 @@ impl TurnTlsRelay {
                     let core = Arc::clone(&self.core);
                     let acceptor = self.acceptor.clone();
                     let handshake_timeout = self.handshake_timeout;
+                    let idle_timeout = Duration::from_secs(u64::from(self.config.idle_timeout_seconds));
                     sessions.spawn(async move {
                         let session = async {
                             let stream = timeout(handshake_timeout, acceptor.accept(stream))
                                 .await
                                 .map_err(|_| TurnRelayError::TlsHandshakeTimeout { client })?
                                 .map_err(|source| TurnRelayError::TlsHandshake { client, source })?;
-                            run_stream_client(stream, client, core).await
+                            run_stream_client(stream, client, core, idle_timeout).await
                         }
                         .await;
                         (client, session)
@@ -800,6 +802,7 @@ impl TurnWebSocketRelay {
                     let relay_id = self.config.relay_id;
                     let websocket_config = self.websocket_config;
                     let handshake_timeout = self.handshake_timeout;
+                    let idle_timeout = Duration::from_secs(u64::from(self.config.idle_timeout_seconds));
                     sessions.spawn(async move {
                         let handshake = timeout(handshake_timeout, async {
                             let stream = acceptor
@@ -818,7 +821,9 @@ impl TurnWebSocketRelay {
                         .await
                         .map_err(|_| TurnRelayError::WebSocketHandshakeTimeout { client });
                         let session = match handshake {
-                            Ok(Ok(stream)) => run_websocket_client(stream, client, core).await,
+                            Ok(Ok(stream)) => {
+                                run_websocket_client(stream, client, core, idle_timeout).await
+                            }
                             Ok(Err(error)) | Err(error) => Err(error),
                         };
                         (client, session)
@@ -966,6 +971,7 @@ async fn run_stream_client<S>(
     stream: S,
     client: SocketAddr,
     core: Arc<Mutex<TurnRelayCore>>,
+    idle_timeout: Duration,
 ) -> Result<(), TurnRelayError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -988,10 +994,11 @@ where
                 writer_joined = true;
                 break joined.map_err(|source| TurnRelayError::ClientWriterTaskJoin { source })?;
             }
-            record = reader.read_record() => {
+            record = timeout(idle_timeout, reader.read_record()) => {
                 let record = match record {
-                    Ok(record) => record,
-                    Err(error) => break Err(error.into()),
+                    Ok(Ok(record)) => record,
+                    Ok(Err(error)) => break Err(error.into()),
+                    Err(_) => break Err(TurnRelayError::ClientReadTimeout),
                 };
                 let now_unix = unix_time()?;
                 let now = Instant::now();
@@ -1019,6 +1026,7 @@ async fn run_websocket_client<S>(
     stream: WebSocketStream<S>,
     client: SocketAddr,
     core: Arc<Mutex<TurnRelayCore>>,
+    idle_timeout: Duration,
 ) -> Result<(), TurnRelayError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1039,10 +1047,14 @@ where
                 writer_joined = true;
                 break joined.map_err(|source| TurnRelayError::ClientWriterTaskJoin { source })?;
             }
-            record = read_websocket_record(&mut reader, MAX_TURN_STREAM_RECORD_SIZE) => {
+            record = timeout(
+                idle_timeout,
+                read_websocket_record(&mut reader, MAX_TURN_STREAM_RECORD_SIZE),
+            ) => {
                 let record = match record {
-                    Ok(record) => record,
-                    Err(error) => break Err(error.into()),
+                    Ok(Ok(record)) => record,
+                    Ok(Err(error)) => break Err(error.into()),
+                    Err(_) => break Err(TurnRelayError::ClientReadTimeout),
                 };
                 let now_unix = unix_time()?;
                 let now = Instant::now();
@@ -2531,6 +2543,9 @@ pub enum TurnRelayError {
         /// Connected client transport address.
         client: SocketAddr,
     },
+    /// A reliable client did not complete another TURN record before its idle deadline.
+    #[error("TURN reliable client stream timed out")]
+    ClientReadTimeout,
     /// A TURN TCP session task panicked or was cancelled unexpectedly.
     #[error("TURN TCP client session task failed")]
     ClientTaskJoin {
@@ -2591,6 +2606,7 @@ pub enum TurnRelayError {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
         time::Duration,
     };
 
@@ -2604,17 +2620,29 @@ mod tests {
         StunErrorCodeView, StunMessageRef, StunMessageType, StunMessageView, StunMethod,
         StunPasswordAlgorithm, StunTransactionId, TurnChannelDataView, TurnChannelNumber,
     };
-    use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
-    use tokio_tungstenite::tungstenite::{
-        handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
-        http::{
-            header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
-            StatusCode,
+    use tokio::{
+        io::{duplex, AsyncWriteExt},
+        net::UdpSocket,
+        sync::{oneshot, Mutex},
+        time::timeout,
+    };
+    use tokio_tungstenite::{
+        tungstenite::{
+            handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
+            http::{
+                header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
+                StatusCode,
+            },
+            protocol::Role,
         },
+        WebSocketStream,
     };
     use zeroize::Zeroizing;
 
-    use super::{authorize_websocket_upgrade, TurnUdpRelay, TurnUdpRelayConfig};
+    use super::{
+        authorize_websocket_upgrade, run_stream_client, run_websocket_client, TurnRelayCore,
+        TurnRelayError, TurnUdpRelay, TurnUdpRelayConfig,
+    };
     use crate::relay_credentials::RelayCredentialAuthority;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -2623,6 +2651,58 @@ mod tests {
         realm: Vec<u8>,
         nonce: Vec<u8>,
         relayed_address: SocketAddr,
+    }
+
+    #[tokio::test]
+    async fn reliable_clients_time_out_incomplete_records() {
+        let relay_id = RelayId::from_bytes([0x41; 16]);
+        let config = TurnUdpRelayConfig::new(
+            relay_id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45_100);
+        let idle_timeout = Duration::from_millis(25);
+
+        let authority = RelayCredentialAuthority::new([0x42; 32], 300)
+            .expect("create stream credential authority");
+        let core = Arc::new(Mutex::new(
+            TurnRelayCore::new(config.into(), authority).expect("create stream relay core"),
+        ));
+        let (mut raw_client, relay_stream) = duplex(64);
+        raw_client
+            .write_all(&[0, 1])
+            .await
+            .expect("write partial TURN prefix");
+        let error = timeout(
+            Duration::from_secs(1),
+            run_stream_client(relay_stream, client, core, idle_timeout),
+        )
+        .await
+        .expect("stream client reaches its idle deadline")
+        .expect_err("partial TURN prefix times out");
+        assert!(matches!(error, TurnRelayError::ClientReadTimeout));
+
+        let authority = RelayCredentialAuthority::new([0x43; 32], 300)
+            .expect("create WebSocket credential authority");
+        let core = Arc::new(Mutex::new(
+            TurnRelayCore::new(config.into(), authority).expect("create WebSocket relay core"),
+        ));
+        let (mut raw_client, relay_stream) = duplex(64);
+        let websocket = WebSocketStream::from_raw_socket(relay_stream, Role::Server, None).await;
+        raw_client
+            .write_all(&[0x82, 0x80])
+            .await
+            .expect("write partial masked WebSocket frame");
+        let error = timeout(
+            Duration::from_secs(1),
+            run_websocket_client(websocket, client, core, idle_timeout),
+        )
+        .await
+        .expect("WebSocket client reaches its idle deadline")
+        .expect_err("partial WebSocket frame times out");
+        assert!(matches!(error, TurnRelayError::ClientReadTimeout));
     }
 
     #[test]
