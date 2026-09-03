@@ -18,10 +18,7 @@ use stella_server::{
     active::serve_control_session,
     authority::{AuthorityHandle, AuthorityThread},
     bootstrap::{initialize_controller, BootstrapOptions},
-    config::{
-        ServerConfig, TurnTcpRelaySettings, TurnTlsRelaySettings, TurnUdpRelaySettings,
-        TurnWebSocketRelaySettings,
-    },
+    config::{ServerConfig, TurnRelaySettings},
     identity::load_controller_identity,
     relay_credentials::{create_relay_credential_key, load_relay_credential_authority},
     runtime::{run_controller, SessionError, SessionHandler},
@@ -231,72 +228,6 @@ struct RelayRunArgs {
     max_channels_per_allocation: usize,
 }
 
-struct RelayRunSettings {
-    relay_id: RelayId,
-    credential_key_path: PathBuf,
-    credential_lifetime_seconds: u64,
-    port: u16,
-    max_datagram_size: usize,
-    allocation_lifetime_seconds: u32,
-    idle_timeout_seconds: u32,
-}
-
-impl From<TurnUdpRelaySettings> for RelayRunSettings {
-    fn from(settings: TurnUdpRelaySettings) -> Self {
-        Self {
-            relay_id: settings.relay_id,
-            credential_key_path: settings.credential_key_path,
-            credential_lifetime_seconds: settings.credential_lifetime_seconds,
-            port: settings.port,
-            max_datagram_size: settings.max_datagram_size,
-            allocation_lifetime_seconds: settings.allocation_lifetime_seconds,
-            idle_timeout_seconds: settings.idle_timeout_seconds,
-        }
-    }
-}
-
-impl From<TurnTcpRelaySettings> for RelayRunSettings {
-    fn from(settings: TurnTcpRelaySettings) -> Self {
-        Self {
-            relay_id: settings.relay_id,
-            credential_key_path: settings.credential_key_path,
-            credential_lifetime_seconds: settings.credential_lifetime_seconds,
-            port: settings.port,
-            max_datagram_size: settings.max_datagram_size,
-            allocation_lifetime_seconds: settings.allocation_lifetime_seconds,
-            idle_timeout_seconds: settings.idle_timeout_seconds,
-        }
-    }
-}
-
-impl From<TurnTlsRelaySettings> for RelayRunSettings {
-    fn from(settings: TurnTlsRelaySettings) -> Self {
-        Self {
-            relay_id: settings.relay_id,
-            credential_key_path: settings.credential_key_path,
-            credential_lifetime_seconds: settings.credential_lifetime_seconds,
-            port: settings.port,
-            max_datagram_size: settings.max_datagram_size,
-            allocation_lifetime_seconds: settings.allocation_lifetime_seconds,
-            idle_timeout_seconds: settings.idle_timeout_seconds,
-        }
-    }
-}
-
-impl From<TurnWebSocketRelaySettings> for RelayRunSettings {
-    fn from(settings: TurnWebSocketRelaySettings) -> Self {
-        Self {
-            relay_id: settings.relay_id,
-            credential_key_path: settings.credential_key_path,
-            credential_lifetime_seconds: settings.credential_lifetime_seconds,
-            port: settings.port,
-            max_datagram_size: settings.max_datagram_size,
-            allocation_lifetime_seconds: settings.allocation_lifetime_seconds,
-            idle_timeout_seconds: settings.idle_timeout_seconds,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Args)]
 struct TokenLifetimeArgs {
     #[arg(long, default_value_t = DEFAULT_TOKEN_TTL_SECONDS)]
@@ -392,23 +323,19 @@ async fn execute_relay(config_path: &Path, command: RelayCommand) -> Result<()> 
     let RelayCommand::Run(args) = command;
     let config = ServerConfig::load(config_path)
         .with_context(|| format!("could not load {}", config_path.display()))?;
-    let settings: RelayRunSettings = match args.carrier {
+    let settings = match args.carrier {
         RelayCarrierArg::Udp => config
             .turn_udp_relay_settings(args.id)
-            .context("could not resolve configured TURN UDP relay")?
-            .into(),
+            .context("could not resolve configured TURN UDP relay")?,
         RelayCarrierArg::Tcp => config
             .turn_tcp_relay_settings(args.id)
-            .context("could not resolve configured TURN TCP relay")?
-            .into(),
+            .context("could not resolve configured TURN TCP relay")?,
         RelayCarrierArg::Tls => config
             .turn_tls_relay_settings(args.id)
-            .context("could not resolve configured TURN TLS relay")?
-            .into(),
+            .context("could not resolve configured TURN TLS relay")?,
         RelayCarrierArg::Websocket => config
             .turn_websocket_relay_settings(args.id)
-            .context("could not resolve configured secure WebSocket TURN relay")?
-            .into(),
+            .context("could not resolve configured secure WebSocket TURN relay")?,
     };
     if args.listen.port() != settings.port {
         return Err(anyhow!(
@@ -458,7 +385,7 @@ impl RelayCarrierArg {
 
 async fn run_turn_udp(
     args: RelayRunArgs,
-    settings: RelayRunSettings,
+    settings: TurnRelaySettings,
     credentials: stella_server::relay_credentials::RelayCredentialAuthority,
 ) -> Result<()> {
     let mut relay_config = TurnUdpRelayConfig::new(
@@ -485,7 +412,7 @@ async fn run_turn_udp(
 
 async fn run_turn_tcp(
     args: RelayRunArgs,
-    settings: RelayRunSettings,
+    settings: TurnRelaySettings,
     credentials: stella_server::relay_credentials::RelayCredentialAuthority,
 ) -> Result<()> {
     let relay_config = stream_relay_config(args, &settings);
@@ -506,7 +433,7 @@ async fn run_turn_tcp(
 
 async fn run_turn_tls(
     args: RelayRunArgs,
-    settings: RelayRunSettings,
+    settings: TurnRelaySettings,
     credentials: stella_server::relay_credentials::RelayCredentialAuthority,
     server: &ServerConfig,
 ) -> Result<()> {
@@ -536,7 +463,7 @@ async fn run_turn_tls(
 
 async fn run_turn_websocket(
     args: RelayRunArgs,
-    settings: RelayRunSettings,
+    settings: TurnRelaySettings,
     credentials: stella_server::relay_credentials::RelayCredentialAuthority,
     server: &ServerConfig,
 ) -> Result<()> {
@@ -564,7 +491,7 @@ async fn run_turn_websocket(
         .context("secure WebSocket TURN relay runtime failed")
 }
 
-fn stream_relay_config(args: RelayRunArgs, settings: &RelayRunSettings) -> TurnTcpRelayConfig {
+fn stream_relay_config(args: RelayRunArgs, settings: &TurnRelaySettings) -> TurnTcpRelayConfig {
     let mut relay_config = TurnTcpRelayConfig::new(
         settings.relay_id,
         args.listen,
@@ -584,7 +511,7 @@ fn stream_relay_config(args: RelayRunArgs, settings: &RelayRunSettings) -> TurnT
 fn apply_relay_limits(
     relay_config: &mut TurnUdpRelayConfig,
     args: RelayRunArgs,
-    settings: &RelayRunSettings,
+    settings: &TurnRelaySettings,
 ) {
     relay_config.max_datagram_size = settings.max_datagram_size;
     relay_config.allocation_lifetime_seconds = settings.allocation_lifetime_seconds;

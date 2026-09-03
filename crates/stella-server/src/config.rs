@@ -151,32 +151,13 @@ impl ServerConfig {
     pub fn turn_udp_relay_settings(
         &self,
         relay_id: RelayId,
-    ) -> Result<TurnUdpRelaySettings, ConfigError> {
-        let connectivity = self
-            .connectivity
-            .as_ref()
-            .ok_or_else(|| invalid_connectivity("connectivity services are not configured"))?;
-        let relay = connectivity
-            .relay_services
-            .iter()
-            .find(|relay| relay.relay_id == relay_id)
-            .ok_or_else(|| invalid_connectivity("requested relay ID is not configured"))?;
-        if !relay.carriers.contains(RelayCarrierMask::TURN_UDP) || relay.ports.turn_udp == 0 {
-            return Err(invalid_connectivity(
-                "requested relay does not advertise TURN UDP",
-            ));
-        }
-        let max_datagram_size =
-            usize::try_from(relay.max_datagram_size).map_err(|_| ConfigError::LengthOverflow)?;
-        Ok(TurnUdpRelaySettings {
+    ) -> Result<TurnRelaySettings, ConfigError> {
+        self.turn_relay_settings(
             relay_id,
-            credential_key_path: connectivity.credential_key_path.clone(),
-            credential_lifetime_seconds: connectivity.credential_lifetime_seconds,
-            port: relay.ports.turn_udp,
-            max_datagram_size,
-            allocation_lifetime_seconds: relay.allocation_lifetime_seconds,
-            idle_timeout_seconds: relay.idle_timeout_seconds,
-        })
+            RelayCarrierMask::TURN_UDP,
+            |ports| ports.turn_udp,
+            "requested relay does not advertise TURN UDP",
+        )
     }
 
     /// Resolves one configured TURN TCP relay into executable service settings.
@@ -189,32 +170,13 @@ impl ServerConfig {
     pub fn turn_tcp_relay_settings(
         &self,
         relay_id: RelayId,
-    ) -> Result<TurnTcpRelaySettings, ConfigError> {
-        let connectivity = self
-            .connectivity
-            .as_ref()
-            .ok_or_else(|| invalid_connectivity("connectivity services are not configured"))?;
-        let relay = connectivity
-            .relay_services
-            .iter()
-            .find(|relay| relay.relay_id == relay_id)
-            .ok_or_else(|| invalid_connectivity("requested relay ID is not configured"))?;
-        if !relay.carriers.contains(RelayCarrierMask::TURN_TCP) || relay.ports.turn_tcp == 0 {
-            return Err(invalid_connectivity(
-                "requested relay does not advertise TURN TCP",
-            ));
-        }
-        let max_datagram_size =
-            usize::try_from(relay.max_datagram_size).map_err(|_| ConfigError::LengthOverflow)?;
-        Ok(TurnTcpRelaySettings {
+    ) -> Result<TurnRelaySettings, ConfigError> {
+        self.turn_relay_settings(
             relay_id,
-            credential_key_path: connectivity.credential_key_path.clone(),
-            credential_lifetime_seconds: connectivity.credential_lifetime_seconds,
-            port: relay.ports.turn_tcp,
-            max_datagram_size,
-            allocation_lifetime_seconds: relay.allocation_lifetime_seconds,
-            idle_timeout_seconds: relay.idle_timeout_seconds,
-        })
+            RelayCarrierMask::TURN_TCP,
+            |ports| ports.turn_tcp,
+            "requested relay does not advertise TURN TCP",
+        )
     }
 
     /// Resolves one configured TURN TLS relay into executable service settings.
@@ -227,32 +189,13 @@ impl ServerConfig {
     pub fn turn_tls_relay_settings(
         &self,
         relay_id: RelayId,
-    ) -> Result<TurnTlsRelaySettings, ConfigError> {
-        let connectivity = self
-            .connectivity
-            .as_ref()
-            .ok_or_else(|| invalid_connectivity("connectivity services are not configured"))?;
-        let relay = connectivity
-            .relay_services
-            .iter()
-            .find(|relay| relay.relay_id == relay_id)
-            .ok_or_else(|| invalid_connectivity("requested relay ID is not configured"))?;
-        if !relay.carriers.contains(RelayCarrierMask::TURN_TLS) || relay.ports.turn_tls == 0 {
-            return Err(invalid_connectivity(
-                "requested relay does not advertise TURN TLS",
-            ));
-        }
-        let max_datagram_size =
-            usize::try_from(relay.max_datagram_size).map_err(|_| ConfigError::LengthOverflow)?;
-        Ok(TurnTlsRelaySettings {
+    ) -> Result<TurnRelaySettings, ConfigError> {
+        self.turn_relay_settings(
             relay_id,
-            credential_key_path: connectivity.credential_key_path.clone(),
-            credential_lifetime_seconds: connectivity.credential_lifetime_seconds,
-            port: relay.ports.turn_tls,
-            max_datagram_size,
-            allocation_lifetime_seconds: relay.allocation_lifetime_seconds,
-            idle_timeout_seconds: relay.idle_timeout_seconds,
-        })
+            RelayCarrierMask::TURN_TLS,
+            |ports| ports.turn_tls,
+            "requested relay does not advertise TURN TLS",
+        )
     }
 
     /// Resolves one configured secure WebSocket TURN relay into executable settings.
@@ -265,7 +208,22 @@ impl ServerConfig {
     pub fn turn_websocket_relay_settings(
         &self,
         relay_id: RelayId,
-    ) -> Result<TurnWebSocketRelaySettings, ConfigError> {
+    ) -> Result<TurnRelaySettings, ConfigError> {
+        self.turn_relay_settings(
+            relay_id,
+            RelayCarrierMask::SECURE_WEBSOCKET,
+            |ports| ports.secure_websocket,
+            "requested relay does not advertise secure WebSocket",
+        )
+    }
+
+    fn turn_relay_settings(
+        &self,
+        relay_id: RelayId,
+        carrier: RelayCarrierMask,
+        port: impl FnOnce(RelayPorts) -> u16,
+        unavailable: &'static str,
+    ) -> Result<TurnRelaySettings, ConfigError> {
         let connectivity = self
             .connectivity
             .as_ref()
@@ -275,20 +233,17 @@ impl ServerConfig {
             .iter()
             .find(|relay| relay.relay_id == relay_id)
             .ok_or_else(|| invalid_connectivity("requested relay ID is not configured"))?;
-        if !relay.carriers.contains(RelayCarrierMask::SECURE_WEBSOCKET)
-            || relay.ports.secure_websocket == 0
-        {
-            return Err(invalid_connectivity(
-                "requested relay does not advertise secure WebSocket",
-            ));
+        let port = port(relay.ports);
+        if !relay.carriers.contains(carrier) || port == 0 {
+            return Err(invalid_connectivity(unavailable));
         }
         let max_datagram_size =
             usize::try_from(relay.max_datagram_size).map_err(|_| ConfigError::LengthOverflow)?;
-        Ok(TurnWebSocketRelaySettings {
+        Ok(TurnRelaySettings {
             relay_id,
             credential_key_path: connectivity.credential_key_path.clone(),
             credential_lifetime_seconds: connectivity.credential_lifetime_seconds,
-            port: relay.ports.secure_websocket,
+            port,
             max_datagram_size,
             allocation_lifetime_seconds: relay.allocation_lifetime_seconds,
             idle_timeout_seconds: relay.idle_timeout_seconds,
@@ -296,73 +251,16 @@ impl ServerConfig {
     }
 }
 
-/// Executable settings derived from one advertised TURN UDP relay service.
+/// Executable settings derived from one advertised TURN relay carrier.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TurnUdpRelaySettings {
+pub struct TurnRelaySettings {
     /// Stable configured relay identity.
     pub relay_id: RelayId,
     /// Protected shared credential authority key path.
     pub credential_key_path: PathBuf,
     /// Controller-issued credential lifetime used by the shared authority.
     pub credential_lifetime_seconds: u64,
-    /// Advertised TURN UDP port.
-    pub port: u16,
-    /// Advertised relayed Stella datagram ceiling.
-    pub max_datagram_size: usize,
-    /// Maximum granted allocation lifetime.
-    pub allocation_lifetime_seconds: u32,
-    /// Allocation inactivity deadline.
-    pub idle_timeout_seconds: u32,
-}
-
-/// Executable settings derived from one advertised TURN TCP relay service.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TurnTcpRelaySettings {
-    /// Stable configured relay identity.
-    pub relay_id: RelayId,
-    /// Protected shared credential authority key path.
-    pub credential_key_path: PathBuf,
-    /// Controller-issued credential lifetime used by the shared authority.
-    pub credential_lifetime_seconds: u64,
-    /// Advertised TURN TCP port.
-    pub port: u16,
-    /// Advertised relayed Stella datagram ceiling.
-    pub max_datagram_size: usize,
-    /// Maximum granted allocation lifetime.
-    pub allocation_lifetime_seconds: u32,
-    /// Allocation inactivity deadline.
-    pub idle_timeout_seconds: u32,
-}
-
-/// Executable settings derived from one advertised TURN TLS relay service.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TurnTlsRelaySettings {
-    /// Stable configured relay identity.
-    pub relay_id: RelayId,
-    /// Protected shared credential authority key path.
-    pub credential_key_path: PathBuf,
-    /// Controller-issued credential lifetime used by the shared authority.
-    pub credential_lifetime_seconds: u64,
-    /// Advertised TURN TLS port.
-    pub port: u16,
-    /// Advertised relayed Stella datagram ceiling.
-    pub max_datagram_size: usize,
-    /// Maximum granted allocation lifetime.
-    pub allocation_lifetime_seconds: u32,
-    /// Allocation inactivity deadline.
-    pub idle_timeout_seconds: u32,
-}
-
-/// Executable settings derived from one advertised secure WebSocket TURN relay service.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TurnWebSocketRelaySettings {
-    /// Stable configured relay identity.
-    pub relay_id: RelayId,
-    /// Protected shared credential authority key path.
-    pub credential_key_path: PathBuf,
-    /// Controller-issued credential lifetime used by the shared authority.
-    pub credential_lifetime_seconds: u64,
-    /// Advertised secure WebSocket port.
+    /// Advertised port for the selected carrier.
     pub port: u16,
     /// Advertised relayed Stella datagram ceiling.
     pub max_datagram_size: usize,
