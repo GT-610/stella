@@ -229,7 +229,6 @@ struct ConnectivityUpdate {
 
 struct SnapshotRequest {
     network_id: NetworkId,
-    _last_revision: u64,
 }
 
 struct HeartbeatRequest {
@@ -349,7 +348,7 @@ fn parse_snapshot_request(
 ) -> Result<SnapshotRequest, ActiveSessionError> {
     let view = message.view()?;
     let mut network_id = None;
-    let mut last_revision = None;
+    let mut has_last_revision = false;
     for field in view.fields() {
         match field.field_type() {
             Some(ControlFieldType::NetworkId) => {
@@ -359,20 +358,21 @@ fn parse_snapshot_request(
                 )?));
             }
             Some(ControlFieldType::SnapshotRevision) => {
-                last_revision = Some(u64::from_be_bytes(fixed_array(
-                    field.value(),
-                    "snapshot revision",
-                )?));
+                let _last_revision =
+                    u64::from_be_bytes(fixed_array(field.value(), "snapshot revision")?);
+                has_last_revision = true;
             }
             _ => {}
         }
     }
+    if !has_last_revision {
+        return Err(ActiveSessionError::ValidatedFieldMissing {
+            field: ControlFieldType::SnapshotRevision,
+        });
+    }
     Ok(SnapshotRequest {
         network_id: network_id.ok_or(ActiveSessionError::ValidatedFieldMissing {
             field: ControlFieldType::NetworkId,
-        })?,
-        _last_revision: last_revision.ok_or(ActiveSessionError::ValidatedFieldMissing {
-            field: ControlFieldType::SnapshotRevision,
         })?,
     })
 }

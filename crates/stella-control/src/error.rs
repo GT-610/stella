@@ -53,25 +53,4 @@ pub enum ControlError {
         /// Received ID.
         actual: u64,
     },
-    /// A request ID was already outstanding.
-    #[error("control request ID {message_id} is already outstanding")]
-    DuplicateCorrelation {
-        /// Duplicate request message ID.
-        message_id: u64,
-    },
-    /// The bounded set of outstanding requests is full.
-    #[error("control request correlation limit {maximum} reached")]
-    CorrelationLimit {
-        /// Configured maximum number of outstanding requests.
-        maximum: usize,
-    },
-    /// A response referred to no outstanding request.
-    #[error("control response has unknown correlation ID {correlation_id}")]
-    UnknownCorrelation {
-        /// Unknown response correlation ID.
-        correlation_id: u64,
-    },
-    /// A zero message ID was supplied where a request ID is required.
-    #[error("control request message ID must be non-zero")]
-    ZeroCorrelation,
 }

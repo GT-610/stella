@@ -76,17 +76,6 @@ pub fn load_node_identity(path: &Path) -> Result<IdentitySigningKey, NodeIdentit
     IdentitySigningKey::from_pkcs8_der(&document).map_err(NodeIdentityFileError::from)
 }
 
-/// Verifies the exact native security policy of a node identity file.
-///
-/// # Errors
-///
-/// Returns [`NodeIdentityFileError`] when the path is not a regular
-/// non-reparse file or its native access policy is not exact.
-pub fn verify_node_identity_permissions(path: &Path) -> Result<(), NodeIdentityFileError> {
-    let _file = platform::open_verified_file(path)?;
-    Ok(())
-}
-
 fn write_identity(
     file: &mut File,
     path: &Path,
@@ -514,10 +503,7 @@ mod tests {
 
     use stella_crypto::MAX_IDENTITY_PKCS8_LENGTH;
 
-    use super::{
-        create_node_identity, load_node_identity, verify_node_identity_permissions,
-        NodeIdentityFileError,
-    };
+    use super::{create_node_identity, load_node_identity, NodeIdentityFileError};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -536,7 +522,6 @@ mod tests {
         std::fs::create_dir(&directory).expect("create test directory");
         let path = directory.join("node.pk8");
         let created = create_node_identity(&path).expect("create node identity");
-        verify_node_identity_permissions(&path).expect("verify exact DACL");
         let loaded = load_node_identity(&path).expect("load node identity");
         assert_eq!(loaded.public_key(), created.public_key());
         assert!(matches!(

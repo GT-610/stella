@@ -17,4 +17,4 @@ pub use proof::{
     CONTROL_NONCE_LENGTH, NODE_PROOF_DOMAIN,
 };
 pub use record::{RecordReader, RecordWriter};
-pub use sequence::{CorrelationTracker, InboundSequence, OutboundSequence, MAX_CORRELATIONS};
+pub use sequence::{InboundSequence, OutboundSequence};

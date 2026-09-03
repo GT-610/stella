@@ -261,15 +261,15 @@ impl L2Switch {
         self.contested.retain(|_, deadline| *deadline > now);
     }
 
-    /// Returns the peer currently selected for one remote MAC, if any.
+    #[cfg(test)]
     #[must_use]
-    pub fn remote_peer(&self, mac: MacAddress) -> Option<NodeId> {
+    fn remote_peer(&self, mac: MacAddress) -> Option<NodeId> {
         self.remote.get(&mac).map(|entry| entry.peer)
     }
 
-    /// Returns whether one MAC is currently under remote-claim quarantine.
+    #[cfg(test)]
     #[must_use]
-    pub fn is_contested(&self, mac: MacAddress) -> bool {
+    fn is_contested(&self, mac: MacAddress) -> bool {
         self.contested.contains_key(&mac)
     }
 

@@ -1024,7 +1024,7 @@ struct InitialDocument<'a> {
     controller: InitialController<'a>,
     identity: InitialIdentity<'a>,
     transport: InitialTransport,
-    networks: Vec<InitialNetwork>,
+    networks: Vec<toml::Value>,
     logging: InitialLogging<'a>,
 }
 
@@ -1047,20 +1047,7 @@ struct InitialTransport {
     udp_bind: SocketAddr,
     #[serde(skip_serializing_if = "Option::is_none")]
     https_proxy: Option<SocketAddr>,
-    advertised_endpoints: Vec<InitialEndpoint>,
-}
-
-#[derive(Serialize)]
-struct InitialEndpoint {
-    address: SocketAddr,
-    priority: u8,
-    max_datagram_size: u32,
-}
-
-#[derive(Serialize)]
-struct InitialNetwork {
-    id: String,
-    tap_adapter: String,
+    advertised_endpoints: Vec<toml::Value>,
 }
 
 #[derive(Serialize)]

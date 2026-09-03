@@ -1,11 +1,6 @@
-//! Per-connection message sequence and request correlation state.
-
-use std::collections::BTreeSet;
+//! Per-connection message sequence state.
 
 use crate::{ControlError, MessageBuilder, OwnedControlMessage};
-
-/// Protocol maximum outstanding correlated requests per connection.
-pub const MAX_CORRELATIONS: usize = 256;
 
 /// Monotonic sender-local message-ID allocator.
 #[derive(Debug)]
@@ -77,79 +72,11 @@ impl Default for InboundSequence {
     }
 }
 
-/// Bounded outstanding request IDs awaiting direct responses.
-#[derive(Debug)]
-pub struct CorrelationTracker {
-    outstanding: BTreeSet<u64>,
-}
-
-impl CorrelationTracker {
-    /// Creates an empty tracker with the protocol limit of 256 requests.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            outstanding: BTreeSet::new(),
-        }
-    }
-
-    /// Registers a non-zero sent request message ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControlError`] for zero, a duplicate ID, or a full tracker.
-    pub fn register(&mut self, message_id: u64) -> Result<(), ControlError> {
-        if message_id == 0 {
-            return Err(ControlError::ZeroCorrelation);
-        }
-        if self.outstanding.contains(&message_id) {
-            return Err(ControlError::DuplicateCorrelation { message_id });
-        }
-        if self.outstanding.len() >= MAX_CORRELATIONS {
-            return Err(ControlError::CorrelationLimit {
-                maximum: MAX_CORRELATIONS,
-            });
-        }
-        self.outstanding.insert(message_id);
-        Ok(())
-    }
-
-    /// Completes and removes exactly one known response correlation ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControlError::UnknownCorrelation`] for zero, unknown,
-    /// duplicate, or already completed responses.
-    pub fn complete(&mut self, correlation_id: u64) -> Result<(), ControlError> {
-        if !self.outstanding.remove(&correlation_id) {
-            return Err(ControlError::UnknownCorrelation { correlation_id });
-        }
-        Ok(())
-    }
-
-    /// Returns the number of outstanding requests.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.outstanding.len()
-    }
-
-    /// Returns whether no request is awaiting a response.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.outstanding.is_empty()
-    }
-}
-
-impl Default for CorrelationTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use stella_proto::{ControlFieldType, ControlMessageType};
 
-    use super::{CorrelationTracker, InboundSequence, OutboundSequence, MAX_CORRELATIONS};
+    use super::{InboundSequence, OutboundSequence};
     use crate::{ControlError, MessageBuilder};
 
     fn join_builder() -> MessageBuilder {
@@ -195,41 +122,6 @@ mod tests {
         assert!(matches!(
             sequence.build(join_builder()),
             Err(ControlError::MessageIdExhausted)
-        ));
-    }
-
-    #[test]
-    fn correlations_are_bounded_and_complete_once() {
-        let mut tracker = CorrelationTracker::new();
-        for message_id in 1..=u64::try_from(MAX_CORRELATIONS).expect("limit fits u64") {
-            tracker.register(message_id).expect("within limit");
-        }
-        assert_eq!(tracker.len(), MAX_CORRELATIONS);
-        assert!(matches!(
-            tracker.register(257),
-            Err(ControlError::CorrelationLimit {
-                maximum: MAX_CORRELATIONS
-            })
-        ));
-        tracker.complete(1).expect("known request");
-        assert!(matches!(
-            tracker.complete(1),
-            Err(ControlError::UnknownCorrelation { correlation_id: 1 })
-        ));
-        tracker.register(257).expect("capacity was released");
-    }
-
-    #[test]
-    fn zero_and_duplicate_requests_are_rejected() {
-        let mut tracker = CorrelationTracker::new();
-        assert!(matches!(
-            tracker.register(0),
-            Err(ControlError::ZeroCorrelation)
-        ));
-        tracker.register(7).expect("first request");
-        assert!(matches!(
-            tracker.register(7),
-            Err(ControlError::DuplicateCorrelation { message_id: 7 })
         ));
     }
 }

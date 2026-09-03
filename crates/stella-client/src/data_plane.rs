@@ -393,9 +393,9 @@ impl PeerDataSession {
         })
     }
 
-    /// Returns the highest authenticated receive sequence, if any.
+    #[cfg(test)]
     #[must_use]
-    pub const fn highest_received_sequence(&self) -> Option<u64> {
+    const fn highest_received_sequence(&self) -> Option<u64> {
         self.replay.highest()
     }
 
@@ -408,9 +408,9 @@ impl PeerDataSession {
         }
     }
 
-    /// Returns the number of currently incomplete frames.
+    #[cfg(test)]
     #[must_use]
-    pub fn incomplete_frame_count(&self) -> usize {
+    fn incomplete_frame_count(&self) -> usize {
         self.incomplete.len()
     }
 
