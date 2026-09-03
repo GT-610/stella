@@ -14,8 +14,8 @@ use std::{
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use stella_client::{
-    authenticate_controller, ActiveControl, BearerCredential, ClientError, ControllerTrust,
-    Enrollment, SpkiPin,
+    authenticate_controller, ActiveControl, BearerCredential, ClientError, ControlUpdate,
+    ControllerTrust, Enrollment, SpkiPin,
 };
 use stella_common::{ControllerId, NetworkId};
 use stella_crypto::{derive_node_id, IdentitySigningKey};
@@ -169,6 +169,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         ClientError::Tls(_)
     ));
 
+    let authentication_started_at = now();
     let first_connection = authenticate_after_listener_ready(
         &trust,
         &node_key,
@@ -178,7 +179,10 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     assert_eq!(first_connection.controller_id(), initialized.controller_id);
     assert_eq!(first_connection.node_id(), node_id);
     assert_eq!(first_connection.protocol_version(), ProtocolVersion::V0_2);
-    assert!(first_connection.server_time() >= issued_at);
+    assert!(
+        (authentication_started_at..=now().saturating_add(1))
+            .contains(&first_connection.server_time())
+    );
     let mut first = ActiveControl::new(first_connection);
     let first_epoch = first
         .join_network(network_id, Some(&join_credential))
@@ -210,7 +214,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .await
         .expect("publish endpoint and reconcile snapshot")
         .snapshot_revision();
-    assert!(endpoint_revision >= initial_revision);
+    assert!(endpoint_revision > initial_revision);
     let candidates = [IceCandidate {
         class: IceCandidateClass::Host,
         carrier: ConnectivityCarrier::DirectUdp,
@@ -293,7 +297,9 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
 
     let heartbeat = first.heartbeat().await.expect("heartbeat is acknowledged");
     assert_eq!(heartbeat.counter(), 1);
-    assert!(heartbeat.server_time() >= issued_at);
+    assert!(
+        (authentication_started_at..=now().saturating_add(1)).contains(&heartbeat.server_time())
+    );
     assert_eq!(heartbeat.updated_networks(), &[network_id]);
     assert_eq!(
         first
@@ -371,7 +377,20 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     ));
     drop(third);
 
+    let shutdown_connection = authenticate_controller(&trust, &node_key, None)
+        .await
+        .expect("known node authenticates before controller shutdown");
+    let mut shutdown_control = ActiveControl::new(shutdown_connection);
     shutdown_sender.send(()).expect("request server shutdown");
+    let ControlUpdate::ServerShutdown { deadline } = shutdown_control
+        .receive_update()
+        .await
+        .expect("receive controller shutdown notice")
+    else {
+        panic!("controller shutdown must produce a shutdown update");
+    };
+    assert!((now()..=now().saturating_add(60)).contains(&deadline));
+    drop(shutdown_control);
     server
         .await
         .expect("join server task")

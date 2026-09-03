@@ -33,8 +33,6 @@ fn installed_adapter_supports_lifecycle_frame_write_and_cancellation() {
     };
     let mut device =
         WindowsTapDevice::create(&config).expect("open configured TAP-Windows adapter");
-    assert!(device.driver_version().major >= 9);
-    assert!(device.driver_mtu() >= u32::from(mtu));
     let mac = device.mac_address().expect("query cached TAP MAC");
     assert_ne!(mac, [0_u8; 6]);
     assert_eq!(mac[0] & 1, 0);

@@ -150,24 +150,6 @@ impl WindowsTapDevice {
             .collect())
     }
 
-    /// Returns metadata for the selected Windows adapter.
-    #[must_use]
-    pub const fn adapter(&self) -> &WindowsTapAdapter {
-        &self.adapter
-    }
-
-    /// Returns the validated TAP-Windows driver version.
-    #[must_use]
-    pub const fn driver_version(&self) -> WindowsTapDriverVersion {
-        self.driver_version
-    }
-
-    /// Returns the miniport MTU ceiling reported when the adapter was opened.
-    #[must_use]
-    pub const fn driver_mtu(&self) -> u32 {
-        self.driver_mtu
-    }
-
     fn disconnect(&mut self) -> Result<()> {
         if !self.media_connected {
             return Ok(());

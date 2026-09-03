@@ -193,20 +193,6 @@ pub struct ClientDataRuntime {
 }
 
 impl ClientDataRuntime {
-    /// Binds UDP, opens one exact TAP adapter per active network, and starts handshakes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RuntimeError`] for invalid local configuration, UDP bind,
-    /// TAP setup, network construction, or initial handshake transmission failure.
-    pub async fn start(
-        config: &ClientConfig,
-        states: &BTreeMap<NetworkId, NetworkState>,
-        signing_key: &IdentitySigningKey,
-    ) -> Result<Self, RuntimeError> {
-        Self::start_with_connectivity(config, states, signing_key, None).await
-    }
-
     /// Binds UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
     ///
     /// # Errors

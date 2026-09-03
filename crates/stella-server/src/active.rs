@@ -92,6 +92,11 @@ pub async fn serve_authenticated_session(
         connectivity_refresh,
     };
 
+    if *shutdown.borrow() {
+        send_shutdown(&mut state).await?;
+        return Ok(());
+    }
+
     loop {
         let refresh_deadline = next_refresh_deadline(&state);
         let wake = {
@@ -1257,6 +1262,7 @@ async fn send_shutdown(state: &mut ActiveSessionState) -> Result<(), ActiveSessi
         .checked_add(state.context.limits().shutdown_timeout_seconds)
         .ok_or(ActiveSessionError::TimeOverflow)?;
     let mut builder = MessageBuilder::new(ControlMessageType::ServerShutdown);
+    builder.push_field(ControlFieldType::StatusMessage, b"controller shutdown")?;
     builder.push_field(ControlFieldType::ShutdownDeadline, &deadline.to_be_bytes())?;
     write_message(state, builder).await?;
     shutdown_writer(&mut state.stream).await

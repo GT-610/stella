@@ -137,6 +137,52 @@ fn status_code(message: &stella_control::OwnedControlMessage) -> u16 {
     )
 }
 
+fn u64_field(message: &stella_control::OwnedControlMessage, field: ControlFieldType) -> u64 {
+    u64::from_be_bytes(
+        field_value(message, field)
+            .try_into()
+            .expect("u64 field width"),
+    )
+}
+
+fn assert_snapshot(
+    snapshot: &stella_control::OwnedControlMessage,
+    network_id: NetworkId,
+    controller_epoch: u64,
+    snapshot_revision: u64,
+    membership_grant: &[u8],
+    policy: &[u8],
+    peer_count: usize,
+) {
+    assert_eq!(
+        NetworkId::from_bytes(
+            field_value(snapshot, ControlFieldType::NetworkId)
+                .try_into()
+                .expect("snapshot network ID width"),
+        ),
+        network_id
+    );
+    assert_eq!(
+        u64_field(snapshot, ControlFieldType::ControllerEpoch),
+        controller_epoch
+    );
+    assert_eq!(
+        u64_field(snapshot, ControlFieldType::SnapshotRevision),
+        snapshot_revision
+    );
+    assert_eq!(
+        field_value(snapshot, ControlFieldType::MembershipGrant),
+        membership_grant
+    );
+    assert_eq!(field_value(snapshot, ControlFieldType::NetworkPolicy), policy);
+    assert_eq!(
+        PeerListView::decode(field_value(snapshot, ControlFieldType::PeerList))
+            .expect("decode snapshot peer list")
+            .len(),
+        peer_count
+    );
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -462,6 +508,10 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         .expect("decode join grant");
     NetworkPolicy::decode(field_value(&join_result, ControlFieldType::NetworkPolicy))
         .expect("decode join policy");
+    let join_epoch = u64_field(&join_result, ControlFieldType::ControllerEpoch);
+    let join_revision = u64_field(&join_result, ControlFieldType::SnapshotRevision);
+    let join_grant = field_value(&join_result, ControlFieldType::MembershipGrant).to_vec();
+    let join_policy = field_value(&join_result, ControlFieldType::NetworkPolicy).to_vec();
     let first_snapshot = client.read(ControlMessageType::PeerSnapshot).await;
     assert_eq!(
         first_snapshot
@@ -470,10 +520,14 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
             .correlation_id,
         0
     );
-    assert!(
-        PeerListView::decode(field_value(&first_snapshot, ControlFieldType::PeerList,))
-            .expect("decode peer list")
-            .is_empty()
+    assert_snapshot(
+        &first_snapshot,
+        network_id,
+        join_epoch,
+        join_revision,
+        &join_grant,
+        &join_policy,
+        0,
     );
 
     let repeated_join_id = client.send(join_request(network_id, &join_token)).await;
@@ -486,7 +540,39 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         repeated_join_id
     );
     assert_eq!(status_code(&repeated_join), 0);
-    let _repeated_snapshot = client.read(ControlMessageType::PeerSnapshot).await;
+    assert_eq!(
+        u64_field(&repeated_join, ControlFieldType::ControllerEpoch),
+        join_epoch
+    );
+    assert_eq!(
+        u64_field(&repeated_join, ControlFieldType::SnapshotRevision),
+        join_revision
+    );
+    assert_eq!(
+        field_value(&repeated_join, ControlFieldType::MembershipGrant),
+        join_grant
+    );
+    assert_eq!(
+        field_value(&repeated_join, ControlFieldType::NetworkPolicy),
+        join_policy
+    );
+    let repeated_snapshot = client.read(ControlMessageType::PeerSnapshot).await;
+    assert_eq!(
+        repeated_snapshot
+            .header()
+            .expect("repeated snapshot header")
+            .correlation_id,
+        0
+    );
+    assert_snapshot(
+        &repeated_snapshot,
+        network_id,
+        join_epoch,
+        join_revision,
+        &join_grant,
+        &join_policy,
+        0,
+    );
 
     let endpoint = Endpoint::UdpIpv4 {
         priority: 10,
@@ -504,11 +590,10 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         endpoint_id
     );
     assert_eq!(status_code(&endpoint_result), 0);
-    let endpoint_revision = u64::from_be_bytes(
-        field_value(&endpoint_result, ControlFieldType::SnapshotRevision)
-            .try_into()
-            .expect("endpoint revision width"),
-    );
+    let endpoint_epoch = u64_field(&endpoint_result, ControlFieldType::ControllerEpoch);
+    assert_eq!(endpoint_epoch, join_epoch);
+    let endpoint_revision = u64_field(&endpoint_result, ControlFieldType::SnapshotRevision);
+    assert!(endpoint_revision > join_revision);
 
     let snapshot_id = client
         .send(snapshot_request(network_id, endpoint_revision))
@@ -521,22 +606,19 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
             .correlation_id,
         snapshot_id
     );
-    assert_eq!(
-        u64::from_be_bytes(
-            field_value(&requested_snapshot, ControlFieldType::SnapshotRevision)
-                .try_into()
-                .expect("requested snapshot revision width")
-        ),
-        endpoint_revision
+    assert_snapshot(
+        &requested_snapshot,
+        network_id,
+        endpoint_epoch,
+        endpoint_revision,
+        &join_grant,
+        &join_policy,
+        0,
     );
 
     let stale_revision = NetworkRevision {
         network_id,
-        controller_epoch: u64::from_be_bytes(
-            field_value(&requested_snapshot, ControlFieldType::ControllerEpoch)
-                .try_into()
-                .expect("requested snapshot epoch width"),
-        ),
+        controller_epoch: endpoint_epoch,
         snapshot_revision: endpoint_revision.saturating_sub(1).max(1),
     };
     let heartbeat_id = client.send(heartbeat(1, &[stale_revision])).await;
@@ -573,6 +655,15 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
             .expect("reconciled snapshot header")
             .correlation_id,
         0
+    );
+    assert_snapshot(
+        &reconciled_snapshot,
+        network_id,
+        endpoint_epoch,
+        endpoint_revision,
+        &join_grant,
+        &join_policy,
+        0,
     );
 
     let current_heartbeat_id = client.send(heartbeat(2, &[authoritative_revision])).await;
