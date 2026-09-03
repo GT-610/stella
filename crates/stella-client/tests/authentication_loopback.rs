@@ -169,6 +169,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         ClientError::Tls(_)
     ));
 
+    let authentication_started_at = now();
     let first_connection = authenticate_after_listener_ready(
         &trust,
         &node_key,
@@ -178,7 +179,10 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     assert_eq!(first_connection.controller_id(), initialized.controller_id);
     assert_eq!(first_connection.node_id(), node_id);
     assert_eq!(first_connection.protocol_version(), ProtocolVersion::V0_2);
-    assert!(first_connection.server_time() >= issued_at);
+    assert!(
+        (authentication_started_at..=now().saturating_add(1))
+            .contains(&first_connection.server_time())
+    );
     let mut first = ActiveControl::new(first_connection);
     let first_epoch = first
         .join_network(network_id, Some(&join_credential))
@@ -210,7 +214,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .await
         .expect("publish endpoint and reconcile snapshot")
         .snapshot_revision();
-    assert!(endpoint_revision >= initial_revision);
+    assert!(endpoint_revision > initial_revision);
     let candidates = [IceCandidate {
         class: IceCandidateClass::Host,
         carrier: ConnectivityCarrier::DirectUdp,
@@ -293,7 +297,9 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
 
     let heartbeat = first.heartbeat().await.expect("heartbeat is acknowledged");
     assert_eq!(heartbeat.counter(), 1);
-    assert!(heartbeat.server_time() >= issued_at);
+    assert!(
+        (authentication_started_at..=now().saturating_add(1)).contains(&heartbeat.server_time())
+    );
     assert_eq!(heartbeat.updated_networks(), &[network_id]);
     assert_eq!(
         first
