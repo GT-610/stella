@@ -66,9 +66,13 @@ fn installed_adapter_supports_lifecycle_frame_write_and_cancellation() {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(!remaining.is_zero(), "TAP read did not become cancellable");
-        ready_rx
-            .recv_timeout(remaining)
-            .expect("worker announced a read attempt");
+        match ready_rx.recv_timeout(remaining) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("worker did not announce a cancellable read before the deadline")
+            }
+        }
         thread::sleep(Duration::from_millis(50));
         cancellation
             .cancel_pending_io()
