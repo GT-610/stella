@@ -305,14 +305,14 @@ async fn accept_with_permit(
     listener: &TcpListener,
     semaphore: Arc<Semaphore>,
 ) -> Result<(TcpStream, SocketAddr, OwnedSemaphorePermit), RuntimeError> {
-    let permit = semaphore
-        .acquire_owned()
-        .await
-        .map_err(|_| RuntimeError::ConnectionSemaphoreClosed)?;
     let (stream, peer_addr) = listener
         .accept()
         .await
         .map_err(|source| RuntimeError::Accept { source })?;
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| RuntimeError::ConnectionSemaphoreClosed)?;
     Ok((stream, peer_addr, permit))
 }
 
