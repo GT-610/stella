@@ -2,7 +2,7 @@
 
 - Status: Draft
 - Protocol version: 0.1
-- Last updated: 2026-08-29
+- Last updated: 2026-09-04
 
 ## 1. Purpose
 
@@ -23,9 +23,11 @@ Version 0.1 is the first design draft. This document establishes architecture,
 terminology, trust boundaries, and invariants. Byte-level formats and state
 machines are defined by the remaining specification documents.
 
-The first implementation targets Windows with TAP-Windows. Linux and macOS
-remain protocol requirements, but their device backends are implemented after
-the Windows path is proven end to end.
+The reference implementation supports Windows with TAP-Windows and macOS with
+persistent feth pairs. The macOS packet side uses BPF receive and AF_NDRV
+transmit so the same complete-frame requirements apply on both platforms.
+Linux remains a protocol requirement but does not yet have a reference device
+backend.
 
 Version 0.1 does not provide Internet reachability, NAT traversal, or an IP
 routing service. The 0.2 connectivity extension adds controller-signaled

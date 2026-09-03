@@ -1,4 +1,4 @@
-# Windows client control plane
+# Client control plane
 
 `stella-client` owns controller trust, the persistent node identity, desired
 network membership, live authorization state, reconnect behavior, and the
@@ -15,19 +15,21 @@ accepted inline in the file. Persistent configuration includes:
 - the expected Stella controller ID and one or more `sha256/` SPKI pins;
 - the protected node PKCS#8 identity path and display name;
 - the UDP bind address, optional explicit HTTPS proxy, and advertised endpoints;
-- one TAP-Windows adapter selection and desired network ID per network entry.
+- one platform TAP selection and desired network ID per network entry; macOS
+  selections include both host-visible and packet-I/O feth names.
 
 An explicit initialization command creates the node identity with create-new
 semantics. On Windows its DACL is protected from inheritance and grants access
-only to the owning account and LocalSystem. Initialization never replaces an
-existing identity or configuration.
+only to the owning account and LocalSystem. On macOS it must be a regular,
+single-link, non-symlink file with mode `0600`. Initialization never replaces
+an existing identity or configuration.
 
 Enrollment and join tokens are ephemeral command inputs. The CLI decodes them
 into redacted zeroizing values, never logs them, and never stores them in TOML.
 After a successful join, the network ID is durable intent; reconnect joins that
 existing membership without a token.
 
-The version 1 Windows configuration schema is:
+The version 1 configuration schema is:
 
 ```toml
 version = 1
@@ -59,10 +61,20 @@ tap_adapter = "Stella LAN"
 filter = "info,stella_client=info"
 ```
 
+On macOS the same network entry uses two explicit numeric feth names:
+
+```toml
+[[networks]]
+id = "fedcba9876543210fedcba9876543210"
+tap_adapter = "feth100"
+tap_peer = "feth101"
+```
+
 Relative paths are rooted beside the configuration file. Endpoint and network
 entries are normalized into protocol order, duplicate network IDs are rejected,
 and unknown keys, including any attempted inline enrollment or join token, make
-the complete file invalid. The `networks` array may be absent immediately after
+the complete file invalid. macOS additionally rejects missing, equal, or
+non-`feth<N>` TAP names. The `networks` array may be absent immediately after
 `init`; each successful `join` adds one durable entry. The proxy field is
 optional, numeric, and local to controller TLS bootstrap and secure WebSocket
 relay fallback. It contains no credentials and is never distributed by the
@@ -151,11 +163,16 @@ acknowledgement must echo its counter and carries authoritative revisions used
 for reconciliation. Three missed acknowledgements reconnect the control
 session.
 
-Any connection or protocol failure closes forwarding immediately, clears live
-network and peer-session state, and reconnects with full-jitter exponential
-backoff from 250 milliseconds through 30 seconds. A new connection rebuilds
-all authority state; grants and snapshots are never loaded from disk. A clean
-`SERVER_SHUTDOWN` uses its advertised deadline as the earliest reconnect time.
+An unexpected connection failure keeps an already-active data runtime only
+while its last completely validated in-memory grants, epoch, policy, peer
+sessions, and time bounds remain valid. Disconnected operation cannot discover
+new peers or extend grants, epochs, connectivity credentials, or session
+lifetimes. The client reconnects with full-jitter exponential backoff from 250
+milliseconds through 30 seconds and reconciles retained state against fresh
+complete controller views. A failure inside the TAP, UDP, or worker runtime
+still closes that runtime; a later valid activation replaces it. Grants and
+snapshots are never loaded from disk. A clean `SERVER_SHUTDOWN` uses its
+advertised deadline as the earliest reconnect time.
 
 On local shutdown the data plane stops accepting TAP frames, the client
 withdraws its endpoint sets when time permits, closes TLS, cancels TAP I/O, and

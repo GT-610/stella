@@ -1,28 +1,30 @@
-# Windows client data plane
+# Client data plane
 
-The Windows data runtime connects validated controller state to TAP-Windows and
-direct authenticated UDP peer paths. Normative packet bytes and timers remain
-in the protocol specification; this page describes reference implementation
-ownership and failure behavior.
+The native Windows and macOS data runtime connects validated controller state
+to a complete-frame TAP backend and direct authenticated UDP peer paths.
+Normative packet bytes and timers remain in the protocol specification; this
+page describes reference implementation ownership and failure behavior.
 
 ## Runtime ownership
 
 One active control session owns one `ClientDataRuntime`. The runtime binds the
 configured UDP address once and creates one `NetworkDataPlane` and one exact
-TAP adapter worker for every active network snapshot. A network is not created
-unless its durable configuration names a matching TAP adapter.
+TAP worker for every active network snapshot. A network is not created unless
+its durable configuration names a matching Windows adapter or complete macOS
+feth pair.
 
-The Windows owner binds UDP and opens every TAP adapter before it publishes its
+The owner binds UDP and opens every TAP endpoint before it publishes its
 receive-ready endpoint set. The publication response is reconciled before the
 I/O loop becomes active. A peer that has joined but has not published a usable
 endpoint is skipped until a later control update; it cannot prevent this node
-from becoming reachable.
+from becoming reachable. ICE candidate enumeration excludes the configured TAP
+interface and, on macOS, its packet-I/O peer.
 
-The runtime never raises an installed adapter's current IP MTU merely to reach
-the network frame ceiling. It keeps a lower existing MTU, which remains safe
-because the signed policy is a maximum rather than a required local size. It
-still lowers an oversized adapter to the policy limit and fails closed if
-Windows denies that required restriction.
+The runtime never raises an existing IP MTU merely to reach the network frame
+ceiling. It keeps a lower value, which remains safe because the signed policy
+is a maximum rather than a required local size. Windows updates both IP-family
+rows under the TAP-Windows driver ceiling. macOS reads the visible feth MTU on
+open and uses `tun-rs` to apply explicit changes to both sides of the pair.
 
 The top-level loop concurrently handles controller updates, heartbeat
 deadlines, 100-millisecond data maintenance, UDP reception, and TAP events.
@@ -32,8 +34,8 @@ learning on epoch, grant, peer, policy, or endpoint changes.
 
 ## TAP worker boundary
 
-TAP-Windows reads and writes are blocking operations and run on a dedicated
-thread per adapter. Two bounded channels cross that boundary:
+Native TAP reads and writes are blocking operations and run on a dedicated
+thread per adapter or pair. Two bounded channels cross that boundary:
 
 - at most 256 TAP events wait for the async runtime;
 - at most 64 authenticated frames wait for one TAP writer.
@@ -41,8 +43,9 @@ thread per adapter. Two bounded channels cross that boundary:
 Incoming TAP frames may be dropped when the event queue is full. A full write
 queue reports a typed congestion error and drops that frame. Neither direction
 creates an unbounded queue. A cancellation handle interrupts a pending read
-when a write or shutdown needs the worker, and shutdown joins the thread after
-the adapter is set media-disconnected and released.
+when a write or shutdown needs the worker. Shutdown joins the thread after
+Windows sets media-disconnected or macOS sets the host-visible feth down and
+releases the pair lock. The persistent macOS pair is not deleted.
 
 ## Peer sessions and forwarding
 
@@ -85,14 +88,18 @@ the controller session continue running while replacement attempts use bounded
 DNS and carrier deadlines plus full-jitter backoff from one to 30 seconds. A
 successful replacement publishes a fresh local connectivity generation.
 
-UDP socket, TAP device, worker, or control failures still end the active owner,
-erase forwarding state, and enter the normal controller reconnect loop.
+A UDP socket, TAP device, or worker failure still closes the data runtime and
+erases its forwarding state. A transient control-plane failure leaves an
+otherwise healthy runtime active within its existing authorization bounds;
+replacement after a data-runtime failure requires a fresh controller
+activation.
 
 ## Verification
 
 Unit tests cover protected fragmentation, replay commitment, keepalive echo and
 timeout, exact endpoint pinning, broadcast and learned unicast, signed session
-rejection, and the 30-second old-session receive window. The Windows end-to-end
-scenario under `tests/two-node-lan/` additionally requires two TAP-Windows
-adapters and verifies ARP, IPv4 broadcast/multicast, and bidirectional IPv4
-traffic through real client processes.
+rejection, and the 30-second old-session receive window. The Windows scenario
+under `tests/two-node-lan/` uses two TAP-Windows adapters. The macOS scenario
+uses two real feth pairs, verifies the same ARP, IPv4 broadcast/multicast,
+bidirectional traffic, and LAN discovery, then restarts the clients to verify
+persistent pair reuse.

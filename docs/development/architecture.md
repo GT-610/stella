@@ -46,9 +46,11 @@ panic. Cryptographic algorithms and I/O are injected by callers.
 ### `stella-tap`
 
 Owns the safe TAP device contract and platform implementations. This is the
-only crate permitted to contain unsafe code. The initial functional backend is
-Windows TAP-Windows; other backends remain explicit unsupported stubs until
-implemented and tested.
+only crate permitted to contain unsafe code. Windows uses a native TAP-Windows
+backend. macOS delegates the low-level unsafe feth/BPF/AF_NDRV implementation
+to pinned `tun-rs` 2.8.8 and wraps it with Stella bounds, locking, cancellation,
+and lifecycle rules. Unsupported platforms do not receive an implicit Layer-3
+substitute.
 
 ### `stella-transport`
 
@@ -101,5 +103,6 @@ expires.
 2. Property tests cover protocol round trips and malformed input.
 3. Platform tests cover TAP lifecycle and actual frame I/O.
 4. Integration tests run controller and clients over loopback transports.
-5. Windows end-to-end tests use TAP adapters and verify ARP, broadcast, and
-   bidirectional IP traffic.
+5. Windows and macOS end-to-end tests use real TAP adapters or feth pairs and
+   verify ARP, broadcast, multicast, LAN discovery, and bidirectional IP
+   traffic.

@@ -20,4 +20,6 @@ features:
     details: 使用由部署方管理的控制器处理身份、成员关系、策略和对等节点发现。
   - title: 直连数据平面
     details: 稳定后的对等流量通过可替换的数据报传输直接发送。
+  - title: 原生二层端点
+    details: Windows 使用 TAP-Windows，macOS 使用持久的系统内置 feth pair。
 ---
