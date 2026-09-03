@@ -357,7 +357,12 @@ mod tests {
         )
         .await
         .expect_err("reject bytes following the response header");
-        assert!(matches!(error, HttpConnectError::Invalid { .. }));
+        assert!(matches!(
+            error,
+            HttpConnectError::Invalid {
+                detail: "bytes follow the CONNECT response header"
+            }
+        ));
         proxy.await.expect("proxy task");
     }
 }
