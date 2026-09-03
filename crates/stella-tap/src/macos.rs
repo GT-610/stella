@@ -78,30 +78,11 @@ pub struct MacosTapDevice {
 
 impl MacosTapDevice {
     fn begin_operation(&self, operation: TapOperation) -> Result<()> {
-        let mut state = lock_operation(&self.state, operation)?;
-        self.state
-            .event
-            .reset()
-            .map_err(|source| TapError::io(TapOperation::CancelIo, source))?;
-        state.pending = true;
-        state.cancelled = false;
-        Ok(())
+        begin_pending_operation(&self.state, operation)
     }
 
     fn finish_operation<T>(&self, operation: TapOperation, result: io::Result<T>) -> Result<T> {
-        let mut state = lock_operation(&self.state, operation)?;
-        state.pending = false;
-        let cancelled = state.cancelled;
-        state.cancelled = false;
-        self.state
-            .event
-            .reset()
-            .map_err(|source| TapError::io(TapOperation::CancelIo, source))?;
-        match result {
-            Ok(value) => Ok(value),
-            Err(_) if cancelled => Err(TapError::Cancelled),
-            Err(source) => Err(TapError::io(operation, source)),
-        }
+        finish_pending_operation(&self.state, operation, result)
     }
 
     fn disable(&mut self) -> Result<()> {
@@ -323,10 +304,48 @@ fn lock_operation(
     })
 }
 
+fn begin_pending_operation(state: &CancellationState, operation: TapOperation) -> Result<()> {
+    let mut pending = lock_operation(state, operation)?;
+    state
+        .event
+        .reset()
+        .map_err(|source| TapError::io(TapOperation::CancelIo, source))?;
+    pending.pending = true;
+    pending.cancelled = false;
+    Ok(())
+}
+
+fn finish_pending_operation<T>(
+    state: &CancellationState,
+    operation: TapOperation,
+    result: io::Result<T>,
+) -> Result<T> {
+    let mut pending = lock_operation(state, operation)?;
+    pending.pending = false;
+    let cancelled = pending.cancelled;
+    pending.cancelled = false;
+    state
+        .event
+        .reset()
+        .map_err(|source| TapError::io(TapOperation::CancelIo, source))?;
+    match result {
+        Ok(value) => Ok(value),
+        Err(_) if cancelled => Err(TapError::Cancelled),
+        Err(source) => Err(TapError::io(operation, source)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{required_feth_name, validate_mac_address};
-    use crate::TapError;
+    use std::{io, sync::Arc};
+
+    use tun_rs::InterruptEvent;
+
+    use super::{
+        begin_pending_operation, finish_pending_operation, required_feth_name,
+        validate_mac_address, CancellationState, MacosTapCancellation, OperationState,
+    };
+    use crate::{TapCancellation, TapError, TapOperation};
 
     #[test]
     fn feth_names_are_explicit_and_numeric() {
@@ -357,5 +376,57 @@ mod tests {
             validate_mac_address([0x01, 1, 2, 3, 4, 5]),
             Err(TapError::InvalidMacAddress)
         ));
+    }
+
+    #[test]
+    fn cancellation_only_affects_the_current_pending_operation() {
+        let state = Arc::new(CancellationState {
+            event: InterruptEvent::new().expect("create interrupt event"),
+            operation: std::sync::Mutex::new(OperationState::default()),
+        });
+        let cancellation = MacosTapCancellation {
+            state: Arc::downgrade(&state),
+        };
+
+        cancellation
+            .cancel_pending_io()
+            .expect("idle cancellation is harmless");
+        begin_pending_operation(&state, TapOperation::ReadFrame).expect("start pending operation");
+        cancellation
+            .cancel_pending_io()
+            .expect("cancel pending operation");
+        cancellation
+            .cancel_pending_io()
+            .expect("repeat pending cancellation");
+        assert!(matches!(
+            finish_pending_operation::<usize>(
+                &state,
+                TapOperation::ReadFrame,
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+            ),
+            Err(TapError::Cancelled)
+        ));
+
+        begin_pending_operation(&state, TapOperation::ReadFrame)
+            .expect("start operation after reset");
+        assert!(matches!(
+            finish_pending_operation(&state, TapOperation::ReadFrame, Ok(60)),
+            Ok(60)
+        ));
+
+        begin_pending_operation(&state, TapOperation::WriteFrame)
+            .expect("start successful cancellation race");
+        cancellation
+            .cancel_pending_io()
+            .expect("race cancellation with completion");
+        assert!(matches!(
+            finish_pending_operation(&state, TapOperation::WriteFrame, Ok(60)),
+            Ok(60)
+        ));
+
+        drop(state);
+        cancellation
+            .cancel_pending_io()
+            .expect("closed-device cancellation is harmless");
     }
 }
