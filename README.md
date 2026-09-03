@@ -11,7 +11,9 @@ implementation. Its initial scope includes:
 The project is in pre-standard development and is not usable for production
 networking yet. The Windows core libraries, self-hosted controller, client
 control plane, and authenticated TAP-to-UDP Layer-2 data path are implemented;
-end-to-end Windows interoperability validation remains in progress.
+end-to-end Windows interoperability validation has passed on one host with two
+real TAP-Windows adapters, covering ARP, bidirectional IPv4 unicast, IPv4
+broadcast and multicast, and LAN discovery.
 
 ## Workspace checks
 

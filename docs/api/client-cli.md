@@ -132,12 +132,16 @@ order without stored tokens, and publishes the complete configured endpoint
 set. It then owns the active controller state, applying snapshots, peer deltas,
 grant refreshes, and heartbeat reconciliation.
 
-Controller failures withdraw all in-memory forwarding authorization before a
-full-jitter reconnect delay. Backoff starts at 250 ms and caps at 30 seconds.
-A heartbeat is treated as lost only after three policy heartbeat periods elapse
-without its acknowledgement. Ctrl+C cancels the session and drops all active
-state before the process exits. On Windows, the active owner binds the
-configured UDP socket, opens each exact TAP adapter, completes peer handshakes,
-and forwards authenticated Layer-2 frames. Invalid peer datagrams are dropped
-without reconnecting the controller; TAP, UDP, or worker failures end the
-active session and use the normal fail-closed reconnect path.
+Unexpected controller failures retain the Windows data runtime while the
+client waits for a full-jitter reconnect delay, reauthenticates, and rejoins
+its configured networks. Retained forwarding uses only the last completely
+validated in-memory view: it cannot add peers or extend grants, connectivity
+credentials, network epochs, or peer-session lifetimes. Backoff starts at 250
+ms and caps at 30 seconds. A heartbeat is treated as lost only after three
+policy heartbeat periods elapse without its acknowledgement. Ctrl+C interrupts
+the control loop and waits for TAP, UDP, and Relay cleanup before the process
+exits. On Windows, the active owner binds the configured UDP socket, opens each
+exact TAP adapter, completes peer handshakes, and forwards authenticated
+Layer-2 frames. Invalid peer datagrams are dropped without reconnecting the
+controller; TAP, UDP, or worker failures close the data runtime and use the
+normal fail-closed reconnect path.
