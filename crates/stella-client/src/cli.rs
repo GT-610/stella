@@ -1,6 +1,6 @@
-//! Windows client command-line parsing, initialization, and network intent.
+//! Client command-line parsing, initialization, and network intent.
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::future::Future;
 use std::{
     fs::OpenOptions,
@@ -19,7 +19,7 @@ use stella_client::{
     authenticate_controller, create_node_identity, load_node_identity, ActiveControl,
     BearerCredential, ClientConfig, Enrollment, SpkiPin,
 };
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use stella_client::{ClientDataRuntime, RuntimeError};
 use stella_common::{ControllerId, NetworkId};
 use stella_crypto::derive_node_id;
@@ -30,29 +30,33 @@ const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAXIMUM_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const DATA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
-
 #[cfg(target_os = "windows")]
+const DATA_PLANE_PLATFORM: &str = "Windows";
+#[cfg(target_os = "macos")]
+const DATA_PLANE_PLATFORM: &str = "macOS";
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct ControlSessionFailure {
     error: anyhow::Error,
     minimum_reconnect_delay: Option<Duration>,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 enum ActiveRuntimeFailure {
     Control(ControlSessionFailure),
     Data(anyhow::Error),
     Shutdown(Result<()>),
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 enum DataDriveOutcome<T> {
     Operation(T),
     Shutdown(Result<()>),
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl ActiveRuntimeFailure {
     fn control(error: anyhow::Error) -> Self {
         Self::Control(ControlSessionFailure {
@@ -144,9 +148,13 @@ struct JoinArgs {
     /// Single-use node enrollment token for a node unknown to the controller.
     #[arg(long)]
     enrollment_token: Option<CliCredential>,
-    /// Exact TAP-Windows adapter display name for this network.
+    /// Exact TAP adapter or host-visible interface name for this network.
     #[arg(long)]
     tap_adapter: String,
+    /// Exact macOS packet-I/O peer feth interface for this network.
+    #[cfg_attr(target_os = "macos", arg(long, required = true))]
+    #[cfg_attr(not(target_os = "macos"), arg(skip))]
+    tap_peer: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -214,11 +222,11 @@ async fn run_client(config_path: &Path) -> Result<()> {
         .try_init()
         .context("could not initialize client logging")?;
     tracing::info!(config = %config_path.display(), "starting client runtime");
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         supervise_control(&config, &identity, tokio::spawn(tokio::signal::ctrl_c())).await
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         tokio::select! {
             result = supervise_control(&config, &identity) => result,
@@ -231,7 +239,7 @@ async fn run_client(config_path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn supervise_control(
     config: &ClientConfig,
     identity: &stella_crypto::IdentitySigningKey,
@@ -335,7 +343,7 @@ async fn supervise_control(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 async fn supervise_control(
     config: &ClientConfig,
     identity: &stella_crypto::IdentitySigningKey,
@@ -416,7 +424,7 @@ async fn publish_configured_endpoints(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn run_active_control(
     config: &ClientConfig,
     identity: &stella_crypto::IdentitySigningKey,
@@ -432,12 +440,14 @@ async fn run_active_control(
             active.connectivity_config(),
         )
         .await
-        .context("could not start Windows UDP/TAP data plane")
+        .with_context(|| format!("could not start {DATA_PLANE_PLATFORM} UDP/TAP data plane"))
         .map_err(ActiveRuntimeFailure::data)?;
         *data = Some(runtime);
     }
     let data = data.as_mut().ok_or_else(|| {
-        ActiveRuntimeFailure::data(anyhow::anyhow!("Windows data runtime is unavailable"))
+        ActiveRuntimeFailure::data(anyhow::anyhow!(
+            "{DATA_PLANE_PLATFORM} data runtime is unavailable"
+        ))
     })?;
     publish_configured_endpoints(config, &mut active)
         .await
@@ -447,15 +457,22 @@ async fn run_active_control(
         .await
         .context("could not reconcile data plane after reachability publication")
         .map_err(ActiveRuntimeFailure::data)?;
+    #[cfg(target_os = "windows")]
     tracing::info!(
         udp = %data.local_udp_address(),
         networks = active.networks().len(),
         "Windows data plane is active"
     );
+    #[cfg(target_os = "macos")]
+    tracing::info!(
+        udp = %data.local_udp_address(),
+        networks = active.networks().len(),
+        "macOS data plane is active"
+    );
     run_active_io(config, identity, &mut active, data, shutdown).await
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn run_active_io(
     config: &ClientConfig,
     identity: &stella_crypto::IdentitySigningKey,
@@ -559,7 +576,7 @@ async fn run_active_io(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn publish_current_connectivity(
     active: &mut ActiveControl,
     data: &ClientDataRuntime,
@@ -586,7 +603,7 @@ async fn publish_current_connectivity(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn synchronize_and_publish_connectivity(
     active: &mut ActiveControl,
     data: &mut ClientDataRuntime,
@@ -599,7 +616,9 @@ async fn synchronize_and_publish_connectivity(
         if data.connectivity_revision() != control_revision {
             data.replace_connectivity_config(active.connectivity_config(), active.networks())
                 .await
-                .context("could not replace Windows relay configuration")
+                .with_context(|| {
+                    format!("could not replace {DATA_PLANE_PLATFORM} relay configuration")
+                })
                 .map_err(ActiveRuntimeFailure::data)?;
             publish = true;
         }
@@ -624,7 +643,7 @@ async fn synchronize_and_publish_connectivity(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn drive_data_until<F, T>(
     data: &mut ClientDataRuntime,
     identity: &stella_crypto::IdentitySigningKey,
@@ -649,7 +668,7 @@ where
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn handle_data_runtime_result(
     result: std::result::Result<(), RuntimeError>,
 ) -> std::result::Result<(), RuntimeError> {
@@ -671,7 +690,7 @@ fn handle_data_runtime_result(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn shutdown_data_runtime(data: &mut Option<ClientDataRuntime>) {
     let Some(runtime) = data.take() else {
         return;
@@ -681,7 +700,7 @@ async fn shutdown_data_runtime(data: &mut Option<ClientDataRuntime>) {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn finish_client_shutdown(
     data: &mut Option<ClientDataRuntime>,
     signal: Result<()>,
@@ -693,7 +712,7 @@ async fn finish_client_shutdown(
     signal
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn decode_shutdown_result(
     result: std::result::Result<std::io::Result<()>, tokio::task::JoinError>,
 ) -> Result<()> {
@@ -702,7 +721,7 @@ fn decode_shutdown_result(
         .context("could not wait for Ctrl+C")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn reconnect_delay_until(deadline: u64) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -710,19 +729,19 @@ fn reconnect_delay_until(deadline: u64) -> Duration {
     reconnect_delay_from(deadline, now)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const fn reconnect_delay_from(deadline: u64, now: u64) -> Duration {
     Duration::from_secs(deadline.saturating_sub(now))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn next_reconnect_delay(attempt: &mut u32, minimum: Option<Duration>) -> Result<Duration> {
     let jitter = full_jitter(reconnect_cap(*attempt))?;
     *attempt = attempt.saturating_add(1);
     Ok(minimum.map_or(jitter, |delay| delay.max(jitter)))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 async fn run_active_control(
     config: &ClientConfig,
     _identity: &stella_crypto::IdentitySigningKey,
@@ -820,16 +839,24 @@ fn status(config_path: &Path, output: &mut dyn Write) -> Result<()> {
     }
     writeln!(output, "desired_networks={}", config.networks.len())?;
     for network in &config.networks {
-        writeln!(
-            output,
-            "network={}\ttap_adapter={}",
-            network.network_id, network.tap_adapter
-        )?;
+        match &network.tap_peer {
+            Some(peer) => writeln!(
+                output,
+                "network={}\ttap_adapter={}\ttap_peer={peer}",
+                network.network_id, network.tap_adapter
+            )?,
+            None => writeln!(
+                output,
+                "network={}\ttap_adapter={}",
+                network.network_id, network.tap_adapter
+            )?,
+        }
     }
     Ok(())
 }
 
 async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Write) -> Result<()> {
+    validate_join_tap(args)?;
     let config = ClientConfig::load(config_path).context("could not load client configuration")?;
     validate_intent_compatibility(&config, args)?;
     let identity = load_node_identity(&config.identity_path).with_context(|| {
@@ -852,7 +879,12 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
         .context("controller network join failed")?;
     let epoch = state.controller_epoch();
     let revision = state.snapshot_revision();
-    persist_network_intent(config_path, args.network, &args.tap_adapter)?;
+    persist_network_intent(
+        config_path,
+        args.network,
+        &args.tap_adapter,
+        args.tap_peer.as_deref(),
+    )?;
     writeln!(output, "network_id={}", args.network)?;
     writeln!(output, "controller_epoch={epoch}")?;
     writeln!(output, "snapshot_revision={revision}")?;
@@ -865,18 +897,26 @@ fn validate_intent_compatibility(config: &ClientConfig, args: &JoinArgs) -> Resu
         .iter()
         .find(|network| network.network_id == args.network)
     {
-        if existing.tap_adapter != args.tap_adapter {
+        if existing.tap_adapter != args.tap_adapter
+            || existing.tap_peer.as_deref() != args.tap_peer.as_deref()
+        {
             anyhow::bail!(
-                "network {} is already configured for TAP adapter {:?}",
+                "network {} is already configured for TAP selection {:?}/{:?}",
                 args.network,
-                existing.tap_adapter
+                existing.tap_adapter,
+                existing.tap_peer
             );
         }
     }
     Ok(())
 }
 
-fn persist_network_intent(config_path: &Path, network_id: NetworkId, tap: &str) -> Result<()> {
+fn persist_network_intent(
+    config_path: &Path,
+    network_id: NetworkId,
+    tap: &str,
+    tap_peer: Option<&str>,
+) -> Result<()> {
     mutate_network_intents(config_path, "network persistence", |networks| {
         let id = network_id.to_string();
         for entry in networks.iter() {
@@ -884,10 +924,12 @@ fn persist_network_intent(config_path: &Path, network_id: NetworkId, tap: &str) 
                 .as_table()
                 .ok_or_else(|| anyhow::anyhow!("configuration network entry is not a table"))?;
             if table.get("id").and_then(toml::Value::as_str) == Some(id.as_str()) {
-                if table.get("tap_adapter").and_then(toml::Value::as_str) == Some(tap) {
+                if table.get("tap_adapter").and_then(toml::Value::as_str) == Some(tap)
+                    && table.get("tap_peer").and_then(toml::Value::as_str) == tap_peer
+                {
                     return Ok(false);
                 }
-                anyhow::bail!("network {network_id} has a conflicting TAP adapter");
+                anyhow::bail!("network {network_id} has a conflicting TAP selection");
             }
         }
         let mut entry = toml::Table::new();
@@ -896,9 +938,42 @@ fn persist_network_intent(config_path: &Path, network_id: NetworkId, tap: &str) 
             "tap_adapter".to_owned(),
             toml::Value::String(tap.to_owned()),
         );
+        if let Some(peer) = tap_peer {
+            entry.insert("tap_peer".to_owned(), toml::Value::String(peer.to_owned()));
+        }
         networks.push(toml::Value::Table(entry));
         Ok(true)
     })
+}
+
+#[cfg(target_os = "macos")]
+fn validate_join_tap(args: &JoinArgs) -> Result<()> {
+    validate_feth_name(&args.tap_adapter, "--tap-adapter")?;
+    let tap_peer = args
+        .tap_peer
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--tap-peer is required on macOS"))?;
+    validate_feth_name(tap_peer, "--tap-peer")?;
+    if args.tap_adapter == tap_peer {
+        anyhow::bail!("--tap-peer must differ from --tap-adapter");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn validate_join_tap(_args: &JoinArgs) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_feth_name(value: &str, option: &'static str) -> Result<()> {
+    let Some(index) = value.strip_prefix("feth") else {
+        anyhow::bail!("{option} must use the feth<N> interface form");
+    };
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("{option} must use the feth<N> interface form");
+    }
+    Ok(())
 }
 
 fn remove_network_intent(config_path: &Path, network_id: NetworkId) -> Result<()> {
@@ -1184,7 +1259,7 @@ fn write_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use std::{collections::BTreeMap, time::Duration};
     use std::{
         net::{Ipv4Addr, SocketAddr},
@@ -1194,19 +1269,25 @@ mod tests {
     };
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    #[cfg(windows)]
-    use stella_client::ClientDataRuntime;
-    use stella_client::{load_node_identity, ClientConfig, SpkiPin};
+    #[cfg(target_os = "macos")]
+    use clap::Parser;
+    #[cfg(any(windows, target_os = "macos"))]
+    use stella_client::{load_node_identity, ClientDataRuntime};
+    use stella_client::{ClientConfig, SpkiPin};
     use stella_common::{ControllerId, NetworkId};
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
 
     use super::{
-        configuration_document, full_jitter, initialize, persist_network_intent, reconnect_cap,
-        remove_network_intent, status, CliCredential, InitArgs, MAXIMUM_RECONNECT_DELAY,
+        configuration_document, full_jitter, persist_network_intent, reconnect_cap,
+        remove_network_intent, CliCredential, InitArgs, MAXIMUM_RECONNECT_DELAY,
     };
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::{initialize, status};
+    #[cfg(target_os = "macos")]
+    use super::{validate_intent_compatibility, validate_join_tap, Cli, Command, JoinArgs};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1224,14 +1305,29 @@ mod tests {
             tls_name: "localhost".to_owned(),
             controller_id: ControllerId::from_bytes([0x41; 16]),
             spki_pins: vec![SpkiPin::from_digest([0x42; 32])],
-            display_name: "Windows node".to_owned(),
+            display_name: "Stella node".to_owned(),
             udp_bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 45_100)),
             https_proxy: None,
             identity: PathBuf::from("secrets/node.pk8"),
         }
     }
 
-    #[cfg(windows)]
+    fn tap_selection(index: u16) -> (String, Option<String>) {
+        #[cfg(target_os = "macos")]
+        {
+            let visible = index.saturating_mul(2);
+            (
+                format!("feth{visible}"),
+                Some(format!("feth{}", visible.saturating_add(1))),
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (format!("Stella LAN {index}"), None)
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     async fn data_runtime_without_tap() -> (ClientDataRuntime, IdentitySigningKey) {
         let mut args = init_args();
         args.udp_bind = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
@@ -1268,7 +1364,7 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn pending_control_operation_keeps_data_runtime_progressing() {
         let (mut data, identity) = data_runtime_without_tap().await;
@@ -1304,7 +1400,7 @@ mod tests {
         data.shutdown().await.expect("shutdown test data runtime");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn shutdown_signal_interrupts_control_wait_and_closes_data_runtime() {
         let (runtime, identity) = data_runtime_without_tap().await;
@@ -1327,7 +1423,7 @@ mod tests {
         assert!(data.is_none());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn authenticated_shutdown_deadline_is_a_minimum_reconnect_delay() {
         assert_eq!(reconnect_delay_from(105, 100), Duration::from_secs(5));
@@ -1342,22 +1438,44 @@ mod tests {
         let initial = configuration_document(&init_args()).expect("encode configuration");
         std::fs::write(&config_path, initial).expect("write configuration");
         let network_id = NetworkId::from_bytes([0x33; 16]);
+        let (tap, tap_peer) = tap_selection(100);
 
-        persist_network_intent(&config_path, network_id, "Stella LAN")
+        persist_network_intent(&config_path, network_id, &tap, tap_peer.as_deref())
             .expect("persist network intent");
         let first = std::fs::read_to_string(&config_path).expect("read updated configuration");
         let loaded = ClientConfig::load(&config_path).expect("load updated configuration");
         assert_eq!(loaded.networks.len(), 1);
         assert_eq!(loaded.networks[0].network_id, network_id);
-        assert_eq!(loaded.networks[0].tap_adapter, "Stella LAN");
+        assert_eq!(loaded.networks[0].tap_adapter, tap);
+        assert_eq!(loaded.networks[0].tap_peer, tap_peer);
 
-        persist_network_intent(&config_path, network_id, "Stella LAN")
-            .expect("repeat identical persistence");
+        persist_network_intent(
+            &config_path,
+            network_id,
+            &loaded.networks[0].tap_adapter,
+            loaded.networks[0].tap_peer.as_deref(),
+        )
+        .expect("repeat identical persistence");
         assert_eq!(
             std::fs::read_to_string(&config_path).expect("reread configuration"),
             first
         );
-        assert!(persist_network_intent(&config_path, network_id, "Other TAP").is_err());
+        let (other_tap, other_peer) = tap_selection(101);
+        assert!(persist_network_intent(
+            &config_path,
+            network_id,
+            &other_tap,
+            other_peer.as_deref()
+        )
+        .is_err());
+        #[cfg(target_os = "macos")]
+        assert!(persist_network_intent(
+            &config_path,
+            network_id,
+            &loaded.networks[0].tap_adapter,
+            Some("feth999")
+        )
+        .is_err());
         assert_eq!(
             std::fs::read_to_string(&config_path).expect("read after conflict"),
             first
@@ -1374,8 +1492,12 @@ mod tests {
         std::fs::write(&config_path, initial).expect("write configuration");
         let first = NetworkId::from_bytes([0x31; 16]);
         let second = NetworkId::from_bytes([0x32; 16]);
-        persist_network_intent(&config_path, first, "First TAP").expect("persist first network");
-        persist_network_intent(&config_path, second, "Second TAP").expect("persist second network");
+        let (first_tap, first_peer) = tap_selection(110);
+        let (second_tap, second_peer) = tap_selection(111);
+        persist_network_intent(&config_path, first, &first_tap, first_peer.as_deref())
+            .expect("persist first network");
+        persist_network_intent(&config_path, second, &second_tap, second_peer.as_deref())
+            .expect("persist second network");
 
         remove_network_intent(&config_path, first).expect("remove first network");
         let remaining = ClientConfig::load(&config_path).expect("load updated configuration");
@@ -1390,7 +1512,7 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn init_is_create_new_transactional_and_self_consistent() {
         let directory = directory();
@@ -1410,17 +1532,19 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn status_reports_only_local_non_secret_configuration() {
         let directory = directory();
         let config_path = directory.join("client.toml");
         let args = init_args();
         initialize(&config_path, &args, &mut Vec::new()).expect("initialize client");
+        let (tap, tap_peer) = tap_selection(120);
         persist_network_intent(
             &config_path,
             NetworkId::from_bytes([0x55; 16]),
-            "Stella LAN",
+            &tap,
+            tap_peer.as_deref(),
         )
         .expect("persist network");
 
@@ -1429,9 +1553,75 @@ mod tests {
         let text = String::from_utf8(output).expect("UTF-8 status");
         assert!(text.contains("controller_address=127.0.0.1:44900"));
         assert!(text.contains("desired_networks=1"));
-        assert!(text.contains("network=55555555555555555555555555555555\ttap_adapter=Stella LAN"));
+        let expected = match tap_peer {
+            Some(peer) => format!(
+                "network=55555555555555555555555555555555\ttap_adapter={tap}\ttap_peer={peer}"
+            ),
+            None => format!("network=55555555555555555555555555555555\ttap_adapter={tap}"),
+        };
+        assert!(text.contains(&expected));
         assert!(!text.contains("node.pk8"));
         assert!(!text.contains("sha256/"));
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_join_requires_and_compares_the_complete_feth_pair() {
+        let network_id = NetworkId::from_bytes([0x66; 16]);
+        let network = network_id.to_string();
+        assert!(Cli::try_parse_from([
+            "stella-client",
+            "join",
+            "--network",
+            &network,
+            "--tap-adapter",
+            "feth300",
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "stella-client",
+            "join",
+            "--network",
+            &network,
+            "--tap-adapter",
+            "feth300",
+            "--tap-peer",
+            "feth301",
+        ])
+        .expect("parse complete macOS feth pair");
+        let Command::Join(args) = cli.command else {
+            panic!("expected join command");
+        };
+        validate_join_tap(&args).expect("validate numeric macOS feth pair");
+
+        let invalid = JoinArgs {
+            network: network_id,
+            token: None,
+            enrollment_token: None,
+            tap_adapter: "en0".to_owned(),
+            tap_peer: Some("feth301".to_owned()),
+        };
+        assert!(validate_join_tap(&invalid).is_err());
+
+        let directory = directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let config_path = directory.join("client.toml");
+        let initial = configuration_document(&init_args()).expect("encode configuration");
+        std::fs::write(&config_path, initial).expect("write configuration");
+        persist_network_intent(&config_path, network_id, "feth300", Some("feth301"))
+            .expect("persist macOS pair");
+        let config = ClientConfig::load(&config_path).expect("load macOS pair");
+        validate_intent_compatibility(&config, &args).expect("identical pair is idempotent");
+
+        let conflict = JoinArgs {
+            network: network_id,
+            token: None,
+            enrollment_token: None,
+            tap_adapter: "feth300".to_owned(),
+            tap_peer: Some("feth302".to_owned()),
+        };
+        assert!(validate_intent_compatibility(&config, &conflict).is_err());
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

@@ -1,4 +1,4 @@
-//! Strict versioned Windows client configuration.
+//! Strict versioned client configuration.
 
 use std::{
     cmp::Ordering,
@@ -178,13 +178,15 @@ impl ClientConfig {
     }
 }
 
-/// One durable desired membership and its TAP-Windows adapter selection.
+/// One durable desired membership and its platform TAP selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfiguredNetwork {
     /// Virtual network to rejoin after every reconnect.
     pub network_id: NetworkId,
-    /// Exact TAP-Windows adapter display name.
+    /// Exact TAP adapter or host-visible interface name.
     pub tap_adapter: String,
+    /// Optional packet-I/O peer interface required by the macOS backend.
+    pub tap_peer: Option<String>,
 }
 
 /// Client configuration loading or semantic validation failure.
@@ -331,6 +333,8 @@ impl RawEndpoint {
 struct RawNetwork {
     id: String,
     tap_adapter: String,
+    #[serde(default)]
+    tap_peer: Option<String>,
 }
 
 impl RawNetwork {
@@ -349,9 +353,30 @@ impl RawNetwork {
             MAX_ADAPTER_NAME_BYTES,
             "networks.tap_adapter",
         )?;
+        #[cfg(target_os = "macos")]
+        validate_macos_feth_name(&self.tap_adapter, "networks.tap_adapter")?;
+        if let Some(tap_peer) = &self.tap_peer {
+            validate_text(tap_peer, 1, MAX_ADAPTER_NAME_BYTES, "networks.tap_peer")?;
+            if tap_peer == &self.tap_adapter {
+                return Err(invalid(
+                    "networks.tap_peer",
+                    "must differ from networks.tap_adapter",
+                ));
+            }
+            #[cfg(target_os = "macos")]
+            validate_macos_feth_name(tap_peer, "networks.tap_peer")?;
+        }
+        #[cfg(target_os = "macos")]
+        if self.tap_peer.is_none() {
+            return Err(invalid(
+                "networks.tap_peer",
+                "is required by the macOS data plane",
+            ));
+        }
         Ok(ConfiguredNetwork {
             network_id,
             tap_adapter: self.tap_adapter,
+            tap_peer: self.tap_peer,
         })
     }
 }
@@ -424,6 +449,17 @@ fn validate_text(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn validate_macos_feth_name(value: &str, field: &'static str) -> Result<(), ClientConfigError> {
+    let Some(index) = value.strip_prefix("feth") else {
+        return Err(invalid(field, "must use the feth<N> interface form"));
+    };
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid(field, "must use the feth<N> interface form"));
+    }
+    Ok(())
+}
+
 fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -458,7 +494,7 @@ spki_pins = ["sha256/AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="]
 
 [identity]
 node_key = "secrets/node.pk8"
-display_name = "Windows node"
+display_name = "Stella node"
 
 [transport]
 udp_bind = "0.0.0.0:45100"
@@ -471,7 +507,8 @@ max_datagram_size = 1200
 
 [[networks]]
 id = "22222222222222222222222222222222"
-tap_adapter = "Stella LAN"
+tap_adapter = "feth100"
+tap_peer = "feth101"
 "#;
 
     fn temp_directory() -> PathBuf {
@@ -496,6 +533,7 @@ tap_adapter = "Stella LAN"
         assert_eq!(config.controller.https_proxy(), config.https_proxy);
         assert_eq!(config.advertised_endpoints.len(), 1);
         assert_eq!(config.networks.len(), 1);
+        assert_eq!(config.networks[0].tap_peer.as_deref(), Some("feth101"));
         assert_eq!(config.log_filter, "info,stella_client=info");
     }
 
@@ -519,7 +557,7 @@ tap_adapter = "Stella LAN"
             Err(ClientConfigError::Parse(_))
         ));
         let duplicate = format!(
-            "{VALID}\n[[networks]]\nid = \"22222222222222222222222222222222\"\ntap_adapter = \"Other\"\n"
+            "{VALID}\n[[networks]]\nid = \"22222222222222222222222222222222\"\ntap_adapter = \"feth102\"\ntap_peer = \"feth103\"\n"
         );
         assert!(matches!(
             ClientConfig::parse(&duplicate, Path::new(".")),
@@ -555,8 +593,48 @@ tap_adapter = "Stella LAN"
                 ..
             })
         ));
-        let bad_name = VALID.replace("Windows node", "Windows\\nnode");
+        let bad_name = VALID.replace("Stella node", "Stella\\nnode");
         assert!(ClientConfig::parse(&bad_name, Path::new(".")).is_err());
+        let duplicate_pair = VALID.replace(
+            "tap_adapter = \"feth100\"\ntap_peer = \"feth101\"",
+            "tap_adapter = \"feth100\"\ntap_peer = \"feth100\"",
+        );
+        assert!(matches!(
+            ClientConfig::parse(&duplicate_pair, Path::new(".")),
+            Err(ClientConfigError::InvalidValue {
+                field: "networks.tap_peer",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_networks_require_two_distinct_numeric_feth_names() {
+        let missing_peer = VALID.replace("\ntap_peer = \"feth101\"", "");
+        assert!(matches!(
+            ClientConfig::parse(&missing_peer, Path::new(".")),
+            Err(ClientConfigError::InvalidValue {
+                field: "networks.tap_peer",
+                ..
+            })
+        ));
+        let physical_adapter = VALID.replace("feth100", "en0");
+        assert!(matches!(
+            ClientConfig::parse(&physical_adapter, Path::new(".")),
+            Err(ClientConfigError::InvalidValue {
+                field: "networks.tap_adapter",
+                ..
+            })
+        ));
+        let nonnumeric_peer = VALID.replace("feth101", "feth-peer");
+        assert!(matches!(
+            ClientConfig::parse(&nonnumeric_peer, Path::new(".")),
+            Err(ClientConfigError::InvalidValue {
+                field: "networks.tap_peer",
+                ..
+            })
+        ));
     }
 
     #[test]

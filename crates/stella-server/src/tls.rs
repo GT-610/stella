@@ -539,7 +539,7 @@ pub enum TlsIdentityError {
     },
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 mod tests {
     use std::{
         path::PathBuf,

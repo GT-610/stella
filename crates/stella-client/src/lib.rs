@@ -14,7 +14,7 @@ mod http_proxy;
 mod ice;
 mod identity;
 mod network;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod runtime;
 mod state;
 mod stun;
@@ -39,7 +39,7 @@ pub use ice::{
 };
 pub use identity::{create_node_identity, load_node_identity, NodeIdentityFileError};
 pub use network::{NetworkDataError, NetworkDataPlane, NetworkOutput, RoutedDatagram};
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use runtime::{ClientDataRuntime, RuntimeError};
 pub use state::{
     GrantRefreshInput, NetworkState, PeerConnectivityState, PeerDeltaInput, PeerDeltaOperation,
