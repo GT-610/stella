@@ -87,7 +87,6 @@ class PeerControl:
                 matches += 1
                 if matches > 1:
                     return False
-                deadline = min(deadline, time.monotonic() + 0.25)
             else:
                 self.pending_frames.append(frame)
         return matches == 1

@@ -557,6 +557,13 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         join_policy
     );
     let repeated_snapshot = client.read(ControlMessageType::PeerSnapshot).await;
+    assert_eq!(
+        repeated_snapshot
+            .header()
+            .expect("repeated snapshot header")
+            .correlation_id,
+        0
+    );
     assert_snapshot(
         &repeated_snapshot,
         network_id,
