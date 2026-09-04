@@ -103,9 +103,18 @@ reuse.
 
 ```sh
 cargo test -p stella-tap
-cargo test -p stella-tap --test macos_tap --no-run
-sudo "$(find target/debug/deps -type f -name 'macos_tap-*' -perm -111 -print -quit)" \
-  --ignored --nocapture
+macos_tap_test=$(
+  cargo test -p stella-tap --test macos_tap --no-run --message-format=json |
+    python3 -c 'import json, sys
+print(next(
+    message["executable"]
+    for message in map(json.loads, sys.stdin)
+    if message.get("reason") == "compiler-artifact"
+    and message.get("target", {}).get("name") == "macos_tap"
+    and message.get("executable")
+))'
+)
+sudo "$macos_tap_test" --ignored --nocapture
 ```
 
 The full helper-backed two-client scenario is documented in

@@ -76,9 +76,18 @@ feth 生命周期、MAC、两端 MTU、4,096 字节 `AF_NDRV` 发送、BPF 接�
 
 ```sh
 cargo test -p stella-tap
-cargo test -p stella-tap --test macos_tap --no-run
-sudo "$(find target/debug/deps -type f -name 'macos_tap-*' -perm -111 -print -quit)" \
-  --ignored --nocapture
+macos_tap_test=$(
+  cargo test -p stella-tap --test macos_tap --no-run --message-format=json |
+    python3 -c 'import json, sys
+print(next(
+    message["executable"]
+    for message in map(json.loads, sys.stdin)
+    if message.get("reason") == "compiler-artifact"
+    and message.get("target", {}).get("name") == "macos_tap"
+    and message.get("executable")
+))'
+)
+sudo "$macos_tap_test" --ignored --nocapture
 ```
 
 完整的 helper 双客户端场景见

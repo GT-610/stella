@@ -7,8 +7,9 @@
 ## 前置条件与可达性
 
 Windows 每个已配置网络需要一个预安装 TAP-Windows Adapter V9，并从提升权限的 PowerShell
-运行。macOS 每个网络需要两个未占用的数值型 feth 名称。普通客户端保持无特权；另行启动
-的 root `stella-tap-helper` 创建或复用 pair，并且只执行有界 TAP 操作。
+运行。macOS 每个网络需要两个互不相同的数值型 feth 名称，且不能由另一个活动进程持有。
+由 Stella 管理且匹配的持久 pair 可以继续存在，并会在客户端启动时复用。普通客户端保持
+无特权；另行启动的 root `stella-tap-helper` 创建或复用 pair，并且只执行有界 TAP 操作。
 
 控制器必须能通过配置的
 TLS/TCP 地址直接访问，或能通过可选的显式 HTTPS 代理访问。运行时会收集直连 UDP 候选，

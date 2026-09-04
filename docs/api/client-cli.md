@@ -8,8 +8,10 @@ runtime. Commands use `--config client.toml` unless another path is supplied.
 
 Windows clients need one pre-installed TAP-Windows Adapter V9 per configured
 network and run from an elevated PowerShell session. macOS clients need two
-unused numeric feth names per network. The normal client remains unprivileged;
-a separately started root `stella-tap-helper` creates or reuses the pair and
+distinct numeric feth names per network that are not owned by another active
+process. A matching Stella-owned persistent pair may already exist and is
+reused when the client starts. The normal client remains unprivileged; a
+separately started root `stella-tap-helper` creates or reuses the pair and
 performs only bounded TAP operations.
 
 The controller must be reachable over its configured TLS/TCP address, either
