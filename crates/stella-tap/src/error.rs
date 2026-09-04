@@ -41,6 +41,8 @@ pub enum TapOperation {
     ConfigureBlockingMode,
     /// Connecting to the privileged macOS TAP helper.
     ConnectHelper,
+    /// Accepting a client connection in the privileged macOS TAP helper.
+    AcceptHelper,
     /// Authenticating the process at the other end of the helper socket.
     AuthenticateHelper,
     /// Exchanging a bounded message with the privileged helper.
@@ -100,6 +102,7 @@ impl fmt::Display for TapOperation {
             Self::QueryPeer => "query interface peer",
             Self::ConfigureBlockingMode => "configure blocking mode",
             Self::ConnectHelper => "connect TAP helper",
+            Self::AcceptHelper => "accept TAP helper connection",
             Self::AuthenticateHelper => "authenticate TAP helper",
             Self::ExchangeHelperMessage => "exchange TAP helper message",
             Self::EnumerateAdapters => "enumerate adapters",

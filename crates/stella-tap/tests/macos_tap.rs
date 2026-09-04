@@ -114,6 +114,15 @@ fn feth_pair_supports_lifecycle_frames_mtu_locking_and_cancellation() {
     assert!(interface_exists(&peer));
     assert!(!interface_is_up(&visible));
 
+    let lower_config = TapConfig {
+        mtu: 1_500,
+        ..config.clone()
+    };
+    let lowered = MacosTapDevice::create(&lower_config).expect("lower persistent feth MTU");
+    assert_eq!(interface_mtu(&visible), lower_config.mtu);
+    assert_eq!(interface_mtu(&peer), lower_config.mtu);
+    lowered.destroy().expect("close lower-MTU feth pair");
+
     let reopened = MacosTapDevice::create(&config).expect("reuse persistent feth pair");
     assert!(interface_is_up(&visible));
     assert_eq!(interface_mtu(&visible), config.mtu);

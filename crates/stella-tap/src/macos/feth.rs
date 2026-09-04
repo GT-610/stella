@@ -90,9 +90,7 @@ impl PreparedFethPair {
                 .map_err(|source| TapError::io(TapOperation::SetMac, source))?;
         }
         pair_interfaces(&prepared.control, peer, visible)?;
-        let installed_mtu = sys::interface_mtu(&prepared.control, visible)
-            .map_err(|source| TapError::io(TapOperation::QueryMtu, source))?;
-        prepared.effective_mtu = installed_mtu.min(requested_mtu);
+        prepared.effective_mtu = requested_mtu;
         set_pair_mtu(&prepared.control, visible, peer, prepared.effective_mtu)?;
         sys::set_interface_up(&prepared.control, peer, true)
             .map_err(|source| TapError::io(TapOperation::SetDeviceState, source))?;

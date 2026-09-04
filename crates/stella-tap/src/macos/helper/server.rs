@@ -13,6 +13,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
+    time::Duration,
 };
 
 use super::protocol::{self, ClientMessage, RemoteErrorKind, ServerMessage};
@@ -24,6 +25,15 @@ use crate::{
 
 const SESSION_QUEUE_CAPACITY: usize = 1;
 const MAX_HELPER_SESSIONS: usize = 64;
+const INITIAL_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
+const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptErrorAction {
+    Retry,
+    Backoff,
+    Propagate,
+}
 
 /// Configuration for the foreground macOS TAP helper service.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,9 +78,25 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
     validate_socket_path(&config.socket_path)?;
     let (listener, _socket_guard) = prepare_listener(&config.socket_path, config.allowed_uid)?;
     let active_sessions = Arc::new(AtomicUsize::new(0));
-    for incoming in listener.incoming() {
-        let stream =
-            incoming.map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
+    let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _address)) => {
+                accept_backoff = INITIAL_ACCEPT_BACKOFF;
+                stream
+            }
+            Err(source) => match accept_error_action(&source) {
+                AcceptErrorAction::Retry => continue,
+                AcceptErrorAction::Backoff => {
+                    thread::sleep(accept_backoff);
+                    accept_backoff = next_accept_backoff(accept_backoff);
+                    continue;
+                }
+                AcceptErrorAction::Propagate => {
+                    return Err(TapError::io(TapOperation::AcceptHelper, source));
+                }
+            },
+        };
         if active_sessions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_HELPER_SESSIONS).then_some(active + 1)
@@ -101,7 +127,18 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
             return Err(TapError::io(TapOperation::OpenDevice, source));
         }
     }
-    Ok(())
+}
+
+fn accept_error_action(error: &io::Error) -> AcceptErrorAction {
+    match error.raw_os_error() {
+        Some(libc::EINTR | libc::ECONNABORTED) => AcceptErrorAction::Retry,
+        Some(libc::EMFILE | libc::ENFILE) => AcceptErrorAction::Backoff,
+        _ => AcceptErrorAction::Propagate,
+    }
+}
+
+fn next_accept_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_ACCEPT_BACKOFF)
 }
 
 struct SessionGuard(Arc<AtomicUsize>);
@@ -520,15 +557,48 @@ mod tests {
         os::unix::net::UnixStream,
         sync::{Arc, Condvar, Mutex},
         thread,
+        time::Duration,
     };
 
-    use super::{serve_connection, DeviceFactory, HelperDevice};
+    use super::{
+        accept_error_action, next_accept_backoff, serve_connection, AcceptErrorAction,
+        DeviceFactory, HelperDevice, INITIAL_ACCEPT_BACKOFF, MAX_ACCEPT_BACKOFF,
+    };
     use crate::{
         macos::helper::protocol::{self, ClientMessage, RemoteErrorKind, ServerMessage},
         Result, TapCancellation, TapCancellationHandle, TapConfig, TapError,
     };
 
     struct FakeCancellation(Arc<(Mutex<bool>, Condvar)>);
+
+    #[test]
+    fn listener_accept_errors_retry_only_when_recoverable() {
+        assert_eq!(
+            accept_error_action(&io::Error::from_raw_os_error(libc::EINTR)),
+            AcceptErrorAction::Retry
+        );
+        assert_eq!(
+            accept_error_action(&io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            AcceptErrorAction::Retry
+        );
+        assert_eq!(
+            accept_error_action(&io::Error::from_raw_os_error(libc::EMFILE)),
+            AcceptErrorAction::Backoff
+        );
+        assert_eq!(
+            accept_error_action(&io::Error::from_raw_os_error(libc::ENFILE)),
+            AcceptErrorAction::Backoff
+        );
+        assert_eq!(
+            accept_error_action(&io::Error::from_raw_os_error(libc::EACCES)),
+            AcceptErrorAction::Propagate
+        );
+        assert_eq!(
+            next_accept_backoff(INITIAL_ACCEPT_BACKOFF),
+            Duration::from_millis(20)
+        );
+        assert_eq!(next_accept_backoff(MAX_ACCEPT_BACKOFF), MAX_ACCEPT_BACKOFF);
+    }
 
     impl TapCancellation for FakeCancellation {
         fn cancel_pending_io(&self) -> Result<()> {

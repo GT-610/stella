@@ -451,10 +451,15 @@ fn validate_text(
 
 #[cfg(target_os = "macos")]
 fn validate_macos_feth_name(value: &str, field: &'static str) -> Result<(), ClientConfigError> {
+    const MAX_FETH_UNIT: u16 = 9_999;
+
     let Some(index) = value.strip_prefix("feth") else {
         return Err(invalid(field, "must use the feth<N> interface form"));
     };
-    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+    let Ok(unit) = index.parse::<u16>() else {
+        return Err(invalid(field, "must use the feth<N> interface form"));
+    };
+    if unit > MAX_FETH_UNIT || unit.to_string() != index {
         return Err(invalid(field, "must use the feth<N> interface form"));
     }
     Ok(())
@@ -635,6 +640,19 @@ tap_peer = "feth101"
                 ..
             })
         ));
+        let maximum_unit = VALID.replace("feth100", "feth9999");
+        ClientConfig::parse(&maximum_unit, Path::new("."))
+            .expect("the maximum canonical feth unit is valid");
+        for invalid_name in ["feth01", "feth10000"] {
+            let invalid_adapter = VALID.replace("feth100", invalid_name);
+            assert!(matches!(
+                ClientConfig::parse(&invalid_adapter, Path::new(".")),
+                Err(ClientConfigError::InvalidValue {
+                    field: "networks.tap_adapter",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
