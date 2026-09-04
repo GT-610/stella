@@ -27,10 +27,15 @@ that ownership record; Stella refuses to re-pair pre-existing feth interfaces
 that it cannot prove it previously managed.
 
 The backend creates missing interfaces with the Darwin interface-cloning ioctl,
-pairs them with the absolute `/sbin/ifconfig` path, and opens nonblocking,
-close-on-exec packet descriptors. Setup tracks which interfaces this attempt
-created. A failure before the ownership record is committed restores reused
-interface state and destroys only interfaces created by that attempt.
+queries and configures the peer relationship with feth driver-specific ioctls,
+assigns each newly created host-visible interface a random locally administered
+unicast MAC address, and opens nonblocking, close-on-exec packet descriptors.
+An already correct relationship is reused without issuing another `SET_PEER`;
+an unpaired pair is connected, while a conflicting relationship is rejected.
+Setup tracks which interfaces this attempt created. A failure before the
+ownership record is committed restores reused interface state and destroys only
+interfaces created by that attempt. Numeric feth units are limited to the
+kernel-supported `0..=9999` range.
 
 `destroy` and `Drop` close packet I/O, set both feth interfaces down, and release
 the lock. They deliberately leave the pair present. A later helper session can
@@ -76,6 +81,16 @@ lower of that value and the signed network-policy limit. It never raises a
 lower host setting merely to reach the policy maximum. Explicit MTU changes
 update both interfaces; failure on the peer restores the visible side, and a
 failed rollback is reported separately.
+
+macOS defaults `net.link.fake.max_mtu` to a value that can be lower than
+Stella's protocol ceiling. XNU copies that value into each feth when the
+interface is created, so the root backend raises the runtime, system-wide limit
+to `9202` before creating either side of a pair. It verifies the per-interface
+ceiling when opening a pair and reports an explicit error for an older feth that
+was created with a lower ceiling. It never lowers an existing value or restores
+the previous limit during shutdown; doing so could invalidate another process's
+concurrently active feth interface. The setting is not persisted across a
+reboot.
 
 ## Verification
 
