@@ -87,7 +87,7 @@ sudo "$(find target/debug/deps -type f -name 'macos_tap-*' -perm -111 -print -qu
 cargo build --release -p stella-server -p stella-client -p stella-tap
 sudo ./tests/two-node-lan/run-macos.sh \
   --skip-build \
-  --python /opt/homebrew/bin/python3
+  --python "$(command -v python3)"
 ```
 
 脚本会拒绝已有的所选名称，通过真实 helper 验证首轮和同配置重启，把报告与进程日志写入

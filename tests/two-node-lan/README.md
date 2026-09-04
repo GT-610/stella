@@ -117,7 +117,7 @@ Then build with the normal user and run the full scenario:
 cargo build --release -p stella-server -p stella-client -p stella-tap
 sudo ./tests/two-node-lan/run-macos.sh \
   --skip-build \
-  --python /opt/homebrew/bin/python3
+  --python "$(command -v python3)"
 ```
 
 The defaults are `feth6100/feth6101` for node A and

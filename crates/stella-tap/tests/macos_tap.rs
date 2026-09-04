@@ -66,7 +66,7 @@ fn feth_pair_supports_lifecycle_frames_mtu_locking_and_cancellation() {
     assert_eq!(interface_mtu(&visible), large_frame_mtu);
     assert_eq!(interface_mtu(&peer), large_frame_mtu);
 
-    let capture_path = std::path::Path::new("/private/tmp").join(format!(
+    let capture_path = std::env::temp_dir().join(format!(
         "stella-macos-tap-{}-large-frame.pcap",
         std::process::id()
     ));

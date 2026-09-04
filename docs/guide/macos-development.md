@@ -95,7 +95,7 @@ Run the full real-controller, real-client scenario with four unused names:
 cargo build --release -p stella-server -p stella-client -p stella-tap
 sudo ./tests/two-node-lan/run-macos.sh \
   --skip-build \
-  --python /opt/homebrew/bin/python3
+  --python "$(command -v python3)"
 ```
 
 The script refuses pre-existing selected names, verifies the first run and a
