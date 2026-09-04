@@ -1,56 +1,69 @@
 # macOS feth TAP 实现
 
-`stella-tap` 把一个持久 macOS feth pair 暴露为 Stella 其余部分使用的同步、完整以太网帧
-契约。后端直接使用发布版 `tun-rs` 2.8.8，不复制其 unsafe BPF、AF_NDRV 和 ioctl 代码。
+`stella-tap` 把持久 macOS feth pair 暴露为与 Stella 其余部分一致的同步完整以太网帧契约。
+实现由 Stella 自己维护：BPF 收包、`AF_NDRV` 发包；一个权限范围很窄的 root helper 通过
+有界本地协议把该设备提供给普通用户客户端。
 
 ## 接口分工
 
-| Stella 字段 | 示例 | 作用 |
+| Stella 字段 | 示例 | 用途 |
 | --- | --- | --- |
 | `TapConfig::name` / `tap_adapter` | `feth100` | 宿主可见端，用于 IP、DHCP 和抓包 |
-| `TapConfig::peer_name` / `tap_peer` | `feth101` | Stella 专用 I/O 端；BPF 收包，AF_NDRV 发包 |
+| `TapConfig::peer_name` / `tap_peer` | `feth101` | Stella 专用 I/O 端；BPF 收包，`AF_NDRV` 发包 |
 
-macOS 上两项都必填，必须不同，并严格使用数值型 `feth<N>`。`en0` 等物理接口会被拒绝。
-ICE 主机候选枚举会排除 pair 两端，避免把虚拟接口误当作 underlay 路径。
+macOS 上两项都必填，必须不同，并且严格符合数值型 `feth<N>`。`en0` 等物理接口会被拒绝。
+ICE host candidate 枚举会排除两端，避免把虚拟 pair 误当 underlay 路径。
 
-## 创建与所有权
+## 原生后端与所有权
 
-后端先在 `/var/run/stella/` 获取独占 advisory lock。该目录必须由 root 所有，且组和其他
-用户不可访问。锁文件按排序后的 pair 命名，因此 `feth100/feth101` 与
-`feth101/feth100` 会发生冲突。
+root 后端先在 `/var/run/stella/` 获取规范化 pair 的独占锁；目录与锁文件都必须为 root
+所有且仅 root 可访问。首次创建完整成功后，锁文件会记录 visible/peer 分工。复用必须匹配
+该记录；Stella 不会重新配对无法证明由自身管理的已有 feth。
 
-随后通过 `tun-rs::DeviceBuilder` 选择 `Layer::L2`，设置显式 visible/peer 名称、
-`reuse_dev(true)` 和 `persist(true)`。I/O 为 nonblocking，并使用可中断同步 API。首个
-版本要求持有设备的客户端进程以 root 运行；Stella 不引入 helper、daemon、kext 或
-DriverKit 组件。
+后端通过 Darwin 接口克隆 ioctl 创建缺失接口，使用绝对路径 `/sbin/ifconfig` 配对，并以
+nonblocking、close-on-exec 打开报文 descriptor。准备过程记录本次创建的接口；所有权记录
+提交前发生失败时，会恢复复用接口的状态，并且只销毁本次创建的部分。
 
-`destroy` 和 `Drop` 会把宿主可见接口置 down、关闭报文 I/O 并释放锁，但刻意保留 pair。
-下次客户端启动会重新配对并复用同名接口，因此宿主 IP 配置可在本次开机期间保留。管理员
-只有在停止所有 owner 并确认准确名称后才应删除 pair。
+`destroy` 与 `Drop` 会关闭报文 I/O、把 pair 两端置 down 并释放锁，但不会删除接口。后续
+helper session 可复用同名 pair，因此本次开机期间的宿主 IP 配置可以跨客户端重启保留。
 
 ## 帧 I/O 与取消
 
-上游 macOS 二层实现使用 BPF 从 peer 接收完整帧，使用 AF_NDRV 向宿主可见端注入帧。
-AF_NDRV 是必须的，因为 BPF 注入不能承载超过 2,048 字节的帧。Stella 在 I/O 前仍会验证
-14 到 9,216 字节的完整帧范围，并拒绝短写。
+BPF 只用于接收。一次内核读取可能包含多个对齐记录，因此解析器在排入完整帧前会检查每个
+header、捕获长度与原始长度、边界和对齐步长。再次 poll BPF 前必须先耗尽用户态帧队列；
+截断记录会被拒绝。
 
-互斥状态记录当前是否有 pending 操作以及是否已取消。空闲取消直接成功且不触发 event；
-pending 取消会触发 event；操作完成会清除状态并 reset。完成与取消竞争时保留已经成功的
-帧。取消 handle 为弱引用，设备关闭后仍是幂等 no-op。
+发送始终走 `AF_NDRV`，包括超过 BPF 实际 2,048 字节注入上限的帧。短写会转为
+`PartialFrameWrite`，诊断不包含帧内容。
 
-## MTU
+nonblocking self-pipe 用于中断 `poll`。只有操作 pending 时才会触发；重复取消幂等；完成后
+会排空 pipe，避免污染下一次操作。当报文 I/O 和取消同时 ready 时，先尝试报文 I/O，从而
+保留已经完成的帧。
 
-打开时读取已有 feth MTU，并应用该值与签名网络策略上限中的较小值，不会为了达到策略
-上限而抬高宿主原有设置。`set_mtu` 会验证完整帧关系，并通过 `tun-rs` 同时更新 pair 两端。
+## 特权 helper
 
-应用程序只应在宿主可见端配置 IP；peer 仅用于报文 I/O 架构。
+普通 macOS `PlatformTapDevice` 是 `MacosTapProxyDevice`。它连接
+`/var/run/stella-tap-helper.sock`，并验证服务端 peer UID 为 root。前台
+`stella-tap-helper` 必须以 root 运行且显式传入 `--allow-uid`；mode `0600` 的 socket 归该
+用户所有，服务端还会独立验证每个客户端的 peer UID。
+
+协议带版本和长度前缀，消息及诊断都有硬上限；每条连接只能打开一个 pair，设备命令队列
+最多保留一个 pending 命令，服务最多接受 64 个 session。取消消息与 pending 请求独立传输。
+客户端 EOF 会取消 I/O、把 pair 置 down、释放锁并关闭 session。helper 不接收节点私钥、
+控制器凭据、Stella 会话密钥、UDP 数据报或 Relay 状态。
+
+## MTU 行为
+
+打开时读取 visible 端现有 MTU，并应用它与签名网络策略上限的较小值，不会为了达到策略
+上限而抬高更低的宿主设置。显式 MTU 更新会修改 pair 两端；peer 更新失败时恢复 visible，
+回滚再次失败则单独报告。
 
 ## 验证
 
-无 root 单元测试覆盖 feth 名称、帧与 MTU 边界、空闲和 pending 取消、重复取消、event
-reset、完成竞争及脱敏诊断。被忽略的 root-only 测试会创建隔离 pair，检查 MAC 和双端
-MTU，抓取一个 4,096 字节 AF_NDRV 帧，取消 pending read，读取宿主产生的 ARP 帧，验证
-锁冲突，并确认 down 但持久的同名复用。
+无特权测试覆盖 feth 名称、ioctl 常量、严格 BPF batch、helper 消息边界与往返、peer 认证、
+空闲与 pending 取消、断连清理、proxy 帧 I/O 和 MTU 请求。被忽略的 root-only 测试覆盖真实
+feth 生命周期、MAC、两端 MTU、4,096 字节 `AF_NDRV` 发送、BPF 接收、锁、取消、持久化与
+复用。
 
 ```sh
 cargo test -p stella-tap
@@ -59,7 +72,5 @@ sudo "$(find target/debug/deps -type f -name 'macos_tap-*' -perm -111 -print -qu
   --ignored --nocapture
 ```
 
-完整双客户端场景见
-[`tests/two-node-lan/README.md`](https://github.com/GT-610/stella/blob/main/tests/two-node-lan/README.md)，
-它复用 Scapy verifier 验证 ARP、双向 IPv4、广播、多播、LAN discovery、关闭后持久化和
-同名 pair 重启。
+完整的 helper 双客户端场景见
+[`tests/two-node-lan/README.md`](https://github.com/GT-610/stella/blob/main/tests/two-node-lan/README.md)。

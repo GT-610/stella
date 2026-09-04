@@ -25,7 +25,8 @@ transport contract, UDP socket behavior, cancellation, and truncation defense.
 [Windows TAP implementation](./tap-windows.md) covers adapter selection,
 complete-frame I/O, MTU handling, and cancellation. [macOS feth TAP
 implementation](./tap-macos.md) covers visible/peer roles, BPF receive,
-AF_NDRV transmit, persistent reuse, locking, and root-only verification;
+AF_NDRV transmit, persistent reuse, helper privilege separation, locking, and
+root-only native verification;
 [Control-channel
 implementation](./control-channel.md) covers framed async I/O, message ownership,
 sequencing, correlation, and exporter-bound proof inputs.

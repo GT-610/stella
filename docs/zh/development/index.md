@@ -20,7 +20,7 @@ Stella 按“规范优先”方式开发。协议或公开 API 的变更只有�
 [数据报传输](./transport.md)说明可对象化传输契约、UDP 套接字、取消与截断防护。
 [Windows TAP](./tap-windows.md)说明适配器选择、完整帧 I/O、MTU 与取消。
 [macOS feth TAP](./tap-macos.md)说明 visible/peer 分工、BPF 收包、AF_NDRV 发包、持久
-复用、独占锁和 root-only 验证。
+复用、helper 权限隔离、独占锁和 root-only 原生验证。
 [控制通道](./control-channel.md)说明异步分帧 I/O、消息所有权、序列、关联与导出器绑定
 证明输入。
 [控制器](./controller.md)说明 TLS 服务边界、事务性授权状态、管理命令和会话行为。

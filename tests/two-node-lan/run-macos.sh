@@ -111,6 +111,8 @@ script_directory=$(cd "$(dirname "$0")" && pwd)
 repository=$(cd "$script_directory/../.." && pwd)
 server="$repository/target/release/stella-server"
 client="$repository/target/release/stella-client"
+helper="$repository/target/release/stella-tap-helper"
+helper_socket="/var/run/stella-tap-helper.sock"
 verifier="$script_directory/verify_l2.py"
 requirements="$script_directory/requirements.txt"
 if [[ -z $artifacts ]]; then
@@ -137,6 +139,8 @@ scapy="$artifacts/python-packages"
 server_pid=""
 left_pid=""
 right_pid=""
+helper_pid=""
+helper_socket_identity=""
 
 stop_process() {
     local pid=$1
@@ -169,7 +173,12 @@ cleanup() {
     set +e
     stop_process "$left_pid"
     stop_process "$right_pid"
+    stop_process "$helper_pid" TERM
     stop_process "$server_pid"
+    if [[ -n $helper_socket_identity && -S $helper_socket ]] && \
+        [[ $(/usr/bin/stat -f '%d:%i' "$helper_socket" 2>/dev/null) == "$helper_socket_identity" ]]; then
+        rm -f "$helper_socket"
+    fi
     for interface in "$right_peer" "$right_visible" "$left_peer" "$left_visible"; do
         if /sbin/ifconfig "$interface" >/dev/null 2>&1; then
             /sbin/ifconfig "$interface" destroy >/dev/null 2>&1 || true
@@ -193,6 +202,22 @@ wait_tcp_port() {
         sleep 0.2
     done
     echo "controller did not listen on 127.0.0.1:$port" >&2
+    return 1
+}
+
+wait_helper_socket() {
+    local deadline=$((SECONDS + 10))
+    while ((SECONDS < deadline)); do
+        if ! kill -0 "$helper_pid" >/dev/null 2>&1; then
+            echo "TAP helper exited before creating its socket" >&2
+            return 1
+        fi
+        if [[ -S $helper_socket ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "TAP helper did not create $helper_socket" >&2
     return 1
 }
 
@@ -300,15 +325,24 @@ run_verifier() {
 if ((skip_build == 0)); then
     if [[ -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
         cargo_path=$(command -v cargo)
-        sudo -u "$SUDO_USER" -H "$cargo_path" build --manifest-path "$repository/Cargo.toml" --release -p stella-server -p stella-client
+        sudo -u "$SUDO_USER" -H "$cargo_path" build --manifest-path "$repository/Cargo.toml" --release -p stella-server -p stella-client -p stella-tap
     else
-        cargo build --manifest-path "$repository/Cargo.toml" --release -p stella-server -p stella-client
+        cargo build --manifest-path "$repository/Cargo.toml" --release -p stella-server -p stella-client -p stella-tap
     fi
 fi
-if [[ ! -x $server || ! -x $client ]]; then
+if [[ ! -x $server || ! -x $client || ! -x $helper ]]; then
     echo "release binaries are missing; rerun without --skip-build" >&2
     exit 1
 fi
+if [[ -e $helper_socket ]]; then
+    echo "refusing to replace an existing helper socket: $helper_socket" >&2
+    exit 1
+fi
+
+"$helper" --allow-uid 0 >"$artifacts/helper.stdout.log" 2>"$artifacts/helper.stderr.log" &
+helper_pid=$!
+wait_helper_socket
+helper_socket_identity=$(/usr/bin/stat -f '%d:%i' "$helper_socket")
 
 init_output=$("$server" --config "$server_config" init --listen "127.0.0.1:$controller_port" --tls-name localhost)
 controller_id=$(key_value "$init_output" controller_id)

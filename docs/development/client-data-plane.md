@@ -24,7 +24,8 @@ The runtime never raises an existing IP MTU merely to reach the network frame
 ceiling. It keeps a lower value, which remains safe because the signed policy
 is a maximum rather than a required local size. Windows updates both IP-family
 rows under the TAP-Windows driver ceiling. macOS reads the visible feth MTU on
-open and uses `tun-rs` to apply explicit changes to both sides of the pair.
+open and asks the privileged Stella TAP helper to apply explicit changes to
+both sides of the pair with rollback on a partial failure.
 
 The top-level loop concurrently handles controller updates, heartbeat
 deadlines, 100-millisecond data maintenance, UDP reception, and TAP events.

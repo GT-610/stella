@@ -47,9 +47,10 @@ panic. Cryptographic algorithms and I/O are injected by callers.
 
 Owns the safe TAP device contract and platform implementations. This is the
 only crate permitted to contain unsafe code. Windows uses a native TAP-Windows
-backend. macOS delegates the low-level unsafe feth/BPF/AF_NDRV implementation
-to pinned `tun-rs` 2.8.8 and wraps it with Stella bounds, locking, cancellation,
-and lifecycle rules. Unsupported platforms do not receive an implicit Layer-3
+backend. macOS contains Stella's native feth/BPF/AF_NDRV implementation and the
+bounded Unix-socket protocol used by `stella-tap-helper`. The ordinary client
+uses a proxy `TapDevice`; only the helper creates interfaces and opens raw
+packet descriptors. Unsupported platforms do not receive an implicit Layer-3
 substitute.
 
 ### `stella-transport`

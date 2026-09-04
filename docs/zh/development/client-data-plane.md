@@ -11,7 +11,8 @@ ICE 枚举会排除 TAP，macOS 还会排除 I/O peer。队列容量固定：最
 异步运行时，最多 64 个已认证帧等待一个 TAP 写入器，任何方向都不会创建无界队列。
 
 运行时不会为了达到网络策略上限而抬高已有 MTU。Windows 在驱动上限内事务性更新 IPv4/
-IPv6 行；macOS 打开时读取 visible feth MTU，显式更新时通过 `tun-rs` 同时修改 pair 两端。
+IPv6 行；macOS 打开时读取 visible feth MTU，显式更新时由 Stella 特权 TAP helper 同时修改
+pair 两端，并在部分失败时回滚。
 同步 TAP I/O 在每个适配器或 pair 的专用线程上执行。关闭时 Windows 设置
 media-disconnected；macOS 把 visible feth 置 down 并释放 pair 锁，但不删除持久接口。
 

@@ -6,10 +6,11 @@
 - 仓库默认 stable Rust 与 Cargo；
 - 用于 VitePress 的 Bun；
 - 用于真实双节点 verifier、带 `pip` 的 Python 3；
-- 运行活动 TAP 客户端和真实 feth 测试所需的 root 权限。
+- 运行 TAP helper 和真实 feth 测试所需的 root 权限。
 
-纯 Rust 测试、配置解析、文档和 release 构建不需要 root；活动 macOS 数据平面需要。本里程碑
-刻意不安装 kext、DriverKit 扩展、特权 helper 或 daemon。
+纯 Rust 测试、配置解析、文档和 release 构建不需要 root；活动 `stella-client` 也以普通
+用户运行，只有 `stella-tap-helper` 需要 root。Stella 不安装 kext 或 DriverKit 扩展。当前
+helper 是前台服务，需要管理员或服务管理器显式启动。
 
 ## 验证工作区
 
@@ -46,10 +47,18 @@ target/debug/stella-client --config /path/to/client.toml join \
   --tap-peer feth101
 ```
 
-以 root 运行活动客户端：
+构建客户端与 helper，再为客户端用户的数值 UID 启动 helper。保持此前台进程运行；其
+socket 为 mode `0600` 且归所选用户所有：
 
 ```sh
-sudo target/debug/stella-client --config /path/to/client.toml run
+cargo build -p stella-client -p stella-tap
+sudo target/debug/stella-tap-helper --allow-uid "$(id -u)"
+```
+
+在另一个终端中，不使用 `sudo` 运行客户端：
+
+```sh
+target/debug/stella-client --config /path/to/client.toml run
 ```
 
 日志出现 `macOS data plane is active` 后，只在 visible 端配置地址或运行 DHCP：
@@ -75,14 +84,14 @@ sudo "$(find target/debug/deps -type f -name 'macos_tap-*' -perm -111 -print -qu
 使用四个未占用名称运行真实控制器、真实客户端场景：
 
 ```sh
-cargo build --release -p stella-server -p stella-client
+cargo build --release -p stella-server -p stella-client -p stella-tap
 sudo ./tests/two-node-lan/run-macos.sh \
   --skip-build \
   --python /opt/homebrew/bin/python3
 ```
 
-脚本会拒绝已有的所选名称，验证首轮和同配置重启，把报告与进程日志写入仅创建的 artifact
-目录，并且只删除它确认可由本次运行创建的四个接口。
+脚本会拒绝已有的所选名称，通过真实 helper 验证首轮和同配置重启，把报告与进程日志写入
+仅创建的 artifact 目录，并且只删除它确认可由本次运行创建的四个接口。
 
 手工管理 pair 时，删除前必须停止所有 owner。删除任一端属于管理员操作，会丢弃持久接口
 以及本次开机期间保留的 IP 配置：

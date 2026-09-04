@@ -8,8 +8,9 @@ runtime. Commands use `--config client.toml` unless another path is supplied.
 
 Windows clients need one pre-installed TAP-Windows Adapter V9 per configured
 network and run from an elevated PowerShell session. macOS clients need two
-unused numeric feth names per network and currently run as root; Stella creates
-or reuses the pair without installing a driver or helper.
+unused numeric feth names per network. The normal client remains unprivileged;
+a separately started root `stella-tap-helper` creates or reuses the pair and
+performs only bounded TAP operations.
 
 The controller must be reachable over its configured TLS/TCP address, either
 directly or through the optional explicit HTTPS proxy. The runtime gathers
@@ -158,7 +159,9 @@ stella-client --config C:\Stella\client.toml run
 macOS:
 
 ```sh
-sudo stella-client --config /etc/stella/client.toml run
+sudo stella-tap-helper --allow-uid "$(id -u)"
+# In another terminal:
+stella-client --config /etc/stella/client.toml run
 ```
 
 `run` validates the configuration and protected identity, initializes the
@@ -178,8 +181,9 @@ the control loop and waits for TAP, UDP, and Relay cleanup before the process
 exits.
 
 Windows opens each exact TAP-Windows adapter and sets it media-disconnected on
-shutdown. macOS creates or reuses each exact feth pair, uses BPF receive and
-AF_NDRV transmit, and sets the host-visible interface down without deleting the
-pair. Invalid peer datagrams are dropped without reconnecting the controller;
+shutdown. On macOS the root helper creates or reuses each exact feth pair, uses
+BPF receive and AF_NDRV transmit, and sets the host-visible interface down
+without deleting the pair. The client and helper authenticate each other with
+Unix peer credentials. Invalid peer datagrams are dropped without reconnecting the controller;
 TAP, UDP, or worker failures close the data runtime and use the normal
 fail-closed reconnect path.

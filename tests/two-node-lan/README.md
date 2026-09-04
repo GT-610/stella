@@ -92,8 +92,9 @@ one-TAP fallback run remains under `reports/windows-one-tap-2026-08-31/`.
 ## macOS
 
 The macOS scenario runs the same real controller, two real clients, and Scapy
-verifier against two persistent feth pairs. Each pair has one host-visible
-interface used by Scapy and one packet-I/O peer owned by Stella.
+verifier against two persistent feth pairs through a real
+`stella-tap-helper`. Each pair has one host-visible interface used by Scapy and
+one packet-I/O peer owned by the helper.
 
 Prerequisites:
 
@@ -113,7 +114,7 @@ sudo "$(find target/debug/deps -type f -name 'macos_tap-*' -perm -111 -print -qu
 Then build with the normal user and run the full scenario:
 
 ```sh
-cargo build --release -p stella-server -p stella-client
+cargo build --release -p stella-server -p stella-client -p stella-tap
 sudo ./tests/two-node-lan/run-macos.sh \
   --skip-build \
   --python /opt/homebrew/bin/python3
@@ -129,9 +130,11 @@ The first run verifies ARP, directed IPv4 in both directions, broadcast,
 multicast, and LAN discovery. The script then stops both clients, verifies that
 both pairs still exist and both host-visible interfaces are down, starts the
 same configurations again, and repeats the verifier as a reuse smoke test.
+The script starts the helper only after refusing any pre-existing default
+helper socket and stops it during cleanup.
 
-`summary.md`, `l2-report.json`, `l2-reuse-report.json`, and separate process
-logs remain in the reported artifact directory. Before starting, the script
+`summary.md`, `l2-report.json`, `l2-reuse-report.json`, and separate controller,
+client, and helper logs remain in the reported artifact directory. Before starting, the script
 refuses any pre-existing selected interface. Its cleanup trap therefore
 destroys only the four names that it first confirmed were absent and that this
 run could have created.

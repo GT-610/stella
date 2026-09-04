@@ -12,9 +12,11 @@ The project is in pre-standard development and is not usable for production
 networking yet. The self-hosted controller and authenticated TAP-to-UDP client
 data plane are implemented on Windows and macOS. Windows uses pre-installed
 TAP-Windows adapters; macOS uses persistent built-in feth pairs with BPF receive
-and AF_NDRV transmit through `tun-rs` 2.8.8. Windows end-to-end verification has
-passed with two real adapters. macOS includes root-only lifecycle and two-node
-verification, but this checkout has not recorded a privileged run yet.
+and AF_NDRV transmit through Stella's own backend. A narrow root helper owns
+only the feth lifecycle and frame I/O; `stella-client` remains unprivileged.
+Windows end-to-end verification has passed with two real adapters. macOS
+includes root-only lifecycle and helper-backed two-node verification, but this
+checkout has not recorded a privileged run yet.
 
 ## Release Compatibility
 

@@ -7,8 +7,8 @@
 ## 前置条件与可达性
 
 Windows 每个已配置网络需要一个预安装 TAP-Windows Adapter V9，并从提升权限的 PowerShell
-运行。macOS 每个网络需要两个未占用的数值型 feth 名称，当前必须以 root 运行；Stella 会
-创建或复用 pair，不安装驱动或 helper。
+运行。macOS 每个网络需要两个未占用的数值型 feth 名称。普通客户端保持无特权；另行启动
+的 root `stella-tap-helper` 创建或复用 pair，并且只执行有界 TAP 操作。
 
 控制器必须能通过配置的
 TLS/TCP 地址直接访问，或能通过可选的显式 HTTPS 代理访问。运行时会收集直连 UDP 候选，
@@ -138,7 +138,9 @@ stella-client --config C:\Stella\client.toml run
 macOS：
 
 ```sh
-sudo stella-client --config /etc/stella/client.toml run
+sudo stella-tap-helper --allow-uid "$(id -u)"
+# 在另一个终端中：
+stella-client --config /etc/stella/client.toml run
 ```
 
 `run` 验证配置和受保护身份，初始化配置的 tracing 过滤器，认证后按稳定 ID 顺序重新
@@ -149,7 +151,7 @@ sudo stella-client --config /etc/stella/client.toml run
 同时按 250 ms 到 30 秒的完整抖动退避重连。只有连续三个策略心跳周期未收到确认，心跳
 才视为丢失。Ctrl+C 会中断控制循环，并等待 TAP、UDP 和 Relay 有序关闭。
 
-Windows 会打开准确的 TAP-Windows，并在关闭时设置 media-disconnected。macOS 会创建或
-复用准确 feth pair，通过 BPF 收包、AF_NDRV 发包，并在关闭时把宿主可见端置 down 而不
-删除 pair。无效对等数据报会被丢弃且不重连控制器；TAP、UDP 或 worker 故障会关闭数据
+Windows 会打开准确的 TAP-Windows，并在关闭时设置 media-disconnected。macOS 上由 root
+helper 创建或复用准确 feth pair，通过 BPF 收包、AF_NDRV 发包，并在关闭时把宿主可见端置
+down 而不删除 pair；客户端与 helper 使用 Unix peer credential 双向认证。无效对等数据报会被丢弃且不重连控制器；TAP、UDP 或 worker 故障会关闭数据
 运行时并进入正常的失败关闭重连路径。

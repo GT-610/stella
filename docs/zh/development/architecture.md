@@ -12,8 +12,9 @@
 
 `stella-common` 保存不含线上布局的共享小型值类型；`stella-proto` 负责协议常量、
 消息、验证和字节级编码；`stella-tap` 提供安全的 TAP 设备契约和平台实现，Windows 使用
-原生 TAP-Windows，macOS 使用固定的 `tun-rs` 2.8.8 feth/BPF/AF_NDRV 实现并在外层执行
-Stella 的边界、锁、取消与生命周期规则；
+原生 TAP-Windows；macOS 包含 Stella 自有的 feth/BPF/AF_NDRV 实现，以及
+`stella-tap-helper` 使用的有界 Unix socket 协议。普通客户端使用 proxy `TapDevice`，只有
+helper 创建接口并打开 raw packet descriptor；
 `stella-transport` 提供可替换的有界数据报抽象；`stella-crypto` 管理身份、会话密钥、
 数据包保护、重放窗口和秘密清零；`stella-control` 负责控制通道的分帧、序列、关联和
 TLS 导出器证明记录。

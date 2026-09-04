@@ -6,11 +6,13 @@
 - the repository's default stable Rust toolchain with Cargo;
 - Bun for the VitePress site;
 - Python 3 with `pip` for the real two-node verifier;
-- root access for active TAP clients and real feth tests.
+- root access for the TAP helper and real feth tests.
 
 Pure Rust tests, configuration parsing, documentation, and release builds do
-not require root. The active macOS data plane does: this milestone intentionally
-does not install a kext, DriverKit extension, privileged helper, or daemon.
+not require root. The active `stella-client` also runs as the normal user; only
+`stella-tap-helper` needs root. Stella does not install a kext or DriverKit
+extension. The current helper is a foreground service that an administrator or
+service manager must start explicitly.
 
 ## Verify the workspace
 
@@ -51,10 +53,19 @@ target/debug/stella-client --config /path/to/client.toml join \
   --tap-peer feth101
 ```
 
-Run the active client as root:
+Build the client and helper, then start the helper for the client user's numeric
+UID. Keep this foreground process running; the socket is mode `0600` and owned
+by the selected user:
 
 ```sh
-sudo target/debug/stella-client --config /path/to/client.toml run
+cargo build -p stella-client -p stella-tap
+sudo target/debug/stella-tap-helper --allow-uid "$(id -u)"
+```
+
+In another terminal, run the client without `sudo`:
+
+```sh
+target/debug/stella-client --config /path/to/client.toml run
 ```
 
 After the log reports `macOS data plane is active`, configure only the visible
@@ -81,16 +92,16 @@ sudo "$(find target/debug/deps -type f -name 'macos_tap-*' -perm -111 -print -qu
 Run the full real-controller, real-client scenario with four unused names:
 
 ```sh
-cargo build --release -p stella-server -p stella-client
+cargo build --release -p stella-server -p stella-client -p stella-tap
 sudo ./tests/two-node-lan/run-macos.sh \
   --skip-build \
   --python /opt/homebrew/bin/python3
 ```
 
 The script refuses pre-existing selected names, verifies the first run and a
-same-configuration restart, writes reports and process logs to a create-new
-artifact directory, and deletes only the four interfaces it confirmed this run
-could create.
+same-configuration restart through a real helper, writes reports and process
+logs to a create-new artifact directory, and deletes only the four interfaces
+it confirmed this run could create.
 
 For a manually managed pair, stop every owning client before deletion. Deleting
 one side is an administrator action and discards the persistent interface and
