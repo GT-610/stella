@@ -21,6 +21,8 @@ use crate::{
     Result, TapCancellation, TapCancellationHandle, TapConfig, TapDevice, TapError, TapOperation,
 };
 
+const MAX_FETH_UNIT: u16 = 9_999;
+
 pub use helper::{
     run_macos_tap_helper, MacosTapHelperConfig, MacosTapProxyCancellation, MacosTapProxyDevice,
     DEFAULT_MACOS_HELPER_SOCKET,
@@ -212,10 +214,16 @@ fn required_feth_name<'a>(value: Option<&'a str>, field: &'static str) -> Result
             reason: "must use the feth<N> interface form",
         });
     };
-    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+    let Ok(unit) = index.parse::<u16>() else {
         return Err(TapError::InvalidConfig {
             field,
-            reason: "must use the feth<N> interface form",
+            reason: "must use the canonical feth<N> form with N in 0..=9999",
+        });
+    };
+    if unit > MAX_FETH_UNIT || unit.to_string() != index {
+        return Err(TapError::InvalidConfig {
+            field,
+            reason: "must use the canonical feth<N> form with N in 0..=9999",
         });
     }
     Ok(name)
@@ -291,7 +299,19 @@ mod tests {
             required_feth_name(Some("feth6100"), "peer name"),
             Ok("feth6100")
         ));
-        for invalid in [None, Some(""), Some("feth"), Some("feth-1"), Some("en0")] {
+        assert!(matches!(
+            required_feth_name(Some("feth9999"), "peer name"),
+            Ok("feth9999")
+        ));
+        for invalid in [
+            None,
+            Some(""),
+            Some("feth"),
+            Some("feth-1"),
+            Some("feth01"),
+            Some("feth10000"),
+            Some("en0"),
+        ] {
             assert!(matches!(
                 required_feth_name(invalid, "name"),
                 Err(TapError::InvalidConfig { .. })

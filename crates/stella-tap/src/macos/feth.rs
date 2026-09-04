@@ -8,19 +8,17 @@ use std::{
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::Path,
-    process::Command,
 };
 
 use fs2::FileExt;
 
 use super::sys;
-use crate::{Result, TapError, TapOperation};
+use crate::{Result, TapError, TapOperation, MAX_TAP_MTU};
 
 const LOCK_DIRECTORY: &str = "/var/run/stella";
 const LOCK_DIRECTORY_MODE: u32 = 0o700;
 const LOCK_FILE_MODE: u32 = 0o600;
 const METADATA_PREFIX: &str = "stella-feth-v1";
-const IFCONFIG: &str = "/sbin/ifconfig";
 
 #[derive(Clone, Copy)]
 struct InterfaceState {
@@ -53,6 +51,9 @@ impl PreparedFethPair {
 
         let control = sys::open_control_socket()
             .map_err(|source| TapError::io(TapOperation::OpenDevice, source))?;
+        // XNU copies net.link.fake.max_mtu into each feth when it is created.
+        // Raising the sysctl after creation cannot enlarge that interface's ceiling.
+        ensure_feth_mtu_limit(MAX_TAP_MTU)?;
         let visible_original = visible_exists
             .then(|| interface_state(&control, visible))
             .transpose()?;
@@ -82,7 +83,13 @@ impl PreparedFethPair {
                 .map_err(|source| TapError::io(TapOperation::CreateDevice, source))?;
             prepared.peer_created = true;
         }
-        pair_interfaces(peer, visible)?;
+        ensure_interface_mtu_capacity(&prepared.control, visible, MAX_TAP_MTU)?;
+        ensure_interface_mtu_capacity(&prepared.control, peer, MAX_TAP_MTU)?;
+        if prepared.visible_created {
+            sys::set_interface_mac(&prepared.control, visible, random_local_unicast_mac())
+                .map_err(|source| TapError::io(TapOperation::SetMac, source))?;
+        }
+        pair_interfaces(&prepared.control, peer, visible)?;
         let installed_mtu = sys::interface_mtu(&prepared.control, visible)
             .map_err(|source| TapError::io(TapOperation::QueryMtu, source))?;
         prepared.effective_mtu = installed_mtu.min(requested_mtu);
@@ -91,7 +98,7 @@ impl PreparedFethPair {
             .map_err(|source| TapError::io(TapOperation::SetDeviceState, source))?;
         sys::set_interface_up(&prepared.control, visible, true)
             .map_err(|source| TapError::io(TapOperation::SetDeviceState, source))?;
-        prepared.mac_address = sys::interface_mac(visible)
+        prepared.mac_address = sys::interface_mac(&prepared.control, visible)
             .map_err(|source| TapError::io(TapOperation::QueryMac, source))?;
         Ok(prepared)
     }
@@ -151,6 +158,9 @@ impl FethPair {
     pub(super) fn set_mtu(&self, mtu: u16) -> Result<()> {
         let control = sys::open_control_socket()
             .map_err(|source| TapError::io(TapOperation::OpenDevice, source))?;
+        ensure_feth_mtu_limit(mtu)?;
+        ensure_interface_mtu_capacity(&control, &self.visible, mtu)?;
+        ensure_interface_mtu_capacity(&control, &self.peer, mtu)?;
         set_pair_mtu(&control, &self.visible, &self.peer, mtu)
     }
 
@@ -206,29 +216,74 @@ fn set_pair_mtu(control: &OwnedFd, visible: &str, peer: &str, mtu: u16) -> Resul
     Ok(())
 }
 
-fn pair_interfaces(peer: &str, visible: &str) -> Result<()> {
-    let output = Command::new(IFCONFIG)
-        .args([peer, "peer", visible])
-        .output()
-        .map_err(|source| TapError::io(TapOperation::PairInterfaces, source))?;
-    if output.status.success() {
+fn ensure_feth_mtu_limit(requested: u16) -> Result<()> {
+    let current = sys::feth_max_mtu()
+        .map_err(|source| TapError::io(TapOperation::QueryFethMtuLimit, source))?;
+    let Some(target) = feth_mtu_limit_update(current, requested) else {
         return Ok(());
-    }
-    let diagnostics = if output.stderr.is_empty() {
-        &output.stdout
-    } else {
-        &output.stderr
     };
-    let mut diagnostics = String::from_utf8_lossy(diagnostics).trim().to_owned();
-    diagnostics.truncate(512);
-    Err(TapError::io(
-        TapOperation::PairInterfaces,
-        io::Error::other(if diagnostics.is_empty() {
-            "ifconfig could not pair the feth interfaces".to_owned()
-        } else {
-            diagnostics
+    sys::set_feth_max_mtu(target)
+        .map_err(|source| TapError::io(TapOperation::SetFethMtuLimit, source))?;
+    let updated = sys::feth_max_mtu()
+        .map_err(|source| TapError::io(TapOperation::QueryFethMtuLimit, source))?;
+    if updated < u32::from(requested) {
+        return Err(TapError::io(
+            TapOperation::SetFethMtuLimit,
+            io::Error::other(format!(
+                "macOS retained feth MTU limit {updated} below requested MTU {requested}"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_interface_mtu_capacity(control: &OwnedFd, interface: &str, required: u16) -> Result<()> {
+    let available = sys::interface_max_mtu(control, interface)
+        .map_err(|source| TapError::io(TapOperation::QueryDeviceMtuLimit, source))?;
+    if available < u32::from(required) {
+        return Err(TapError::FethMtuTooSmall {
+            interface: interface.to_owned(),
+            required,
+            available,
+        });
+    }
+    Ok(())
+}
+
+fn feth_mtu_limit_update(current: u32, requested: u16) -> Option<u16> {
+    (current < u32::from(requested)).then_some(MAX_TAP_MTU)
+}
+
+fn pair_interfaces(control: &OwnedFd, peer: &str, visible: &str) -> Result<()> {
+    let visible_peer = sys::interface_peer(control, visible)
+        .map_err(|source| TapError::io(TapOperation::QueryPeer, source))?;
+    let packet_peer = sys::interface_peer(control, peer)
+        .map_err(|source| TapError::io(TapOperation::QueryPeer, source))?;
+    match (visible_peer.as_deref(), packet_peer.as_deref()) {
+        (Some(actual_peer), Some(actual_visible))
+            if actual_peer == peer && actual_visible == visible =>
+        {
+            Ok(())
+        }
+        (None, None) => sys::set_interface_peer(control, peer, visible)
+            .map_err(|source| TapError::io(TapOperation::PairInterfaces, source)),
+        _ => Err(TapError::DeviceOwnershipConflict {
+            name: visible.to_owned(),
+            peer_name: peer.to_owned(),
         }),
-    ))
+    }
+}
+
+fn random_local_unicast_mac() -> [u8; 6] {
+    let mut address = [0_u8; 6];
+    // SAFETY: `address` is writable for its full length. arc4random_buf has no failure mode.
+    unsafe { libc::arc4random_buf(address.as_mut_ptr().cast(), address.len()) };
+    normalize_local_unicast_mac(address)
+}
+
+fn normalize_local_unicast_mac(mut address: [u8; 6]) -> [u8; 6] {
+    address[0] = (address[0] | 0x02) & 0xfe;
+    address
 }
 
 fn acquire_pair_lock(name: &str, peer_name: &str) -> Result<File> {
@@ -340,7 +395,8 @@ fn ownership_record(visible: &str, peer: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ownership_record;
+    use super::{feth_mtu_limit_update, normalize_local_unicast_mac, ownership_record};
+    use crate::MAX_TAP_MTU;
 
     #[test]
     fn ownership_record_preserves_interface_roles() {
@@ -352,5 +408,20 @@ mod tests {
             ownership_record("feth100", "feth101"),
             ownership_record("feth101", "feth100")
         );
+    }
+
+    #[test]
+    fn generated_mac_is_locally_administered_unicast() {
+        assert_eq!(normalize_local_unicast_mac([0; 6]), [0x02, 0, 0, 0, 0, 0]);
+        let address = normalize_local_unicast_mac([0xff; 6]);
+        assert_eq!(address[0], 0xfe);
+        assert_eq!(address[1..], [0xff; 5]);
+    }
+
+    #[test]
+    fn feth_mtu_limit_is_only_raised_and_never_lowered() {
+        assert_eq!(feth_mtu_limit_update(2_048, 4_082), Some(MAX_TAP_MTU));
+        assert_eq!(feth_mtu_limit_update(4_082, 4_082), None);
+        assert_eq!(feth_mtu_limit_update(10_000, MAX_TAP_MTU), None);
     }
 }

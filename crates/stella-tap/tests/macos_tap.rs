@@ -145,9 +145,13 @@ fn cancel_pending_read(
     while !worker.is_finished() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(!remaining.is_zero(), "feth read did not become cancellable");
-        ready_receiver
-            .recv_timeout(remaining)
-            .expect("worker announced a pending feth read");
+        match ready_receiver.recv_timeout(remaining) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("worker did not announce a pending feth read before the deadline")
+            }
+        }
         thread::sleep(Duration::from_millis(50));
         cancellation
             .cancel_pending_io()
@@ -289,7 +293,7 @@ fn test_interface_names() -> (String, String) {
     ) {
         (Some(visible), Some(peer)) => (visible, peer),
         (None, None) => {
-            let base = 62_000 + (std::process::id() % 1_000) * 2;
+            let base = 8_000 + (std::process::id() % 1_000) * 2;
             (format!("feth{base}"), format!("feth{}", base + 1))
         }
         _ => panic!("set both STELLA_TAP_MACOS_VISIBLE and STELLA_TAP_MACOS_PEER"),

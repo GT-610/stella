@@ -35,6 +35,8 @@ pub enum TapOperation {
     CreateDevice,
     /// Pairing two macOS fake-Ethernet interfaces.
     PairInterfaces,
+    /// Querying the peer of a macOS fake-Ethernet interface.
+    QueryPeer,
     /// Configuring blocking behavior for frame I/O.
     ConfigureBlockingMode,
     /// Connecting to the privileged macOS TAP helper.
@@ -51,8 +53,16 @@ pub enum TapOperation {
     QueryVersion,
     /// Querying the TAP driver MAC address.
     QueryMac,
+    /// Assigning a MAC address to a newly created macOS feth interface.
+    SetMac,
     /// Querying a platform interface MTU.
     QueryMtu,
+    /// Querying the system-wide macOS feth MTU ceiling.
+    QueryFethMtuLimit,
+    /// Raising the system-wide macOS feth MTU ceiling.
+    SetFethMtuLimit,
+    /// Querying the creation-time MTU ceiling of one macOS feth interface.
+    QueryDeviceMtuLimit,
     /// Querying the TAP driver MTU ceiling.
     QueryDriverMtu,
     /// Changing the TAP driver's logical media state.
@@ -87,6 +97,7 @@ impl fmt::Display for TapOperation {
             Self::RecordDeviceOwnership => "record device ownership",
             Self::CreateDevice => "create device",
             Self::PairInterfaces => "pair interfaces",
+            Self::QueryPeer => "query interface peer",
             Self::ConfigureBlockingMode => "configure blocking mode",
             Self::ConnectHelper => "connect TAP helper",
             Self::AuthenticateHelper => "authenticate TAP helper",
@@ -95,7 +106,11 @@ impl fmt::Display for TapOperation {
             Self::OpenDevice => "open device",
             Self::QueryVersion => "query driver version",
             Self::QueryMac => "query MAC",
+            Self::SetMac => "set MAC",
             Self::QueryMtu => "query MTU",
+            Self::QueryFethMtuLimit => "query feth MTU limit",
+            Self::SetFethMtuLimit => "set feth MTU limit",
+            Self::QueryDeviceMtuLimit => "query device MTU limit",
             Self::QueryDriverMtu => "query driver MTU",
             Self::SetMediaStatus => "set media status",
             Self::ConfigurePriority => "configure 802.1Q priority behavior",
@@ -193,6 +208,18 @@ pub enum TapError {
         /// Requested Layer-3 MTU.
         requested: u16,
         /// MTU reported by the TAP driver.
+        available: u32,
+    },
+    /// A persistent feth was created before Stella raised the system ceiling.
+    #[error(
+        "macOS feth interface {interface:?} has creation-time MTU ceiling {available}, below required {required}"
+    )]
+    FethMtuTooSmall {
+        /// Interface whose immutable per-instance ceiling is insufficient.
+        interface: String,
+        /// MTU the backend must support.
+        required: u16,
+        /// Maximum MTU captured by the interface when it was created.
         available: u32,
     },
     /// Configured complete-frame ceiling exceeds the miniport capability.

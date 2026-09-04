@@ -7,7 +7,6 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::ffi::OsStrExt,
     path::Path,
-    ptr,
 };
 
 const IOC_OUT: libc::c_ulong = 0x4000_0000;
@@ -38,23 +37,38 @@ const SIOCSIFFLAGS: libc::c_ulong = iow::<libc::ifreq>(b'i', 16);
 const SIOCGIFFLAGS: libc::c_ulong = iowr::<libc::ifreq>(b'i', 17);
 const SIOCGIFMTU: libc::c_ulong = iowr::<libc::ifreq>(b'i', 51);
 const SIOCSIFMTU: libc::c_ulong = iow::<libc::ifreq>(b'i', 52);
+const SIOCSIFLLADDR: libc::c_ulong = iow::<libc::ifreq>(b'i', 60);
+const SIOCGIFDEVMTU: libc::c_ulong = iowr::<libc::ifreq>(b'i', 68);
 const SIOCIFCREATE: libc::c_ulong = iowr::<libc::ifreq>(b'i', 120);
 const SIOCIFDESTROY: libc::c_ulong = iow::<libc::ifreq>(b'i', 121);
+const IF_FAKE_S_CMD_SET_PEER: libc::c_ulong = 1;
+const IF_FAKE_G_CMD_GET_PEER: libc::c_ulong = 1;
+const SIOCGIFLLADDR: libc::c_ulong = iowr::<libc::ifreq>(b'i', 158);
 const BIOCSSEESENT: libc::c_ulong = iow::<libc::c_uint>(b'B', 119);
 const DLT_EN10MB: libc::c_uint = 1;
+const ETHERNET_ADDRESS_LENGTH: usize = 6;
+const FETH_MAX_MTU_SYSCTL: &CStr = c"net.link.fake.max_mtu";
+
+#[repr(C, packed(4))]
+struct IfDrv {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    command: libc::c_ulong,
+    length: usize,
+    data: *mut libc::c_void,
+}
+
+#[repr(C)]
+struct IfFakeRequest {
+    reserved: [u64; 4],
+    data: [u8; 128],
+}
+
+const SIOCSDRVSPEC: libc::c_ulong = iow::<IfDrv>(b'i', 123);
+const SIOCGDRVSPEC: libc::c_ulong = iowr::<IfDrv>(b'i', 123);
 
 pub(super) enum PollReady {
     Io,
     Cancelled,
-}
-
-struct InterfaceAddresses(*mut libc::ifaddrs);
-
-impl Drop for InterfaceAddresses {
-    fn drop(&mut self) {
-        // SAFETY: the pointer was returned by `getifaddrs` and is freed exactly once.
-        unsafe { libc::freeifaddrs(self.0) };
-    }
 }
 
 pub(super) fn open_control_socket() -> io::Result<OwnedFd> {
@@ -303,6 +317,129 @@ pub(super) fn set_interface_mtu(control: &OwnedFd, name: &str, mtu: u16) -> io::
     ioctl_mut(control, SIOCSIFMTU, &mut request)
 }
 
+pub(super) fn interface_max_mtu(control: &OwnedFd, name: &str) -> io::Result<u32> {
+    let mut request = interface_request(name)?;
+    ioctl_mut(control, SIOCGIFDEVMTU, &mut request)?;
+    // SAFETY: SIOCGIFDEVMTU initialized the `ifru_devmtu` union member.
+    let maximum = unsafe { request.ifr_ifru.ifru_devmtu.ifdm_max };
+    if maximum <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "interface returned an invalid maximum MTU",
+        ));
+    }
+    u32::try_from(maximum).map_err(invalid_input)
+}
+
+pub(super) fn interface_peer(control: &OwnedFd, name: &str) -> io::Result<Option<String>> {
+    let mut request = IfFakeRequest {
+        reserved: [0; 4],
+        data: [0; 128],
+    };
+    let mut driver = interface_driver_request(name, IF_FAKE_G_CMD_GET_PEER, &mut request)?;
+    ioctl_mut(control, SIOCGDRVSPEC, &mut driver)?;
+    let peer = &request.data[..libc::IFNAMSIZ];
+    let length = peer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(peer.len());
+    if length == 0 {
+        return Ok(None);
+    }
+    let peer = std::str::from_utf8(&peer[..length]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "feth returned a non-UTF-8 peer interface name",
+        )
+    })?;
+    Ok(Some(peer.to_owned()))
+}
+
+pub(super) fn set_interface_peer(control: &OwnedFd, name: &str, peer: &str) -> io::Result<()> {
+    let peer = peer.as_bytes();
+    if peer.is_empty() || peer.len() >= libc::IFNAMSIZ {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid feth peer interface name length",
+        ));
+    }
+    let mut request = IfFakeRequest {
+        reserved: [0; 4],
+        data: [0; 128],
+    };
+    request.data[..peer.len()].copy_from_slice(peer);
+    let mut driver = interface_driver_request(name, IF_FAKE_S_CMD_SET_PEER, &mut request)?;
+    ioctl_mut(control, SIOCSDRVSPEC, &mut driver)
+}
+
+fn interface_driver_request<T>(
+    name: &str,
+    command: libc::c_ulong,
+    data: &mut T,
+) -> io::Result<IfDrv> {
+    let name = name.as_bytes();
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid interface name length",
+        ));
+    }
+    let mut request = IfDrv {
+        name: [0; libc::IFNAMSIZ],
+        command,
+        length: size_of::<T>(),
+        data: std::ptr::from_mut(data).cast(),
+    };
+    for (target, source) in request.name.iter_mut().zip(name) {
+        *target = libc::c_char::from_ne_bytes([*source]);
+    }
+    Ok(request)
+}
+
+pub(super) fn feth_max_mtu() -> io::Result<u32> {
+    let mut value: libc::c_int = 0;
+    let mut length = size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and both output pointers refer to writable storage.
+    if unsafe {
+        libc::sysctlbyname(
+            FETH_MAX_MTU_SYSCTL.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if length != size_of::<libc::c_int>() || value <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "macOS returned an invalid feth MTU limit",
+        ));
+    }
+    u32::try_from(value).map_err(invalid_input)
+}
+
+pub(super) fn set_feth_max_mtu(mtu: u16) -> io::Result<()> {
+    let mut value = libc::c_int::from(mtu);
+    // SAFETY: the name is NUL-terminated and `value` is readable for the supplied length.
+    if unsafe {
+        libc::sysctlbyname(
+            FETH_MAX_MTU_SYSCTL.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            (&raw mut value).cast(),
+            size_of::<libc::c_int>(),
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub(super) fn interface_flags(control: &OwnedFd, name: &str) -> io::Result<libc::c_short> {
     let mut request = interface_request(name)?;
     ioctl_mut(control, SIOCGIFFLAGS, &mut request)?;
@@ -333,47 +470,47 @@ pub(super) fn set_interface_up(control: &OwnedFd, name: &str, up: bool) -> io::R
     set_interface_flags(control, name, next)
 }
 
-pub(super) fn interface_mac(name: &str) -> io::Result<[u8; 6]> {
-    let requested = CString::new(name).map_err(invalid_input)?;
-    let mut head = ptr::null_mut();
-    // SAFETY: `head` points to storage for the returned linked-list head.
-    if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
-        return Err(io::Error::last_os_error());
+pub(super) fn set_interface_mac(
+    control: &OwnedFd,
+    name: &str,
+    mac: [u8; ETHERNET_ADDRESS_LENGTH],
+) -> io::Result<()> {
+    let mut request = interface_request(name)?;
+    let mut address: libc::sockaddr = unsafe { std::mem::zeroed() };
+    address.sa_len = u8::try_from(ETHERNET_ADDRESS_LENGTH).map_err(invalid_input)?;
+    address.sa_family = libc::sa_family_t::try_from(libc::AF_LINK).map_err(invalid_input)?;
+    for (target, source) in address.sa_data.iter_mut().zip(mac) {
+        *target = libc::c_char::from_ne_bytes([source]);
     }
-    let _guard = InterfaceAddresses(head);
-    let mut current = head;
-    while !current.is_null() {
-        // SAFETY: nodes in the `getifaddrs` list remain valid until `freeifaddrs`.
-        let entry = unsafe { &*current };
-        if !entry.ifa_name.is_null()
-            // SAFETY: `ifa_name` is a NUL-terminated string owned by the list.
-            && unsafe { CStr::from_ptr(entry.ifa_name) } == requested.as_c_str()
-            && !entry.ifa_addr.is_null()
-            // SAFETY: every sockaddr begins with the length and family bytes.
-            && unsafe { libc::c_int::from((*entry.ifa_addr).sa_family) } == libc::AF_LINK
-        {
-            // SAFETY: AF_LINK entries point to `sockaddr_dl` values.
-            let link = unsafe { &*entry.ifa_addr.cast::<libc::sockaddr_dl>() };
-            if usize::from(link.sdl_alen) == 6 {
-                let offset = usize::from(link.sdl_nlen);
-                let end = offset.checked_add(6).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "link-layer address overflow")
-                })?;
-                if end <= link.sdl_data.len() {
-                    let mut address = [0_u8; 6];
-                    for (output, input) in address.iter_mut().zip(&link.sdl_data[offset..end]) {
-                        *output = input.to_ne_bytes()[0];
-                    }
-                    return Ok(address);
-                }
-            }
-        }
-        current = entry.ifa_next;
+    request.ifr_ifru.ifru_addr = address;
+    ioctl_mut(control, SIOCSIFLLADDR, &mut request)
+}
+
+pub(super) fn interface_mac(
+    control: &OwnedFd,
+    name: &str,
+) -> io::Result<[u8; ETHERNET_ADDRESS_LENGTH]> {
+    let mut request = interface_request(name)?;
+    let mut address: libc::sockaddr = unsafe { std::mem::zeroed() };
+    address.sa_len = u8::try_from(ETHERNET_ADDRESS_LENGTH).map_err(invalid_input)?;
+    address.sa_family = libc::sa_family_t::try_from(libc::AF_LINK).map_err(invalid_input)?;
+    request.ifr_ifru.ifru_addr = address;
+    ioctl_mut(control, SIOCGIFLLADDR, &mut request)?;
+    // SAFETY: SIOCGIFLLADDR initialized the `ifru_addr` union member.
+    let address = unsafe { &request.ifr_ifru.ifru_addr };
+    if libc::c_int::from(address.sa_family) != libc::AF_LINK
+        || usize::from(address.sa_len) < ETHERNET_ADDRESS_LENGTH
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "interface returned an invalid Ethernet address",
+        ));
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "interface has no Ethernet address",
-    ))
+    let mut mac = [0_u8; ETHERNET_ADDRESS_LENGTH];
+    for (target, source) in mac.iter_mut().zip(&address.sa_data) {
+        *target = source.to_ne_bytes()[0];
+    }
+    Ok(mac)
 }
 
 pub(super) fn bind_ndrv(fd: &OwnedFd, name: &str) -> io::Result<()> {
@@ -471,12 +608,21 @@ fn invalid_input(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{iow, iowr};
+    use std::mem::size_of;
+
+    use super::{iow, iowr, IfDrv, IfFakeRequest};
 
     #[test]
     fn sdk_ioctl_numbers_match_darwin_abi() {
         assert_eq!(iowr::<libc::ifreq>(b'i', 120), 0xc020_6978);
         assert_eq!(iow::<libc::ifreq>(b'i', 121), 0x8020_6979);
+        assert_eq!(iow::<libc::ifreq>(b'i', 60), 0x8020_693c);
+        assert_eq!(iowr::<libc::ifreq>(b'i', 68), 0xc020_6944);
+        assert_eq!(size_of::<IfDrv>(), 40);
+        assert_eq!(size_of::<IfFakeRequest>(), 160);
+        assert_eq!(iow::<IfDrv>(b'i', 123), 0x8028_697b);
+        assert_eq!(iowr::<IfDrv>(b'i', 123), 0xc028_697b);
+        assert_eq!(iowr::<libc::ifreq>(b'i', 158), 0xc020_699e);
         assert_eq!(iow::<libc::c_uint>(b'B', 119), 0x8004_4277);
     }
 }

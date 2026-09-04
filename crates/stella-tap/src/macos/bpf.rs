@@ -1,12 +1,23 @@
 //! Complete-frame BPF receive path with strict batch parsing.
 
-use std::{collections::VecDeque, ffi::CString, io, mem::size_of, os::fd::OwnedFd};
+use std::{
+    collections::VecDeque,
+    ffi::CString,
+    io,
+    mem::{offset_of, size_of},
+    os::fd::OwnedFd,
+};
 
 use super::{interrupt::Interrupt, sys};
 
 const REQUESTED_BUFFER_LENGTH: usize = 128 * 1024;
 const MAX_BPF_DEVICES: usize = 5_000;
-const HEADER_LENGTH: usize = size_of::<libc::bpf_hdr>();
+const BPF_ALIGNMENT: usize = size_of::<i32>();
+const CAPTURED_LENGTH_OFFSET: usize = offset_of!(libc::bpf_hdr, bh_caplen);
+const ORIGINAL_LENGTH_OFFSET: usize = offset_of!(libc::bpf_hdr, bh_datalen);
+const HEADER_LENGTH_OFFSET: usize = offset_of!(libc::bpf_hdr, bh_hdrlen);
+// XNU deliberately excludes the C structure's trailing padding from SIZEOF_BPF_HDR.
+const MIN_HEADER_LENGTH: usize = HEADER_LENGTH_OFFSET + size_of::<u16>();
 
 pub(super) struct BpfReceiver {
     fd: OwnedFd,
@@ -20,7 +31,7 @@ impl BpfReceiver {
         sys::set_cloexec(&fd)?;
         sys::set_nonblocking(&fd)?;
         let buffer_length = sys::configure_bpf(&fd, interface, REQUESTED_BUFFER_LENGTH)?;
-        if buffer_length < HEADER_LENGTH + 14 {
+        if buffer_length < MIN_HEADER_LENGTH + 14 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "BPF returned an unusably small capture buffer",
@@ -93,16 +104,13 @@ fn parse_batch(batch: &[u8], frames: &mut VecDeque<Vec<u8>>) -> io::Result<()> {
     let mut offset = 0_usize;
     while offset < batch.len() {
         let remaining = batch.len() - offset;
-        if remaining < HEADER_LENGTH {
+        if remaining < MIN_HEADER_LENGTH {
             return Err(invalid_batch("truncated BPF header"));
         }
-        // SAFETY: `remaining` covers a complete header; unaligned reads are required for BPF records.
-        let header =
-            unsafe { std::ptr::read_unaligned(batch.as_ptr().add(offset).cast::<libc::bpf_hdr>()) };
-        let header_length = usize::from(header.bh_hdrlen);
-        let captured_length = header.bh_caplen as usize;
-        let original_length = header.bh_datalen as usize;
-        if header_length < HEADER_LENGTH {
+        let header_length = usize::from(read_u16(batch, offset + HEADER_LENGTH_OFFSET));
+        let captured_length = read_u32(batch, offset + CAPTURED_LENGTH_OFFSET) as usize;
+        let original_length = read_u32(batch, offset + ORIGINAL_LENGTH_OFFSET) as usize;
+        if header_length < MIN_HEADER_LENGTH {
             return Err(invalid_batch("BPF header length is too small"));
         }
         if captured_length == 0 || captured_length != original_length {
@@ -119,14 +127,19 @@ fn parse_batch(batch: &[u8], frames: &mut VecDeque<Vec<u8>>) -> io::Result<()> {
         }
         frames.push_back(batch[frame_start..frame_end].to_vec());
 
+        if frame_end == batch.len() {
+            offset = batch.len();
+            continue;
+        }
+
         let record_length = header_length
             .checked_add(captured_length)
             .ok_or_else(|| invalid_batch("BPF record length overflow"))?;
         let step = record_length
-            .checked_add(3)
-            .map(|length| length & !3)
+            .checked_add(BPF_ALIGNMENT - 1)
+            .map(|length| length & !(BPF_ALIGNMENT - 1))
             .ok_or_else(|| invalid_batch("BPF alignment overflow"))?;
-        if step < HEADER_LENGTH || offset.checked_add(step).is_none() {
+        if step < MIN_HEADER_LENGTH || offset.checked_add(step).is_none() {
             return Err(invalid_batch("BPF record cannot advance"));
         }
         let next = offset + step;
@@ -141,31 +154,73 @@ fn parse_batch(batch: &[u8], frames: &mut VecDeque<Vec<u8>>) -> io::Result<()> {
     Ok(())
 }
 
+fn read_u16(batch: &[u8], offset: usize) -> u16 {
+    let mut bytes = [0_u8; size_of::<u16>()];
+    bytes.copy_from_slice(&batch[offset..offset + size_of::<u16>()]);
+    u16::from_ne_bytes(bytes)
+}
+
+fn read_u32(batch: &[u8], offset: usize) -> u32 {
+    let mut bytes = [0_u8; size_of::<u32>()];
+    bytes.copy_from_slice(&batch[offset..offset + size_of::<u32>()]);
+    u32::from_ne_bytes(bytes)
+}
+
 fn invalid_batch(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, mem::size_of};
+    use std::collections::VecDeque;
 
-    use super::parse_batch;
+    use super::{
+        parse_batch, BPF_ALIGNMENT, CAPTURED_LENGTH_OFFSET, HEADER_LENGTH_OFFSET,
+        MIN_HEADER_LENGTH, ORIGINAL_LENGTH_OFFSET,
+    };
 
-    fn record(frame: &[u8], captured_length: Option<u32>) -> Vec<u8> {
-        // SAFETY: all-zero is a valid test value for the timestamp fields.
-        let mut header: libc::bpf_hdr = unsafe { std::mem::zeroed() };
-        header.bh_hdrlen = u16::try_from(size_of::<libc::bpf_hdr>()).expect("header fits u16");
+    fn record(frame: &[u8], captured_length: Option<u32>, trailing_padding: bool) -> Vec<u8> {
         let frame_length = u32::try_from(frame.len()).expect("test frame length fits u32");
-        header.bh_caplen = captured_length.unwrap_or(frame_length);
-        header.bh_datalen = frame_length;
-        let step = (usize::from(header.bh_hdrlen) + frame.len() + 3) & !3;
-        let mut output = vec![0_u8; step];
-        // SAFETY: output starts with enough initialized storage for an unaligned header write.
-        unsafe {
-            std::ptr::write_unaligned(output.as_mut_ptr().cast::<libc::bpf_hdr>(), header);
+        let record_length = MIN_HEADER_LENGTH + frame.len();
+        let output_length = if trailing_padding {
+            (record_length + BPF_ALIGNMENT - 1) & !(BPF_ALIGNMENT - 1)
+        } else {
+            record_length
+        };
+        let mut output = vec![0_u8; output_length];
+        output[CAPTURED_LENGTH_OFFSET..CAPTURED_LENGTH_OFFSET + 4]
+            .copy_from_slice(&captured_length.unwrap_or(frame_length).to_ne_bytes());
+        output[ORIGINAL_LENGTH_OFFSET..ORIGINAL_LENGTH_OFFSET + 4]
+            .copy_from_slice(&frame_length.to_ne_bytes());
+        output[HEADER_LENGTH_OFFSET..HEADER_LENGTH_OFFSET + 2].copy_from_slice(
+            &u16::try_from(MIN_HEADER_LENGTH)
+                .expect("header fits u16")
+                .to_ne_bytes(),
+        );
+        output[MIN_HEADER_LENGTH..MIN_HEADER_LENGTH + frame.len()].copy_from_slice(frame);
+        output
+    }
+
+    #[test]
+    fn accepts_xnu_header_without_c_structure_tail_padding() {
+        assert!(MIN_HEADER_LENGTH < std::mem::size_of::<libc::bpf_hdr>());
+        let frame = vec![0x33; 60];
+        let mut frames = VecDeque::new();
+        parse_batch(&record(&frame, None, false), &mut frames)
+            .expect("parse XNU-sized unpadded final record");
+        assert_eq!(frames.pop_front().as_deref(), Some(frame.as_slice()));
+        assert!(frames.is_empty());
+    }
+
+    fn padded_record(frame: &[u8], captured_length: Option<u32>) -> Vec<u8> {
+        record(frame, captured_length, true)
+    }
+
+    fn malformed_record(frame: &[u8], captured_length: Option<u32>) -> Vec<u8> {
+        let mut output = padded_record(frame, captured_length);
+        if output.len() == MIN_HEADER_LENGTH + frame.len() {
+            output.push(0);
         }
-        let start = usize::from(header.bh_hdrlen);
-        output[start..start + frame.len()].copy_from_slice(frame);
         output
     }
 
@@ -173,8 +228,8 @@ mod tests {
     fn parses_every_frame_from_one_bpf_batch() {
         let first = vec![0x11; 60];
         let second = vec![0x22; 4_096];
-        let mut batch = record(&first, None);
-        batch.extend(record(&second, None));
+        let mut batch = padded_record(&first, None);
+        batch.extend(record(&second, None, false));
         let mut frames = VecDeque::new();
         parse_batch(&batch, &mut frames).expect("parse complete batch");
         assert_eq!(frames.pop_front().as_deref(), Some(first.as_slice()));
@@ -186,9 +241,9 @@ mod tests {
     fn rejects_truncated_and_malformed_bpf_records() {
         let mut frames = VecDeque::new();
         assert!(parse_batch(&[0_u8; 3], &mut frames).is_err());
-        assert!(parse_batch(&record(&[0_u8; 60], Some(59)), &mut frames).is_err());
+        assert!(parse_batch(&padded_record(&[0_u8; 60], Some(59)), &mut frames).is_err());
 
-        let mut malformed = record(&[0_u8; 60], None);
+        let mut malformed = malformed_record(&[0_u8; 60], None);
         malformed.truncate(malformed.len() - 1);
         assert!(parse_batch(&malformed, &mut frames).is_err());
     }
