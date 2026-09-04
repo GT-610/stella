@@ -2,6 +2,25 @@
 node_modules
 target
 
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+.localized
+Network Trash Folder
+Temporary Items
+.apdisk
+
 # Docs
 docs/.vitepress/dist
 docs/.vitepress/cache
