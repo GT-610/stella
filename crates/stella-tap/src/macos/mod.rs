@@ -1,35 +1,24 @@
-//! macOS Layer-2 backend using a persistent fake-Ethernet pair.
+//! Stella-owned macOS Layer-2 backend using persistent fake-Ethernet pairs.
+
+mod bpf;
+mod feth;
+mod interrupt;
+mod ndrv;
+mod sys;
 
 use std::{
-    fmt,
-    fs::{DirBuilder, File, OpenOptions},
-    io,
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
-    path::Path,
-    sync::{Arc, Mutex, Weak},
+    fmt, io,
+    sync::{Arc, Weak},
 };
 
-use fs2::FileExt;
-use tun_rs::{DeviceBuilder, InterruptEvent, Layer, SyncDevice};
+use bpf::BpfReceiver;
+use feth::FethPair;
+use interrupt::{CancellationState, Interrupt, OperationState};
+use ndrv::NdrvSender;
 
 use crate::{
     Result, TapCancellation, TapCancellationHandle, TapConfig, TapDevice, TapError, TapOperation,
 };
-
-const LOCK_DIRECTORY: &str = "/var/run/stella";
-const LOCK_DIRECTORY_MODE: u32 = 0o700;
-const LOCK_FILE_MODE: u32 = 0o600;
-
-#[derive(Default)]
-struct OperationState {
-    pending: bool,
-    cancelled: bool,
-}
-
-struct CancellationState {
-    event: InterruptEvent,
-    operation: Mutex<OperationState>,
-}
 
 /// Cancellation control for one currently open macOS feth pair.
 #[derive(Clone)]
@@ -43,7 +32,7 @@ impl TapCancellation for MacosTapCancellation {
             return Ok(());
         };
         let mut operation = lock_operation(&state, TapOperation::CancelIo)?;
-        if !operation.pending {
+        if !operation.pending || operation.cancelled {
             return Ok(());
         }
         operation.cancelled = true;
@@ -66,14 +55,14 @@ impl fmt::Debug for MacosTapCancellation {
 
 /// Exclusive complete-frame handle for one persistent macOS feth pair.
 pub struct MacosTapDevice {
-    device: SyncDevice,
-    _lock: File,
+    receiver: BpfReceiver,
+    sender: NdrvSender,
+    pair: FethPair,
     state: Arc<CancellationState>,
     config: TapConfig,
     name: String,
     peer_name: String,
     mac_address: [u8; 6],
-    enabled: bool,
 }
 
 impl MacosTapDevice {
@@ -83,17 +72,6 @@ impl MacosTapDevice {
 
     fn finish_operation<T>(&self, operation: TapOperation, result: io::Result<T>) -> Result<T> {
         finish_pending_operation(&self.state, operation, result)
-    }
-
-    fn disable(&mut self) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        self.device
-            .enabled(false)
-            .map_err(|source| TapError::io(TapOperation::SetDeviceState, source))?;
-        self.enabled = false;
-        Ok(())
     }
 }
 
@@ -108,45 +86,31 @@ impl TapDevice for MacosTapDevice {
                 reason: "must differ from the host-visible interface name",
             });
         }
-        let lock = acquire_pair_lock(name, peer_name)?;
+        let prepared = feth::PreparedFethPair::prepare(name, peer_name, config.mtu)?;
+        let sender = NdrvSender::open(peer_name)
+            .map_err(|source| TapError::io(TapOperation::OpenDevice, source))?;
+        let receiver = BpfReceiver::open(peer_name)
+            .map_err(|source| TapError::io(TapOperation::OpenDevice, source))?;
         let state = Arc::new(CancellationState {
-            event: InterruptEvent::new()
+            event: Interrupt::new()
                 .map_err(|source| TapError::io(TapOperation::CancelIo, source))?,
-            operation: Mutex::new(OperationState::default()),
+            operation: std::sync::Mutex::new(OperationState::default()),
         });
-        let device = DeviceBuilder::new()
-            .name(name)
-            .peer_feth(peer_name)
-            .layer(Layer::L2)
-            .reuse_dev(true)
-            .persist(true)
-            .build_sync()
-            .map_err(|source| TapError::io(TapOperation::CreateDevice, source))?;
-        device
-            .set_nonblocking(true)
-            .map_err(|source| TapError::io(TapOperation::ConfigureBlockingMode, source))?;
-        let installed_mtu = device
-            .mtu()
-            .map_err(|source| TapError::io(TapOperation::QueryMtu, source))?;
-        let mtu = config.mtu.min(installed_mtu);
-        device
-            .set_mtu(mtu)
-            .map_err(|source| TapError::io(TapOperation::SetMtu, source))?;
-        let mac_address = device
-            .mac_address()
-            .map_err(|source| TapError::io(TapOperation::QueryMac, source))?;
+        let mtu = prepared.effective_mtu();
+        let mac_address = prepared.mac_address();
         validate_mac_address(mac_address)?;
+        let pair = prepared.commit()?;
         let mut effective_config = config.clone();
         effective_config.mtu = mtu;
         Ok(Self {
-            device,
-            _lock: lock,
+            receiver,
+            sender,
+            pair,
             state,
             config: effective_config,
             name: name.to_owned(),
             peer_name: peer_name.to_owned(),
             mac_address,
-            enabled: true,
         })
     }
 
@@ -156,10 +120,10 @@ impl TapDevice for MacosTapDevice {
         })
     }
 
-    fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.config.validate_read_buffer(buf.len())?;
+    fn read_frame(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        self.config.validate_read_buffer(buffer.len())?;
         self.begin_operation(TapOperation::ReadFrame)?;
-        let result = self.device.recv_intr(buf, &self.state.event);
+        let result = self.receiver.read_frame(buffer, &self.state.event);
         let length = self.finish_operation(TapOperation::ReadFrame, result)?;
         self.config.validate_frame(length)?;
         Ok(length)
@@ -168,7 +132,7 @@ impl TapDevice for MacosTapDevice {
     fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
         self.config.validate_frame(frame.len())?;
         self.begin_operation(TapOperation::WriteFrame)?;
-        let result = self.device.send_intr(frame, &self.state.event);
+        let result = self.sender.write_frame(frame, &self.state.event);
         let written = self.finish_operation(TapOperation::WriteFrame, result)?;
         if written != frame.len() {
             return Err(TapError::PartialFrameWrite {
@@ -187,21 +151,13 @@ impl TapDevice for MacosTapDevice {
         let mut next = self.config.clone();
         next.mtu = mtu;
         next.validate()?;
-        self.device
-            .set_mtu(mtu)
-            .map_err(|source| TapError::io(TapOperation::SetMtu, source))?;
+        self.pair.set_mtu(mtu)?;
         self.config = next;
         Ok(())
     }
 
     fn destroy(mut self) -> Result<()> {
-        self.disable()
-    }
-}
-
-impl Drop for MacosTapDevice {
-    fn drop(&mut self) {
-        let _ = self.disable();
+        self.pair.disable()
     }
 }
 
@@ -213,7 +169,6 @@ impl fmt::Debug for MacosTapDevice {
             .field("peer_name", &self.peer_name)
             .field("config", &self.config)
             .field("mac_address", &self.mac_address)
-            .field("enabled", &self.enabled)
             .finish_non_exhaustive()
     }
 }
@@ -241,53 +196,6 @@ fn required_feth_name<'a>(value: Option<&'a str>, field: &'static str) -> Result
 fn validate_mac_address(address: [u8; 6]) -> Result<()> {
     if address == [0; 6] || address[0] & 1 != 0 {
         return Err(TapError::InvalidMacAddress);
-    }
-    Ok(())
-}
-
-fn acquire_pair_lock(name: &str, peer_name: &str) -> Result<File> {
-    ensure_lock_directory()?;
-    let (first, second) = if name <= peer_name {
-        (name, peer_name)
-    } else {
-        (peer_name, name)
-    };
-    let path = Path::new(LOCK_DIRECTORY).join(format!("tap-{first}-{second}.lock"));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(LOCK_FILE_MODE)
-        .open(path)
-        .map_err(|source| TapError::io(TapOperation::AcquireDeviceLock, source))?;
-    match FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(file),
-        Err(source) if source.kind() == io::ErrorKind::WouldBlock => Err(TapError::DeviceBusy {
-            name: name.to_owned(),
-            peer_name: peer_name.to_owned(),
-        }),
-        Err(source) => Err(TapError::io(TapOperation::AcquireDeviceLock, source)),
-    }
-}
-
-fn ensure_lock_directory() -> Result<()> {
-    let mut builder = DirBuilder::new();
-    builder.mode(LOCK_DIRECTORY_MODE);
-    match builder.create(LOCK_DIRECTORY) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(source) => return Err(TapError::io(TapOperation::AcquireDeviceLock, source)),
-    }
-    let metadata = std::fs::symlink_metadata(LOCK_DIRECTORY)
-        .map_err(|source| TapError::io(TapOperation::AcquireDeviceLock, source))?;
-    if !metadata.file_type().is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
-        return Err(TapError::io(
-            TapOperation::AcquireDeviceLock,
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "macOS TAP lock directory must be a root-owned private directory",
-            ),
-        ));
     }
     Ok(())
 }
@@ -339,11 +247,9 @@ fn finish_pending_operation<T>(
 mod tests {
     use std::{io, sync::Arc};
 
-    use tun_rs::InterruptEvent;
-
     use super::{
         begin_pending_operation, finish_pending_operation, required_feth_name,
-        validate_mac_address, CancellationState, MacosTapCancellation, OperationState,
+        validate_mac_address, CancellationState, Interrupt, MacosTapCancellation, OperationState,
     };
     use crate::{TapCancellation, TapError, TapOperation};
 
@@ -381,7 +287,7 @@ mod tests {
     #[test]
     fn cancellation_only_affects_the_current_pending_operation() {
         let state = Arc::new(CancellationState {
-            event: InterruptEvent::new().expect("create interrupt event"),
+            event: Interrupt::new().expect("create interrupt event"),
             operation: std::sync::Mutex::new(OperationState::default()),
         });
         let cancellation = MacosTapCancellation {

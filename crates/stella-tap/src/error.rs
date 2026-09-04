@@ -27,8 +27,14 @@ impl fmt::Display for AddressFamily {
 pub enum TapOperation {
     /// Acquiring exclusive ownership of a platform TAP pair.
     AcquireDeviceLock,
+    /// Verifying that a persistent feth pair belongs to Stella.
+    VerifyDeviceOwnership,
+    /// Recording ownership after a feth pair is fully configured.
+    RecordDeviceOwnership,
     /// Creating or reusing a platform TAP device.
     CreateDevice,
+    /// Pairing two macOS fake-Ethernet interfaces.
+    PairInterfaces,
     /// Configuring blocking behavior for frame I/O.
     ConfigureBlockingMode,
     /// Enumerating installed Windows network adapters.
@@ -55,6 +61,8 @@ pub enum TapOperation {
     CancelIo,
     /// Enabling or disabling a platform TAP interface.
     SetDeviceState,
+    /// Querying whether a platform TAP interface is present or enabled.
+    QueryDeviceState,
     /// Setting a platform interface MTU.
     SetMtu,
     /// Querying a Windows IP interface MTU.
@@ -69,7 +77,10 @@ impl fmt::Display for TapOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::AcquireDeviceLock => "acquire device lock",
+            Self::VerifyDeviceOwnership => "verify device ownership",
+            Self::RecordDeviceOwnership => "record device ownership",
             Self::CreateDevice => "create device",
+            Self::PairInterfaces => "pair interfaces",
             Self::ConfigureBlockingMode => "configure blocking mode",
             Self::EnumerateAdapters => "enumerate adapters",
             Self::OpenDevice => "open device",
@@ -83,6 +94,7 @@ impl fmt::Display for TapOperation {
             Self::WriteFrame => "write frame",
             Self::CancelIo => "cancel I/O",
             Self::SetDeviceState => "set device state",
+            Self::QueryDeviceState => "query device state",
             Self::SetMtu => "set MTU",
             Self::QueryInterfaceMtu => "query interface MTU",
             Self::SetInterfaceMtu => "set interface MTU",
@@ -124,6 +136,14 @@ pub enum TapError {
     /// Another process already owns the selected platform TAP pair.
     #[error("TAP interface pair {name:?}/{peer_name:?} is already in use")]
     DeviceBusy {
+        /// Host-visible interface name.
+        name: String,
+        /// Packet-I/O peer interface name.
+        peer_name: String,
+    },
+    /// Existing feth interfaces are not covered by Stella ownership metadata.
+    #[error("refusing to take ownership of unmanaged feth pair {name:?}/{peer_name:?}")]
+    DeviceOwnershipConflict {
         /// Host-visible interface name.
         name: String,
         /// Packet-I/O peer interface name.
@@ -195,6 +215,20 @@ pub enum TapError {
         failed_family: AddressFamily,
         /// Previously updated family whose rollback failed.
         rollback_family: AddressFamily,
+        /// Original update failure.
+        update: io::Error,
+        /// Rollback failure.
+        rollback: io::Error,
+    },
+    /// Updating the second feth MTU failed and restoring the first also failed.
+    #[error(
+        "setting MTU on {failed_interface:?} failed and restoring {rollback_interface:?} also failed"
+    )]
+    PairMtuRollbackFailed {
+        /// Interface whose requested update failed.
+        failed_interface: String,
+        /// Previously updated interface whose rollback failed.
+        rollback_interface: String,
         /// Original update failure.
         update: io::Error,
         /// Rollback failure.
