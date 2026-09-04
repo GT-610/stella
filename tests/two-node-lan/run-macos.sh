@@ -141,6 +141,8 @@ left_pid=""
 right_pid=""
 helper_pid=""
 helper_socket_identity=""
+current_stage="initialization"
+completed=0
 
 stop_process() {
     local pid=$1
@@ -152,7 +154,7 @@ stop_process() {
     kill -"$signal" "$pid" >/dev/null 2>&1 || true
     deadline=$((SECONDS + 10))
     while kill -0 "$pid" >/dev/null 2>&1 && ((SECONDS < deadline)); do
-        state=$(ps -o state= -p "$pid" 2>/dev/null | tr -d ' ')
+        state=$(ps -o state= -p "$pid" 2>/dev/null | tr -d ' ') || state=""
         if [[ -z $state || $state == Z* ]]; then
             wait "$pid" >/dev/null 2>&1 || true
             return 0
@@ -170,6 +172,7 @@ stop_process() {
 }
 
 cleanup() {
+    local exit_status=$?
     set +e
     stop_process "$left_pid"
     stop_process "$right_pid"
@@ -184,8 +187,13 @@ cleanup() {
             /sbin/ifconfig "$interface" destroy >/dev/null 2>&1 || true
         fi
     done
+    if ((completed == 0)); then
+        echo "FAIL: macOS E2E stopped during $current_stage (exit status $exit_status); artifacts=$artifacts" >&2
+    fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 wait_tcp_port() {
     local port=$1
@@ -235,6 +243,12 @@ wait_log() {
         if grep -Fq "$pattern" "$stdout_path" 2>/dev/null || grep -Fq "$pattern" "$stderr_path" 2>/dev/null; then
             return 0
         fi
+        if grep -Fq "active data plane ended" "$stdout_path" 2>/dev/null || \
+            grep -Fq "active data plane ended" "$stderr_path" 2>/dev/null; then
+            echo "client data plane failed before reporting '$pattern'" >&2
+            tail -n 12 "$stdout_path" "$stderr_path" >&2
+            return 1
+        fi
         sleep 0.25
     done
     echo "timed out waiting for '$pattern'" >&2
@@ -275,17 +289,25 @@ interface_mac() {
     /sbin/ifconfig "$1" | awk '$1 == "ether" { print $2; exit }'
 }
 
-assert_pair_persisted_and_visible_down() {
+wait_pair_persisted_and_visible_down() {
     local visible=$1
     local peer=$2
+    local deadline=$((SECONDS + 5))
     local first_line
-    /sbin/ifconfig "$visible" >/dev/null
-    /sbin/ifconfig "$peer" >/dev/null
-    first_line=$(/sbin/ifconfig "$visible" | head -n 1)
-    if [[ $first_line == *"<UP,"* || $first_line == *",UP,"* || $first_line == *",UP>"* ]]; then
-        echo "host-visible interface remained up after client shutdown: $visible" >&2
-        return 1
-    fi
+    while ((SECONDS < deadline)); do
+        if /sbin/ifconfig "$visible" >/dev/null 2>&1 && \
+            /sbin/ifconfig "$peer" >/dev/null 2>&1; then
+            first_line=$(/sbin/ifconfig "$visible" | sed -n '1p')
+            if [[ $first_line != *"<UP,"* && $first_line != *",UP,"* && $first_line != *",UP>"* ]]; then
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    echo "feth pair did not persist in the down state after client shutdown: $visible/$peer" >&2
+    /sbin/ifconfig "$visible" >&2 || true
+    /sbin/ifconfig "$peer" >&2 || true
+    return 1
 }
 
 start_clients() {
@@ -308,8 +330,8 @@ stop_clients_and_verify_persistence() {
     stop_process "$right_pid"
     left_pid=""
     right_pid=""
-    assert_pair_persisted_and_visible_down "$left_visible" "$left_peer"
-    assert_pair_persisted_and_visible_down "$right_visible" "$right_peer"
+    wait_pair_persisted_and_visible_down "$left_visible" "$left_peer"
+    wait_pair_persisted_and_visible_down "$right_visible" "$right_peer"
 }
 
 run_verifier() {
@@ -322,6 +344,7 @@ run_verifier() {
         --output "$output"
 }
 
+current_stage="release build"
 if ((skip_build == 0)); then
     if [[ -n ${SUDO_USER:-} && ${SUDO_USER} != root ]]; then
         cargo_path=$(command -v cargo)
@@ -339,11 +362,13 @@ if [[ -e $helper_socket ]]; then
     exit 1
 fi
 
+current_stage="TAP helper startup"
 "$helper" --allow-uid 0 >"$artifacts/helper.stdout.log" 2>"$artifacts/helper.stderr.log" &
 helper_pid=$!
 wait_helper_socket
 helper_socket_identity=$(/usr/bin/stat -f '%d:%i' "$helper_socket")
 
+current_stage="controller and client configuration"
 init_output=$("$server" --config "$server_config" init --listen "127.0.0.1:$controller_port" --tls-name localhost)
 controller_id=$(key_value "$init_output" controller_id)
 tls_spki_pin=$(key_value "$init_output" tls_spki_pin)
@@ -374,10 +399,12 @@ right_join=$("$server" --config "$server_config" join-token create --network "$n
 add_advertised_endpoint "$left_config" "$left_udp_port"
 add_advertised_endpoint "$right_config" "$right_udp_port"
 
+current_stage="controller startup"
 "$server" --config "$server_config" run >"$artifacts/server.stdout.log" 2>"$artifacts/server.stderr.log" &
 server_pid=$!
 wait_tcp_port "$controller_port" "$server_pid"
 
+current_stage="network join"
 "$client" --config "$left_config" join \
     --network "$network_id" \
     --token "$left_join" \
@@ -392,6 +419,8 @@ wait_tcp_port "$controller_port" "$server_pid"
     --tap-peer "$right_peer"
 unset left_enrollment right_enrollment left_join right_join
 
+echo "INFO: starting initial client data planes"
+current_stage="initial client startup"
 start_clients first
 left_mac=$(interface_mac "$left_visible")
 right_mac=$(interface_mac "$right_visible")
@@ -400,14 +429,34 @@ if [[ -z $left_mac || -z $right_mac ]]; then
     exit 1
 fi
 
-"$python" -m pip install --disable-pip-version-check --target "$scapy" -r "$requirements"
+current_stage="Scapy installation"
+PIP_ROOT_USER_ACTION=ignore "$python" -m pip install \
+    --disable-pip-version-check \
+    --no-cache-dir \
+    --target "$scapy" \
+    -r "$requirements"
+echo "INFO: running initial L2 verification"
+current_stage="initial L2 verification"
 run_verifier "$artifacts/l2-report.json"
+echo "PASS: initial L2 verification"
+echo "INFO: stopping initial clients and checking persistent feth pairs"
+current_stage="initial persistent-pair check"
 stop_clients_and_verify_persistence
+echo "PASS: initial feth pairs persisted with visible interfaces down"
 
+echo "INFO: restarting clients with the same feth pairs"
+current_stage="reuse client startup"
 start_clients reuse
+echo "INFO: running persistent-pair reuse L2 verification"
+current_stage="reuse L2 verification"
 run_verifier "$artifacts/l2-reuse-report.json"
+echo "PASS: persistent-pair reuse L2 verification"
+echo "INFO: stopping reused clients and checking persistent feth pairs"
+current_stage="reuse persistent-pair check"
 stop_clients_and_verify_persistence
+echo "PASS: reused feth pairs persisted with visible interfaces down"
 
+current_stage="summary generation"
 git_commit=$(git -C "$repository" rev-parse HEAD)
 "$python" - "$artifacts/l2-report.json" "$artifacts/l2-reuse-report.json" "$artifacts/summary.md" \
     "$git_commit" "$left_visible" "$left_peer" "$left_mac" "$right_visible" "$right_peer" "$right_mac" "$controller_port" <<'PY'
@@ -442,4 +491,5 @@ for check in reuse["checks"]:
 output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 
+completed=1
 echo "PASS: artifacts=$artifacts"

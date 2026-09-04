@@ -39,6 +39,7 @@ def transfer(
     sniffer = AsyncSniffer(
         iface=destination_interface,
         store=True,
+        count=1,
         lfilter=predicate,
         timeout=timeout,
         started_callback=ready.set,
