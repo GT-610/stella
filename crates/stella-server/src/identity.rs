@@ -488,6 +488,8 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
+    #[cfg(test)]
+    use std::process::Command;
     use std::{
         fs::{File, OpenOptions},
         os::unix::fs::{MetadataExt, OpenOptionsExt},
@@ -548,7 +550,49 @@ mod platform {
                 reason: "mode must be exactly 0600",
             });
         }
+        validate_extended_acl(file, path, metadata.uid())?;
         Ok(())
+    }
+
+    fn validate_extended_acl(
+        file: &File,
+        path: &Path,
+        owner_uid: u32,
+    ) -> Result<(), IdentityFileError> {
+        let grants_non_owner_access = stella_file_security::extended_acl_grants_non_owner_access(
+            file, owner_uid,
+        )
+        .map_err(|source| IdentityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if grants_non_owner_access {
+            return Err(IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "an extended ACL grants access to a non-owner principal",
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_test_acl(path: &Path, acl: &str) -> Result<(), IdentityFileError> {
+        let status = Command::new("/bin/chmod")
+            .args(["+a", acl])
+            .arg(path)
+            .status()
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("chmod could not install the test ACL"),
+            })
+        }
     }
 
     #[cfg(test)]
@@ -564,6 +608,11 @@ mod platform {
             path: path.to_path_buf(),
             source,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_inherited_everyone_for_test(path: &Path) -> Result<(), IdentityFileError> {
+        install_test_acl(path, "everyone allow read,file_inherit")
     }
 }
 
@@ -661,6 +710,22 @@ mod tests {
         ));
         drop(replacement_document);
         drop(replacement);
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_extended_acl_is_rejected() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        super::platform::grant_inherited_everyone_for_test(&directory)
+            .expect("grant inheritable test ACL");
+        let path = directory.join("controller.pk8");
+        assert!(matches!(
+            create_controller_identity(&path),
+            Err(IdentityFileError::InsecurePermissions { .. })
+        ));
+        assert!(!path.exists());
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 

@@ -4,6 +4,7 @@ members = [
     "crates/stella-common",
     "crates/stella-control",
     "crates/stella-crypto",
+    "crates/stella-file-security",
     "crates/stella-proto",
     "crates/stella-server",
     "crates/stella-tap",

@@ -1198,6 +1198,7 @@ dependencies = [
  "stella-common",
  "stella-control",
  "stella-crypto",
+ "stella-file-security",
  "stella-proto",
  "stella-server",
  "stella-tap",
@@ -1253,6 +1254,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stella-file-security"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "stella-proto"
 version = "0.2.0"
 dependencies = [
@@ -1280,6 +1288,7 @@ dependencies = [
  "stella-common",
  "stella-control",
  "stella-crypto",
+ "stella-file-security",
  "stella-proto",
  "stella-transport",
  "subtle",
