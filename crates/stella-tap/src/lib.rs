@@ -17,7 +17,10 @@ pub use config::{
 };
 pub use error::{AddressFamily, TapError, TapOperation};
 #[cfg(target_os = "macos")]
-pub use macos::{MacosTapCancellation, MacosTapDevice};
+pub use macos::{
+    run_macos_tap_helper, MacosTapCancellation, MacosTapDevice, MacosTapHelperConfig,
+    MacosTapProxyCancellation, MacosTapProxyDevice, DEFAULT_MACOS_HELPER_SOCKET,
+};
 #[cfg(target_os = "windows")]
 pub use windows::{
     WindowsTapAdapter, WindowsTapCancellation, WindowsTapDevice, WindowsTapDriverVersion,
@@ -29,7 +32,7 @@ pub type PlatformTapDevice = WindowsTapDevice;
 
 /// Native TAP implementation selected for this macOS build.
 #[cfg(target_os = "macos")]
-pub type PlatformTapDevice = MacosTapDevice;
+pub type PlatformTapDevice = MacosTapProxyDevice;
 
 /// Result type returned by TAP operations.
 pub type Result<T> = std::result::Result<T, TapError>;

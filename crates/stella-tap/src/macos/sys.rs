@@ -5,6 +5,8 @@ use std::{
     io,
     mem::size_of,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::unix::ffi::OsStrExt,
+    path::Path,
     ptr,
 };
 
@@ -57,6 +59,30 @@ impl Drop for InterfaceAddresses {
 
 pub(super) fn open_control_socket() -> io::Result<OwnedFd> {
     open_socket(libc::AF_INET, libc::SOCK_DGRAM, 0)
+}
+
+pub(super) fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+pub(super) fn peer_credentials(stream: &impl AsRawFd) -> io::Result<(u32, u32)> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both output pointers are valid and the stream descriptor remains open.
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((uid, gid))
+}
+
+pub(super) fn chown_path(path: &Path, uid: u32) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(invalid_input)?;
+    // SAFETY: `path` is NUL-terminated; `-1` preserves the existing group owner.
+    if unsafe { libc::chown(path.as_ptr(), uid, !0 as libc::gid_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(super) fn open_ndrv_socket() -> io::Result<OwnedFd> {

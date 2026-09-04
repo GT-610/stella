@@ -2,6 +2,7 @@
 
 mod bpf;
 mod feth;
+mod helper;
 mod interrupt;
 mod ndrv;
 mod sys;
@@ -18,6 +19,11 @@ use ndrv::NdrvSender;
 
 use crate::{
     Result, TapCancellation, TapCancellationHandle, TapConfig, TapDevice, TapError, TapOperation,
+};
+
+pub use helper::{
+    run_macos_tap_helper, MacosTapHelperConfig, MacosTapProxyCancellation, MacosTapProxyDevice,
+    DEFAULT_MACOS_HELPER_SOCKET,
 };
 
 /// Cancellation control for one currently open macOS feth pair.

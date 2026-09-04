@@ -37,6 +37,12 @@ pub enum TapOperation {
     PairInterfaces,
     /// Configuring blocking behavior for frame I/O.
     ConfigureBlockingMode,
+    /// Connecting to the privileged macOS TAP helper.
+    ConnectHelper,
+    /// Authenticating the process at the other end of the helper socket.
+    AuthenticateHelper,
+    /// Exchanging a bounded message with the privileged helper.
+    ExchangeHelperMessage,
     /// Enumerating installed Windows network adapters.
     EnumerateAdapters,
     /// Opening the TAP userspace device path.
@@ -82,6 +88,9 @@ impl fmt::Display for TapOperation {
             Self::CreateDevice => "create device",
             Self::PairInterfaces => "pair interfaces",
             Self::ConfigureBlockingMode => "configure blocking mode",
+            Self::ConnectHelper => "connect TAP helper",
+            Self::AuthenticateHelper => "authenticate TAP helper",
+            Self::ExchangeHelperMessage => "exchange TAP helper message",
             Self::EnumerateAdapters => "enumerate adapters",
             Self::OpenDevice => "open device",
             Self::QueryVersion => "query driver version",
@@ -148,6 +157,24 @@ pub enum TapError {
         name: String,
         /// Packet-I/O peer interface name.
         peer_name: String,
+    },
+    /// The helper peer is not the privileged service Stella expected.
+    #[error("macOS TAP helper peer has unexpected effective user ID {actual_uid}")]
+    HelperIdentityMismatch {
+        /// Effective user ID reported by the local Unix socket.
+        actual_uid: u32,
+    },
+    /// A bounded helper message violated the versioned IPC contract.
+    #[error("invalid macOS TAP helper protocol message: {reason}")]
+    HelperProtocol {
+        /// Stable diagnostic that never contains Ethernet frame content.
+        reason: &'static str,
+    },
+    /// The privileged helper rejected an operation without exposing packet data.
+    #[error("macOS TAP helper rejected the operation: {reason}")]
+    HelperRejected {
+        /// Bounded helper-side diagnostic.
+        reason: String,
     },
     /// The opened device reports an unsupported TAP-Windows driver version.
     #[error("unsupported TAP-Windows driver version {major}.{minor}")]
