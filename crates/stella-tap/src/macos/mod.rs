@@ -79,6 +79,43 @@ impl MacosTapDevice {
     fn finish_operation<T>(&self, operation: TapOperation, result: io::Result<T>) -> Result<T> {
         finish_pending_operation(&self.state, operation, result)
     }
+
+    fn read_frame_armed<F>(&mut self, buffer: &mut [u8], armed: F) -> Result<usize>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.config.validate_read_buffer(buffer.len())?;
+        self.begin_operation(TapOperation::ReadFrame)?;
+        if let Err(error) = armed() {
+            self.finish_operation(TapOperation::ReadFrame, Ok(()))?;
+            return Err(error);
+        }
+        let result = self.receiver.read_frame(buffer, &self.state.event);
+        let length = self.finish_operation(TapOperation::ReadFrame, result)?;
+        self.config.validate_frame(length)?;
+        Ok(length)
+    }
+
+    fn write_frame_armed<F>(&mut self, frame: &[u8], armed: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.config.validate_frame(frame.len())?;
+        self.begin_operation(TapOperation::WriteFrame)?;
+        if let Err(error) = armed() {
+            self.finish_operation(TapOperation::WriteFrame, Ok(()))?;
+            return Err(error);
+        }
+        let result = self.sender.write_frame(frame, &self.state.event);
+        let written = self.finish_operation(TapOperation::WriteFrame, result)?;
+        if written != frame.len() {
+            return Err(TapError::PartialFrameWrite {
+                expected: frame.len(),
+                actual: written,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl TapDevice for MacosTapDevice {
@@ -127,26 +164,11 @@ impl TapDevice for MacosTapDevice {
     }
 
     fn read_frame(&mut self, buffer: &mut [u8]) -> Result<usize> {
-        self.config.validate_read_buffer(buffer.len())?;
-        self.begin_operation(TapOperation::ReadFrame)?;
-        let result = self.receiver.read_frame(buffer, &self.state.event);
-        let length = self.finish_operation(TapOperation::ReadFrame, result)?;
-        self.config.validate_frame(length)?;
-        Ok(length)
+        self.read_frame_armed(buffer, || Ok(()))
     }
 
     fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
-        self.config.validate_frame(frame.len())?;
-        self.begin_operation(TapOperation::WriteFrame)?;
-        let result = self.sender.write_frame(frame, &self.state.event);
-        let written = self.finish_operation(TapOperation::WriteFrame, result)?;
-        if written != frame.len() {
-            return Err(TapError::PartialFrameWrite {
-                expected: frame.len(),
-                actual: written,
-            });
-        }
-        Ok(())
+        self.write_frame_armed(frame, || Ok(()))
     }
 
     fn mac_address(&self) -> Result<[u8; 6]> {

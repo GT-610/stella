@@ -10,7 +10,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{sync_channel, SyncSender, TrySendError},
-        Arc,
+        Arc, Mutex,
     },
     thread,
 };
@@ -114,8 +114,8 @@ impl Drop for SessionGuard {
 
 trait HelperDevice: Send {
     fn cancellation_handle(&self) -> TapCancellationHandle;
-    fn read_frame(&mut self, buffer: &mut [u8]) -> Result<usize>;
-    fn write_frame(&mut self, frame: &[u8]) -> Result<()>;
+    fn read_frame(&mut self, buffer: &mut [u8], operation: &SessionOperation) -> Result<usize>;
+    fn write_frame(&mut self, frame: &[u8], operation: &SessionOperation) -> Result<()>;
     fn mac_address(&self) -> Result<[u8; 6]>;
     fn set_mtu(&mut self, mtu: u16) -> Result<()>;
     fn destroy(&mut self) -> Result<()>;
@@ -131,18 +131,20 @@ impl HelperDevice for NativeHelperDevice {
         Arc::clone(&self.cancellation)
     }
 
-    fn read_frame(&mut self, buffer: &mut [u8]) -> Result<usize> {
+    fn read_frame(&mut self, buffer: &mut [u8], operation: &SessionOperation) -> Result<usize> {
+        let cancellation = Arc::clone(&self.cancellation);
         self.device
             .as_mut()
             .ok_or(TapError::Closed)?
-            .read_frame(buffer)
+            .read_frame_armed(buffer, || operation.deliver_cancellation(&cancellation))
     }
 
-    fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
+    fn write_frame(&mut self, frame: &[u8], operation: &SessionOperation) -> Result<()> {
+        let cancellation = Arc::clone(&self.cancellation);
         self.device
             .as_mut()
             .ok_or(TapError::Closed)?
-            .write_frame(frame)
+            .write_frame_armed(frame, || operation.deliver_cancellation(&cancellation))
     }
 
     fn mac_address(&self) -> Result<[u8; 6]> {
@@ -165,6 +167,73 @@ enum DeviceCommand {
     Write { request_id: u64, frame: Vec<u8> },
     SetMtu { request_id: u64, mtu: u16 },
     Close { request_id: u64 },
+}
+
+#[derive(Default)]
+struct SessionOperationState {
+    outstanding: bool,
+    cancel_requested: bool,
+}
+
+#[derive(Default)]
+struct SessionOperation(Mutex<SessionOperationState>);
+
+impl SessionOperation {
+    fn queue(&self) -> io::Result<()> {
+        let mut state = self.lock()?;
+        if state.outstanding {
+            return Err(invalid_protocol(
+                "helper session permits only one outstanding request",
+            ));
+        }
+        state.outstanding = true;
+        state.cancel_requested = false;
+        Ok(())
+    }
+
+    fn cancel(&self, cancellation: &TapCancellationHandle) -> Result<()> {
+        let should_cancel = {
+            let mut state = self
+                .lock()
+                .map_err(|source| TapError::io(TapOperation::ExchangeHelperMessage, source))?;
+            if state.outstanding {
+                state.cancel_requested = true;
+                true
+            } else {
+                false
+            }
+        };
+        if should_cancel {
+            cancellation.cancel_pending_io()?;
+        }
+        Ok(())
+    }
+
+    fn deliver_cancellation(&self, cancellation: &TapCancellationHandle) -> Result<()> {
+        let should_cancel = {
+            let mut state = self
+                .lock()
+                .map_err(|source| TapError::io(TapOperation::ExchangeHelperMessage, source))?;
+            std::mem::take(&mut state.cancel_requested)
+        };
+        if should_cancel {
+            cancellation.cancel_pending_io()?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.outstanding = false;
+            state.cancel_requested = false;
+        }
+    }
+
+    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, SessionOperationState>> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("helper session operation state is poisoned"))
+    }
 }
 
 fn serve_connection(
@@ -207,6 +276,8 @@ fn serve_connection(
     let response_stream = stream.try_clone()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
+    let operation = Arc::new(SessionOperation::default());
+    let worker_operation = Arc::clone(&operation);
     let (commands, command_receiver) = sync_channel(SESSION_QUEUE_CAPACITY);
     let worker = thread::Builder::new()
         .name("stella-tap-helper-io".to_owned())
@@ -220,7 +291,8 @@ fn serve_connection(
                 if worker_shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                let (response, close) = execute_command(&mut *device, command);
+                let (response, close) = execute_command(&mut *device, command, &worker_operation);
+                worker_operation.finish();
                 if close {
                     destroyed = true;
                 }
@@ -233,9 +305,9 @@ fn serve_connection(
             }
         })?;
 
-    let result = read_commands(&mut stream, &commands, &cancellation);
+    let result = read_commands(&mut stream, &commands, &cancellation, &operation);
     shutdown.store(true, Ordering::Release);
-    let _ = cancellation.cancel_pending_io();
+    let _ = operation.cancel(&cancellation);
     drop(commands);
     let _ = worker.join();
     result
@@ -245,6 +317,7 @@ fn read_commands(
     stream: &mut UnixStream,
     commands: &SyncSender<DeviceCommand>,
     cancellation: &TapCancellationHandle,
+    operation: &SessionOperation,
 ) -> io::Result<()> {
     loop {
         let message = match protocol::read_client(stream) {
@@ -273,8 +346,8 @@ fn read_commands(
             ClientMessage::SetMtu { request_id, mtu } => DeviceCommand::SetMtu { request_id, mtu },
             ClientMessage::Close { request_id } => DeviceCommand::Close { request_id },
             ClientMessage::Cancel => {
-                cancellation
-                    .cancel_pending_io()
+                operation
+                    .cancel(cancellation)
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 continue;
             }
@@ -284,26 +357,35 @@ fn read_commands(
                 ));
             }
         };
+        operation.queue()?;
         match commands.try_send(command) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                operation.finish();
                 return Err(invalid_protocol(
                     "helper session has too many pending requests",
                 ));
             }
-            Err(TrySendError::Disconnected(_)) => return Ok(()),
+            Err(TrySendError::Disconnected(_)) => {
+                operation.finish();
+                return Ok(());
+            }
         }
     }
 }
 
-fn execute_command(device: &mut dyn HelperDevice, command: DeviceCommand) -> (ServerMessage, bool) {
+fn execute_command(
+    device: &mut dyn HelperDevice,
+    command: DeviceCommand,
+    operation: &SessionOperation,
+) -> (ServerMessage, bool) {
     match command {
         DeviceCommand::Read {
             request_id,
             capacity,
         } => {
             let mut frame = vec![0_u8; usize::from(capacity)];
-            let response = match device.read_frame(&mut frame) {
+            let response = match device.read_frame(&mut frame, operation) {
                 Ok(length) => match frame.get(..length) {
                     Some(frame) => ServerMessage::Frame {
                         request_id,
@@ -320,7 +402,7 @@ fn execute_command(device: &mut dyn HelperDevice, command: DeviceCommand) -> (Se
             (response, false)
         }
         DeviceCommand::Write { request_id, frame } => (
-            match device.write_frame(&frame) {
+            match device.write_frame(&frame, operation) {
                 Ok(()) => ServerMessage::Ok { request_id },
                 Err(error) => error_response(request_id, &error),
             },
@@ -467,7 +549,12 @@ mod tests {
             Arc::new(FakeCancellation(Arc::clone(&self.cancellation)))
         }
 
-        fn read_frame(&mut self, _buffer: &mut [u8]) -> Result<usize> {
+        fn read_frame(
+            &mut self,
+            _buffer: &mut [u8],
+            operation: &super::SessionOperation,
+        ) -> Result<usize> {
+            operation.deliver_cancellation(&self.cancellation_handle())?;
             let (cancelled, ready) = &*self.cancellation;
             let mut cancelled = cancelled.lock().expect("lock fake read");
             while !*cancelled {
@@ -477,7 +564,12 @@ mod tests {
             Err(TapError::Cancelled)
         }
 
-        fn write_frame(&mut self, _frame: &[u8]) -> Result<()> {
+        fn write_frame(
+            &mut self,
+            _frame: &[u8],
+            operation: &super::SessionOperation,
+        ) -> Result<()> {
+            operation.deliver_cancellation(&self.cancellation_handle())?;
             Ok(())
         }
 
@@ -559,6 +651,14 @@ mod tests {
         protocol::write_client(&mut client, &ClientMessage::Open(TapConfig::default()))
             .expect("open fake TAP");
         let _ = protocol::read_server(&mut client).expect("read opened");
+        protocol::write_client(
+            &mut client,
+            &ClientMessage::Read {
+                request_id: 1,
+                capacity: 1_514,
+            },
+        )
+        .expect("queue read before disconnect");
         drop(client);
         worker
             .join()
