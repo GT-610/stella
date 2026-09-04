@@ -1,19 +1,25 @@
-# Windows client CLI
+# Client CLI
 
 `stella-client` owns one protected node identity, strict controller trust, the
-durable desired-network list, and the Windows TAP/data-plane runtime. Commands
-use `--config client.toml` unless another path is supplied.
+durable desired-network list, and the native Windows or macOS TAP/data-plane
+runtime. Commands use `--config client.toml` unless another path is supplied.
 
 ## Prerequisites and reachability
 
-Each client needs its own pre-installed TAP-Windows Adapter V9. The controller
-must be reachable over its configured TLS/TCP address, either directly or
-through the optional explicit HTTPS proxy. The runtime gathers direct UDP
-candidates and uses controller-provided STUN and relay services. A manually
-forwarded client port is optional: if direct ICE checks fail, the client tries
-TURN UDP, TCP, TLS, then secure WebSocket. At least one direct or relay path
-must succeed. Run `run` from an elevated PowerShell session so the process can
-open its TAP adapter.
+Windows clients need one pre-installed TAP-Windows Adapter V9 per configured
+network and run from an elevated PowerShell session. macOS clients need two
+distinct numeric feth names per network that are not owned by another active
+process. A matching Stella-owned persistent pair may already exist and is
+reused when the client starts. The normal client remains unprivileged; a
+separately started root `stella-tap-helper` creates or reuses the pair and
+performs only bounded TAP operations.
+
+The controller must be reachable over its configured TLS/TCP address, either
+directly or through the optional explicit HTTPS proxy. The runtime gathers
+direct UDP candidates and uses controller-provided STUN and relay services. A
+manually forwarded client port is optional: if direct ICE checks fail, the
+client tries TURN UDP, TCP, TLS, then secure WebSocket. At least one direct or
+relay path must succeed.
 
 Stella is a Layer-2 overlay: it does not assign IP addresses or provide DHCP.
 Configure addresses on the TAP adapters yourself, or provide DHCP inside the
@@ -35,8 +41,9 @@ stella-client --config C:\Stella\client.toml init `
 Omit `--https-proxy` on networks that permit direct outbound controller TCP.
 
 `init` creates the configuration and `secrets/node.pk8` with create-new
-semantics. On Windows, identity inheritance is disabled and only the current
-account and `LocalSystem` receive access. Existing targets are never replaced;
+semantics. Windows disables identity inheritance and grants access only to the
+current account and `LocalSystem`. macOS requires a single-link regular file
+with mode `0600` and refuses symlinks. Existing targets are never replaced;
 failed initialization removes only targets created by that invocation.
 
 Successful output contains the lowercase node ID and configuration path. The
@@ -79,6 +86,8 @@ to disk.
 
 ## Join
 
+Windows selects the exact pre-installed adapter:
+
 ```powershell
 stella-client --config C:\Stella\client.toml join `
   --network <id> `
@@ -86,16 +95,36 @@ stella-client --config C:\Stella\client.toml join `
   --tap-adapter "Stella LAN"
 ```
 
+macOS selects both ends of one feth pair. The first name is host-visible; the
+second is reserved for Stella packet I/O:
+
+```sh
+stella-client --config /etc/stella/client.toml join \
+  --network <id> \
+  --token <unpadded-base64url-token> \
+  --tap-adapter feth100 \
+  --tap-peer feth101
+```
+
 For a node not yet enrolled with the controller, add the one-use
 `--enrollment-token <unpadded-base64url-token>` argument. Both token forms must
 decode to exactly 32 bytes. They remain process-local, are redacted from debug
 output, and are never written to the configuration.
 
-`join` authenticates and waits for a complete validated controller snapshot
-before atomically persisting the network ID and TAP adapter. Repeating an
-already accepted join may omit `--token`; repeating it with the same TAP adapter
-is idempotent, while a conflicting adapter is rejected before contacting the
-controller.
+`join` validates the local TAP selection, authenticates, and waits for a
+complete validated controller snapshot before atomically persisting the
+network ID and selection. Repeating an already accepted join may omit
+`--token`; the same Windows adapter or same complete macOS pair is idempotent.
+A conflicting adapter or peer is rejected before contacting the controller.
+
+The resulting macOS entry remains configuration version 1:
+
+```toml
+[[networks]]
+id = "fedcba9876543210fedcba9876543210"
+tap_adapter = "feth100"
+tap_peer = "feth101"
+```
 
 ## Status
 
@@ -105,8 +134,9 @@ stella-client --config C:\Stella\client.toml status
 
 `status` is an offline command. It validates the configuration and protected
 identity, then prints the derived node ID, controller address/name/ID, optional
-HTTPS proxy, UDP bind, and each desired network with its TAP adapter. It never
-prints SPKI pins, credentials, private key material, or the private-key path.
+HTTPS proxy, UDP bind, and each desired network with its TAP selection. macOS
+entries include both `tap_adapter` and `tap_peer`. It never prints SPKI pins,
+credentials, private key material, or the private-key path.
 
 ## Leave
 
@@ -122,8 +152,18 @@ forwarding and preserves durable intent for recovery or retry.
 
 ## Run
 
+Windows:
+
 ```powershell
 stella-client --config C:\Stella\client.toml run
+```
+
+macOS:
+
+```sh
+sudo stella-tap-helper --allow-uid "$(id -u)"
+# In another terminal:
+stella-client --config /etc/stella/client.toml run
 ```
 
 `run` validates the configuration and protected identity, initializes the
@@ -132,7 +172,7 @@ order without stored tokens, and publishes the complete configured endpoint
 set. It then owns the active controller state, applying snapshots, peer deltas,
 grant refreshes, and heartbeat reconciliation.
 
-Unexpected controller failures retain the Windows data runtime while the
+Unexpected controller failures retain the native data runtime while the
 client waits for a full-jitter reconnect delay, reauthenticates, and rejoins
 its configured networks. Retained forwarding uses only the last completely
 validated in-memory view: it cannot add peers or extend grants, connectivity
@@ -140,8 +180,12 @@ credentials, network epochs, or peer-session lifetimes. Backoff starts at 250
 ms and caps at 30 seconds. A heartbeat is treated as lost only after three
 policy heartbeat periods elapse without its acknowledgement. Ctrl+C interrupts
 the control loop and waits for TAP, UDP, and Relay cleanup before the process
-exits. On Windows, the active owner binds the configured UDP socket, opens each
-exact TAP adapter, completes peer handshakes, and forwards authenticated
-Layer-2 frames. Invalid peer datagrams are dropped without reconnecting the
-controller; TAP, UDP, or worker failures close the data runtime and use the
-normal fail-closed reconnect path.
+exits.
+
+Windows opens each exact TAP-Windows adapter and sets it media-disconnected on
+shutdown. On macOS the root helper creates or reuses each exact feth pair, uses
+BPF receive and AF_NDRV transmit, and sets the host-visible interface down
+without deleting the pair. The client and helper authenticate each other with
+Unix peer credentials. Invalid peer datagrams are dropped without reconnecting the controller;
+TAP, UDP, or worker failures close the data runtime and use the normal
+fail-closed reconnect path.

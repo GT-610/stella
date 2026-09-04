@@ -8,13 +8,13 @@ pub const MIN_ETHERNET_FRAME_LENGTH: u16 = 14;
 /// Protocol hard limit for one complete Ethernet frame.
 pub const MAX_ETHERNET_FRAME_LENGTH: u16 = 9_216;
 
-/// Smallest supported Windows TAP Layer-3 MTU.
+/// Smallest supported TAP Layer-3 MTU.
 pub const MIN_TAP_MTU: u16 = 576;
 
 /// Largest MTU that can fit the protocol frame ceiling plus Ethernet header.
 pub const MAX_TAP_MTU: u16 = MAX_ETHERNET_FRAME_LENGTH - MIN_ETHERNET_FRAME_LENGTH;
 
-/// Default Windows TAP Layer-3 MTU.
+/// Default TAP Layer-3 MTU.
 pub const DEFAULT_TAP_MTU: u16 = 1_500;
 
 /// Default complete untagged Ethernet frame limit.
@@ -23,8 +23,10 @@ pub const DEFAULT_MAX_FRAME_SIZE: u16 = DEFAULT_TAP_MTU + MIN_ETHERNET_FRAME_LEN
 /// Configuration used to open and constrain a TAP device.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TapConfig {
-    /// Optional Windows connection-friendly name or interface GUID.
+    /// Platform TAP selector or host-visible interface name.
     pub name: Option<String>,
+    /// Optional platform peer interface name used for packet I/O.
+    pub peer_name: Option<String>,
     /// Requested Layer-3 MTU.
     pub mtu: u16,
     /// Largest complete Ethernet frame accepted from or written to the device.
@@ -47,6 +49,22 @@ impl TapConfig {
             return Err(TapError::InvalidConfig {
                 field: "name",
                 reason: "must not be empty or whitespace",
+            });
+        }
+        if self
+            .peer_name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(TapError::InvalidConfig {
+                field: "peer name",
+                reason: "must not be empty or whitespace",
+            });
+        }
+        if self.name.as_deref() == self.peer_name.as_deref() && self.name.is_some() {
+            return Err(TapError::InvalidConfig {
+                field: "peer name",
+                reason: "must differ from the host-visible interface name",
             });
         }
         if !(MIN_TAP_MTU..=MAX_TAP_MTU).contains(&self.mtu) {
@@ -106,6 +124,7 @@ impl Default for TapConfig {
     fn default() -> Self {
         Self {
             name: None,
+            peer_name: None,
             mtu: DEFAULT_TAP_MTU,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
@@ -134,6 +153,31 @@ mod tests {
         assert!(matches!(
             empty_name.validate(),
             Err(TapError::InvalidConfig { field: "name", .. })
+        ));
+
+        let empty_peer = TapConfig {
+            peer_name: Some("  ".to_string()),
+            ..TapConfig::default()
+        };
+        assert!(matches!(
+            empty_peer.validate(),
+            Err(TapError::InvalidConfig {
+                field: "peer name",
+                ..
+            })
+        ));
+
+        let duplicate_peer = TapConfig {
+            name: Some("feth100".to_string()),
+            peer_name: Some("feth100".to_string()),
+            ..TapConfig::default()
+        };
+        assert!(matches!(
+            duplicate_peer.validate(),
+            Err(TapError::InvalidConfig {
+                field: "peer name",
+                ..
+            })
         ));
 
         let short_frame = TapConfig {

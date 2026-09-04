@@ -1,12 +1,20 @@
-# Windows 客户端数据平面
+# 客户端数据平面
 
-Windows 数据运行时将验证后的控制器状态连接到 TAP-Windows 和直连、已认证的 UDP 对等路径。
-规范包字节和计时器以协议规范为准。本页描述参考实现的所有权和失败行为。
+Windows 和 macOS 原生数据运行时把验证后的控制器状态连接到完整帧 TAP 后端，以及直连、
+已认证的 UDP 对等路径。规范包字节和计时器以协议规范为准。本页描述参考实现的所有权和
+失败行为。
 
 一个活动控制会话拥有一个 `ClientDataRuntime`。运行时只绑定一次 UDP 地址，并为每个活动
-网络快照创建一个 `NetworkDataPlane` 和一个精确的 TAP 适配器工作线程。只有在 UDP 和所有
-TAP 适配器都打开后才发布可接收端点。队列有固定容量：最多 256 个 TAP 事件等待异步运行
-时，最多 64 个已认证帧等待一个 TAP 写入器。任何方向都不会创建无界队列。
+网络快照创建一个 `NetworkDataPlane` 和一个精确的 TAP 工作线程。Windows 配置一个准确
+适配器；macOS 配置完整 feth pair。只有在 UDP 和全部 TAP 端点打开后才发布可接收端点。
+ICE 枚举会排除 TAP，macOS 还会排除 I/O peer。队列容量固定：最多 256 个 TAP 事件等待
+异步运行时，最多 64 个已认证帧等待一个 TAP 写入器，任何方向都不会创建无界队列。
+
+运行时不会为了达到网络策略上限而抬高已有 MTU。Windows 在驱动上限内事务性更新 IPv4/
+IPv6 行；macOS 打开时读取 visible feth MTU，显式更新时由 Stella 特权 TAP helper 同时修改
+pair 两端，并在部分失败时回滚。
+同步 TAP I/O 在每个适配器或 pair 的专用线程上执行。关闭时 Windows 设置
+media-disconnected；macOS 把 visible feth 置 down 并释放 pair 锁，但不删除持久接口。
 
 较小节点 ID 发起四消息签名 X25519 握手。回复仅发给控制器提供端点集合中已确认的观察到
 源地址。完整会话随后固定到精确 IP 和 UDP 端口；其他公布地址必须完成新握手，不能原地
@@ -21,5 +29,10 @@ MAC 项。畸形、未认证、重放、错误会话或错误端点的数据报�
 Relay actor 或流故障只会撤回 Relay 候选并启动一个后台替换任务。已有直连会话、
 TAP worker、UDP 套接字和控制器会话在恢复期间继续运行。替换使用有界 DNS 与
 carrier 期限，失败后按 1 至 30 秒指数上限执行全抖动重试；成功后发布新的本地连接
-generation。UDP 套接字、TAP 设备、worker 或控制面故障仍会结束当前 owner，并进入
-正常的控制器重连循环。
+generation。UDP 套接字、TAP 设备或 worker 故障仍会关闭数据运行时并清除其转发状态；
+临时控制面故障会让其他方面健康的数据运行时在既有授权边界内继续运行。数据运行时故障
+后必须由新的控制器激活才能创建替换。
+
+Windows 真实场景使用两个 TAP-Windows；macOS 真实场景使用两个 feth pair。两者都验证
+ARP、双向 IPv4、广播、多播和 LAN discovery；macOS 场景还会停止并以同一配置重启客户端，
+验证 pair 持久化与复用。

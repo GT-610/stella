@@ -23,13 +23,17 @@ ownership, key derivation, packet protection, and replay handling.
 [Datagram transport implementation](./transport.md) documents the object-safe
 transport contract, UDP socket behavior, cancellation, and truncation defense.
 [Windows TAP implementation](./tap-windows.md) covers adapter selection,
-complete-frame I/O, MTU handling, and cancellation; [Control-channel
+complete-frame I/O, MTU handling, and cancellation. [macOS feth TAP
+implementation](./tap-macos.md) covers visible/peer roles, BPF receive,
+AF_NDRV transmit, persistent reuse, helper privilege separation, locking, and
+root-only native verification;
+[Control-channel
 implementation](./control-channel.md) covers framed async I/O, message ownership,
 sequencing, correlation, and exporter-bound proof inputs.
 For TLS service boundaries, transactional authority state, administrative commands,
 and session behavior, see [Controller implementation](./controller.md). The
-[Windows client control plane](./client-control.md) documents persistent trust,
+[Client control plane](./client-control.md) documents persistent trust,
 authentication, atomic peer state, heartbeats, reconnect, and fail-closed
-forwarding behavior. [Windows client data plane](./client-data-plane.md) covers
+forwarding behavior. [Client data plane](./client-data-plane.md) covers
 TAP worker ownership, authenticated peer routing, keepalives, endpoint pinning,
 and rekey behavior.

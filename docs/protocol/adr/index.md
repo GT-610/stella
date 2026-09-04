@@ -47,3 +47,5 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0033: Preserve the reachable relay carrier on refresh](./0033-preserve-relay-carrier-on-refresh.md)
 - [0034: Recover relay without restarting direct sessions](./0034-recover-relay-without-restarting-direct-sessions.md)
 - [0035: Preserve valid forwarding during controller reconnect](./0035-preserve-forwarding-during-controller-reconnect.md)
+- [0036: Use persistent feth pairs for macOS Layer-2 access](./0036-use-persistent-feth-pairs-on-macos.md)
+- [0037: Own the macOS TAP backend behind a privileged helper](./0037-own-macos-tap-helper.md)

@@ -179,10 +179,8 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     assert_eq!(first_connection.controller_id(), initialized.controller_id);
     assert_eq!(first_connection.node_id(), node_id);
     assert_eq!(first_connection.protocol_version(), ProtocolVersion::V0_2);
-    assert!(
-        (authentication_started_at..=now().saturating_add(1))
-            .contains(&first_connection.server_time())
-    );
+    assert!((authentication_started_at..=now().saturating_add(1))
+        .contains(&first_connection.server_time()));
     let mut first = ActiveControl::new(first_connection);
     let first_epoch = first
         .join_network(network_id, Some(&join_credential))

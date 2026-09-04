@@ -468,6 +468,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,11 +1192,13 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "if-addrs",
+ "libc",
  "serde",
  "sha2",
  "stella-common",
  "stella-control",
  "stella-crypto",
+ "stella-file-security",
  "stella-proto",
  "stella-server",
  "stella-tap",
@@ -1242,6 +1254,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stella-file-security"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "stella-proto"
 version = "0.2.0"
 dependencies = [
@@ -1260,6 +1279,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hmac",
+ "libc",
  "rcgen",
  "redb",
  "rustls-pemfile",
@@ -1268,6 +1288,7 @@ dependencies = [
  "stella-common",
  "stella-control",
  "stella-crypto",
+ "stella-file-security",
  "stella-proto",
  "stella-transport",
  "subtle",
@@ -1287,6 +1308,8 @@ dependencies = [
 name = "stella-tap"
 version = "0.2.0"
 dependencies = [
+ "fs2",
+ "libc",
  "thiserror",
  "windows",
 ]

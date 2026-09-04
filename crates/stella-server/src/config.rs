@@ -996,19 +996,23 @@ private_key = "secrets/tls-key.pem"
 
     #[test]
     fn explicit_limits_and_absolute_paths_are_preserved() {
+        #[cfg(windows)]
+        let absolute_path = "C:/absolute/controller.redb";
+        #[cfg(not(windows))]
+        let absolute_path = "/absolute/controller.redb";
+        #[cfg(windows)]
+        let base_path = Path::new("C:/base");
+        #[cfg(not(windows))]
+        let base_path = Path::new("/base");
         let config = format!(
             "{VALID_CONFIG}\n[limits]\nauthority_queue = 4\nmax_connections = 5\noutbound_messages = 6\ntls_handshake_timeout_seconds = 7\nauthentication_timeout_seconds = 8\nrequest_timeout_seconds = 9\nshutdown_timeout_seconds = 10\n\n[logging]\nfilter = \"stella_server=debug\"\n"
         )
         .replace(
             "database = \"state/controller.redb\"",
-            "database = \"C:/absolute/controller.redb\"",
+            &format!("database = \"{absolute_path}\""),
         );
-        let parsed =
-            ServerConfig::parse(&config, Path::new("C:/base")).expect("explicit values are valid");
-        assert_eq!(
-            parsed.database_path,
-            Path::new("C:/absolute/controller.redb")
-        );
+        let parsed = ServerConfig::parse(&config, base_path).expect("explicit values are valid");
+        assert_eq!(parsed.database_path, Path::new(absolute_path));
         assert_eq!(parsed.limits.authority_queue, 4);
         assert_eq!(parsed.limits.tls_handshake_timeout_seconds, 7);
         assert_eq!(parsed.limits.authentication_timeout_seconds, 8);

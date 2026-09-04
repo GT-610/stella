@@ -174,7 +174,10 @@ fn assert_snapshot(
         field_value(snapshot, ControlFieldType::MembershipGrant),
         membership_grant
     );
-    assert_eq!(field_value(snapshot, ControlFieldType::NetworkPolicy), policy);
+    assert_eq!(
+        field_value(snapshot, ControlFieldType::NetworkPolicy),
+        policy
+    );
     assert_eq!(
         PeerListView::decode(field_value(snapshot, ControlFieldType::PeerList))
             .expect("decode snapshot peer list")

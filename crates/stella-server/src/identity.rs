@@ -486,7 +486,137 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod platform {
+    #[cfg(test)]
+    use std::process::Command;
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        path::Path,
+    };
+
+    use super::{cleanup_created_file, IdentityFileError};
+
+    const SECRET_FILE_MODE: u32 = 0o600;
+
+    pub(super) fn create_secure_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Create {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if let Err(error) = validate_file(&file, path) {
+            drop(file);
+            return Err(cleanup_created_file(path, error));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_verified_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file(&file, path)?;
+        Ok(file)
+    }
+
+    fn validate_file(file: &File, path: &Path) -> Result<(), IdentityFileError> {
+        let metadata = file
+            .metadata()
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(IdentityFileError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        if metadata.mode() & 0o777 != SECRET_FILE_MODE {
+            return Err(IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "mode must be exactly 0600",
+            });
+        }
+        validate_extended_acl(file, path, metadata.uid())?;
+        Ok(())
+    }
+
+    fn validate_extended_acl(
+        file: &File,
+        path: &Path,
+        owner_uid: u32,
+    ) -> Result<(), IdentityFileError> {
+        let grants_non_owner_access = stella_file_security::extended_acl_grants_non_owner_access(
+            file, owner_uid,
+        )
+        .map_err(|source| IdentityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if grants_non_owner_access {
+            return Err(IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "an extended ACL grants access to a non-owner principal",
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_test_acl(path: &Path, acl: &str) -> Result<(), IdentityFileError> {
+        let status = Command::new("/bin/chmod")
+            .args(["+a", acl])
+            .arg(path)
+            .status()
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("chmod could not install the test ACL"),
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_everyone_for_test(path: &Path) -> Result<(), IdentityFileError> {
+        let mut permissions = std::fs::metadata(path)
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        std::fs::set_permissions(path, permissions).map_err(|source| IdentityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_inherited_everyone_for_test(path: &Path) -> Result<(), IdentityFileError> {
+        install_test_acl(path, "everyone allow read,file_inherit")
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use std::{fs::File, path::Path};
 
@@ -508,7 +638,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use std::{fs::OpenOptions, io::Write};
 
     use stella_crypto::MAX_IDENTITY_PKCS8_LENGTH;
@@ -528,7 +658,7 @@ mod tests {
         ))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn identity_create_load_and_overwrite_refusal_are_secure() {
         let directory = temp_directory();
@@ -547,9 +677,9 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    fn malformed_oversized_and_acl_tampered_files_are_rejected() {
+    fn malformed_oversized_and_permission_tampered_files_are_rejected() {
         let directory = temp_directory();
         std::fs::create_dir(&directory).expect("create test directory");
         let path = directory.join("controller.pk8");
@@ -573,7 +703,7 @@ mod tests {
             .to_pkcs8_der()
             .expect("encode replacement identity");
         overwrite(&path, replacement_document.expose_secret());
-        super::platform::grant_everyone_for_test(&path).expect("tamper ACL");
+        super::platform::grant_everyone_for_test(&path).expect("tamper permissions");
         assert!(matches!(
             load_controller_identity(&path),
             Err(IdentityFileError::InsecurePermissions { .. })
@@ -583,7 +713,23 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_extended_acl_is_rejected() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        super::platform::grant_inherited_everyone_for_test(&directory)
+            .expect("grant inheritable test ACL");
+        let path = directory.join("controller.pk8");
+        assert!(matches!(
+            create_controller_identity(&path),
+            Err(IdentityFileError::InsecurePermissions { .. })
+        ));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     fn overwrite(path: &std::path::Path, bytes: &[u8]) {
         let mut file = OpenOptions::new()
             .write(true)
@@ -594,7 +740,7 @@ mod tests {
         file.sync_all().expect("sync test identity");
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn unsupported_platform_fails_before_creating_a_file() {
         let directory = temp_directory();

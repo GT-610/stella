@@ -20,4 +20,6 @@ features:
     details: Uses a deployment-owned controller for identity, membership, policy, and peer discovery.
   - title: Direct data plane
     details: Sends steady-state peer traffic directly over a replaceable datagram transport.
+  - title: Native Layer-2 endpoints
+    details: Uses TAP-Windows on Windows and persistent built-in feth pairs on macOS.
 ---

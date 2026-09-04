@@ -84,7 +84,8 @@ export default defineConfig({
                 { text: '0032：Relay DNS 期限', link: '/zh/protocol/adr/0032-bound-relay-dns-preparation' },
                 { text: '0033：Relay 刷新', link: '/zh/protocol/adr/0033-preserve-relay-carrier-on-refresh' },
                 { text: '0034：Relay 热恢复', link: '/zh/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' },
-                { text: '0035：控制重连保活', link: '/zh/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' }
+                { text: '0035：控制重连保活', link: '/zh/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' },
+                { text: '0036：macOS feth', link: '/zh/protocol/adr/0036-use-persistent-feth-pairs-on-macos' }
               ]
             }
           ],
@@ -94,6 +95,7 @@ export default defineConfig({
               items: [
                 { text: '项目状态', link: '/zh/guide/' },
                 { text: 'Windows 开发环境', link: '/zh/guide/windows-development' },
+                { text: 'macOS 开发环境', link: '/zh/guide/macos-development' },
                 { text: '部署 Windows 控制器', link: '/zh/guide/server-deployment' }
               ]
             }
@@ -102,7 +104,7 @@ export default defineConfig({
             {
               text: '命令行参考',
               items: [
-                { text: 'Windows 客户端', link: '/zh/api/client-cli' },
+                { text: '客户端', link: '/zh/api/client-cli' },
                 { text: '服务器管理', link: '/zh/api/server-cli' }
               ]
             }
@@ -117,10 +119,11 @@ export default defineConfig({
                 { text: '密码学实现', link: '/zh/development/cryptography' },
                 { text: '数据报传输', link: '/zh/development/transport' },
                 { text: 'Windows TAP', link: '/zh/development/tap-windows' },
+                { text: 'macOS feth TAP', link: '/zh/development/tap-macos' },
                 { text: '控制通道', link: '/zh/development/control-channel' },
                 { text: '控制器', link: '/zh/development/controller' },
-                { text: 'Windows 客户端控制平面', link: '/zh/development/client-control' },
-                { text: 'Windows 客户端数据平面', link: '/zh/development/client-data-plane' }
+                { text: '客户端控制平面', link: '/zh/development/client-control' },
+                { text: '客户端数据平面', link: '/zh/development/client-data-plane' }
               ]
             }
           ]
@@ -201,7 +204,8 @@ export default defineConfig({
             { text: '0032: Relay DNS bounds', link: '/protocol/adr/0032-bound-relay-dns-preparation' },
             { text: '0033: Preserve relay carrier', link: '/protocol/adr/0033-preserve-relay-carrier-on-refresh' },
             { text: '0034: Hot relay recovery', link: '/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' },
-            { text: '0035: Preserve reconnect forwarding', link: '/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' }
+            { text: '0035: Preserve reconnect forwarding', link: '/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' },
+            { text: '0036: macOS feth pairs', link: '/protocol/adr/0036-use-persistent-feth-pairs-on-macos' }
           ]
         }
       ],
@@ -211,6 +215,7 @@ export default defineConfig({
           items: [
             { text: 'Project status', link: '/guide/' },
             { text: 'Windows development setup', link: '/guide/windows-development' },
+            { text: 'macOS development setup', link: '/guide/macos-development' },
             { text: 'Deploy a Windows controller', link: '/guide/server-deployment' }
           ]
         }
@@ -225,10 +230,11 @@ export default defineConfig({
             { text: 'Cryptography', link: '/development/cryptography' },
             { text: 'Transport', link: '/development/transport' },
             { text: 'Windows TAP', link: '/development/tap-windows' },
+            { text: 'macOS feth TAP', link: '/development/tap-macos' },
             { text: 'Control channel', link: '/development/control-channel' },
             { text: 'Controller', link: '/development/controller' },
-            { text: 'Windows client control plane', link: '/development/client-control' },
-            { text: 'Windows client data plane', link: '/development/client-data-plane' }
+            { text: 'Client control plane', link: '/development/client-control' },
+            { text: 'Client data plane', link: '/development/client-data-plane' }
           ]
         }
       ],
@@ -236,7 +242,7 @@ export default defineConfig({
         {
           text: 'Command-line reference',
           items: [
-            { text: 'Windows client', link: '/api/client-cli' },
+            { text: 'Client', link: '/api/client-cli' },
             { text: 'Server administration', link: '/api/server-cli' }
           ]
         }

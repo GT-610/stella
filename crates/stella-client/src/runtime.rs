@@ -1,4 +1,4 @@
-//! Windows direct, relayed, and TAP execution runtime for active network data planes.
+//! Native direct, relayed, and TAP execution runtime for active network data planes.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -22,7 +22,9 @@ use stella_proto::{
     CommonHeader, ConnectivityCarrier, ConnectivityGenerationRef, IceCandidate, IceCandidateClass,
     RelayCarrierMask, RelayTrustRequirements, MAX_RELAY_ADDRESSES,
 };
-use stella_tap::{TapCancellationHandle, TapConfig, TapDevice, TapError, WindowsTapDevice};
+#[cfg(target_os = "windows")]
+use stella_tap::WindowsTapDevice;
+use stella_tap::{PlatformTapDevice, TapCancellationHandle, TapConfig, TapDevice, TapError};
 use stella_transport::{
     DatagramTransport, Endpoint as TransportEndpoint, ReceivedDatagram, TransportError, UdpConfig,
     UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
@@ -63,7 +65,7 @@ const RELAY_CARRIER_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_RELAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAXIMUM_RELAY_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
-/// Failure while owning the Windows client data-plane runtime.
+/// Failure while owning the native client data-plane runtime.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RuntimeError {
@@ -169,7 +171,7 @@ pub enum RuntimeError {
     },
 }
 
-/// A complete Windows client data plane sharing one bounded UDP socket.
+/// A complete native client data plane sharing one bounded UDP socket.
 pub struct ClientDataRuntime {
     udp: UdpTransport,
     udp_buffer: Vec<u8>,
@@ -212,11 +214,7 @@ impl ClientDataRuntime {
             max_datagram_size,
         })
         .await?;
-        let excluded_interfaces = config
-            .networks
-            .iter()
-            .map(|network| network.tap_adapter.clone())
-            .collect::<BTreeSet<_>>();
+        let excluded_interfaces = excluded_tap_interfaces(&config.networks);
         let candidate_datagram_size = u32::try_from(max_datagram_size).unwrap_or(65_507);
         let host_candidates = match gather_host_candidates(
             udp.local_address(),
@@ -772,7 +770,7 @@ impl ClientDataRuntime {
             .iter()
             .find(|network| network.network_id == network_id)
             .ok_or(RuntimeError::MissingTapConfiguration { network_id })?;
-        let mtu = state
+        let policy_mtu = state
             .policy()
             .max_frame_size
             .checked_sub(ETHERNET_HEADER_LENGTH)
@@ -780,20 +778,26 @@ impl ClientDataRuntime {
                 field: "mtu",
                 reason: "maximum frame size is below Ethernet header length",
             })?;
-        let installed_mtu = WindowsTapDevice::installed_adapters()?
-            .into_iter()
-            .find(|adapter| {
-                adapter
-                    .friendly_name
-                    .eq_ignore_ascii_case(&configured.tap_adapter)
-            })
-            .ok_or_else(|| TapError::AdapterNotFound {
-                selector: Some(configured.tap_adapter.clone()),
-            })?
-            .system_mtu;
-        let mtu = effective_tap_mtu(mtu, installed_mtu)?;
+        #[cfg(target_os = "windows")]
+        let mtu = {
+            let installed_mtu = WindowsTapDevice::installed_adapters()?
+                .into_iter()
+                .find(|adapter| {
+                    adapter
+                        .friendly_name
+                        .eq_ignore_ascii_case(&configured.tap_adapter)
+                })
+                .ok_or_else(|| TapError::AdapterNotFound {
+                    selector: Some(configured.tap_adapter.clone()),
+                })?
+                .system_mtu;
+            effective_tap_mtu(policy_mtu, installed_mtu)?
+        };
+        #[cfg(target_os = "macos")]
+        let mtu = policy_mtu;
         let tap_config = TapConfig {
             name: Some(configured.tap_adapter.clone()),
+            peer_name: configured.tap_peer.clone(),
             mtu,
             max_frame_size: state.policy().max_frame_size,
         };
@@ -1553,7 +1557,7 @@ impl TapWorker {
         config: &TapConfig,
         events: mpsc::Sender<TapEvent>,
     ) -> Result<Self, RuntimeError> {
-        let mut device = WindowsTapDevice::create(config)?;
+        let mut device = PlatformTapDevice::create(config)?;
         let primary_mac = MacAddress::from_bytes(device.mac_address()?);
         let cancellation = device.cancellation_handle();
         let (writes, write_receiver) = sync_channel(TAP_WRITE_QUEUE_CAPACITY);
@@ -1654,7 +1658,7 @@ impl Drop for TapWorker {
 
 fn run_tap_worker(
     network_id: NetworkId,
-    device: &mut WindowsTapDevice,
+    device: &mut PlatformTapDevice,
     writes: &SyncReceiver<Vec<u8>>,
     events: &mpsc::Sender<TapEvent>,
     reading: &AtomicBool,
@@ -1734,6 +1738,17 @@ fn configured_datagram_size(config: &ClientConfig) -> usize {
         .max()
         .unwrap_or(DEFAULT_UDP_DATAGRAM_SIZE)
         .min(MAX_UDP_DATAGRAM_SIZE)
+}
+
+fn excluded_tap_interfaces(networks: &[crate::ConfiguredNetwork]) -> BTreeSet<String> {
+    let mut excluded = BTreeSet::new();
+    for network in networks {
+        excluded.insert(network.tap_adapter.clone());
+        if let Some(peer) = &network.tap_peer {
+            excluded.insert(peer.clone());
+        }
+    }
+    excluded
 }
 
 async fn allocate_preferred_relay(
@@ -2223,6 +2238,7 @@ fn random_ice_credential(random_length: usize) -> Result<Zeroizing<Vec<u8>>, Run
     ))
 }
 
+#[cfg(target_os = "windows")]
 fn effective_tap_mtu(policy_mtu: u16, installed_mtu: u32) -> Result<u16, TapError> {
     u16::try_from(u32::from(policy_mtu).min(installed_mtu)).map_err(|_| TapError::InvalidConfig {
         field: "mtu",
@@ -2259,8 +2275,10 @@ mod tests {
         turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
     };
 
+    #[cfg(target_os = "windows")]
+    use super::effective_tap_mtu;
     use super::{
-        allocate_preferred_relay, allocate_relay_selections, effective_tap_mtu,
+        allocate_preferred_relay, allocate_relay_selections, excluded_tap_interfaces,
         matching_relay_selection, next_relay_dns_result, preferred_relay_settings,
         random_ice_credential, relay_reconnect_cap, relay_reconnect_delay, relay_selections,
         turn_bind_address, unix_time, ClientDataRuntime, ConnectivityConfigState,
@@ -2270,6 +2288,19 @@ mod tests {
         TURN_UDP_MAX_DATAGRAM_SIZE,
     };
     use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
+
+    #[test]
+    fn ice_excludes_both_sides_of_configured_tap_pairs() {
+        let networks = [crate::ConfiguredNetwork {
+            network_id: stella_common::NetworkId::from_bytes([0x11; 16]),
+            tap_adapter: "feth100".to_owned(),
+            tap_peer: Some("feth101".to_owned()),
+        }];
+        let excluded = excluded_tap_interfaces(&networks);
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.contains("feth100"));
+        assert!(excluded.contains("feth101"));
+    }
 
     async fn runtime_with_pending_relay_recovery() -> ClientDataRuntime {
         let udp = UdpTransport::bind(UdpConfig {
@@ -2512,6 +2543,7 @@ mod tests {
             .expect("decode DNS connectivity config")
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn effective_mtu_preserves_lower_host_setting_and_caps_higher_setting() {
         assert_eq!(

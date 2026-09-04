@@ -2782,7 +2782,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use std::{
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -2794,7 +2794,7 @@ mod tests {
         relay_credentials::RelayCredentialAuthority,
         turn_relay::{TurnTcpRelay, TurnTcpRelayConfig, TurnUdpRelay, TurnUdpRelayConfig},
     };
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use stella_server::{
         tls::{create_self_signed_tls_identity, load_tls_server_config, DEFAULT_TLS_VALIDITY_DAYS},
         turn_relay::{TurnTlsRelay, TurnWebSocketRelay},
@@ -2818,10 +2818,10 @@ mod tests {
         websocket_upgrade_request, ClientIo, TurnCredentials, TurnTcpClient, TurnTcpClientConfig,
         TurnUdpClient, TurnUdpClientConfig, TurnUdpError, TurnWebSocketClientConfig,
     };
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use super::{TurnTlsClient, TurnTlsClientConfig, TurnWebSocketClient};
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[tokio::test]
@@ -3136,7 +3136,7 @@ mod tests {
             .expect("relay run");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn tls_allocations_validate_pins_and_preserve_datagrams() {
@@ -3261,7 +3261,7 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("remove TLS test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn websocket_allocations_authenticate_upgrade_and_preserve_datagrams() {
@@ -3395,7 +3395,7 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("remove WebSocket TLS test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn websocket_allocation_traverses_canonical_http_connect_proxy() {
@@ -3663,7 +3663,7 @@ mod tests {
             .as_secs()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn temp_directory() -> PathBuf {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("stella-turn-tls-{}-{sequence}", std::process::id()))

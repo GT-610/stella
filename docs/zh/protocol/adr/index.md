@@ -41,3 +41,5 @@ ADR 记录约束 Stella 协议或其参考实现的决策。已接受的记录�
 - [0033：刷新时保留可达的 Relay carrier](./0033-preserve-relay-carrier-on-refresh.md)
 - [0034：恢复 Relay 时不重启直连会话](./0034-recover-relay-without-restarting-direct-sessions.md)
 - [0035：控制器重连期间保留有效转发](./0035-preserve-forwarding-during-controller-reconnect.md)
+- [0036：在 macOS 上使用持久 feth pair 提供二层接入](./0036-use-persistent-feth-pairs-on-macos.md)
+- [0037：在特权 helper 后维护自有 macOS TAP 后端](./0037-own-macos-tap-helper.md)

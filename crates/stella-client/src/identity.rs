@@ -12,9 +12,9 @@ use zeroize::Zeroizing;
 
 /// Creates a new protected Ed25519 node identity file.
 ///
-/// The target is never overwritten. On Windows the DACL is protected from
-/// inheritance and grants exact full access only to the current account and
-/// `LocalSystem` before secret bytes are written.
+/// The target is never overwritten. Windows applies a protected exact DACL;
+/// macOS requires a non-linked regular file with mode `0600`. The native
+/// policy is verified before secret bytes are written.
 ///
 /// # Errors
 ///
@@ -476,7 +476,141 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod platform {
+    #[cfg(test)]
+    use std::process::Command;
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        path::Path,
+    };
+
+    use super::{cleanup_created_file, NodeIdentityFileError};
+
+    const SECRET_FILE_MODE: u32 = 0o600;
+
+    pub(super) fn create_secure_file(path: &Path) -> Result<File, NodeIdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| NodeIdentityFileError::Create {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if let Err(error) = validate_file(&file, path) {
+            drop(file);
+            return Err(cleanup_created_file(path, error));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_verified_file(path: &Path) -> Result<File, NodeIdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| NodeIdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file(&file, path)?;
+        Ok(file)
+    }
+
+    fn validate_file(file: &File, path: &Path) -> Result<(), NodeIdentityFileError> {
+        let metadata = file
+            .metadata()
+            .map_err(|source| NodeIdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(NodeIdentityFileError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        if metadata.mode() & 0o777 != SECRET_FILE_MODE {
+            return Err(NodeIdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "mode must be exactly 0600",
+            });
+        }
+        validate_extended_acl(file, path, metadata.uid())?;
+        Ok(())
+    }
+
+    fn validate_extended_acl(
+        file: &File,
+        path: &Path,
+        owner_uid: u32,
+    ) -> Result<(), NodeIdentityFileError> {
+        let grants_non_owner_access = stella_file_security::extended_acl_grants_non_owner_access(
+            file, owner_uid,
+        )
+        .map_err(|source| NodeIdentityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if grants_non_owner_access {
+            return Err(NodeIdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "an extended ACL grants access to a non-owner principal",
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_test_acl(path: &Path, acl: &str) -> Result<(), NodeIdentityFileError> {
+        let status = Command::new("/bin/chmod")
+            .args(["+a", acl])
+            .arg(path)
+            .status()
+            .map_err(|source| NodeIdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(NodeIdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("chmod could not install the test ACL"),
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_everyone_for_test(path: &Path) -> Result<(), NodeIdentityFileError> {
+        let mut permissions = std::fs::metadata(path)
+            .map_err(|source| NodeIdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        std::fs::set_permissions(path, permissions).map_err(|source| {
+            NodeIdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_inherited_everyone_for_test(
+        path: &Path,
+    ) -> Result<(), NodeIdentityFileError> {
+        install_test_acl(path, "everyone allow read,file_inherit")
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod platform {
     use std::{fs::File, path::Path};
 
@@ -498,7 +632,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     use std::{fs::OpenOptions, io::Write};
 
     use stella_crypto::MAX_IDENTITY_PKCS8_LENGTH;
@@ -515,7 +649,7 @@ mod tests {
         ))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn create_load_verify_and_refuse_overwrite() {
         let directory = temp_directory();
@@ -533,9 +667,9 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    fn malformed_oversized_and_acl_tampered_files_are_rejected() {
+    fn malformed_oversized_and_permission_tampered_files_are_rejected() {
         let directory = temp_directory();
         std::fs::create_dir(&directory).expect("create test directory");
         let path = directory.join("node.pk8");
@@ -557,7 +691,7 @@ mod tests {
         let replacement = create_node_identity(&replacement_path).expect("create replacement");
         let document = replacement.to_pkcs8_der().expect("encode replacement");
         overwrite(&path, document.expose_secret());
-        super::platform::grant_everyone_for_test(&path).expect("tamper DACL");
+        super::platform::grant_everyone_for_test(&path).expect("tamper permissions");
         assert!(matches!(
             load_node_identity(&path),
             Err(NodeIdentityFileError::InsecurePermissions { .. })
@@ -567,7 +701,23 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_extended_acl_is_rejected() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        super::platform::grant_inherited_everyone_for_test(&directory)
+            .expect("grant inheritable test ACL");
+        let path = directory.join("node.pk8");
+        assert!(matches!(
+            create_node_identity(&path),
+            Err(NodeIdentityFileError::InsecurePermissions { .. })
+        ));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     fn overwrite(path: &std::path::Path, bytes: &[u8]) {
         let mut file = OpenOptions::new()
             .write(true)
@@ -578,7 +728,7 @@ mod tests {
         file.sync_all().expect("sync identity");
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn unsupported_platform_creates_nothing() {
         let directory = temp_directory();
