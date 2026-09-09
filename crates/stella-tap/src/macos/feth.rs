@@ -147,7 +147,9 @@ impl Drop for PreparedFethPair {
 pub(super) struct FethPair {
     visible: String,
     peer: String,
-    #[allow(dead_code)]
+    // RAII guard: holding the exclusive lock file prevents a second process
+    // from claiming the same feth pair. The field is never read directly.
+    #[allow(dead_code, reason = "exclusive lock is held for its lifetime, not read")]
     lock: File,
     enabled: bool,
 }
