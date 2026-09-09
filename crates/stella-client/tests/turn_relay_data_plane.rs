@@ -1,4 +1,7 @@
 //! Relay-first encrypted L2 coverage with ICE-driven direct-path upgrade.
+//!
+//! Windows-only. This target intentionally compiles to an empty test binary
+//! on other platforms; run it on Windows.
 
 #![cfg(windows)]
 

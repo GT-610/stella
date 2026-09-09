@@ -1,4 +1,7 @@
 //! Windows loopback coverage for client TLS pinning and Stella authentication.
+//!
+//! Windows-only. This target intentionally compiles to an empty test binary
+//! on other platforms; run it on Windows.
 
 #![cfg(windows)]
 

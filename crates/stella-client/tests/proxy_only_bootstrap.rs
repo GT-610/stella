@@ -1,4 +1,7 @@
 //! Proxy-only controller bootstrap through controller-issued WSS relay data.
+//!
+//! Windows-only. This target intentionally compiles to an empty test binary
+//! on other platforms; run it on Windows.
 
 #![cfg(windows)]
 
