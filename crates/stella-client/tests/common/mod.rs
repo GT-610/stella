@@ -3,6 +3,13 @@
 //! Windows-only in practice: this module is included via `mod common;` from
 //! `cfg(windows)` test targets, so it is not compiled on other platforms.
 
+// Each integration test binary is a separate crate that uses a different
+// subset of these helpers; unused-in-one-binary warnings would otherwise fire.
+#![allow(
+    dead_code,
+    reason = "shared by Windows-only test binaries with different subsets"
+)]
+
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -11,6 +18,10 @@ use std::{
 };
 
 use tokio::{io::AsyncReadExt, net::TcpStream, time::sleep};
+
+use stella_common::NetworkId;
+use stella_crypto::{IdentitySeed, IdentitySigningKey};
+use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -74,10 +85,6 @@ pub async fn read_connect_request(stream: &mut TcpStream) -> Vec<u8> {
 ///
 /// Only used by the proxy bootstrap tests; other test binaries that share
 /// this module do not need it.
-#[allow(
-    dead_code,
-    reason = "shared by a subset of the Windows-only test binaries"
-)]
 #[must_use]
 pub fn canonical_connect_request(port: u16) -> Vec<u8> {
     format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").into_bytes()
@@ -87,14 +94,35 @@ pub fn canonical_connect_request(port: u16) -> Vec<u8> {
 ///
 /// Only used by the authentication tests to assert that secrets never appear
 /// in plaintext CONNECT requests; other test binaries do not need it.
-#[allow(
-    dead_code,
-    reason = "shared by a subset of the Windows-only test binaries"
-)]
 #[must_use]
 pub fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+/// Derives a deterministic test identity from a single marker byte.
+#[must_use]
+pub fn signing_key(marker: u8) -> IdentitySigningKey {
+    IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([marker; 32]))
+}
+
+/// Canonical test network policy shared by the loopback scenarios.
+#[must_use]
+pub fn network_policy(network_id: NetworkId) -> NetworkPolicy {
+    NetworkPolicy {
+        confidentiality: ConfidentialityPolicy::Encrypt,
+        max_frame_size: 1_514,
+        max_flood_peers: 8,
+        flood_rate: 1_000,
+        flood_burst: 2_000,
+        mac_age_seconds: 300,
+        heartbeat_seconds: 10,
+        peer_lease_seconds: 30,
+        session_lifetime_seconds: 900,
+        reassembly_timeout_ms: 3_000,
+        network_id,
+        policy_revision: 1,
+    }
 }

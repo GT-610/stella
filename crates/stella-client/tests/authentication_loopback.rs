@@ -21,8 +21,8 @@ use stella_client::{
 use stella_common::{ControllerId, NetworkId};
 use stella_crypto::{derive_node_id, IdentitySigningKey};
 use stella_proto::{
-    ConfidentialityPolicy, ConnectivityCarrier, ConnectivityGenerationRef, Endpoint, IceCandidate,
-    IceCandidateClass, NetworkPolicy, ProtocolVersion, CONTROL_MAGIC,
+    ConnectivityCarrier, ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass,
+    ProtocolVersion, CONTROL_MAGIC,
 };
 use stella_server::{
     active::serve_control_session,
@@ -37,23 +37,6 @@ use tokio::{
     sync::oneshot,
     time::{sleep, Instant},
 };
-
-fn network_policy(network_id: NetworkId) -> NetworkPolicy {
-    NetworkPolicy {
-        confidentiality: ConfidentialityPolicy::Encrypt,
-        max_frame_size: 1_514,
-        max_flood_peers: 8,
-        flood_rate: 1_000,
-        flood_burst: 2_000,
-        mac_age_seconds: 300,
-        heartbeat_seconds: 10,
-        peer_lease_seconds: 30,
-        session_lifetime_seconds: 900,
-        reassembly_timeout_ms: 3_000,
-        network_id,
-        policy_revision: 1,
-    }
-}
 
 #[tokio::test(flavor = "current_thread")]
 #[allow(
@@ -88,7 +71,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     store
         .create_network(
             &NetworkRecord::new(
-                network_policy(network_id),
+                common::network_policy(network_id),
                 "Windows loopback LAN",
                 issued_at,
             )

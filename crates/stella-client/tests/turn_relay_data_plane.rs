@@ -5,12 +5,12 @@
 
 #![cfg(windows)]
 
+mod common;
+
 use std::{
     collections::VecDeque,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use stella_client::{
@@ -18,10 +18,10 @@ use stella_client::{
     RoutedDatagram, SnapshotInput, TurnCredentials, TurnUdpClient, TurnUdpClientConfig,
 };
 use stella_common::{MacAddress, NetworkId, RelayId};
-use stella_crypto::{derive_controller_id, derive_node_id, IdentitySeed, IdentitySigningKey};
+use stella_crypto::{derive_controller_id, derive_node_id, IdentitySigningKey};
 use stella_proto::{
-    encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
-    ConnectivityGenerationRef, IceCandidate, IceCandidateClass, NetworkPolicy, ProtocolVersion,
+    encode_connectivity_generation, ConnectivityCarrier, ConnectivityGenerationRef, IceCandidate,
+    IceCandidateClass, ProtocolVersion,
 };
 use stella_server::{
     network_state::encode_network_state,
@@ -35,44 +35,6 @@ use tokio::{sync::oneshot, time::timeout};
 const CONTROL_TIME: u64 = 130;
 const RELAY_PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 200);
 const RELATED_PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 201);
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-fn temp_directory() -> PathBuf {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "stella-turn-data-plane-{}-{sequence}",
-        std::process::id()
-    ))
-}
-
-fn signing_key(marker: u8) -> IdentitySigningKey {
-    IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([marker; 32]))
-}
-
-fn unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("test clock after Unix epoch")
-        .as_secs()
-}
-
-fn network_policy(network_id: NetworkId) -> NetworkPolicy {
-    NetworkPolicy {
-        confidentiality: ConfidentialityPolicy::Encrypt,
-        max_frame_size: 1_514,
-        max_flood_peers: 8,
-        flood_rate: 1_000,
-        flood_burst: 2_000,
-        mac_age_seconds: 300,
-        heartbeat_seconds: 10,
-        peer_lease_seconds: 30,
-        session_lifetime_seconds: 900,
-        reassembly_timeout_ms: 3_000,
-        network_id,
-        policy_revision: 1,
-    }
-}
-
 fn connectivity_bytes(client: &TurnUdpClient) -> Vec<u8> {
     let candidate = IceCandidate {
         class: IceCandidateClass::Relay,
@@ -372,11 +334,11 @@ fn direct_flight(
     reason = "the complete relay-first handshake, ICE upgrade, and grace window are one scenario"
 )]
 async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
-    let directory = temp_directory();
+    let directory = common::temp_directory("stella-turn-data-plane");
     std::fs::create_dir(&directory).expect("create test directory");
-    let controller = signing_key(0x61);
-    let alice_key = signing_key(0x62);
-    let bob_key = signing_key(0x63);
+    let controller = common::signing_key(0x61);
+    let alice_key = common::signing_key(0x62);
+    let bob_key = common::signing_key(0x63);
     let alice_id = derive_node_id(alice_key.public_key());
     let bob_id = derive_node_id(bob_key.public_key());
     let network_id = NetworkId::from_bytes([0x64; 16]);
@@ -388,7 +350,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
     .expect("initialize store");
     store
         .create_network(
-            &NetworkRecord::new(network_policy(network_id), "Relay-only LAN", 100)
+            &NetworkRecord::new(common::network_policy(network_id), "Relay-only LAN", 100)
                 .expect("network record"),
         )
         .expect("create network");
@@ -402,7 +364,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
 
     let authority =
         RelayCredentialAuthority::new([0x66; 32], 300).expect("relay credential authority");
-    let credential_time = unix_time();
+    let credential_time = common::unix_time();
     let alice_credential = authority
         .issue(relay_id, alice_id, credential_time)
         .expect("issue Alice relay credential");
