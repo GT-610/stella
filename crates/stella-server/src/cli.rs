@@ -11,7 +11,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use stella_common::{NetworkId, NodeId, RelayId};
+use stella_common::{JoinInvitation, NetworkId, NodeId, RelayId};
 use stella_crypto::derive_controller_id;
 use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 use stella_server::{
@@ -23,7 +23,7 @@ use stella_server::{
     relay_credentials::{create_relay_credential_key, load_relay_credential_authority},
     runtime::{run_controller, SessionError, SessionHandler},
     store::{AuthorityStore, BearerToken, MembershipStatus, NetworkRecord, NodeRecord},
-    tls::load_tls_server_config,
+    tls::{load_tls_server_config, load_tls_spki_sha256},
     turn_relay::{
         TurnTcpRelay, TurnTcpRelayConfig, TurnTlsRelay, TurnUdpRelay, TurnUdpRelayConfig,
         TurnWebSocketRelay,
@@ -72,6 +72,11 @@ enum Command {
     JoinToken {
         #[command(subcommand)]
         command: JoinTokenCommand,
+    },
+    /// Creates self-contained, single-use client invitations.
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
     },
     /// Creates protected deployment keys for relay credential issuance.
     RelayKey {
@@ -181,6 +186,27 @@ enum EnrollmentTokenCommand {
 enum JoinTokenCommand {
     /// Creates one network-scoped token and prints it exactly once to stdout.
     Create(JoinTokenCreateArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum InviteCommand {
+    /// Creates one invitation containing controller trust and single-use tokens.
+    Create(InviteCreateArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+struct InviteCreateArgs {
+    /// Virtual network the invitation joins.
+    #[arg(long)]
+    network: NetworkId,
+    /// Numeric controller address reachable by the invited client.
+    #[arg(long, value_name = "IP:PORT")]
+    controller: SocketAddr,
+    /// Certificate DNS name or IP name validated by the invited client.
+    #[arg(long)]
+    tls_name: String,
+    #[command(flatten)]
+    lifetime: TokenLifetimeArgs,
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,6 +330,7 @@ async fn execute(cli: Cli, output: &mut dyn Write) -> Result<()> {
             execute_enrollment_token(&cli.config, command, output).await
         }
         Command::JoinToken { command } => execute_join_token(&cli.config, command, output).await,
+        Command::Invite { command } => execute_invite(&cli.config, command, output).await,
         Command::RelayKey { command } => execute_relay_key(command, output),
         Command::Relay { command } => execute_relay(&cli.config, command).await,
         Command::Node { command } => execute_node(&cli.config, command, output).await,
@@ -697,6 +724,56 @@ async fn execute_join_token(
     write_token(output, &token)
 }
 
+async fn execute_invite(
+    config_path: &Path,
+    command: InviteCommand,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let InviteCommand::Create(args) = command;
+    let config = ServerConfig::load(config_path)
+        .with_context(|| format!("could not load {}", config_path.display()))?;
+    let identity =
+        load_controller_identity(&config.controller_identity_path).with_context(|| {
+            format!(
+                "could not load controller identity {}",
+                config.controller_identity_path.display()
+            )
+        })?;
+    let controller_id = derive_controller_id(identity.public_key());
+    drop(identity);
+    let spki_sha256 = load_tls_spki_sha256(&config.tls_certificate_path).with_context(|| {
+        format!(
+            "could not load controller certificate {}",
+            config.tls_certificate_path.display()
+        )
+    })?;
+    let (created_at, expires_at) = token_lifetime(args.lifetime.ttl_seconds)?;
+    let network_id = args.network;
+    let (enrollment_token, join_token) = with_authority(config_path, |authority| async move {
+        let enrollment_token = authority
+            .issue_enrollment_token(created_at, expires_at)
+            .await?;
+        let join_token = authority
+            .issue_join_token(network_id, created_at, expires_at)
+            .await?;
+        Ok((enrollment_token, join_token))
+    })
+    .await?;
+    let invitation = JoinInvitation::new(
+        args.controller,
+        args.tls_name,
+        controller_id,
+        spki_sha256,
+        network_id,
+        expires_at,
+        *enrollment_token.expose_secret(),
+        *join_token.expose_secret(),
+    )
+    .context("could not construct invitation")?;
+    let encoded = invitation.encode();
+    writeln!(output, "{}", encoded.as_str()).context("could not write invitation")
+}
+
 async fn execute_node(
     config_path: &Path,
     command: NodeCommand,
@@ -927,11 +1004,13 @@ mod tests {
     use std::{
         ffi::OsString,
         path::PathBuf,
+        str::FromStr,
         sync::atomic::{AtomicU64, Ordering},
     };
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use clap::Parser;
+    use stella_common::JoinInvitation;
     use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
     use stella_server::{
         config::ServerConfig,
@@ -1169,6 +1248,50 @@ mod tests {
         assert!(text.contains("tls_not_after="));
         let loaded = ServerConfig::load(&config).expect("load generated configuration");
         assert_eq!(loaded.listen.to_string(), "127.0.0.1:44902");
+        let network = "48484848484848484848484848484848";
+        let network_cli = Cli::try_parse_from([
+            OsString::from("stella-server"),
+            OsString::from("--config"),
+            config.as_os_str().to_owned(),
+            OsString::from("network"),
+            OsString::from("create"),
+            OsString::from("--id"),
+            OsString::from(network),
+            OsString::from("--name"),
+            OsString::from("Invitation LAN"),
+        ])
+        .expect("parse network create command");
+        execute(network_cli, &mut Vec::new())
+            .await
+            .expect("create invitation network");
+        let invite_cli = Cli::try_parse_from([
+            OsString::from("stella-server"),
+            OsString::from("--config"),
+            config.as_os_str().to_owned(),
+            OsString::from("invite"),
+            OsString::from("create"),
+            OsString::from("--network"),
+            OsString::from(network),
+            OsString::from("--controller"),
+            OsString::from("192.0.2.10:44902"),
+            OsString::from("--tls-name"),
+            OsString::from("controller.example.test"),
+        ])
+        .expect("parse invitation command");
+        let mut invitation_output = Vec::new();
+        execute(invite_cli, &mut invitation_output)
+            .await
+            .expect("create invitation");
+        let invitation_text = std::str::from_utf8(&invitation_output)
+            .expect("UTF-8 invitation")
+            .trim();
+        let invitation = JoinInvitation::from_str(invitation_text).expect("parse invitation");
+        assert_eq!(
+            invitation.controller_address().to_string(),
+            "192.0.2.10:44902"
+        );
+        assert_eq!(invitation.tls_name(), "controller.example.test");
+        assert_eq!(invitation.network_id().to_string(), network);
         std::fs::remove_dir_all(directory).expect("remove init test directory");
     }
 

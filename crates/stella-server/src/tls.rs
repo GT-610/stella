@@ -20,6 +20,7 @@ use tokio_rustls::rustls::{
     version::TLS13,
     ServerConfig,
 };
+use x509_parser::parse_x509_certificate;
 use zeroize::Zeroizing;
 
 use crate::identity::{
@@ -152,6 +153,41 @@ pub fn load_tls_server_config(
         .map_err(TlsIdentityError::TlsConfiguration)?;
     configuration.max_early_data_size = 0;
     Ok(Arc::new(configuration))
+}
+
+/// Loads the leaf certificate and returns its exact SHA-256 SPKI digest.
+///
+/// # Errors
+///
+/// Returns [`TlsIdentityError`] for an inaccessible, oversized, malformed, or
+/// empty certificate file, or a malformed leaf X.509 certificate.
+pub fn load_tls_spki_sha256(certificate_path: &Path) -> Result<[u8; 32], TlsIdentityError> {
+    let certificate_file =
+        File::open(certificate_path).map_err(|source| TlsIdentityError::Open {
+            path: certificate_path.to_path_buf(),
+            source,
+        })?;
+    let certificate_bytes = read_bounded(
+        certificate_file,
+        certificate_path,
+        MAX_TLS_CERTIFICATE_BYTES,
+    )?;
+    let certificates = parse_certificates(certificate_path, &certificate_bytes)?;
+    let leaf = certificates
+        .first()
+        .ok_or_else(|| TlsIdentityError::MissingCertificate {
+            path: certificate_path.to_path_buf(),
+        })?;
+    let (remaining, parsed) =
+        parse_x509_certificate(leaf.as_ref()).map_err(|_| TlsIdentityError::ParseCertificate {
+            path: certificate_path.to_path_buf(),
+        })?;
+    if !remaining.is_empty() {
+        return Err(TlsIdentityError::ParseCertificate {
+            path: certificate_path.to_path_buf(),
+        });
+    }
+    Ok(sha256_segments(&[parsed.public_key().raw]))
 }
 
 fn validate_validity_days(validity_days: u16) -> Result<(), TlsIdentityError> {
@@ -488,6 +524,12 @@ pub enum TlsIdentityError {
         /// PEM parser failure.
         #[source]
         source: std::io::Error,
+    },
+    /// The leaf DER certificate is malformed or has trailing bytes.
+    #[error("invalid X.509 certificate in TLS identity file {path}")]
+    ParseCertificate {
+        /// Rejected certificate path.
+        path: PathBuf,
     },
     /// A PEM file contains an item outside its strict role.
     #[error("TLS identity file {path} must contain {expected}")]

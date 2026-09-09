@@ -93,6 +93,7 @@ export default defineConfig({
             {
               text: '使用指南',
               items: [
+                { text: '快速开始', link: '/zh/guide/quick-start' },
                 { text: '项目状态', link: '/zh/guide/' },
                 { text: 'Windows 开发环境', link: '/zh/guide/windows-development' },
                 { text: 'macOS 开发环境', link: '/zh/guide/macos-development' },
@@ -213,6 +214,7 @@ export default defineConfig({
         {
           text: 'User guide',
           items: [
+            { text: 'Quick start', link: '/guide/quick-start' },
             { text: 'Project status', link: '/guide/' },
             { text: 'Windows development setup', link: '/guide/windows-development' },
             { text: 'macOS development setup', link: '/guide/macos-development' },

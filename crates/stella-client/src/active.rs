@@ -100,6 +100,15 @@ impl ActiveControl {
         self.connection.leave_network(network_id).await
     }
 
+    /// Sends TLS close notification before ending this active control session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the carrier cannot shut down cleanly.
+    pub async fn shutdown(self) -> Result<(), ClientError> {
+        self.connection.shutdown().await
+    }
+
     /// Publishes the complete receive-ready endpoint set and reconciles the
     /// resulting authoritative snapshot before returning.
     ///

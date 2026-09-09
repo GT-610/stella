@@ -18,6 +18,16 @@ Windows end-to-end verification has passed with two real adapters. macOS
 includes root-only lifecycle and helper-backed two-node verification, but this
 checkout has not recorded a privileged run yet.
 
+## Start here
+
+Users joining an existing deployment should follow the
+[quick start](docs/guide/quick-start.md). A deployment administrator can now
+create one self-contained, single-use invitation with `stella-server invite
+create`; `stella-client join --invite-file -` reads it from standard input to
+create strict local trust,
+enroll the node, and join the target network. The detailed CLI remains available
+for operators who need to handle controller trust and tokens separately.
+
 ## Release Compatibility
 
 Version 0.2.0 removes the public `stella_control::CorrelationTracker` type and

@@ -122,24 +122,29 @@ UDP → TCP → TLS → Secure WebSocket 的顺序自动尝试，无需客户端
 TLS，取得 Relay 授权后再用同一代理建立 Secure WebSocket Relay 兜底。控制器和 Relay
 的 TLS 认证在各自 CONNECT 隧道内保持端到端。首个方案暂不支持代理认证。
 
-## 创建网络和注册材料
+## 创建网络和邀请
 
 ```powershell
 $Server = 'C:\Stella\stella-server.exe'
 $Config = 'C:\Stella\server.toml'
 
 $NetworkId = & $Server --config $Config network create --name 'Game LAN'
-$EnrollmentToken = & $Server --config $Config enrollment-token create
-$JoinToken = & $Server --config $Config join-token create --network $NetworkId
-
 $NetworkId
-$EnrollmentToken
-$JoinToken
+
+& $Server --config $Config invite create `
+  --network $NetworkId `
+  --controller 203.0.113.10:44900 `
+  --tls-name controller.example.net
 ```
 
-注册令牌和加入令牌都是 Bearer 凭据，默认一小时后过期，只输出一次，并在首次
-成功使用时消耗。不要将它们写入 shell 历史、日志或源代码管理系统。请为每个
-节点生成不同的令牌，不要在客户端之间共享。
+把 `--controller` 替换成客户端实际能够访问的数值地址；`--tls-name` 必须包含在初始化
+生成的证书中。邀请以 `stella1:` 开头，封装控制器信任、网络 ID、注册和加入令牌，默认
+一小时后过期且只输出一次。请通过可信私密渠道发送，为每个节点生成不同邀请，不要写入
+日志、工单或源代码管理系统。客户端可按[快速开始](./quick-start)用一条 `join` 命令完成
+首次配置和加入。
+
+需要分别管理令牌时，仍可使用 `enrollment-token create` 和 `join-token create`；详见
+[服务器 CLI 参考](/zh/api/server-cli)。
 
 ## 验证并运行
 

@@ -7,11 +7,11 @@ hero:
   tagline: 自托管控制平面与直连对等数据路径，用于透明传输以太网帧。
   actions:
     - theme: brand
+      text: 快速开始
+      link: /zh/guide/quick-start
+    - theme: alt
       text: 阅读协议
       link: /zh/protocol/
-    - theme: alt
-      text: 项目状态
-      link: /zh/guide/
 
 features:
   - title: 透明二层网络

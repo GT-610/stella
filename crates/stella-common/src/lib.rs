@@ -2,9 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+mod invitation;
+
 use std::{fmt, str::FromStr};
 
 use thiserror::Error;
+
+pub use invitation::{InvitationError, JoinInvitation};
 
 const IDENTIFIER_LENGTH: usize = 16;
 

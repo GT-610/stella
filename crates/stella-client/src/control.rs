@@ -245,6 +245,18 @@ impl AuthenticatedControl {
             .await
             .unwrap_or(Err(ClientError::ConnectionClosed))
     }
+
+    /// Sends TLS close notification before ending this control connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the carrier cannot shut down its writing
+    /// side cleanly.
+    pub async fn shutdown(mut self) -> Result<(), ClientError> {
+        self.writer.shutdown().await?;
+        self.reader_task.abort();
+        Ok(())
+    }
 }
 
 impl Drop for AuthenticatedControl {

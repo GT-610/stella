@@ -71,6 +71,40 @@ TLS 1.3、服务器名与 SPKI 验证、Stella 控制器认证以及 Relay TLS/W
 
 ## 加入网络
 
+推荐使用管理员生成的单一邀请完成首次初始化和加入：
+
+```powershell
+$Invitation = Read-Host 'Stella invitation'
+$Invitation | stella-client --config C:\Stella\client.toml join `
+  --invite-file - `
+  --display-name "Gaming PC" `
+  --tap-adapter "Stella LAN"
+$Invitation = $null
+```
+
+macOS 同时提供完整 feth pair：
+
+```sh
+printf 'Stella invitation: ' >&2
+IFS= read -r -s invitation
+printf '\n' >&2
+printf '%s\n' "$invitation" | stella-client --config /etc/stella/client.toml join \
+  --invite-file - \
+  --display-name 'Gaming Mac' \
+  --tap-adapter feth100 \
+  --tap-peer feth101
+unset invitation
+```
+
+配置不存在时，邀请会提供控制器地址、TLS 名称、Controller ID、SPKI pin、网络 ID 和
+两类一次性令牌；客户端创建身份与配置后完成注册和加入。配置已存在时，邀请中的控制器
+信任必须与现有配置匹配。邀请默认一小时过期，并包含 Bearer 凭据，应通过可信私密渠道
+传递。`--udp-bind`、`--https-proxy` 和 `--identity` 可在邀请首次创建配置时覆盖初始化默认值。
+`--invite-file -` 从标准输入读取邀请，因此邀请不会出现在进程参数列表或 shell 历史中；
+它也接受一个权限受保护的邀请文件路径。
+
+以下精细形式继续用于已有配置、已有成员关系或独立令牌工作流。
+
 Windows 选择准确的预安装适配器：
 
 ```powershell

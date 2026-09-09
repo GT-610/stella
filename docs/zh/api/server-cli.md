@@ -164,6 +164,23 @@ stella-server --config C:\Stella\server.toml network delete --network <network-i
 
 ## 一次性令牌
 
+普通首次加入优先使用单一邀请：
+
+```powershell
+stella-server --config C:\Stella\server.toml invite create `
+  --network <network-id> `
+  --controller 203.0.113.10:44900 `
+  --tls-name controller.example.net
+```
+
+`invite create` 从现有控制器身份和叶证书取得 Controller ID 与 SPKI pin，为目标网络签发
+具有相同有效期的注册、加入令牌，并把全部材料编码为一个以 `stella1:` 开头的邀请。
+`--controller` 是客户端实际可达的数值地址；`--tls-name` 必须由控制器证书覆盖。
+`--ttl-seconds` 默认 3600。邀请包含 Bearer 凭据，只输出一次，应通过可信私密渠道发送，
+且每个客户端分别生成。
+
+需要独立控制两种令牌时使用底层命令：
+
 ```powershell
 stella-server --config C:\Stella\server.toml enrollment-token create
 stella-server --config C:\Stella\server.toml join-token create --network <network-id>

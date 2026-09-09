@@ -152,25 +152,33 @@ secure WebSocket relay fallback after receiving Relay authorization. Controller
 and Relay TLS authentication remain end to end inside their CONNECT tunnels.
 The first profile does not support proxy authentication.
 
-## Create a network and enrollment material
+## Create a network and invitation
 
 ```powershell
 $Server = 'C:\Stella\stella-server.exe'
 $Config = 'C:\Stella\server.toml'
 
 $NetworkId = & $Server --config $Config network create --name 'Game LAN'
-$EnrollmentToken = & $Server --config $Config enrollment-token create
-$JoinToken = & $Server --config $Config join-token create --network $NetworkId
-
 $NetworkId
-$EnrollmentToken
-$JoinToken
+
+& $Server --config $Config invite create `
+  --network $NetworkId `
+  --controller 203.0.113.10:44900 `
+  --tls-name controller.example.net
 ```
 
-Enrollment and join tokens are bearer credentials, expire after one hour by
-default, are printed only once, and are consumed by the first successful use.
-Keep them out of shell history, logs, and source control. Generate distinct
-tokens for each node instead of sharing one token between clients.
+Replace `--controller` with the numeric address clients can actually reach;
+`--tls-name` must be present in the certificate generated during initialization.
+The `stella1:` invitation contains controller trust, the network ID, and both
+single-use tokens. It expires after one hour by default and is printed exactly
+once. Deliver it through a trusted private channel, generate a separate
+invitation for every node, and do not place it in logs, tickets, or source
+control. The client can follow the [quick start](./quick-start) to configure and
+join with one command.
+
+The lower-level `enrollment-token create` and `join-token create` commands
+remain available when tokens must be managed separately; see the
+[server CLI reference](/api/server-cli).
 
 ## Verify and run
 
