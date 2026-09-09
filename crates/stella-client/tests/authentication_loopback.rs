@@ -5,14 +5,12 @@
 
 #![cfg(windows)]
 
+mod common;
+
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::Duration,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -34,34 +32,11 @@ use stella_server::{
     store::{AuthorityStore, NetworkRecord},
 };
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     time::{sleep, Instant},
 };
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-fn temp_directory() -> PathBuf {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "stella-client-authentication-{}-{sequence}",
-        std::process::id()
-    ))
-}
-
-fn reserve_loopback_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("reserve loopback controller address");
-    listener.local_addr().expect("read reserved address")
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("test clock after Unix epoch")
-        .as_secs()
-}
 
 fn network_policy(network_id: NetworkId) -> NetworkPolicy {
     NetworkPolicy {
@@ -86,9 +61,9 @@ fn network_policy(network_id: NetworkId) -> NetworkPolicy {
     reason = "the ordered end-to-end authentication and join transcript is clearer as one scenario"
 )]
 async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
-    let directory = temp_directory();
+    let directory = common::temp_directory("stella-client-authentication");
     let config_path = directory.join("server.toml");
-    let address = reserve_loopback_address();
+    let address = common::reserve_loopback_address();
     let initialized = initialize_controller(
         &config_path,
         &BootstrapOptions {
@@ -100,7 +75,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     let config = ServerConfig::load(&config_path).expect("load controller configuration");
     let store = AuthorityStore::open(&config.database_path, initialized.controller_id)
         .expect("open authority before server starts");
-    let issued_at = now();
+    let issued_at = common::unix_time();
     let enrollment_token = store
         .issue_enrollment_token(issued_at, issued_at + 3_600)
         .expect("issue enrollment token");
@@ -172,7 +147,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         ClientError::Tls(_)
     ));
 
-    let authentication_started_at = now();
+    let authentication_started_at = common::unix_time();
     let first_connection = authenticate_after_listener_ready(
         &trust,
         &node_key,
@@ -182,8 +157,10 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     assert_eq!(first_connection.controller_id(), initialized.controller_id);
     assert_eq!(first_connection.node_id(), node_id);
     assert_eq!(first_connection.protocol_version(), ProtocolVersion::V0_2);
-    assert!((authentication_started_at..=now().saturating_add(1))
-        .contains(&first_connection.server_time()));
+    assert!(
+        (authentication_started_at..=common::unix_time().saturating_add(1))
+            .contains(&first_connection.server_time())
+    );
     let mut first = ActiveControl::new(first_connection);
     let first_epoch = first
         .join_network(network_id, Some(&join_credential))
@@ -299,7 +276,8 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     let heartbeat = first.heartbeat().await.expect("heartbeat is acknowledged");
     assert_eq!(heartbeat.counter(), 1);
     assert!(
-        (authentication_started_at..=now().saturating_add(1)).contains(&heartbeat.server_time())
+        (authentication_started_at..=common::unix_time().saturating_add(1))
+            .contains(&heartbeat.server_time())
     );
     assert_eq!(heartbeat.updated_networks(), &[network_id]);
     assert_eq!(
@@ -390,7 +368,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     else {
         panic!("controller shutdown must produce a shutdown update");
     };
-    assert!((now()..=now().saturating_add(60)).contains(&deadline));
+    assert!((common::unix_time()..=common::unix_time().saturating_add(60)).contains(&deadline));
     drop(shutdown_control);
     server
         .await
@@ -405,9 +383,9 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
     reason = "the real proxy, TLS controller, enrollment, and reauthentication are one security scenario"
 )]
 async fn proxied_client_enrolls_and_reauthenticates_without_plaintext_credentials() {
-    let directory = temp_directory();
+    let directory = common::temp_directory("stella-client-authentication");
     let config_path = directory.join("server.toml");
-    let controller_address = reserve_loopback_address();
+    let controller_address = common::reserve_loopback_address();
     let initialized = initialize_controller(
         &config_path,
         &BootstrapOptions {
@@ -419,7 +397,7 @@ async fn proxied_client_enrolls_and_reauthenticates_without_plaintext_credential
     let config = ServerConfig::load(&config_path).expect("load proxied controller configuration");
     let store = AuthorityStore::open(&config.database_path, initialized.controller_id)
         .expect("open proxied authority before server starts");
-    let issued_at = now();
+    let issued_at = common::unix_time();
     let enrollment_token = store
         .issue_enrollment_token(issued_at, issued_at + 3_600)
         .expect("issue proxied enrollment token");
@@ -447,7 +425,7 @@ async fn proxied_client_enrolls_and_reauthenticates_without_plaintext_credential
         )
         .await
     });
-    wait_for_tcp_listener(controller_address).await;
+    common::wait_for_tcp_listener(controller_address).await;
 
     let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -467,12 +445,15 @@ async fn proxied_client_enrolls_and_reauthenticates_without_plaintext_credential
                 .accept()
                 .await
                 .expect("accept proxied controller connection");
-            let request = read_connect_request(&mut downstream).await;
+            let request = common::read_connect_request(&mut downstream).await;
             assert_eq!(request, expected_request);
-            assert!(!contains_subslice(&request, &enrollment_secret));
-            assert!(!contains_subslice(&request, enrollment_text.as_bytes()));
-            assert!(!contains_subslice(&request, pin_text.as_bytes()));
-            assert!(!contains_subslice(&request, &CONTROL_MAGIC));
+            assert!(!common::contains_subslice(&request, &enrollment_secret));
+            assert!(!common::contains_subslice(
+                &request,
+                enrollment_text.as_bytes()
+            ));
+            assert!(!common::contains_subslice(&request, pin_text.as_bytes()));
+            assert!(!common::contains_subslice(&request, &CONTROL_MAGIC));
 
             let mut upstream = TcpStream::connect(controller_address)
                 .await
@@ -545,12 +526,15 @@ async fn controller_proxy_rejection_is_status_only_and_precedes_enrollment() {
             .accept()
             .await
             .expect("accept rejected controller connection");
-        let request = read_connect_request(&mut stream).await;
+        let request = common::read_connect_request(&mut stream).await;
         assert_eq!(request, expected_request);
-        assert!(!contains_subslice(&request, &enrollment_secret));
-        assert!(!contains_subslice(&request, enrollment_text.as_bytes()));
-        assert!(!contains_subslice(&request, pin_text.as_bytes()));
-        assert!(!contains_subslice(&request, &CONTROL_MAGIC));
+        assert!(!common::contains_subslice(&request, &enrollment_secret));
+        assert!(!common::contains_subslice(
+            &request,
+            enrollment_text.as_bytes()
+        ));
+        assert!(!common::contains_subslice(&request, pin_text.as_bytes()));
+        assert!(!common::contains_subslice(&request, &CONTROL_MAGIC));
         stream
             .write_all(
                 b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=super-secret\r\nContent-Length: 0\r\n\r\n",
@@ -582,44 +566,6 @@ async fn controller_proxy_rejection_is_status_only_and_precedes_enrollment() {
     ));
     assert!(!error.to_string().contains("super-secret"));
     proxy.await.expect("rejecting controller proxy task");
-}
-
-async fn wait_for_tcp_listener(address: SocketAddr) {
-    for _attempt in 0..100 {
-        match TcpStream::connect(address).await {
-            Ok(stream) => {
-                drop(stream);
-                return;
-            }
-            Err(_) => sleep(Duration::from_millis(10)).await,
-        }
-    }
-    TcpStream::connect(address)
-        .await
-        .expect("controller listener becomes ready");
-}
-
-async fn read_connect_request(stream: &mut TcpStream) -> Vec<u8> {
-    let mut request = Vec::new();
-    loop {
-        let mut byte = [0_u8; 1];
-        stream
-            .read_exact(&mut byte)
-            .await
-            .expect("read controller CONNECT request");
-        request.push(byte[0]);
-        assert!(request.len() <= 1_024);
-        if request.ends_with(b"\r\n\r\n") {
-            return request;
-        }
-    }
-}
-
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
 }
 
 async fn authentication_error_after_listener_ready(
