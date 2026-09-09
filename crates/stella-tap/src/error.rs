@@ -37,8 +37,6 @@ pub enum TapOperation {
     PairInterfaces,
     /// Querying the peer of a macOS fake-Ethernet interface.
     QueryPeer,
-    /// Configuring blocking behavior for frame I/O.
-    ConfigureBlockingMode,
     /// Connecting to the privileged macOS TAP helper.
     ConnectHelper,
     /// Accepting a client connection in the privileged macOS TAP helper.
@@ -100,7 +98,6 @@ impl fmt::Display for TapOperation {
             Self::CreateDevice => "create device",
             Self::PairInterfaces => "pair interfaces",
             Self::QueryPeer => "query interface peer",
-            Self::ConfigureBlockingMode => "configure blocking mode",
             Self::ConnectHelper => "connect TAP helper",
             Self::AcceptHelper => "accept TAP helper connection",
             Self::AuthenticateHelper => "authenticate TAP helper",

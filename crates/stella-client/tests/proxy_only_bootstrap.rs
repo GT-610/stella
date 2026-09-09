@@ -1,16 +1,17 @@
 //! Proxy-only controller bootstrap through controller-issued WSS relay data.
+//!
+//! Windows-only. This target intentionally compiles to an empty test binary
+//! on other platforms; run it on Windows.
 
 #![cfg(windows)]
+
+mod common;
 
 use std::{
     fmt::Write as _,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::Duration,
 };
 
 use stella_client::{
@@ -31,34 +32,11 @@ use stella_server::{
     turn_relay::{TurnTcpRelayConfig, TurnWebSocketRelay},
 };
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
-    time::{sleep, timeout},
+    time::timeout,
 };
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-fn temp_directory() -> PathBuf {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "stella-proxy-only-bootstrap-{}-{sequence}",
-        std::process::id()
-    ))
-}
-
-fn reserve_loopback_address() -> SocketAddr {
-    let listener =
-        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback address");
-    listener.local_addr().expect("read reserved address")
-}
-
-fn unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("test clock after Unix epoch")
-        .as_secs()
-}
 
 #[tokio::test(flavor = "current_thread")]
 #[allow(
@@ -66,10 +44,10 @@ fn unix_time() -> u64 {
     reason = "controller bootstrap, credential issuance, two CONNECT tunnels, and WSS relay data form one scenario"
 )]
 async fn controller_issued_credentials_drive_proxied_websocket_relay_data() {
-    let directory = temp_directory();
+    let directory = common::temp_directory("stella-proxy-only-bootstrap");
     let config_path = directory.join("server.toml");
-    let controller_address = reserve_loopback_address();
-    let relay_address = reserve_loopback_address();
+    let controller_address = common::reserve_loopback_address();
+    let relay_address = common::reserve_loopback_address();
     let relay_id = RelayId::from_bytes([0x51; 16]);
     let initialized = initialize_controller(
         &config_path,
@@ -98,7 +76,7 @@ async fn controller_issued_credentials_drive_proxied_websocket_relay_data() {
 
     let store = AuthorityStore::open(&config.database_path, initialized.controller_id)
         .expect("open authority before proxy-only controller starts");
-    let issued_at = unix_time();
+    let issued_at = common::unix_time();
     let enrollment_a = store
         .issue_enrollment_token(issued_at, issued_at + 3_600)
         .expect("issue A enrollment token");
@@ -162,14 +140,14 @@ async fn controller_issued_credentials_drive_proxied_websocket_relay_data() {
         )
         .await
     });
-    wait_for_tcp_listener(controller_address).await;
+    common::wait_for_tcp_listener(controller_address).await;
 
     let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind shared explicit proxy");
     let proxy_address = proxy_listener.local_addr().expect("shared proxy address");
-    let controller_request = canonical_connect_request(controller_address.port());
-    let relay_request = canonical_connect_request(relay_address.port());
+    let controller_request = common::canonical_connect_request(controller_address.port());
+    let relay_request = common::canonical_connect_request(relay_address.port());
     let proxy_task = tokio::spawn(async move {
         let mut controller_tunnels = 0_u8;
         let mut relay_tunnels = 0_u8;
@@ -179,7 +157,7 @@ async fn controller_issued_credentials_drive_proxied_websocket_relay_data() {
                 .accept()
                 .await
                 .expect("accept proxy-only connection");
-            let request = read_connect_request(&mut downstream).await;
+            let request = common::read_connect_request(&mut downstream).await;
             let upstream_address = if request == controller_request {
                 controller_tunnels = controller_tunnels.saturating_add(1);
                 controller_address
@@ -355,39 +333,4 @@ async fn allocate_from_controller(
         )?,
     )
     .await
-}
-
-fn canonical_connect_request(port: u16) -> Vec<u8> {
-    format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").into_bytes()
-}
-
-async fn read_connect_request(stream: &mut TcpStream) -> Vec<u8> {
-    let mut request = Vec::new();
-    loop {
-        let mut byte = [0_u8; 1];
-        stream
-            .read_exact(&mut byte)
-            .await
-            .expect("read proxy-only CONNECT request");
-        request.push(byte[0]);
-        assert!(request.len() <= 1_024);
-        if request.ends_with(b"\r\n\r\n") {
-            return request;
-        }
-    }
-}
-
-async fn wait_for_tcp_listener(address: SocketAddr) {
-    for _attempt in 0..100 {
-        match TcpStream::connect(address).await {
-            Ok(stream) => {
-                drop(stream);
-                return;
-            }
-            Err(_) => sleep(Duration::from_millis(10)).await,
-        }
-    }
-    TcpStream::connect(address)
-        .await
-        .expect("controller listener becomes ready");
 }

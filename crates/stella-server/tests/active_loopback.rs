@@ -1,4 +1,7 @@
 //! Windows loopback coverage for the authenticated controller request loop.
+//!
+//! Windows-only. This target intentionally compiles to an empty test binary
+//! on other platforms; run it on Windows.
 
 #![cfg(windows)]
 
