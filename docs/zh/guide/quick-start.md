@@ -20,19 +20,29 @@ Windows 在提升权限的 PowerShell 中执行：
 
 ```powershell
 $Invitation = Read-Host 'Stella invitation'
-C:\Stella\stella-client.exe --config C:\Stella\client.toml join $Invitation `
+$Invitation | C:\Stella\stella-client.exe --config C:\Stella\client.toml join `
+  --invite-file - `
   --display-name $env:COMPUTERNAME `
   --tap-adapter 'Stella LAN'
+$Invitation = $null
 ```
 
 macOS 执行：
 
 ```sh
-stella-client --config /etc/stella/client.toml join '<stella1:invitation>' \
+printf 'Stella invitation: ' >&2
+IFS= read -r -s invitation
+printf '\n' >&2
+printf '%s\n' "$invitation" | stella-client --config /etc/stella/client.toml join \
+  --invite-file - \
   --display-name "$(scutil --get ComputerName)" \
   --tap-adapter feth100 \
   --tap-peer feth101
+unset invitation
 ```
+
+`--invite-file -` 从标准输入读取邀请，因此邀请不会出现在进程参数列表或 shell 历史中；
+也可以改为提供一个权限受保护的邀请文件路径。
 
 当配置不存在时，`join` 会从邀请创建受保护的节点身份和严格的控制器信任配置，然后
 注册节点并加入网络。配置已经存在时，它要求邀请中的控制器地址、TLS 名称、Controller

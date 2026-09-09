@@ -91,18 +91,25 @@ the administrator:
 
 ```powershell
 $Invitation = Read-Host 'Stella invitation'
-stella-client --config C:\Stella\client.toml join $Invitation `
+$Invitation | stella-client --config C:\Stella\client.toml join `
+  --invite-file - `
   --display-name "Gaming PC" `
   --tap-adapter "Stella LAN"
+$Invitation = $null
 ```
 
 macOS also supplies the complete feth pair:
 
 ```sh
-stella-client --config /etc/stella/client.toml join '<stella1:invitation>' \
+printf 'Stella invitation: ' >&2
+IFS= read -r -s invitation
+printf '\n' >&2
+printf '%s\n' "$invitation" | stella-client --config /etc/stella/client.toml join \
+  --invite-file - \
   --display-name 'Gaming Mac' \
   --tap-adapter feth100 \
   --tap-peer feth101
+unset invitation
 ```
 
 When the configuration does not exist, the invitation supplies the controller
@@ -113,6 +120,9 @@ match the stored trust. Invitations expire after one hour by default and contain
 bearer credentials, so deliver them through a trusted private channel.
 `--udp-bind`, `--https-proxy`, and `--identity` can override initialization
 defaults when the invitation first creates the configuration.
+`--invite-file -` reads from standard input, so the invitation does not appear
+in the process argument list or shell history. It also accepts a path to a
+permission-protected invitation file.
 
 The detailed form below remains available for an existing configuration,
 existing membership, or separately managed tokens.

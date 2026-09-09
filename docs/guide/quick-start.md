@@ -23,19 +23,30 @@ Run this from an elevated PowerShell on Windows:
 
 ```powershell
 $Invitation = Read-Host 'Stella invitation'
-C:\Stella\stella-client.exe --config C:\Stella\client.toml join $Invitation `
+$Invitation | C:\Stella\stella-client.exe --config C:\Stella\client.toml join `
+  --invite-file - `
   --display-name $env:COMPUTERNAME `
   --tap-adapter 'Stella LAN'
+$Invitation = $null
 ```
 
 On macOS:
 
 ```sh
-stella-client --config /etc/stella/client.toml join '<stella1:invitation>' \
+printf 'Stella invitation: ' >&2
+IFS= read -r -s invitation
+printf '\n' >&2
+printf '%s\n' "$invitation" | stella-client --config /etc/stella/client.toml join \
+  --invite-file - \
   --display-name "$(scutil --get ComputerName)" \
   --tap-adapter feth100 \
   --tap-peer feth101
+unset invitation
 ```
+
+`--invite-file -` reads the invitation from standard input, keeping it out of
+the process argument list and shell history. A path to a permission-protected
+file may be supplied instead.
 
 When no configuration exists, `join` creates a protected node identity and a
 strict controller trust configuration from the invitation, then enrolls the
