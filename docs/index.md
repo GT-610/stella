@@ -7,11 +7,11 @@ hero:
   tagline: A self-hosted control plane with direct peer data paths for transparent Ethernet frames.
   actions:
     - theme: brand
+      text: Quick start
+      link: /guide/quick-start
+    - theme: alt
       text: Read the protocol
       link: /protocol/spec/00-overview
-    - theme: alt
-      text: Development status
-      link: /guide/
 
 features:
   - title: Transparent Layer-2 networking

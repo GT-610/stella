@@ -215,6 +215,26 @@ endpoints, and unused join tokens and prints `deleted` or `absent`.
 
 ## Single-use tokens
 
+Prefer one invitation for an ordinary first join:
+
+```powershell
+stella-server --config C:\Stella\server.toml invite create `
+  --network <network-id> `
+  --controller 203.0.113.10:44900 `
+  --tls-name controller.example.net
+```
+
+`invite create` derives the controller ID and SPKI pin from the existing
+controller identity and leaf certificate, issues enrollment and network-join
+tokens with the same lifetime, and encodes all material into one invitation
+beginning with `stella1:`. `--controller` is the numeric address the client can
+actually reach; `--tls-name` must be covered by the controller certificate.
+`--ttl-seconds` defaults to 3600. The invitation contains bearer credentials,
+is printed exactly once, must be delivered through a trusted private channel,
+and should be generated separately for each client.
+
+Use the lower-level commands when the two tokens must be managed separately:
+
 ```powershell
 stella-server --config C:\Stella\server.toml enrollment-token create
 stella-server --config C:\Stella\server.toml join-token create --network <network-id>
