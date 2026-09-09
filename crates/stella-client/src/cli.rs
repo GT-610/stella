@@ -845,6 +845,10 @@ async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Wr
         .await
         .context("controller network leave failed")?;
     remove_network_intent(config_path, args.network)?;
+    active
+        .shutdown()
+        .await
+        .context("controller connection shutdown failed")?;
     writeln!(output, "network_id={}", args.network)?;
     writeln!(output, "controller_epoch={epoch}")?;
     Ok(())
@@ -939,6 +943,10 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
         &args.tap_adapter,
         args.tap_peer.as_deref(),
     )?;
+    active
+        .shutdown()
+        .await
+        .context("controller connection shutdown failed")?;
     writeln!(output, "network_id={network_id}")?;
     writeln!(output, "controller_epoch={epoch}")?;
     writeln!(output, "snapshot_revision={revision}")?;
