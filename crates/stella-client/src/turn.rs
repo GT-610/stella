@@ -712,6 +712,9 @@ pub enum TurnUdpError {
     /// The allocation actor stopped before completing an operation.
     #[error("TURN allocation actor stopped")]
     ActorStopped,
+    /// The bounded allocation command queue cannot accept another datagram.
+    #[error("TURN allocation command queue is full")]
+    CommandQueueFull,
     /// The allocation actor task panicked or was cancelled unexpectedly.
     #[error("TURN allocation actor task failed")]
     TaskFailed,
@@ -1014,6 +1017,41 @@ impl TurnUdpClient {
         .await
     }
 
+    /// Enqueues one complete datagram without waiting for relay I/O.
+    ///
+    /// Delivery failures stop the allocation actor and are reported by
+    /// [`Self::receive`]. The bounded command queue keeps a slow reliable
+    /// carrier from applying backpressure to unrelated runtime paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnUdpError`] for size, queue saturation, or a stopped actor.
+    pub fn try_send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnUdpError> {
+        if datagram.len() > self.capabilities.max_datagram_size {
+            return Err(TurnUdpError::DatagramTooLarge {
+                actual: datagram.len(),
+                maximum: self.capabilities.max_datagram_size,
+            });
+        }
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(TurnUdpError::ActorStopped);
+        }
+        let command = Command::SendQueued {
+            endpoint: endpoint.clone(),
+            datagram: datagram.to_vec(),
+        };
+        self.commands
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => TurnUdpError::CommandQueueFull,
+                mpsc::error::TrySendError::Closed(_) => TurnUdpError::ActorStopped,
+            })
+    }
+
     /// Sends one complete datagram as a TURN Send indication.
     ///
     /// The actor automatically creates or refreshes the required permission;
@@ -1293,6 +1331,19 @@ impl TurnTcpClient {
         self.inner.send_to(endpoint, datagram).await
     }
 
+    /// Enqueues one complete datagram without waiting for TURN TCP stream I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTcpError`] for size, queue saturation, or a stopped actor.
+    pub fn try_send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnTcpError> {
+        self.inner.try_send_to(endpoint, datagram)
+    }
+
     /// Sends one complete datagram as a TURN Send indication over TCP.
     ///
     /// # Errors
@@ -1498,6 +1549,19 @@ impl TurnTlsClient {
         datagram: &[u8],
     ) -> Result<(), TurnTlsError> {
         self.inner.send_to(endpoint, datagram).await
+    }
+
+    /// Enqueues one complete datagram without waiting for TURN TLS stream I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnTlsError`] for size, queue saturation, or a stopped actor.
+    pub fn try_send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnTlsError> {
+        self.inner.try_send_to(endpoint, datagram)
     }
 
     /// Sends one complete datagram as a TURN Send indication over TLS.
@@ -1723,6 +1787,19 @@ impl TurnWebSocketClient {
         self.inner.send_to(endpoint, datagram).await
     }
 
+    /// Enqueues one complete datagram without waiting for WebSocket stream I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnWebSocketError`] for size, queue saturation, or a stopped actor.
+    pub fn try_send_to(
+        &self,
+        endpoint: &TransportEndpoint,
+        datagram: &[u8],
+    ) -> Result<(), TurnWebSocketError> {
+        self.inner.try_send_to(endpoint, datagram)
+    }
+
     /// Sends one complete datagram as a TURN Send indication over WebSocket.
     ///
     /// # Errors
@@ -1854,6 +1931,10 @@ enum Command {
         endpoint: TransportEndpoint,
         datagram: Vec<u8>,
         response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+    SendQueued {
+        endpoint: TransportEndpoint,
+        datagram: Vec<u8>,
     },
     SendIndication {
         endpoint: TransportEndpoint,
@@ -2046,6 +2127,15 @@ impl Actor {
                 let result = self.send_to_peer(&endpoint, &datagram).await;
                 let _result = response.send(result);
                 false
+            }
+            Command::SendQueued { endpoint, datagram } => {
+                match self.send_to_peer(&endpoint, &datagram).await {
+                    Ok(()) => false,
+                    Err(error) => {
+                        self.fail(error).await;
+                        true
+                    }
+                }
             }
             Command::ReplaceCredentials {
                 credentials,
@@ -2824,6 +2914,38 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn queued_relay_send_applies_bounded_backpressure() {
+        let relay_id = RelayId::from_bytes([0x31; 16]);
+        let (commands, _command_receiver) = tokio::sync::mpsc::channel(1);
+        let (_inbound_sender, inbound) = tokio::sync::mpsc::channel(1);
+        let client = TurnUdpClient {
+            carrier: stella_transport::RelayCarrier::TurnUdp,
+            relay_id,
+            relayed_address: "192.0.2.31:50000".parse().expect("relayed address"),
+            mapped_address: "198.51.100.31:50001".parse().expect("mapped address"),
+            local_address: "127.0.0.1:50002".parse().expect("local address"),
+            capabilities: stella_transport::TransportCapabilities {
+                max_datagram_size: 1_200,
+            },
+            commands,
+            inbound: tokio::sync::Mutex::new(inbound),
+            task: tokio::sync::Mutex::new(None),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+        };
+        let endpoint = TransportEndpoint::TurnUdp {
+            relay_id,
+            address: "192.0.2.32:50003".parse().expect("peer address"),
+        };
+        client
+            .try_send_to(&endpoint, b"first")
+            .expect("first queued send");
+        assert!(matches!(
+            client.try_send_to(&endpoint, b"second"),
+            Err(TurnUdpError::CommandQueueFull)
+        ));
+    }
+
     #[tokio::test]
     async fn reliable_transactions_use_one_complete_framed_exchange() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -2996,9 +3118,8 @@ mod tests {
         assert_eq!(&received[..metadata.length], b"A to B");
 
         client_b
-            .send_to(&endpoint_a, b"B to A")
-            .await
-            .expect("relay B to A");
+            .try_send_to(&endpoint_a, b"B to A")
+            .expect("enqueue relay B to A");
         let metadata = timeout(Duration::from_secs(2), client_a.receive(&mut received))
             .await
             .expect("A receive timeout")

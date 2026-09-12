@@ -980,9 +980,19 @@ impl ClientDataRuntime {
                     .iter()
                     .find(|relay| relay.path_key() == key)
                     .ok_or(TurnUdpError::ActorStopped)?;
-                if let Err(error) = relay.client.send_to(&endpoint, datagram.bytes()).await {
-                    let error = RuntimeError::Turn(error);
-                    return self.handle_relay_failure(key, &error);
+                match relay.client.try_send_to(&endpoint, datagram.bytes()) {
+                    Ok(()) => {}
+                    Err(TurnUdpError::CommandQueueFull) => {
+                        tracing::debug!(
+                            relay_id = %key.relay_id,
+                            carrier = ?key.carrier,
+                            "dropping relayed datagram because the carrier queue is full"
+                        );
+                    }
+                    Err(error) => {
+                        let error = RuntimeError::Turn(error);
+                        return self.handle_relay_failure(key, &error);
+                    }
                 }
             } else {
                 return Err(RuntimeError::UnsupportedTransportEndpoint { endpoint });
@@ -1559,16 +1569,16 @@ impl WarmRelayClient {
         }
     }
 
-    async fn send_to(
+    fn try_send_to(
         &self,
         endpoint: &TransportEndpoint,
         datagram: &[u8],
     ) -> Result<(), TurnUdpError> {
         match self {
-            Self::Udp(client) => client.send_to(endpoint, datagram).await,
-            Self::Tcp(client) => client.send_to(endpoint, datagram).await,
-            Self::Tls(client) => client.send_to(endpoint, datagram).await,
-            Self::Websocket(client) => client.send_to(endpoint, datagram).await,
+            Self::Udp(client) => client.try_send_to(endpoint, datagram),
+            Self::Tcp(client) => client.try_send_to(endpoint, datagram),
+            Self::Tls(client) => client.try_send_to(endpoint, datagram),
+            Self::Websocket(client) => client.try_send_to(endpoint, datagram),
         }
     }
 
