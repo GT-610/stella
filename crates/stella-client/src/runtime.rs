@@ -20,7 +20,7 @@ use stella_common::{MacAddress, NetworkId};
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
     CommonHeader, ConnectivityCarrier, ConnectivityGenerationRef, IceCandidate, IceCandidateClass,
-    RelayCarrierMask, RelayTrustRequirements, MAX_RELAY_ADDRESSES,
+    RelayCarrierMask, RelayTrustRequirements, MAX_ICE_CANDIDATES, MAX_RELAY_ADDRESSES,
 };
 #[cfg(target_os = "windows")]
 use stella_tap::WindowsTapDevice;
@@ -171,10 +171,12 @@ pub enum RuntimeError {
     },
 }
 
-/// A complete native client data plane sharing one bounded UDP socket.
+/// A complete native client data plane sharing bounded IPv4 and IPv6 UDP sockets.
 pub struct ClientDataRuntime {
     udp: UdpTransport,
     udp_buffer: Vec<u8>,
+    secondary_udp: Option<UdpTransport>,
+    secondary_udp_buffer: Vec<u8>,
     deferred_udp: VecDeque<DeferredUdpDatagram>,
     direct_candidates: Vec<IceCandidate>,
     https_proxy: Option<SocketAddr>,
@@ -195,7 +197,7 @@ pub struct ClientDataRuntime {
 }
 
 impl ClientDataRuntime {
-    /// Binds UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
+    /// Binds direct UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
     ///
     /// # Errors
     ///
@@ -214,49 +216,66 @@ impl ClientDataRuntime {
             max_datagram_size,
         })
         .await?;
+        let secondary_udp = bind_complementary_udp(config.udp_bind, &udp, max_datagram_size).await;
         let excluded_interfaces = excluded_tap_interfaces(&config.networks);
         let candidate_datagram_size = u32::try_from(max_datagram_size).unwrap_or(65_507);
-        let host_candidates = match gather_host_candidates(
+        let mut host_candidates = gather_runtime_host_candidates(
             udp.local_address(),
             &excluded_interfaces,
             candidate_datagram_size,
-        ) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                tracing::warn!(%error, "could not enumerate host ICE candidates");
-                Vec::new()
+        );
+        if let Some(secondary) = &secondary_udp {
+            host_candidates.extend(gather_runtime_host_candidates(
+                secondary.local_address(),
+                &excluded_interfaces,
+                candidate_datagram_size,
+            ));
+        }
+        let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
+        let secondary_discovery = async {
+            match &secondary_udp {
+                Some(secondary) => discover_server_reflexive(secondary, stun_servers).await,
+                None => Ok(StunDiscovery::default()),
             }
         };
-        let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
-        let (discovery, relay) = tokio::join!(
+        let (primary_discovery, secondary_discovery, relay) = tokio::join!(
             discover_server_reflexive(&udp, stun_servers),
+            secondary_discovery,
             allocate_preferred_relay(config.udp_bind, config.https_proxy, connectivity,),
         );
-        let discovery = match discovery {
-            Ok(discovery) => discovery,
-            Err(error) => {
-                tracing::warn!(%error, "same-socket STUN discovery failed");
-                StunDiscovery {
-                    mappings: Vec::new(),
-                    deferred: Vec::new(),
-                    dropped_datagrams: 0,
-                }
-            }
-        };
-        if discovery.dropped_datagrams > 0 {
+        let primary_discovery =
+            recover_stun_discovery(primary_discovery, Some(udp.local_address()));
+        let secondary_discovery = recover_stun_discovery(
+            secondary_discovery,
+            secondary_udp.as_ref().map(UdpTransport::local_address),
+        );
+        let dropped_datagrams = primary_discovery
+            .dropped_datagrams
+            .saturating_add(secondary_discovery.dropped_datagrams);
+        let retained_datagrams = primary_discovery
+            .deferred
+            .len()
+            .saturating_add(secondary_discovery.deferred.len());
+        if dropped_datagrams > 0 {
             tracing::warn!(
-                dropped = discovery.dropped_datagrams,
-                retained = discovery.deferred.len(),
+                dropped = dropped_datagrams,
+                retained = retained_datagrams,
                 "dropped UDP datagrams while the STUN discovery queue was full"
             );
         }
         let relay = relay?;
         let mut direct_candidates = host_candidates;
         direct_candidates.extend(server_reflexive_candidates(
-            &discovery,
+            &primary_discovery,
             candidate_datagram_size,
         ));
-        direct_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
+        direct_candidates.extend(server_reflexive_candidates(
+            &secondary_discovery,
+            candidate_datagram_size,
+        ));
+        normalize_direct_candidates(&mut direct_candidates, relay.is_some());
+        let mut deferred_udp = VecDeque::from(primary_discovery.deferred);
+        deferred_udp.extend(secondary_discovery.deferred);
         let relay_buffer_size = relay.as_ref().map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
             relay.client.capabilities().max_datagram_size
         });
@@ -265,7 +284,9 @@ impl ClientDataRuntime {
         let mut runtime = Self {
             udp,
             udp_buffer: vec![0_u8; max_datagram_size],
-            deferred_udp: discovery.deferred.into(),
+            secondary_udp,
+            secondary_udp_buffer: vec![0_u8; max_datagram_size],
+            deferred_udp,
             direct_candidates,
             https_proxy: config.https_proxy,
             connectivity_revision: connectivity.map(ConnectivityConfigState::revision),
@@ -318,6 +339,7 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         enum Ready {
             Udp(stella_transport::ReceivedDatagram),
+            SecondaryUdp(stella_transport::ReceivedDatagram),
             Relay(Result<ReceivedDatagram, RuntimeError>),
             RelayRecovery(Box<RelayRecoveryResult>),
             RelayRetry,
@@ -330,6 +352,10 @@ impl ClientDataRuntime {
         }
         let ready = tokio::select! {
             received = self.udp.receive(&mut self.udp_buffer) => Ready::Udp(received?),
+            received = receive_optional_udp(
+                self.secondary_udp.as_ref(),
+                &mut self.secondary_udp_buffer,
+            ) => Ready::SecondaryUdp(received?),
             received = receive_relay(self.relay.as_ref(), &mut self.relay_buffer) => {
                 Ready::Relay(received)
             }
@@ -342,7 +368,8 @@ impl ClientDataRuntime {
             }
         };
         let result = match ready {
-            Ready::Udp(received) => self.process_udp(received, signing_key).await,
+            Ready::Udp(received) => self.process_udp(received, false, signing_key).await,
+            Ready::SecondaryUdp(received) => self.process_udp(received, true, signing_key).await,
             Ready::Relay(Ok(received)) => self.process_relay(received, signing_key).await,
             Ready::Relay(Err(error)) => Err(error),
             Ready::RelayRecovery(result) => self.handle_relay_recovery(*result),
@@ -394,10 +421,15 @@ impl ClientDataRuntime {
     async fn process_udp(
         &mut self,
         received: stella_transport::ReceivedDatagram,
+        secondary: bool,
         signing_key: &IdentitySigningKey,
     ) -> Result<(), RuntimeError> {
-        let datagram = self
-            .udp_buffer
+        let buffer = if secondary {
+            &self.secondary_udp_buffer
+        } else {
+            &self.udp_buffer
+        };
+        let datagram = buffer
             .get(..received.length)
             .ok_or(TransportError::ReceiveTruncated {
                 source: std::io::Error::new(
@@ -738,6 +770,13 @@ impl ClientDataRuntime {
                 first_error = Some(RuntimeError::Transport(error));
             }
         }
+        if let Some(secondary) = self.secondary_udp.take() {
+            if let Err(error) = secondary.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(RuntimeError::Transport(error));
+                }
+            }
+        }
         let networks = std::mem::take(&mut self.networks);
         for network in networks.into_values() {
             if let Err(error) = network.tap.shutdown().await {
@@ -756,6 +795,12 @@ impl ClientDataRuntime {
     #[must_use]
     pub const fn local_udp_address(&self) -> std::net::SocketAddr {
         self.udp.local_address()
+    }
+
+    /// Returns every direct UDP socket address owned by this runtime.
+    #[must_use]
+    pub fn local_udp_addresses(&self) -> Vec<SocketAddr> {
+        self.direct_udp_addresses()
     }
 
     fn insert_network(
@@ -803,10 +848,11 @@ impl ClientDataRuntime {
         };
         let tap = TapWorker::spawn(network_id, &tap_config, self.tap_event_sender.clone())?;
         let primary_mac = tap.primary_mac();
-        let mut plane = NetworkDataPlane::new(
+        let udp_addresses = self.direct_udp_addresses();
+        let mut plane = NetworkDataPlane::new_with_udp_addresses(
             state.clone(),
             primary_mac,
-            self.udp.local_address(),
+            &udp_addresses,
             self.udp.capabilities().max_datagram_size,
             signing_key,
             self.monotonic_now(),
@@ -837,11 +883,7 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         let (transmissions, nominations, failures) = output.into_all_parts();
         for transmission in transmissions {
-            self.udp
-                .send_to(
-                    &TransportEndpoint::Udp(transmission.target()),
-                    transmission.bytes(),
-                )
+            self.send_direct(transmission.target(), transmission.bytes())
                 .await?;
         }
         let mut path_changed = false;
@@ -904,8 +946,8 @@ impl ClientDataRuntime {
                 .plane
                 .transport_endpoint(datagram.path_id())?
                 .clone();
-            if endpoint.as_udp().is_some() {
-                self.udp.send_to(&endpoint, datagram.bytes()).await?;
+            if let Some(target) = endpoint.as_udp() {
+                self.send_direct(target, datagram.bytes()).await?;
             } else if endpoint.as_relay().is_some() {
                 self.relay
                     .as_ref()
@@ -925,6 +967,35 @@ impl ClientDataRuntime {
                 .write(frame)?;
         }
         Ok(())
+    }
+
+    async fn send_direct(&self, target: SocketAddr, datagram: &[u8]) -> Result<(), RuntimeError> {
+        let transport = self.direct_udp_transport(target).ok_or_else(|| {
+            RuntimeError::UnsupportedTransportEndpoint {
+                endpoint: TransportEndpoint::Udp(target),
+            }
+        })?;
+        transport
+            .send_to(&TransportEndpoint::Udp(target), datagram)
+            .await?;
+        Ok(())
+    }
+
+    fn direct_udp_transport(&self, target: SocketAddr) -> Option<&UdpTransport> {
+        if self.udp.local_address().is_ipv4() == target.is_ipv4() {
+            return Some(&self.udp);
+        }
+        self.secondary_udp
+            .as_ref()
+            .filter(|transport| transport.local_address().is_ipv4() == target.is_ipv4())
+    }
+
+    fn direct_udp_addresses(&self) -> Vec<SocketAddr> {
+        let mut addresses = vec![self.udp.local_address()];
+        if let Some(secondary) = &self.secondary_udp {
+            addresses.push(secondary.local_address());
+        }
+        addresses
     }
 
     fn monotonic_now(&self) -> Duration {
@@ -1186,6 +1257,10 @@ impl std::fmt::Debug for ClientDataRuntime {
         formatter
             .debug_struct("ClientDataRuntime")
             .field("local_udp_address", &self.udp.local_address())
+            .field(
+                "secondary_udp_address",
+                &self.secondary_udp.as_ref().map(UdpTransport::local_address),
+            )
             .field(
                 "relay_id",
                 &self.relay.as_ref().map(|relay| relay.client.relay_id()),
@@ -2155,6 +2230,100 @@ const fn turn_bind_address(configured: SocketAddr, relay: IpAddr) -> Option<Sock
     }
 }
 
+async fn bind_complementary_udp(
+    configured: SocketAddr,
+    primary: &UdpTransport,
+    max_datagram_size: usize,
+) -> Option<UdpTransport> {
+    let bind_address = complementary_bind_address(configured, primary.local_address())?;
+    match UdpTransport::bind(UdpConfig {
+        bind_address,
+        max_datagram_size,
+    })
+    .await
+    {
+        Ok(transport) => {
+            tracing::info!(address = %transport.local_address(), "bound complementary direct UDP socket");
+            Some(transport)
+        }
+        Err(error) => {
+            tracing::warn!(%bind_address, %error, "could not bind complementary direct UDP socket");
+            None
+        }
+    }
+}
+
+fn complementary_bind_address(configured: SocketAddr, primary: SocketAddr) -> Option<SocketAddr> {
+    if !configured.ip().is_unspecified() {
+        return None;
+    }
+    if primary.is_ipv4() {
+        Some(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            primary.port(),
+        ))
+    } else {
+        Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            primary.port(),
+        ))
+    }
+}
+
+fn gather_runtime_host_candidates(
+    local_address: SocketAddr,
+    excluded_interfaces: &BTreeSet<String>,
+    max_datagram_size: u32,
+) -> Vec<IceCandidate> {
+    match gather_host_candidates(local_address, excluded_interfaces, max_datagram_size) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%local_address, %error, "could not enumerate host ICE candidates");
+            Vec::new()
+        }
+    }
+}
+
+fn normalize_direct_candidates(candidates: &mut Vec<IceCandidate>, reserve_relay: bool) {
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
+    let mut addresses = BTreeSet::new();
+    candidates.retain(|candidate| addresses.insert(candidate.address));
+    let mut previous_priority = None;
+    for candidate in candidates.iter_mut() {
+        if let Some(previous) = previous_priority {
+            if candidate.priority >= previous {
+                candidate.priority = previous.saturating_sub(1).max(1);
+            }
+        }
+        previous_priority = Some(candidate.priority);
+    }
+    let reserved = usize::from(reserve_relay);
+    candidates.truncate(usize::from(MAX_ICE_CANDIDATES).saturating_sub(reserved));
+}
+
+fn recover_stun_discovery(
+    result: Result<StunDiscovery, StunDiscoveryError>,
+    local_address: Option<SocketAddr>,
+) -> StunDiscovery {
+    match result {
+        Ok(discovery) => discovery,
+        Err(error) => {
+            tracing::warn!(?local_address, %error, "same-socket STUN discovery failed");
+            StunDiscovery::default()
+        }
+    }
+}
+
+async fn receive_optional_udp(
+    transport: Option<&UdpTransport>,
+    output: &mut [u8],
+) -> Result<ReceivedDatagram, TransportError> {
+    match transport {
+        Some(transport) => transport.receive(output).await,
+        None => pending().await,
+    }
+}
+
 async fn receive_relay(
     relay: Option<&WarmRelay>,
     output: &mut [u8],
@@ -2268,14 +2437,14 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::effective_tap_mtu;
     use super::{
-        allocate_preferred_relay, allocate_relay_selections, excluded_tap_interfaces,
-        matching_relay_selection, next_relay_dns_result, preferred_relay_settings,
-        random_ice_credential, relay_reconnect_cap, relay_reconnect_delay, relay_selections,
-        turn_bind_address, unix_time, ClientDataRuntime, ConnectivityConfigState,
-        LocalConnectivityGeneration, RelayDnsFuture, RuntimeError, RuntimeRelayCarrier,
-        TurnUdpError, WarmRelay, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
-        MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY,
-        TURN_UDP_MAX_DATAGRAM_SIZE,
+        allocate_preferred_relay, allocate_relay_selections, complementary_bind_address,
+        excluded_tap_interfaces, matching_relay_selection, next_relay_dns_result,
+        normalize_direct_candidates, preferred_relay_settings, random_ice_credential,
+        relay_reconnect_cap, relay_reconnect_delay, relay_selections, turn_bind_address, unix_time,
+        ClientDataRuntime, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
+        RuntimeError, RuntimeRelayCarrier, TurnUdpError, WarmRelay, ICE_PASSWORD_RANDOM_LENGTH,
+        ICE_USERNAME_RANDOM_LENGTH, MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY,
+        TAP_EVENT_QUEUE_CAPACITY, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
     use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
 
@@ -2303,6 +2472,8 @@ mod tests {
         ClientDataRuntime {
             udp,
             udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            secondary_udp: None,
+            secondary_udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
             deferred_udp: VecDeque::new(),
             direct_candidates: Vec::new(),
             https_proxy: None,
@@ -2338,6 +2509,8 @@ mod tests {
         ClientDataRuntime {
             udp,
             udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            secondary_udp: None,
+            secondary_udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
             deferred_udp: VecDeque::new(),
             direct_candidates: Vec::new(),
             https_proxy: None,
@@ -2963,6 +3136,54 @@ mod tests {
             turn_bind_address(configured, "2001:db8::10".parse().expect("IPv6 relay")),
             None
         );
+    }
+
+    #[test]
+    fn unspecified_udp_bind_enables_the_complementary_address_family() {
+        assert_eq!(
+            complementary_bind_address(
+                "0.0.0.0:45100".parse().expect("configured IPv4 bind"),
+                "0.0.0.0:45100".parse().expect("active IPv4 bind"),
+            ),
+            Some("[::]:45100".parse().expect("complementary IPv6 bind"))
+        );
+        assert_eq!(
+            complementary_bind_address(
+                "[::]:45100".parse().expect("configured IPv6 bind"),
+                "[::]:45100".parse().expect("active IPv6 bind"),
+            ),
+            Some("0.0.0.0:45100".parse().expect("complementary IPv4 bind"))
+        );
+        assert!(complementary_bind_address(
+            "127.0.0.1:45100".parse().expect("specific IPv4 bind"),
+            "127.0.0.1:45100".parse().expect("active IPv4 bind"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn dual_stack_candidates_are_deduplicated_bounded_and_strictly_ordered() {
+        let base = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("IPv4 candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let mut candidates = vec![
+            base,
+            IceCandidate {
+                address: "[2001:db8::70]:47000".parse().expect("IPv6 candidate"),
+                ..base
+            },
+            base,
+        ];
+        normalize_direct_candidates(&mut candidates, true);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].priority > candidates[1].priority);
     }
 
     #[test]

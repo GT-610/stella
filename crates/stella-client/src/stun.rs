@@ -59,7 +59,7 @@ pub(crate) struct DeferredUdpDatagram {
 }
 
 /// Successful same-socket server-reflexive discovery and deferred traffic.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct StunDiscovery {
     pub(crate) mappings: Vec<StunMapping>,
     pub(crate) deferred: Vec<DeferredUdpDatagram>,

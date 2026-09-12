@@ -194,7 +194,7 @@ pub struct IceAgent {
     tie_breaker: u64,
     username_fragment: Zeroizing<Vec<u8>>,
     password: Zeroizing<Vec<u8>>,
-    local_candidate: Option<IceCandidate>,
+    local_candidates: Vec<IceCandidate>,
     peers: BTreeMap<NodeId, Peer>,
     transactions: HashMap<StunTransactionId, Transaction>,
 }
@@ -222,17 +222,25 @@ impl IceAgent {
                 field: "local ICE tie breaker",
             });
         }
-        let mut local_candidate = None;
+        let mut local_candidates = Vec::new();
         for candidate in candidates
             .iter()
             .copied()
             .filter(|candidate| candidate.carrier == ConnectivityCarrier::DirectUdp)
         {
             candidate.validate()?;
-            if local_candidate.is_none_or(|current: IceCandidate| {
-                candidate.priority > current.priority
-            }) {
-                local_candidate = Some(candidate);
+            if let Some(current) =
+                local_candidates
+                    .iter_mut()
+                    .find(|current: &&mut IceCandidate| {
+                        current.address.is_ipv4() == candidate.address.is_ipv4()
+                    })
+            {
+                if candidate.priority > current.priority {
+                    *current = candidate;
+                }
+            } else {
+                local_candidates.push(candidate);
             }
         }
         Ok(Self {
@@ -240,7 +248,7 @@ impl IceAgent {
             tie_breaker,
             username_fragment: Zeroizing::new(username_fragment.to_vec()),
             password: Zeroizing::new(password.to_vec()),
-            local_candidate,
+            local_candidates,
             peers: BTreeMap::new(),
             transactions: HashMap::new(),
         })
@@ -258,16 +266,16 @@ impl IceAgent {
                 field: "remote ICE tie breaker",
             });
         }
-        let family = self
-            .local_candidate
-            .map(|candidate| candidate.address.is_ipv4());
         let mut candidates = config
             .candidates
             .iter()
             .copied()
             .filter(|candidate| {
                 candidate.carrier == ConnectivityCarrier::DirectUdp
-                    && family.is_some_and(|ipv4| candidate.address.is_ipv4() == ipv4)
+                    && self
+                        .local_candidates
+                        .iter()
+                        .any(|local| local.address.is_ipv4() == candidate.address.is_ipv4())
             })
             .take(MAX_REMOTE_CANDIDATES)
             .collect::<Vec<_>>();
@@ -397,12 +405,7 @@ impl IceAgent {
                 None
             });
             if let Some(target) = target {
-                self.create_transaction(
-                    peer_node_id,
-                    target,
-                    TransactionKind::Connectivity,
-                    now,
-                )?;
+                self.create_transaction(peer_node_id, target, TransactionKind::Connectivity, now)?;
             }
         }
         let mut transmissions = Vec::new();
@@ -533,14 +536,11 @@ impl IceAgent {
                 });
             }
         }
-        let triggered = self
-            .peers
-            .get(&peer_node_id)
-            .is_some_and(|peer| {
-                peer.nominated.is_none()
-                    && peer.nomination_target.is_none()
-                    && !peer.active_connectivity.contains(&source)
-            });
+        let triggered = self.peers.get(&peer_node_id).is_some_and(|peer| {
+            peer.nominated.is_none()
+                && peer.nomination_target.is_none()
+                && !peer.active_connectivity.contains(&source)
+        });
         if triggered {
             self.learn_peer_reflexive(peer_node_id, source, priority);
             let transaction_id =
@@ -675,9 +675,14 @@ impl IceAgent {
             .peers
             .get(&peer_node_id)
             .ok_or(IceError::InvalidAttribute { field: "peer" })?;
-        let local_candidate = self.local_candidate.ok_or(IceError::InvalidAttribute {
-            field: "local direct candidate",
-        })?;
+        let local_candidate = self
+            .local_candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.address.is_ipv4() == target.is_ipv4())
+            .ok_or(IceError::InvalidAttribute {
+                field: "local direct candidate",
+            })?;
         let transaction_id = random_transaction_id()?;
         let username = [
             peer.username_fragment.as_slice(),
@@ -796,8 +801,7 @@ impl IceAgent {
 
     fn cancel_connectivity_checks(&mut self, peer_node_id: NodeId) {
         self.transactions.retain(|_, transaction| {
-            transaction.peer_node_id != peer_node_id
-                || transaction.kind == TransactionKind::Consent
+            transaction.peer_node_id != peer_node_id || transaction.kind == TransactionKind::Consent
         });
         if let Some(peer) = self.peers.get_mut(&peer_node_id) {
             peer.active_connectivity.clear();
@@ -843,7 +847,7 @@ impl std::fmt::Debug for IceAgent {
             .field("tie_breaker", &self.tie_breaker)
             .field("username_fragment_length", &self.username_fragment.len())
             .field("password_length", &self.password.len())
-            .field("has_direct_candidate", &self.local_candidate.is_some())
+            .field("local_candidate_count", &self.local_candidates.len())
             .field("peer_count", &self.peers.len())
             .field("transaction_count", &self.transactions.len())
             .finish()
@@ -1145,7 +1149,10 @@ mod tests {
 
         let first = agent.poll(Duration::ZERO).expect("first check");
         assert_eq!(first.transmissions().len(), 1);
-        assert_eq!(first.transmissions()[0].target(), remote_candidates[0].address);
+        assert_eq!(
+            first.transmissions()[0].target(),
+            remote_candidates[0].address
+        );
         assert!(agent
             .poll(Duration::from_millis(49))
             .expect("respect pacing")
@@ -1156,13 +1163,62 @@ mod tests {
             .poll(Duration::from_millis(50))
             .expect("second overlapping check");
         assert_eq!(second.transmissions().len(), 1);
-        assert_eq!(second.transmissions()[0].target(), remote_candidates[1].address);
+        assert_eq!(
+            second.transmissions()[0].target(),
+            remote_candidates[1].address
+        );
         let third = agent
             .poll(Duration::from_millis(100))
             .expect("third overlapping check");
         assert_eq!(third.transmissions().len(), 1);
-        assert_eq!(third.transmissions()[0].target(), remote_candidates[2].address);
+        assert_eq!(
+            third.transmissions()[0].target(),
+            remote_candidates[2].address
+        );
         assert_eq!(agent.transactions.len(), 3);
+    }
+
+    #[test]
+    fn dual_stack_agent_checks_candidates_from_both_families() {
+        let local_id = NodeId::from_bytes([0x51; 16]);
+        let peer_id = NodeId::from_bytes([0x52; 16]);
+        let local_candidates = [
+            candidate("192.0.2.50:41000", 200),
+            candidate("[2001:db8::50]:41000", 300),
+        ];
+        let remote_candidates = [
+            candidate("[2001:db8::51]:41001", 300),
+            candidate("192.0.2.51:41001", 200),
+        ];
+        let mut agent = IceAgent::new(
+            local_id,
+            30,
+            b"DualUfrag",
+            b"DualPassword1234567890",
+            &local_candidates,
+        )
+        .expect("dual-stack agent");
+        agent
+            .upsert_peer(IcePeerConfig {
+                node_id: peer_id,
+                generation_id: 4,
+                tie_breaker: 40,
+                username_fragment: b"PeerDual",
+                password: b"PeerDualPassword1234567",
+                candidates: &remote_candidates,
+            })
+            .expect("configure dual-stack peer");
+
+        let ipv6 = agent.poll(Duration::ZERO).expect("IPv6 check");
+        assert_eq!(
+            ipv6.transmissions()[0].target(),
+            remote_candidates[0].address
+        );
+        let ipv4 = agent.poll(Duration::from_millis(50)).expect("IPv4 check");
+        assert_eq!(
+            ipv4.transmissions()[0].target(),
+            remote_candidates[1].address
+        );
     }
 
     #[test]

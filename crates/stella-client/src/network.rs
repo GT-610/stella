@@ -172,7 +172,7 @@ struct PeerPath {
 /// Active, isolated state for one TAP-backed virtual network.
 pub struct NetworkDataPlane {
     state: NetworkState,
-    udp_family: IpFamily,
+    udp_families: u8,
     max_datagram_size: usize,
     switch: L2Switch,
     handshakes: PeerHandshakeManager,
@@ -201,6 +201,30 @@ impl NetworkDataPlane {
         signing_key: &IdentitySigningKey,
         now: Duration,
     ) -> Result<Self, NetworkDataError> {
+        Self::new_with_udp_addresses(
+            state,
+            primary_mac,
+            &[udp_bind],
+            max_datagram_size,
+            signing_key,
+            now,
+        )
+    }
+
+    /// Creates a network router that can use every supplied direct UDP family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] when the primary TAP MAC, authoritative
+    /// peer state, or handshake configuration is invalid.
+    pub fn new_with_udp_addresses(
+        state: NetworkState,
+        primary_mac: MacAddress,
+        udp_addresses: &[SocketAddr],
+        max_datagram_size: usize,
+        signing_key: &IdentitySigningKey,
+        now: Duration,
+    ) -> Result<Self, NetworkDataError> {
         let local_node_id = state.local_grant().node_id;
         let mut handshakes = PeerHandshakeManager::new(local_node_id);
         for peer in state.peers().keys().copied() {
@@ -214,7 +238,9 @@ impl NetworkDataPlane {
         let switch = L2Switch::new(state.policy(), primary_mac, now)?;
         let mut plane = Self {
             state,
-            udp_family: IpFamily::from(udp_bind.ip()),
+            udp_families: udp_addresses.iter().fold(0_u8, |families, address| {
+                families | IpFamily::from(address.ip()).bit()
+            }),
             max_datagram_size,
             switch,
             handshakes,
@@ -304,7 +330,7 @@ impl NetworkDataPlane {
         if !self.state.peers().contains_key(&peer) {
             return Err(NetworkDataError::NoPeerPath { peer_node_id: peer });
         }
-        if !self.udp_family.matches_socket(address) || !usable_direct_address(address) {
+        if !self.udp_family_available(address) || !usable_direct_address(address) {
             return Err(NetworkDataError::UnauthorizedEndpoint {
                 peer_node_id: peer,
                 endpoint: TransportEndpoint::Udp(address),
@@ -985,7 +1011,9 @@ impl NetworkDataPlane {
                     .endpoints()
                     .iter()
                     .copied()
-                    .filter(|endpoint| self.udp_family.matches(*endpoint))
+                    .filter(|endpoint| {
+                        self.udp_family_available(endpoint_socket_address(*endpoint))
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1056,6 +1084,10 @@ impl NetworkDataPlane {
         self.available_relay_carriers
             .get(&relay_id)
             .is_some_and(|carriers| carriers & bit != 0)
+    }
+
+    fn udp_family_available(&self, address: SocketAddr) -> bool {
+        self.udp_families & IpFamily::from(address.ip()).bit() != 0
     }
 
     fn remove_peer_paths(&mut self, peer: NodeId) {
@@ -1222,18 +1254,11 @@ enum IpFamily {
 }
 
 impl IpFamily {
-    const fn matches(self, endpoint: Endpoint) -> bool {
-        matches!(
-            (self, endpoint),
-            (Self::V4, Endpoint::UdpIpv4 { .. }) | (Self::V6, Endpoint::UdpIpv6 { .. })
-        )
-    }
-
-    const fn matches_socket(self, endpoint: SocketAddr) -> bool {
-        matches!(
-            (self, endpoint),
-            (Self::V4, SocketAddr::V4(_)) | (Self::V6, SocketAddr::V6(_))
-        )
+    const fn bit(self) -> u8 {
+        match self {
+            Self::V4 => 1 << 0,
+            Self::V6 => 1 << 1,
+        }
     }
 }
 
@@ -1543,10 +1568,13 @@ mod tests {
             TransportEndpoint::Udp("127.0.0.1:46001".parse().expect("primary alice address"));
         let alternate =
             TransportEndpoint::Udp("127.0.0.1:46003".parse().expect("alternate alice address"));
-        let plane = NetworkDataPlane::new(
+        let mut plane = NetworkDataPlane::new_with_udp_addresses(
             state(&store, &controller, &bob_key, network_id),
             MacAddress::from_bytes([0x02, 0, 0, 0, 1, 4]),
-            bob_address,
+            &[
+                bob_address,
+                "[::]:46002".parse().expect("Bob IPv6 bind address"),
+            ],
             1_200,
             &bob_key,
             Duration::ZERO,
@@ -1572,6 +1600,13 @@ mod tests {
                 .expect("resolve alternate path"),
             &alternate
         );
+        let ipv6_address: SocketAddr = "[2001:db8::10]:46001".parse().expect("Alice IPv6 address");
+        plane
+            .nominate_direct_path(alice_id, ipv6_address)
+            .expect("nominate IPv6 direct path");
+        assert!(plane
+            .resolve_peer_path(alice_id, &TransportEndpoint::Udp(ipv6_address))
+            .is_ok());
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
