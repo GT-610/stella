@@ -8,17 +8,30 @@ page describes reference implementation ownership and failure behavior.
 ## Runtime ownership
 
 One active control session owns one `ClientDataRuntime`. The runtime binds the
-configured UDP address once and creates one `NetworkDataPlane` and one exact
-TAP worker for every active network snapshot. A network is not created unless
-its durable configuration names a matching Windows adapter or complete macOS
-feth pair.
+configured UDP address once. When that address is unspecified, it also tries to
+bind the complementary IPv4 or IPv6 family on the same port. Failure to bind
+the complementary family is non-fatal and leaves a valid single-stack runtime.
+The runtime creates one `NetworkDataPlane` and one exact TAP worker for every
+active network snapshot. A network is not created unless its durable
+configuration names a matching Windows adapter or complete macOS feth pair.
 
 The owner binds UDP and opens every TAP endpoint before it publishes its
-receive-ready endpoint set. The publication response is reconciled before the
-I/O loop becomes active. A peer that has joined but has not published a usable
-endpoint is skipped until a later control update; it cannot prevent this node
-from becoming reachable. ICE candidate enumeration excludes the configured TAP
-interface and, on macOS, its packet-I/O peer.
+receive-ready endpoint set. Host candidates are gathered for both active
+families. STUN services are probed in parallel on the matching data socket and
+valid responses are bound to their transaction, source service, address family,
+and optional fingerprint. ICE checks overlap across remote candidates under a
+bounded pacing interval instead of waiting for one candidate to time out. The
+publication response is reconciled before the I/O loop becomes active. A peer
+that has joined but has not published a usable endpoint is skipped until a
+later control update; it cannot prevent this node from becoming reachable. ICE
+candidate enumeration excludes the configured TAP interface and, on macOS, its
+packet-I/O peer.
+
+Every five seconds the runtime compares current host addresses with its active
+generation. An interface change atomically replaces host candidates, rotates
+ICE credentials, rebuilds the network-scoped agents, and asks the control loop
+to publish the new generation. Existing server-reflexive candidates remain
+available until a future mapping refresh or runtime restart.
 
 The runtime never raises an existing IP MTU merely to reach the network frame
 ceiling. It keeps a lower value, which remains safe because the signed policy
@@ -89,7 +102,7 @@ the controller session continue running while replacement attempts use bounded
 DNS and carrier deadlines plus full-jitter backoff from one to 30 seconds. A
 successful replacement publishes a fresh local connectivity generation.
 
-A UDP socket, TAP device, or worker failure still closes the data runtime and
+A direct UDP socket, TAP device, or worker failure still closes the data runtime and
 erases its forwarding state. A transient control-plane failure leaves an
 otherwise healthy runtime active within its existing authorization bounds;
 replacement after a data-runtime failure requires a fresh controller

@@ -4,11 +4,20 @@ Windows 和 macOS 原生数据运行时把验证后的控制器状态连接到�
 已认证的 UDP 对等路径。规范包字节和计时器以协议规范为准。本页描述参考实现的所有权和
 失败行为。
 
-一个活动控制会话拥有一个 `ClientDataRuntime`。运行时只绑定一次 UDP 地址，并为每个活动
-网络快照创建一个 `NetworkDataPlane` 和一个精确的 TAP 工作线程。Windows 配置一个准确
-适配器；macOS 配置完整 feth pair。只有在 UDP 和全部 TAP 端点打开后才发布可接收端点。
-ICE 枚举会排除 TAP，macOS 还会排除 I/O peer。队列容量固定：最多 256 个 TAP 事件等待
-异步运行时，最多 64 个已认证帧等待一个 TAP 写入器，任何方向都不会创建无界队列。
+一个活动控制会话拥有一个 `ClientDataRuntime`。运行时绑定配置的 UDP 地址；如果配置的是
+未指定地址，还会尝试在同一端口绑定另一个 IPv4 或 IPv6 地址族。补充地址族绑定失败时会
+安全降级为单栈。运行时为每个活动网络快照创建一个 `NetworkDataPlane` 和一个精确的 TAP
+工作线程。Windows 配置一个准确适配器；macOS 配置完整 feth pair。
+
+只有在 UDP 和全部 TAP 端点打开后才发布可接收端点。本机候选会覆盖两个已绑定地址族；
+匹配地址族的 STUN 服务会并行探测，响应必须匹配事务 ID、来源服务、地址族以及可选的
+FINGERPRINT。ICE 会在有界 pacing 下重叠检查多个远端候选，不再等待单个候选完全超时。
+ICE 枚举会排除 TAP，macOS 还会排除 I/O peer。运行时每五秒比较一次本机接口地址；地址
+变化时会原子替换 host candidate、轮换 ICE 凭据、重建 ICE agent，并请求控制面发布新的
+generation。现有服务器反射候选保留到后续映射刷新或运行时重启。
+
+队列容量固定：最多 256 个 TAP 事件等待异步运行时，最多 64 个已认证帧等待一个 TAP
+写入器，任何方向都不会创建无界队列。
 
 运行时不会为了达到网络策略上限而抬高已有 MTU。Windows 在驱动上限内事务性更新 IPv4/
 IPv6 行；macOS 打开时读取 visible feth MTU，显式更新时由 Stella 特权 TAP helper 同时修改
@@ -27,9 +36,9 @@ media-disconnected；macOS 把 visible feth 置 down 并释放 pair 锁，但不
 MAC 项。畸形、未认证、重放、错误会话或错误端点的数据报会被丢弃而不会重连控制器。
 
 Relay actor 或流故障只会撤回 Relay 候选并启动一个后台替换任务。已有直连会话、
-TAP worker、UDP 套接字和控制器会话在恢复期间继续运行。替换使用有界 DNS 与
+TAP worker、直连 UDP 套接字和控制器会话在恢复期间继续运行。替换使用有界 DNS 与
 carrier 期限，失败后按 1 至 30 秒指数上限执行全抖动重试；成功后发布新的本地连接
-generation。UDP 套接字、TAP 设备或 worker 故障仍会关闭数据运行时并清除其转发状态；
+generation。任一直连 UDP 套接字、TAP 设备或 worker 故障仍会关闭数据运行时并清除其转发状态；
 临时控制面故障会让其他方面健康的数据运行时在既有授权边界内继续运行。数据运行时故障
 后必须由新的控制器激活才能创建替换。
 
