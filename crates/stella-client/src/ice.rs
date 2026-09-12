@@ -22,9 +22,11 @@ type HmacSha256 = Hmac<Sha256>;
 const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const CHECK_PACING_INTERVAL: Duration = Duration::from_millis(50);
 const CONSENT_INTERVAL: Duration = Duration::from_secs(15);
 const DIRECT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_ACTIVE_TRANSACTIONS: usize = 256;
+const MAX_ACTIVE_CHECKS_PER_PEER: usize = 32;
 const MAX_REMOTE_CANDIDATES: usize = 32;
 
 /// Failure while validating or advancing bounded ICE checks.
@@ -220,15 +222,19 @@ impl IceAgent {
                 field: "local ICE tie breaker",
             });
         }
-        let local_candidate = candidates
+        let mut local_candidate = None;
+        for candidate in candidates
             .iter()
             .copied()
-            .find(|candidate| candidate.carrier == ConnectivityCarrier::DirectUdp)
-            .map(|candidate| {
-                candidate.validate()?;
-                Ok::<_, IceError>(candidate)
-            })
-            .transpose()?;
+            .filter(|candidate| candidate.carrier == ConnectivityCarrier::DirectUdp)
+        {
+            candidate.validate()?;
+            if local_candidate.is_none_or(|current: IceCandidate| {
+                candidate.priority > current.priority
+            }) {
+                local_candidate = Some(candidate);
+            }
+        }
         Ok(Self {
             local_node_id,
             tie_breaker,
@@ -276,13 +282,19 @@ impl IceAgent {
             password: Zeroizing::new(config.password.to_vec()),
             candidates: candidates
                 .into_iter()
-                .map(|candidate| candidate.address)
+                .map(|candidate| CandidateTarget {
+                    address: candidate.address,
+                    priority: candidate.priority,
+                })
                 .collect(),
             next_candidate: 0,
-            active_transaction: None,
-            succeeded: None,
+            active_connectivity: BTreeSet::new(),
+            nomination_target: None,
+            consent_target: None,
+            succeeded: BTreeSet::new(),
             nominated: None,
             next_consent_at: None,
+            next_check_at: Duration::ZERO,
             retry_at: Duration::ZERO,
         };
         if self.peers.get(&config.node_id).is_some_and(|current| {
@@ -324,7 +336,7 @@ impl IceAgent {
             .peers
             .iter()
             .filter_map(|(peer_node_id, peer)| {
-                (peer.active_transaction.is_none()
+                (peer.consent_target.is_none()
                     && peer
                         .next_consent_at
                         .is_some_and(|next_consent_at| now >= next_consent_at))
@@ -335,22 +347,63 @@ impl IceAgent {
         for (peer_node_id, target) in consent_due {
             self.create_transaction(peer_node_id, target, TransactionKind::Consent, now)?;
         }
-        let to_start = self
+
+        let nomination_due = self
             .peers
             .iter()
-            .filter(|(_, peer)| {
-                peer.nominated.is_none()
-                    && peer.active_transaction.is_none()
-                    && now >= peer.retry_at
-                    && peer.next_candidate < peer.candidates.len()
+            .filter_map(|(peer_node_id, peer)| {
+                if peer.nominated.is_some()
+                    || peer.nomination_target.is_some()
+                    || !self.local_controlling(*peer_node_id, peer.tie_breaker)
+                {
+                    return None;
+                }
+                peer.candidates
+                    .iter()
+                    .find(|candidate| peer.succeeded.contains(&candidate.address))
+                    .map(|candidate| candidate.address)
+                    .or_else(|| peer.succeeded.iter().next().copied())
+                    .map(|target| (*peer_node_id, target))
             })
-            .map(|(peer_node_id, peer)| (*peer_node_id, peer.candidates[peer.next_candidate]))
             .collect::<Vec<_>>();
-        for (peer_node_id, target) in to_start {
-            if let Some(peer) = self.peers.get_mut(&peer_node_id) {
-                peer.next_candidate += 1;
+        for (peer_node_id, target) in nomination_due {
+            self.create_transaction(peer_node_id, target, TransactionKind::Nomination, now)?;
+        }
+
+        let peer_node_ids = self.peers.keys().copied().collect::<Vec<_>>();
+        for peer_node_id in peer_node_ids {
+            if self.transactions.len() >= MAX_ACTIVE_TRANSACTIONS {
+                break;
             }
-            self.create_transaction(peer_node_id, target, TransactionKind::Connectivity, now)?;
+            let target = self.peers.get_mut(&peer_node_id).and_then(|peer| {
+                if peer.nominated.is_some()
+                    || peer.nomination_target.is_some()
+                    || now < peer.retry_at
+                    || now < peer.next_check_at
+                    || peer.active_connectivity.len() >= MAX_ACTIVE_CHECKS_PER_PEER
+                {
+                    return None;
+                }
+                while let Some(candidate) = peer.candidates.get(peer.next_candidate).copied() {
+                    peer.next_candidate += 1;
+                    if peer.active_connectivity.contains(&candidate.address)
+                        || peer.succeeded.contains(&candidate.address)
+                    {
+                        continue;
+                    }
+                    peer.next_check_at = now.saturating_add(CHECK_PACING_INTERVAL);
+                    return Some(candidate.address);
+                }
+                None
+            });
+            if let Some(target) = target {
+                self.create_transaction(
+                    peer_node_id,
+                    target,
+                    TransactionKind::Connectivity,
+                    now,
+                )?;
+            }
         }
         let mut transmissions = Vec::new();
         let mut due = self
@@ -463,6 +516,7 @@ impl IceAgent {
             failures: Vec::new(),
         };
         if use_candidate {
+            self.cancel_connectivity_checks(peer_node_id);
             let newly_nominated = self
                 .peers
                 .get(&peer_node_id)
@@ -482,7 +536,11 @@ impl IceAgent {
         let triggered = self
             .peers
             .get(&peer_node_id)
-            .is_some_and(|peer| peer.nominated.is_none() && peer.active_transaction.is_none());
+            .is_some_and(|peer| {
+                peer.nominated.is_none()
+                    && peer.nomination_target.is_none()
+                    && !peer.active_connectivity.contains(&source)
+            });
         if triggered {
             self.learn_peer_reflexive(peer_node_id, source, priority);
             let transaction_id =
@@ -527,12 +585,19 @@ impl IceAgent {
         let _local_mapping = decode_stun_xor_address(mapped, message.transaction_id())?;
         self.transactions.remove(&message.transaction_id());
         if let Some(peer) = self.peers.get_mut(&peer_node_id) {
-            peer.active_transaction = None;
-            peer.succeeded = Some(source);
+            match kind {
+                TransactionKind::Connectivity => {
+                    peer.active_connectivity.remove(&source);
+                    peer.succeeded.insert(source);
+                }
+                TransactionKind::Nomination => peer.nomination_target = None,
+                TransactionKind::Consent => peer.consent_target = None,
+            }
         }
         let mut output = IceOutput::default();
         match kind {
             TransactionKind::Nomination => {
+                self.cancel_connectivity_checks(peer_node_id);
                 if let Some(peer) = self.peers.get_mut(&peer_node_id) {
                     peer.nominated = Some(source);
                     peer.next_consent_at = Some(now.saturating_add(CONSENT_INTERVAL));
@@ -544,7 +609,10 @@ impl IceAgent {
                 });
             }
             TransactionKind::Connectivity
-                if self.local_controlling(peer_node_id, peer_tie_breaker) =>
+                if self.local_controlling(peer_node_id, peer_tie_breaker)
+                    && self.peers.get(&peer_node_id).is_some_and(|peer| {
+                        peer.nominated.is_none() && peer.nomination_target.is_none()
+                    }) =>
             {
                 let transaction_id = self.create_transaction(
                     peer_node_id,
@@ -657,7 +725,13 @@ impl IceAgent {
             },
         );
         if let Some(peer) = self.peers.get_mut(&peer_node_id) {
-            peer.active_transaction = Some(transaction_id);
+            match kind {
+                TransactionKind::Connectivity => {
+                    peer.active_connectivity.insert(target);
+                }
+                TransactionKind::Nomination => peer.nomination_target = Some(target),
+                TransactionKind::Consent => peer.consent_target = Some(target),
+            }
         }
         Ok(transaction_id)
     }
@@ -679,22 +753,36 @@ impl IceAgent {
         for (transaction_id, peer_node_id, target, kind) in expired {
             self.transactions.remove(&transaction_id);
             if let Some(peer) = self.peers.get_mut(&peer_node_id) {
-                if peer.active_transaction == Some(transaction_id) {
-                    peer.active_transaction = None;
+                match kind {
+                    TransactionKind::Connectivity => {
+                        peer.active_connectivity.remove(&target);
+                    }
+                    TransactionKind::Nomination => {
+                        peer.nomination_target = None;
+                        peer.succeeded.remove(&target);
+                    }
+                    TransactionKind::Consent => peer.consent_target = None,
                 }
                 if kind == TransactionKind::Consent && peer.nominated == Some(target) {
                     peer.nominated = None;
-                    peer.succeeded = None;
+                    peer.succeeded.clear();
                     peer.next_consent_at = None;
                     peer.next_candidate = 0;
                     peer.retry_at = now.saturating_add(DIRECT_RETRY_INTERVAL);
+                    peer.next_check_at = peer.retry_at;
                     failures.push(IcePathFailure {
                         peer_node_id,
                         address: target,
                     });
-                } else if peer.nominated.is_none() && peer.next_candidate >= peer.candidates.len() {
+                } else if peer.nominated.is_none()
+                    && peer.nomination_target.is_none()
+                    && peer.active_connectivity.is_empty()
+                    && peer.succeeded.is_empty()
+                    && peer.next_candidate >= peer.candidates.len()
+                {
                     peer.next_candidate = 0;
                     peer.retry_at = now.saturating_add(DIRECT_RETRY_INTERVAL);
+                    peer.next_check_at = peer.retry_at;
                 }
             }
         }
@@ -706,15 +794,44 @@ impl IceAgent {
             .retain(|_, transaction| transaction.peer_node_id != peer_node_id);
     }
 
-    fn learn_peer_reflexive(&mut self, peer_node_id: NodeId, source: SocketAddr, _priority: u32) {
+    fn cancel_connectivity_checks(&mut self, peer_node_id: NodeId) {
+        self.transactions.retain(|_, transaction| {
+            transaction.peer_node_id != peer_node_id
+                || transaction.kind == TransactionKind::Consent
+        });
+        if let Some(peer) = self.peers.get_mut(&peer_node_id) {
+            peer.active_connectivity.clear();
+            peer.nomination_target = None;
+            peer.succeeded.clear();
+            peer.next_candidate = peer.candidates.len();
+        }
+    }
+
+    fn learn_peer_reflexive(&mut self, peer_node_id: NodeId, source: SocketAddr, priority: u32) {
         let Some(peer) = self.peers.get_mut(&peer_node_id) else {
             return;
         };
-        if peer.candidates.contains(&source) || peer.candidates.len() >= MAX_REMOTE_CANDIDATES {
+        if peer
+            .candidates
+            .iter()
+            .any(|candidate| candidate.address == source)
+            || peer.candidates.len() >= MAX_REMOTE_CANDIDATES
+        {
             return;
         }
-        peer.candidates.insert(0, source);
-        peer.next_candidate = peer.next_candidate.saturating_add(1);
+        let insert_at = peer
+            .candidates
+            .partition_point(|candidate| candidate.priority >= priority);
+        peer.candidates.insert(
+            insert_at,
+            CandidateTarget {
+                address: source,
+                priority,
+            },
+        );
+        if insert_at < peer.next_candidate {
+            peer.next_candidate = peer.next_candidate.saturating_add(1);
+        }
     }
 }
 
@@ -738,13 +855,22 @@ struct Peer {
     tie_breaker: u64,
     username_fragment: Zeroizing<Vec<u8>>,
     password: Zeroizing<Vec<u8>>,
-    candidates: Vec<SocketAddr>,
+    candidates: Vec<CandidateTarget>,
     next_candidate: usize,
-    active_transaction: Option<StunTransactionId>,
-    succeeded: Option<SocketAddr>,
+    active_connectivity: BTreeSet<SocketAddr>,
+    nomination_target: Option<SocketAddr>,
+    consent_target: Option<SocketAddr>,
+    succeeded: BTreeSet<SocketAddr>,
     nominated: Option<SocketAddr>,
     next_consent_at: Option<Duration>,
+    next_check_at: Duration,
     retry_at: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidateTarget {
+    address: SocketAddr,
+    priority: u32,
 }
 
 struct Transaction {
@@ -986,6 +1112,57 @@ mod tests {
             related_address: None,
             relay_id: None,
         }
+    }
+
+    #[test]
+    fn connectivity_checks_are_paced_and_overlap_across_candidates() {
+        let local_id = NodeId::from_bytes([0x41; 16]);
+        let peer_id = NodeId::from_bytes([0x42; 16]);
+        let local_candidate = candidate("192.0.2.40:40000", 2_130_706_431);
+        let remote_candidates = [
+            candidate("192.0.2.41:40001", 300),
+            candidate("192.0.2.42:40002", 200),
+            candidate("192.0.2.43:40003", 100),
+        ];
+        let mut agent = IceAgent::new(
+            local_id,
+            10,
+            b"LocalUfr",
+            b"LocalPassword123456789",
+            &[local_candidate],
+        )
+        .expect("local agent");
+        agent
+            .upsert_peer(IcePeerConfig {
+                node_id: peer_id,
+                generation_id: 2,
+                tie_breaker: 20,
+                username_fragment: b"PeerUfrag",
+                password: b"PeerPassword1234567890",
+                candidates: &remote_candidates,
+            })
+            .expect("configure peer candidates");
+
+        let first = agent.poll(Duration::ZERO).expect("first check");
+        assert_eq!(first.transmissions().len(), 1);
+        assert_eq!(first.transmissions()[0].target(), remote_candidates[0].address);
+        assert!(agent
+            .poll(Duration::from_millis(49))
+            .expect("respect pacing")
+            .transmissions()
+            .is_empty());
+
+        let second = agent
+            .poll(Duration::from_millis(50))
+            .expect("second overlapping check");
+        assert_eq!(second.transmissions().len(), 1);
+        assert_eq!(second.transmissions()[0].target(), remote_candidates[1].address);
+        let third = agent
+            .poll(Duration::from_millis(100))
+            .expect("third overlapping check");
+        assert_eq!(third.transmissions().len(), 1);
+        assert_eq!(third.transmissions()[0].target(), remote_candidates[2].address);
+        assert_eq!(agent.transactions.len(), 3);
     }
 
     #[test]
