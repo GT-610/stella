@@ -219,66 +219,15 @@ impl ClientDataRuntime {
             max_datagram_size,
         })
         .await?;
-        let secondary_udp = bind_complementary_udp(config.udp_bind, &udp, max_datagram_size).await;
-        let excluded_interfaces = excluded_tap_interfaces(&config.networks);
-        let candidate_datagram_size = u32::try_from(max_datagram_size).unwrap_or(65_507);
-        let mut host_candidates = gather_runtime_host_candidates(
-            udp.local_address(),
-            &excluded_interfaces,
-            candidate_datagram_size,
-        );
-        if let Some(secondary) = &secondary_udp {
-            host_candidates.extend(gather_runtime_host_candidates(
-                secondary.local_address(),
-                &excluded_interfaces,
-                candidate_datagram_size,
-            ));
-        }
-        let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
-        let secondary_discovery = async {
-            match &secondary_udp {
-                Some(secondary) => discover_server_reflexive(secondary, stun_servers).await,
-                None => Ok(StunDiscovery::default()),
-            }
-        };
-        let (primary_discovery, secondary_discovery, relay) = tokio::join!(
-            discover_server_reflexive(&udp, stun_servers),
-            secondary_discovery,
-            allocate_preferred_relay(config.udp_bind, config.https_proxy, connectivity,),
-        );
-        let primary_discovery =
-            recover_stun_discovery(primary_discovery, Some(udp.local_address()));
-        let secondary_discovery = recover_stun_discovery(
-            secondary_discovery,
-            secondary_udp.as_ref().map(UdpTransport::local_address),
-        );
-        let dropped_datagrams = primary_discovery
-            .dropped_datagrams
-            .saturating_add(secondary_discovery.dropped_datagrams);
-        let retained_datagrams = primary_discovery
-            .deferred
-            .len()
-            .saturating_add(secondary_discovery.deferred.len());
-        if dropped_datagrams > 0 {
-            tracing::warn!(
-                dropped = dropped_datagrams,
-                retained = retained_datagrams,
-                "dropped UDP datagrams while the STUN discovery queue was full"
-            );
-        }
-        let relay = relay?;
-        let mut direct_candidates = host_candidates;
-        direct_candidates.extend(server_reflexive_candidates(
-            &primary_discovery,
-            candidate_datagram_size,
-        ));
-        direct_candidates.extend(server_reflexive_candidates(
-            &secondary_discovery,
-            candidate_datagram_size,
-        ));
-        normalize_direct_candidates(&mut direct_candidates, relay.is_some());
-        let mut deferred_udp = VecDeque::from(primary_discovery.deferred);
-        deferred_udp.extend(secondary_discovery.deferred);
+        let initial =
+            gather_initial_connectivity(config, &udp, max_datagram_size, connectivity).await?;
+        let InitialConnectivity {
+            secondary_udp,
+            excluded_interfaces,
+            deferred_udp,
+            direct_candidates,
+            relay,
+        } = initial;
         let relay_buffer_size = relay.as_ref().map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
             relay.client.capabilities().max_datagram_size
         });
@@ -1339,6 +1288,14 @@ struct RuntimeIceAgent {
     agent: IceAgent,
 }
 
+struct InitialConnectivity {
+    secondary_udp: Option<UdpTransport>,
+    excluded_interfaces: BTreeSet<String>,
+    deferred_udp: VecDeque<DeferredUdpDatagram>,
+    direct_candidates: Vec<IceCandidate>,
+    relay: Option<WarmRelay>,
+}
+
 struct WarmRelay {
     settings: RelaySettings,
     credential_expires_at: u64,
@@ -2284,6 +2241,85 @@ const fn turn_bind_address(configured: SocketAddr, relay: IpAddr) -> Option<Sock
         }
         _ => None,
     }
+}
+
+async fn gather_initial_connectivity(
+    config: &ClientConfig,
+    udp: &UdpTransport,
+    max_datagram_size: usize,
+    connectivity: Option<&ConnectivityConfigState>,
+) -> Result<InitialConnectivity, RuntimeError> {
+    let secondary_udp = bind_complementary_udp(config.udp_bind, udp, max_datagram_size).await;
+    let excluded_interfaces = excluded_tap_interfaces(&config.networks);
+    let candidate_datagram_size = u32::try_from(max_datagram_size).unwrap_or(65_507);
+    let mut host_candidates = gather_runtime_host_candidates(
+        udp.local_address(),
+        &excluded_interfaces,
+        candidate_datagram_size,
+    );
+    if let Some(secondary) = &secondary_udp {
+        host_candidates.extend(gather_runtime_host_candidates(
+            secondary.local_address(),
+            &excluded_interfaces,
+            candidate_datagram_size,
+        ));
+    }
+    let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
+    let secondary_discovery = async {
+        match &secondary_udp {
+            Some(secondary) => discover_server_reflexive(secondary, stun_servers).await,
+            None => Ok(StunDiscovery::default()),
+        }
+    };
+    let (primary_discovery, secondary_discovery, relay) = tokio::join!(
+        discover_server_reflexive(udp, stun_servers),
+        secondary_discovery,
+        allocate_preferred_relay(config.udp_bind, config.https_proxy, connectivity,),
+    );
+    let primary_discovery = recover_stun_discovery(primary_discovery, Some(udp.local_address()));
+    let secondary_discovery = recover_stun_discovery(
+        secondary_discovery,
+        secondary_udp.as_ref().map(UdpTransport::local_address),
+    );
+    report_stun_discovery_drops(&primary_discovery, &secondary_discovery);
+    let relay = relay?;
+    let mut direct_candidates = host_candidates;
+    direct_candidates.extend(server_reflexive_candidates(
+        &primary_discovery,
+        candidate_datagram_size,
+    ));
+    direct_candidates.extend(server_reflexive_candidates(
+        &secondary_discovery,
+        candidate_datagram_size,
+    ));
+    normalize_direct_candidates(&mut direct_candidates, relay.is_some());
+    let mut deferred_udp = VecDeque::from(primary_discovery.deferred);
+    deferred_udp.extend(secondary_discovery.deferred);
+    Ok(InitialConnectivity {
+        secondary_udp,
+        excluded_interfaces,
+        deferred_udp,
+        direct_candidates,
+        relay,
+    })
+}
+
+fn report_stun_discovery_drops(primary: &StunDiscovery, secondary: &StunDiscovery) {
+    let dropped = primary
+        .dropped_datagrams
+        .saturating_add(secondary.dropped_datagrams);
+    if dropped == 0 {
+        return;
+    }
+    let retained = primary
+        .deferred
+        .len()
+        .saturating_add(secondary.deferred.len());
+    tracing::warn!(
+        dropped,
+        retained,
+        "dropped UDP datagrams while the STUN discovery queue was full"
+    );
 }
 
 async fn bind_complementary_udp(
@@ -3303,7 +3339,7 @@ mod tests {
             vec![replacement],
             false
         ));
-        assert!(candidates.iter().any(|candidate| *candidate == replacement));
+        assert!(candidates.contains(&replacement));
         assert!(candidates
             .iter()
             .any(|candidate| candidate.address == server_reflexive.address));

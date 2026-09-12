@@ -170,92 +170,110 @@ pub(crate) async fn discover_server_reflexive(
             Err(_elapsed) => continue,
         };
         let bytes = receive_buffer[..received.length].to_vec();
-        let Some(source) = received.source.as_udp() else {
+        if !accept_binding_response(
+            transport.local_address(),
+            &received.source,
+            &bytes,
+            &mut transactions,
+            &mut mappings,
+        )? {
             defer_datagram(
                 &mut deferred,
                 received.source,
                 bytes,
                 &mut dropped_datagrams,
             );
-            continue;
-        };
-        if !transactions
-            .iter()
-            .any(|transaction| transaction.server == source)
-        {
-            defer_datagram(
-                &mut deferred,
-                received.source,
-                bytes,
-                &mut dropped_datagrams,
-            );
-            continue;
         }
-        let Ok(message) = StunMessageView::decode(&bytes) else {
-            continue;
-        };
-        let Some(index) = transactions.iter().position(|transaction| {
-            transaction.server == source && transaction.transaction_id == message.transaction_id()
-        }) else {
-            continue;
-        };
-        if message.message_type().method != StunMethod::Binding {
-            continue;
-        }
-        if message.message_type().class != StunClass::SuccessResponse {
-            transactions.swap_remove(index);
-            continue;
-        }
-        if validate_optional_fingerprint(&message).is_err() {
-            transactions.swap_remove(index);
-            continue;
-        }
-        let mapped = match unique_attribute(&message, StunAttributeType::XOR_MAPPED_ADDRESS) {
-            Ok(Some(mapped)) => mapped,
-            Ok(None) | Err(_) => {
-                transactions.swap_remove(index);
-                continue;
-            }
-        };
-        let mapped_address =
-            match decode_stun_xor_address(mapped, transactions[index].transaction_id) {
-                Ok(address) => address,
-                Err(_) => {
-                    transactions.swap_remove(index);
-                    continue;
-                }
-            };
-        if mapped_address.is_ipv4() != transport.local_address().is_ipv4() {
-            transactions.swap_remove(index);
-            continue;
-        }
-        if let Some(base_address) =
-            routed_base_address(transport.local_address(), transactions[index].server)
-        {
-            let mapping = StunMapping {
-                mapped_address,
-                base_address,
-            };
-            let first_success = mappings.is_empty();
-            if !mappings.contains(&mapping) {
-                mappings.push(mapping);
-            }
-            if first_success {
-                let completion_deadline = Instant::now()
-                    .checked_add(POST_SUCCESS_GRACE)
-                    .ok_or(StunDiscoveryError::DeadlineOverflow)?;
-                for transaction in &mut transactions {
-                    transaction.deadline = transaction.deadline.min(completion_deadline);
-                }
-            }
-        }
-        transactions.swap_remove(index);
     }
     Ok(StunDiscovery {
         mappings,
         deferred,
         dropped_datagrams,
     })
+}
+
+fn accept_binding_response(
+    local_address: SocketAddr,
+    source: &Endpoint,
+    bytes: &[u8],
+    transactions: &mut Vec<BindingTransaction>,
+    mappings: &mut Vec<StunMapping>,
+) -> Result<bool, StunDiscoveryError> {
+    let Some(source) = source.as_udp() else {
+        return Ok(false);
+    };
+    if !transactions
+        .iter()
+        .any(|transaction| transaction.server == source)
+    {
+        return Ok(false);
+    }
+    let Ok(message) = StunMessageView::decode(bytes) else {
+        return Ok(true);
+    };
+    let Some(index) = transactions.iter().position(|transaction| {
+        transaction.server == source && transaction.transaction_id == message.transaction_id()
+    }) else {
+        return Ok(true);
+    };
+    if message.message_type().method != StunMethod::Binding {
+        return Ok(true);
+    }
+    if message.message_type().class != StunClass::SuccessResponse
+        || validate_optional_fingerprint(&message).is_err()
+    {
+        transactions.swap_remove(index);
+        return Ok(true);
+    }
+    let Ok(Some(mapped)) = unique_attribute(&message, StunAttributeType::XOR_MAPPED_ADDRESS) else {
+        transactions.swap_remove(index);
+        return Ok(true);
+    };
+    let Ok(mapped_address) = decode_stun_xor_address(mapped, transactions[index].transaction_id)
+    else {
+        transactions.swap_remove(index);
+        return Ok(true);
+    };
+    if mapped_address.is_ipv4() == local_address.is_ipv4() {
+        record_stun_mapping(
+            local_address,
+            transactions[index].server,
+            mapped_address,
+            transactions,
+            mappings,
+        )?;
+    }
+    transactions.swap_remove(index);
+    Ok(true)
+}
+
+fn record_stun_mapping(
+    local_address: SocketAddr,
+    server: SocketAddr,
+    mapped_address: SocketAddr,
+    transactions: &mut [BindingTransaction],
+    mappings: &mut Vec<StunMapping>,
+) -> Result<(), StunDiscoveryError> {
+    let Some(base_address) = routed_base_address(local_address, server) else {
+        return Ok(());
+    };
+    let mapping = StunMapping {
+        mapped_address,
+        base_address,
+    };
+    let first_success = mappings.is_empty();
+    if !mappings.contains(&mapping) {
+        mappings.push(mapping);
+    }
+    if first_success {
+        let completion_deadline = Instant::now()
+            .checked_add(POST_SUCCESS_GRACE)
+            .ok_or(StunDiscoveryError::DeadlineOverflow)?;
+        for transaction in transactions {
+            transaction.deadline = transaction.deadline.min(completion_deadline);
+        }
+    }
+    Ok(())
 }
 
 /// Builds validated server-reflexive candidates from discovery output.

@@ -275,7 +275,12 @@ async fn run_client(config_path: &Path) -> Result<()> {
     tracing::info!(config = %config_path.display(), "starting client runtime");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        supervise_control(&config, &identity, tokio::spawn(tokio::signal::ctrl_c())).await
+        Box::pin(supervise_control(
+            &config,
+            &identity,
+            tokio::spawn(tokio::signal::ctrl_c()),
+        ))
+        .await
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -1168,6 +1173,7 @@ fn validate_join_tap(args: &JoinArgs) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
 const fn validate_join_tap(_args: &JoinArgs) -> Result<()> {
     Ok(())
 }
