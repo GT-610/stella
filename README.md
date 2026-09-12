@@ -6,7 +6,7 @@ implementation. Its initial scope includes:
 - Layer-2 compatibility for LAN-style games and applications;
 - a self-hosted centralized control plane;
 - dual-stack direct peer paths with paced ICE checks and parallel STUN discovery;
-- TURN UDP, TCP, TLS, and secure WebSocket relay fallback;
+- two bounded warm TURN UDP, TCP, TLS, or secure WebSocket relay paths;
 - protocol-level authentication independent of the carrying network.
 
 The project is in pre-standard development and is not usable for production

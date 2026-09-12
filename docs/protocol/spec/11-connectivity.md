@@ -102,7 +102,7 @@ Gathering runs in parallel:
 1. enumerate permitted host addresses;
 2. request server-reflexive addresses from at least one configured STUN service;
 3. optionally request automatic mappings using PCP, NAT-PMP, or UPnP;
-4. establish at least one relay allocation or carrier; and
+4. establish up to two distinct relay allocation/carrier paths; and
 5. publish the complete generation after initial relay readiness or the bounded
    startup deadline, whichever occurs first.
 
@@ -196,7 +196,9 @@ Direct checks continue at a low bounded rate. When a better direct path is
 nominated, peers establish a fresh Stella session there. After confirmation,
 new sends use the direct session and the old relay session follows the normal
 receive-only rekey grace before erasure. The relay allocation remains warm while
-the network is active.
+the network is active. The reference client keeps at most two distinct
+`(relay-id, carrier)` allocations warm and publishes both with strictly
+decreasing candidate priorities.
 
 ## 12. Failure, rebinding, and recovery
 
@@ -208,7 +210,7 @@ On path failure the client:
 
 1. stops selecting the failed session for new TAP frames;
 2. selects an already confirmed alternate session when available;
-3. otherwise handshakes on the ready relay path;
+3. otherwise handshakes on an already ready alternate relay path;
 4. starts or refreshes direct checks; and
 5. drops frames rather than creating an unbounded recovery queue.
 

@@ -374,6 +374,7 @@ specification.
 
 Per allocation, the reference limits are:
 
+- 64 queued client egress commands;
 - 256 queued datagrams total;
 - 128 queued datagrams per destination peer;
 - one megabyte of queued encoded data;
@@ -408,14 +409,17 @@ flood limits.
 
 ## 10. Availability and selection
 
-A client keeps at least one relay ready while any virtual network is active.
-When multiple relays exist, it prefers an operator-compatible region with a
-healthy carrier and lower measured latency. It may keep a second allocation as
-standby, subject to deployment resource policy.
+A client keeps up to two distinct `(relay-id, carrier)` allocations ready while
+any virtual network is active. When multiple relays exist, it prefers the
+controller order and carrier fallback order, publishes both candidates, and
+keeps the second allocation as hot standby. Duplicate addresses for the same
+relay and carrier do not consume the second slot.
 
 Relay failure triggers bounded reconnect with full jitter. Direct sessions
-continue unaffected. If no direct session exists, the client reports degraded
-connectivity and drops rather than indefinitely queues TAP frames.
+and a surviving standby relay continue unaffected. A bounded per-allocation
+client queue prevents reliable-carrier I/O from blocking direct UDP or another
+relay. If no usable session exists, the client reports degraded connectivity
+and drops rather than indefinitely queues TAP frames.
 
 ## 11. Deployment profile
 

@@ -18,8 +18,11 @@ The controller must be reachable over its configured TLS/TCP address, either
 directly or through the optional explicit HTTPS proxy. The runtime gathers
 direct UDP candidates and uses controller-provided STUN and relay services. A
 manually forwarded client port is optional: if direct ICE checks fail, the
-client tries TURN UDP, TCP, TLS, then secure WebSocket. At least one direct or
-relay path must succeed.
+client tries TURN UDP, TCP, TLS, then secure WebSocket and keeps up to two
+distinct relay/carrier paths warm. At least one direct or relay path must
+succeed. Failure of one warm relay withdraws only that candidate while the
+client keeps the standby usable and replenishes the empty slot in the
+background.
 
 Stella is a Layer-2 overlay: it does not assign IP addresses or provide DHCP.
 Configure addresses on the TAP adapters yourself, or provide DHCP inside the
