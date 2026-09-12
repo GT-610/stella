@@ -902,23 +902,17 @@ impl ClientDataRuntime {
                 .plane
                 .transport_endpoint(datagram.path_id())?
                 .clone();
-            match &endpoint {
-                TransportEndpoint::Udp(_) => {
-                    self.udp.send_to(&endpoint, datagram.bytes()).await?;
-                }
-                TransportEndpoint::TurnUdp { .. }
-                | TransportEndpoint::TurnTcp { .. }
-                | TransportEndpoint::TurnTls { .. } => {
-                    self.relay
-                        .as_ref()
-                        .ok_or(TurnUdpError::ActorStopped)?
-                        .client
-                        .send_to(&endpoint, datagram.bytes())
-                        .await?;
-                }
-                _ => {
-                    return Err(RuntimeError::UnsupportedTransportEndpoint { endpoint });
-                }
+            if endpoint.as_udp().is_some() {
+                self.udp.send_to(&endpoint, datagram.bytes()).await?;
+            } else if endpoint.as_relay().is_some() {
+                self.relay
+                    .as_ref()
+                    .ok_or(TurnUdpError::ActorStopped)?
+                    .client
+                    .send_to(&endpoint, datagram.bytes())
+                    .await?;
+            } else {
+                return Err(RuntimeError::UnsupportedTransportEndpoint { endpoint });
             }
         }
         if let Some(frame) = tap_frame {
