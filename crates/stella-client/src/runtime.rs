@@ -193,6 +193,7 @@ pub struct ClientDataRuntime {
     relay_recovery_attempt: u32,
     connectivity_changed: bool,
     relay_buffers: Vec<Vec<u8>>,
+    relay_receive_cursor: usize,
     connectivity_generations: BTreeMap<NetworkId, LocalConnectivityGeneration>,
     ice_agents: BTreeMap<NetworkId, RuntimeIceAgent>,
     networks: BTreeMap<NetworkId, ActiveNetwork>,
@@ -251,6 +252,7 @@ impl ClientDataRuntime {
             relay_recovery_attempt: 0,
             connectivity_changed: false,
             relay_buffers,
+            relay_receive_cursor: 0,
             connectivity_generations: BTreeMap::new(),
             ice_agents: BTreeMap::new(),
             networks: BTreeMap::new(),
@@ -310,7 +312,11 @@ impl ClientDataRuntime {
                 self.secondary_udp.as_ref(),
                 &mut self.secondary_udp_buffer,
             ) => Ready::SecondaryUdp(received?),
-            received = receive_relay(&self.relays, &mut self.relay_buffers) => {
+            received = receive_relay(
+                &self.relays,
+                &mut self.relay_buffers,
+                self.relay_receive_cursor,
+            ) => {
                 Ready::Relay(received)
             }
             recovery = receive_relay_recovery(self.relay_recovery.as_mut()) => {
@@ -325,9 +331,13 @@ impl ClientDataRuntime {
             Ready::Udp(received) => self.process_udp(received, false, signing_key).await,
             Ready::SecondaryUdp(received) => self.process_udp(received, true, signing_key).await,
             Ready::Relay((index, _key, Ok(received))) => {
+                self.relay_receive_cursor = index.saturating_add(1);
                 self.process_relay(index, received, signing_key).await
             }
-            Ready::Relay((_index, key, Err(error))) => self.handle_relay_failure(key, &error),
+            Ready::Relay((index, key, Err(error))) => {
+                self.relay_receive_cursor = index.saturating_add(1);
+                self.handle_relay_failure(key, &error)
+            }
             Ready::RelayRecovery(result) => self.handle_relay_recovery(*result),
             Ready::RelayRetry => {
                 self.start_relay_recovery();
@@ -2589,7 +2599,11 @@ async fn receive_optional_udp(
 
 type RelayReceiveResult = (usize, RelayPathKey, Result<ReceivedDatagram, RuntimeError>);
 
-async fn receive_relay(relays: &[WarmRelay], outputs: &mut [Vec<u8>]) -> RelayReceiveResult {
+async fn receive_relay(
+    relays: &[WarmRelay],
+    outputs: &mut [Vec<u8>],
+    start_index: usize,
+) -> RelayReceiveResult {
     let mut receives = relays
         .iter()
         .zip(outputs.iter_mut())
@@ -2610,8 +2624,9 @@ async fn receive_relay(relays: &[WarmRelay], outputs: &mut [Vec<u8>]) -> RelayRe
         })
         .collect::<Vec<_>>();
     poll_fn(|context| {
-        for receive in &mut receives {
-            if let Poll::Ready(result) = receive.as_mut().poll(context) {
+        for offset in 0..receives.len() {
+            let index = start_index.saturating_add(offset) % receives.len();
+            if let Poll::Ready(result) = receives[index].as_mut().poll(context) {
                 return Poll::Ready(result);
             }
         }
@@ -2797,6 +2812,7 @@ mod tests {
             relay_recovery_attempt: 0,
             connectivity_changed: false,
             relay_buffers: Vec::new(),
+            relay_receive_cursor: 0,
             connectivity_generations: BTreeMap::new(),
             ice_agents: BTreeMap::new(),
             networks: BTreeMap::new(),
@@ -2836,6 +2852,7 @@ mod tests {
             relay_recovery_attempt: 0,
             connectivity_changed: false,
             relay_buffers,
+            relay_receive_cursor: 0,
             connectivity_generations: BTreeMap::new(),
             ice_agents: BTreeMap::new(),
             networks: BTreeMap::new(),
