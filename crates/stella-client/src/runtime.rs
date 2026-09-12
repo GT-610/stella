@@ -41,7 +41,7 @@ use zeroize::Zeroizing;
 use crate::{
     ice::looks_like_stun,
     stun::{
-        discover_server_reflexive, gather_host_candidates, server_reflexive_candidate,
+        discover_server_reflexive, gather_host_candidates, server_reflexive_candidates,
         DeferredUdpDatagram, StunDiscovery,
     },
     ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
@@ -237,8 +237,7 @@ impl ClientDataRuntime {
             Err(error) => {
                 tracing::warn!(%error, "same-socket STUN discovery failed");
                 StunDiscovery {
-                    mapped_address: None,
-                    base_address: None,
+                    mappings: Vec::new(),
                     deferred: Vec::new(),
                     dropped_datagrams: 0,
                 }
@@ -253,9 +252,10 @@ impl ClientDataRuntime {
         }
         let relay = relay?;
         let mut direct_candidates = host_candidates;
-        if let Some(candidate) = server_reflexive_candidate(&discovery, candidate_datagram_size) {
-            direct_candidates.push(candidate);
-        }
+        direct_candidates.extend(server_reflexive_candidates(
+            &discovery,
+            candidate_datagram_size,
+        ));
         direct_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
         let relay_buffer_size = relay.as_ref().map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
             relay.client.capabilities().max_datagram_size
