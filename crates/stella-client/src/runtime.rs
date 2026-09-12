@@ -59,6 +59,7 @@ const ICE_GENERATION_MAX_LIFETIME: u64 = 600;
 const ICE_GENERATION_REFRESH_LEAD: u64 = 120;
 const ICE_USERNAME_RANDOM_LENGTH: usize = 6;
 const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
+const HOST_CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
 const RELAY_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_CARRIER_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -177,6 +178,8 @@ pub struct ClientDataRuntime {
     udp_buffer: Vec<u8>,
     secondary_udp: Option<UdpTransport>,
     secondary_udp_buffer: Vec<u8>,
+    excluded_interfaces: BTreeSet<String>,
+    next_host_candidate_refresh_at: Duration,
     deferred_udp: VecDeque<DeferredUdpDatagram>,
     direct_candidates: Vec<IceCandidate>,
     https_proxy: Option<SocketAddr>,
@@ -286,6 +289,8 @@ impl ClientDataRuntime {
             udp_buffer: vec![0_u8; max_datagram_size],
             secondary_udp,
             secondary_udp_buffer: vec![0_u8; max_datagram_size],
+            excluded_interfaces,
+            next_host_candidate_refresh_at: HOST_CANDIDATE_REFRESH_INTERVAL,
             deferred_udp,
             direct_candidates,
             https_proxy: config.https_proxy,
@@ -540,6 +545,7 @@ impl ClientDataRuntime {
     pub async fn maintain(&mut self, signing_key: &IdentitySigningKey) -> Result<(), RuntimeError> {
         let wall_time = unix_time()?;
         let now = self.monotonic_now();
+        self.refresh_host_candidates(wall_time, now)?;
         let ice_network_ids = self.ice_agents.keys().copied().collect::<Vec<_>>();
         for network_id in ice_network_ids {
             let Some(runtime_agent) = self.ice_agents.get_mut(&network_id) else {
@@ -559,6 +565,56 @@ impl ClientDataRuntime {
                 .maintain(signing_key, wall_time, now)?;
             self.apply_output(network_id, output).await?;
         }
+        Ok(())
+    }
+
+    fn refresh_host_candidates(
+        &mut self,
+        wall_time: u64,
+        now: Duration,
+    ) -> Result<(), RuntimeError> {
+        if now < self.next_host_candidate_refresh_at {
+            return Ok(());
+        }
+        self.next_host_candidate_refresh_at = now.saturating_add(HOST_CANDIDATE_REFRESH_INTERVAL);
+        let candidate_datagram_size =
+            u32::try_from(self.udp.capabilities().max_datagram_size).unwrap_or(65_507);
+        let mut refreshed = Vec::new();
+        for local_address in self.direct_udp_addresses() {
+            match gather_host_candidates(
+                local_address,
+                &self.excluded_interfaces,
+                candidate_datagram_size,
+            ) {
+                Ok(candidates) => refreshed.extend(candidates),
+                Err(error) => {
+                    tracing::warn!(%local_address, %error, "could not refresh host ICE candidates");
+                    return Ok(());
+                }
+            }
+        }
+        let previous_count = self
+            .direct_candidates
+            .iter()
+            .filter(|candidate| candidate.class == IceCandidateClass::Host)
+            .count();
+        if !replace_host_candidates(&mut self.direct_candidates, refreshed, self.relay.is_some()) {
+            return Ok(());
+        }
+        let states = self.current_network_states();
+        self.replace_local_connectivity_generations(&states)?;
+        self.reconcile_ice_agents(&states, wall_time)?;
+        self.connectivity_changed = true;
+        let current_count = self
+            .direct_candidates
+            .iter()
+            .filter(|candidate| candidate.class == IceCandidateClass::Host)
+            .count();
+        tracing::info!(
+            previous = previous_count,
+            current = current_count,
+            "host ICE candidates changed"
+        );
         Ok(())
     }
 
@@ -2301,6 +2357,29 @@ fn normalize_direct_candidates(candidates: &mut Vec<IceCandidate>, reserve_relay
     candidates.truncate(usize::from(MAX_ICE_CANDIDATES).saturating_sub(reserved));
 }
 
+fn replace_host_candidates(
+    candidates: &mut Vec<IceCandidate>,
+    refreshed: Vec<IceCandidate>,
+    reserve_relay: bool,
+) -> bool {
+    let previous_addresses = candidates
+        .iter()
+        .filter(|candidate| candidate.class == IceCandidateClass::Host)
+        .map(|candidate| candidate.address)
+        .collect::<BTreeSet<_>>();
+    let refreshed_addresses = refreshed
+        .iter()
+        .map(|candidate| candidate.address)
+        .collect::<BTreeSet<_>>();
+    if previous_addresses == refreshed_addresses {
+        return false;
+    }
+    candidates.retain(|candidate| candidate.class != IceCandidateClass::Host);
+    candidates.extend(refreshed);
+    normalize_direct_candidates(candidates, reserve_relay);
+    true
+}
+
 fn recover_stun_discovery(
     result: Result<StunDiscovery, StunDiscoveryError>,
     local_address: Option<SocketAddr>,
@@ -2415,7 +2494,7 @@ fn unix_time() -> Result<u64, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, BTreeSet, VecDeque},
         future::pending,
         net::{IpAddr, SocketAddr},
         sync::{Arc, Mutex},
@@ -2440,9 +2519,10 @@ mod tests {
         allocate_preferred_relay, allocate_relay_selections, complementary_bind_address,
         excluded_tap_interfaces, matching_relay_selection, next_relay_dns_result,
         normalize_direct_candidates, preferred_relay_settings, random_ice_credential,
-        relay_reconnect_cap, relay_reconnect_delay, relay_selections, turn_bind_address, unix_time,
-        ClientDataRuntime, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
-        RuntimeError, RuntimeRelayCarrier, TurnUdpError, WarmRelay, ICE_PASSWORD_RANDOM_LENGTH,
+        relay_reconnect_cap, relay_reconnect_delay, relay_selections, replace_host_candidates,
+        turn_bind_address, unix_time, ClientDataRuntime, ConnectivityConfigState,
+        LocalConnectivityGeneration, RelayDnsFuture, RuntimeError, RuntimeRelayCarrier,
+        TurnUdpError, WarmRelay, HOST_CANDIDATE_REFRESH_INTERVAL, ICE_PASSWORD_RANDOM_LENGTH,
         ICE_USERNAME_RANDOM_LENGTH, MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY,
         TAP_EVENT_QUEUE_CAPACITY, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
@@ -2474,6 +2554,8 @@ mod tests {
             udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
             secondary_udp: None,
             secondary_udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            excluded_interfaces: BTreeSet::new(),
+            next_host_candidate_refresh_at: HOST_CANDIDATE_REFRESH_INTERVAL,
             deferred_udp: VecDeque::new(),
             direct_candidates: Vec::new(),
             https_proxy: None,
@@ -2511,6 +2593,8 @@ mod tests {
             udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
             secondary_udp: None,
             secondary_udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            excluded_interfaces: BTreeSet::new(),
+            next_host_candidate_refresh_at: HOST_CANDIDATE_REFRESH_INTERVAL,
             deferred_udp: VecDeque::new(),
             direct_candidates: Vec::new(),
             https_proxy: None,
@@ -3184,6 +3268,50 @@ mod tests {
         normalize_direct_candidates(&mut candidates, true);
         assert_eq!(candidates.len(), 2);
         assert!(candidates[0].priority > candidates[1].priority);
+    }
+
+    #[test]
+    fn host_candidate_refresh_preserves_server_reflexive_paths() {
+        let host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("old host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let server_reflexive = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000"
+                .parse()
+                .expect("server-reflexive candidate"),
+            related_address: Some(host.address),
+            ..host
+        };
+        let replacement = IceCandidate {
+            address: "192.0.2.71:47000".parse().expect("new host candidate"),
+            foundation: 9,
+            ..host
+        };
+        let mut candidates = vec![host, server_reflexive];
+        assert!(replace_host_candidates(
+            &mut candidates,
+            vec![replacement],
+            false
+        ));
+        assert!(candidates.iter().any(|candidate| *candidate == replacement));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.address == server_reflexive.address));
+        assert!(!replace_host_candidates(
+            &mut candidates,
+            vec![replacement],
+            false
+        ));
     }
 
     #[test]

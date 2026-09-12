@@ -614,6 +614,9 @@ async fn run_active_io(
                     .await
                     .context("data-plane maintenance failed")
                     .map_err(ActiveRuntimeFailure::data)?;
+                if data.take_connectivity_changed() {
+                    publish_current_connectivity(active, data).await?;
+                }
             }
             result = data.receive_next(identity) => {
                 handle_data_runtime_result(result)
