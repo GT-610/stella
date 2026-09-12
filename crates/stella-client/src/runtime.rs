@@ -812,8 +812,10 @@ impl ClientDataRuntime {
             self.monotonic_now(),
         )?;
         if let Some(relay) = &self.relay {
-            plane
-                .set_relay_carrier_available(relay.settings.carrier.connectivity_carrier(), true)?;
+            plane.set_available_relay_carriers(&[(
+                relay.settings.relay_id,
+                relay.settings.carrier.connectivity_carrier(),
+            )])?;
         }
         self.networks.insert(
             network_id,
@@ -956,19 +958,13 @@ impl ClientDataRuntime {
         states: &BTreeMap<NetworkId, NetworkState>,
     ) -> Result<(), RuntimeError> {
         for network in self.networks.values_mut() {
-            for carrier in [
-                ConnectivityCarrier::TurnUdp,
-                ConnectivityCarrier::TurnTcp,
-                ConnectivityCarrier::TurnTls,
-                ConnectivityCarrier::SecureWebSocket,
-            ] {
-                let available = self
-                    .relay
-                    .as_ref()
-                    .is_some_and(|relay| relay.settings.carrier.connectivity_carrier() == carrier);
-                network
-                    .plane
-                    .set_relay_carrier_available(carrier, available)?;
+            if let Some(relay) = &self.relay {
+                network.plane.set_available_relay_carriers(&[(
+                    relay.settings.relay_id,
+                    relay.settings.carrier.connectivity_carrier(),
+                )])?;
+            } else {
+                network.plane.set_available_relay_carriers(&[])?;
             }
         }
         self.relay_buffer.resize(
