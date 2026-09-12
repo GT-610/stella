@@ -114,6 +114,12 @@ fingerprint requirements, source service, address family, length, and timeout
 match the outstanding transaction. STUN never allocates Stella handshake or
 frame-reassembly state.
 
+The reference client checks the host-interface candidate set every five
+seconds. When that set changes, it repeats same-socket STUN discovery for both
+address families, replaces every prior server-reflexive candidate, rotates the
+local generation, and republishes it. Non-STUN datagrams received during that
+bounded discovery window are retained for normal processing.
+
 ## 7. Controller signaling
 
 Only an authenticated node with active membership may publish connectivity for
