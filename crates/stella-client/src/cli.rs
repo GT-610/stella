@@ -1616,6 +1616,7 @@ mod tests {
 
     #[test]
     fn cli_accepts_stdin_invitation_without_exposing_it_as_an_argument() {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut arguments = vec![
             "stella-client",
             "join",
