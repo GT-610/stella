@@ -486,7 +486,7 @@ impl ClientDataRuntime {
     pub async fn maintain(&mut self, signing_key: &IdentitySigningKey) -> Result<(), RuntimeError> {
         let wall_time = unix_time()?;
         let now = self.monotonic_now();
-        self.refresh_host_candidates(wall_time, now)?;
+        self.refresh_host_candidates(wall_time, now).await?;
         let ice_network_ids = self.ice_agents.keys().copied().collect::<Vec<_>>();
         for network_id in ice_network_ids {
             let Some(runtime_agent) = self.ice_agents.get_mut(&network_id) else {
@@ -509,7 +509,7 @@ impl ClientDataRuntime {
         Ok(())
     }
 
-    fn refresh_host_candidates(
+    async fn refresh_host_candidates(
         &mut self,
         wall_time: u64,
         now: Duration,
@@ -542,6 +542,8 @@ impl ClientDataRuntime {
         if !replace_host_candidates(&mut self.direct_candidates, refreshed, self.relays.len()) {
             return Ok(());
         }
+        self.refresh_server_reflexive_candidates(candidate_datagram_size)
+            .await;
         let states = self.current_network_states();
         self.replace_local_connectivity_generations(&states)?;
         self.reconcile_ice_agents(&states, wall_time)?;
@@ -557,6 +559,40 @@ impl ClientDataRuntime {
             "host ICE candidates changed"
         );
         Ok(())
+    }
+
+    async fn refresh_server_reflexive_candidates(&mut self, max_datagram_size: u32) {
+        let stun_servers = self
+            .connectivity
+            .as_ref()
+            .map_or_else(Vec::new, |connectivity| {
+                connectivity.stun_servers().to_vec()
+            });
+        let secondary_discovery = async {
+            match &self.secondary_udp {
+                Some(secondary) => discover_server_reflexive(secondary, &stun_servers).await,
+                None => Ok(StunDiscovery::default()),
+            }
+        };
+        let (primary_discovery, secondary_discovery) = tokio::join!(
+            discover_server_reflexive(&self.udp, &stun_servers),
+            secondary_discovery,
+        );
+        let primary_discovery =
+            recover_stun_discovery(primary_discovery, Some(self.udp.local_address()));
+        let secondary_discovery = recover_stun_discovery(
+            secondary_discovery,
+            self.secondary_udp.as_ref().map(UdpTransport::local_address),
+        );
+        report_stun_discovery_drops(&primary_discovery, &secondary_discovery);
+        replace_server_reflexive_candidates(
+            &mut self.direct_candidates,
+            [&primary_discovery, &secondary_discovery],
+            max_datagram_size,
+            self.relays.len(),
+        );
+        self.deferred_udp.extend(primary_discovery.deferred);
+        self.deferred_udp.extend(secondary_discovery.deferred);
     }
 
     /// Reconciles all active control snapshots and tears down removed networks first.
@@ -2515,6 +2551,19 @@ fn replace_host_candidates(
     true
 }
 
+fn replace_server_reflexive_candidates(
+    candidates: &mut Vec<IceCandidate>,
+    discoveries: [&StunDiscovery; 2],
+    max_datagram_size: u32,
+    reserved_relays: usize,
+) {
+    candidates.retain(|candidate| candidate.class != IceCandidateClass::ServerReflexive);
+    for discovery in discoveries {
+        candidates.extend(server_reflexive_candidates(discovery, max_datagram_size));
+    }
+    normalize_direct_candidates(candidates, reserved_relays);
+}
+
 fn recover_stun_discovery(
     result: Result<StunDiscovery, StunDiscoveryError>,
     local_address: Option<SocketAddr>,
@@ -2680,6 +2729,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    use crate::stun::{StunDiscovery, StunMapping};
     use stella_common::{NodeId, RelayId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
     use stella_proto::{
@@ -2699,11 +2749,12 @@ mod tests {
         excluded_tap_interfaces, matching_relay_selection, next_relay_dns_result,
         normalize_direct_candidates, preferred_relay_settings, random_ice_credential,
         relay_reconnect_cap, relay_reconnect_delay, relay_selections, replace_host_candidates,
-        turn_bind_address, unix_time, ClientDataRuntime, ConnectivityConfigState,
-        LocalConnectivityGeneration, RelayDnsFuture, RelayPathKey, RuntimeError,
-        RuntimeRelayCarrier, TurnUdpError, WarmRelay, HOST_CANDIDATE_REFRESH_INTERVAL,
-        ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH, MAXIMUM_RELAY_RECONNECT_DELAY,
-        MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY, TURN_UDP_MAX_DATAGRAM_SIZE,
+        replace_server_reflexive_candidates, turn_bind_address, unix_time, ClientDataRuntime,
+        ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture, RelayPathKey,
+        RuntimeError, RuntimeRelayCarrier, TurnUdpError, WarmRelay,
+        HOST_CANDIDATE_REFRESH_INTERVAL, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
+        MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY,
+        TURN_UDP_MAX_DATAGRAM_SIZE,
     };
     use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
 
@@ -3603,6 +3654,47 @@ mod tests {
             vec![replacement],
             0
         ));
+    }
+
+    #[test]
+    fn interface_change_replaces_stale_server_reflexive_mapping() {
+        let host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let stale = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000".parse().expect("stale mapping"),
+            related_address: Some(host.address),
+            ..host
+        };
+        let refreshed_address = "203.0.113.70:48000".parse().expect("refreshed mapping");
+        let discovery = StunDiscovery {
+            mappings: vec![StunMapping {
+                mapped_address: refreshed_address,
+                base_address: host.address,
+            }],
+            deferred: Vec::new(),
+            dropped_datagrams: 0,
+        };
+        let empty = StunDiscovery::default();
+        let mut candidates = vec![host, stale];
+        replace_server_reflexive_candidates(&mut candidates, [&discovery, &empty], 1_200, 0);
+        assert!(candidates.iter().any(|candidate| {
+            candidate.class == IceCandidateClass::ServerReflexive
+                && candidate.address == refreshed_address
+        }));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.address == stale.address));
     }
 
     #[test]
