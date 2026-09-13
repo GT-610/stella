@@ -145,11 +145,12 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
             .contains(&first_connection.server_time())
     );
     let mut first = ActiveControl::new(first_connection);
-    let first_epoch = first
+    let (first_state, first_membership_created) = first
         .join_network(network_id, Some(&join_credential))
         .await
-        .expect("join network and activate initial snapshot")
-        .controller_epoch();
+        .expect("join network and activate initial snapshot");
+    assert!(first_membership_created);
+    let first_epoch = first_state.controller_epoch();
     assert!(first
         .network(network_id)
         .expect("active first network")
@@ -295,10 +296,11 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .expect("known node authenticates without enrollment material");
     assert_eq!(second_connection.node_id(), node_id);
     let mut second = ActiveControl::new(second_connection);
-    let repeated_state = second
+    let (repeated_state, repeated_membership_created) = second
         .join_network(network_id, None)
         .await
         .expect("existing membership rejoins without a token");
+    assert!(!repeated_membership_created);
     assert_eq!(repeated_state.controller_epoch(), reconciled_epoch);
     assert!(matches!(
         second

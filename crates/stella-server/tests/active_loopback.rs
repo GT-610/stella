@@ -510,6 +510,10 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         join_id
     );
     assert_eq!(status_code(&join_result), 0);
+    assert_eq!(
+        field_value(&join_result, ControlFieldType::MembershipCreated),
+        &[1]
+    );
     MembershipGrantView::decode(field_value(&join_result, ControlFieldType::MembershipGrant))
         .expect("decode join grant");
     NetworkPolicy::decode(field_value(&join_result, ControlFieldType::NetworkPolicy))
@@ -546,6 +550,10 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         repeated_join_id
     );
     assert_eq!(status_code(&repeated_join), 0);
+    assert_eq!(
+        field_value(&repeated_join, ControlFieldType::MembershipCreated),
+        &[0]
+    );
     assert_eq!(
         u64_field(&repeated_join, ControlFieldType::ControllerEpoch),
         join_epoch

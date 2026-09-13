@@ -1045,10 +1045,6 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
     let enrollment = enrollment_token
         .as_ref()
         .map(|credential| Enrollment::new(credential, &config.display_name));
-    // The controller join contract uses a one-shot join token only when this
-    // invocation is creating membership; an already active membership joins
-    // without a token and must remain untouched if local persistence fails.
-    let membership_created = join_token.is_some();
     let join_result: Result<_> = async {
         let identity = load_node_identity(&config.identity_path).with_context(|| {
             format!(
@@ -1060,7 +1056,7 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
             .await
             .context("controller authentication failed")?;
         let mut active = ActiveControl::new(connection);
-        let state = active
+        let (state, membership_created) = active
             .join_network(network_id, join_token)
             .await
             .context("controller network join failed")?;

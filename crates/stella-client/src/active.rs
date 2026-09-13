@@ -70,7 +70,8 @@ impl ActiveControl {
     }
 
     /// Joins and activates one network, replacing any prior view only after
-    /// the complete new snapshot validates.
+    /// the complete new snapshot validates. Returns whether this request
+    /// created the controller membership.
     ///
     /// # Errors
     ///
@@ -80,12 +81,15 @@ impl ActiveControl {
         &mut self,
         network_id: NetworkId,
         credential: Option<&BearerCredential>,
-    ) -> Result<&NetworkState, ClientError> {
-        let state = self.connection.join_network(network_id, credential).await?;
+    ) -> Result<(&NetworkState, bool), ClientError> {
+        let (state, membership_created) =
+            self.connection.join_network(network_id, credential).await?;
         self.networks.insert(network_id, state);
-        self.networks
+        let state = self
+            .networks
             .get(&network_id)
-            .ok_or(ClientError::NetworkNotActive { network_id })
+            .ok_or(ClientError::NetworkNotActive { network_id })?;
+        Ok((state, membership_created))
     }
 
     /// Stops local forwarding state before authoritatively leaving one
@@ -751,6 +755,8 @@ pub enum ControlUpdate {
 
 impl AuthenticatedControl {
     /// Joins one network and atomically validates its initial peer snapshot.
+    /// Returns the validated state and whether this request created the
+    /// controller membership.
     ///
     /// `credential` is required only when the authenticated node does not
     /// already have an active membership. A successful `JOIN_RESULT` does not
@@ -766,7 +772,7 @@ impl AuthenticatedControl {
         &mut self,
         network_id: NetworkId,
         credential: Option<&BearerCredential>,
-    ) -> Result<NetworkState, ClientError> {
+    ) -> Result<(NetworkState, bool), ClientError> {
         let mut request = MessageBuilder::new(ControlMessageType::JoinRequest);
         request.push_field(ControlFieldType::NetworkId, network_id.as_bytes())?;
         if let Some(credential) = credential {
@@ -809,6 +815,7 @@ impl AuthenticatedControl {
 
 struct PendingJoin {
     network_id: NetworkId,
+    membership_created: bool,
     controller_epoch: u64,
     snapshot_revision: u64,
     local_grant: Vec<u8>,
@@ -850,6 +857,11 @@ impl PendingJoin {
         }
         Ok(Self {
             network_id,
+            membership_created: fixed_array::<1>(
+                field_value(message, ControlFieldType::MembershipCreated)?,
+                "membership created",
+            )?[0]
+                == 1,
             controller_epoch: decode_u64(
                 field_value(message, ControlFieldType::ControllerEpoch)?,
                 "controller epoch",
@@ -867,7 +879,7 @@ impl PendingJoin {
         self,
         control: &AuthenticatedControl,
         snapshot: &OwnedControlMessage,
-    ) -> Result<NetworkState, ClientError> {
+    ) -> Result<(NetworkState, bool), ClientError> {
         require_unsolicited(snapshot, ControlMessageType::PeerSnapshot)?;
         ensure_control_field(
             decode_network_id(snapshot)? == self.network_id,
@@ -904,7 +916,7 @@ impl PendingJoin {
             "PEER_SNAPSHOT after JOIN_RESULT",
             "network policy",
         )?;
-        Ok(NetworkState::from_snapshot(&SnapshotInput {
+        let state = NetworkState::from_snapshot(&SnapshotInput {
             controller_id: control.controller_id(),
             controller_public_key: control.controller_public_key(),
             local_node_id: control.node_id(),
@@ -920,7 +932,8 @@ impl PendingJoin {
                 ControlFieldType::ConnectivityList,
             )?,
             now: unix_time()?,
-        })?)
+        })?;
+        Ok((state, self.membership_created))
     }
 }
 

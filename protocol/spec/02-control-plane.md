@@ -163,6 +163,7 @@ All version 0.1 fields are critical:
 | `0x8021` | `CONNECTIVITY_RECORD` | One connectivity-record encoding; version 0.2 |
 | `0x8022` | `STUN_SERVER_LIST` | STUN-server-list encoding; version 0.2 |
 | `0x8023` | `RELAY_SERVICE_LIST` | Relay-service-list encoding; version 0.2 |
+| `0x8024` | `MEMBERSHIP_CREATED` | One byte: `0` existing membership, `1` created by this join |
 
 Tokens are permitted only in the messages that name them. A receiver MUST NOT
 echo a token in status text or an error.
@@ -384,7 +385,7 @@ optional field.
 | `0x0004` | `NODE_AUTH` | C to S | node signature, (enrollment token), (display name) |
 | `0x0005` | `AUTH_RESULT` | S to C | status code, (status message), server time, (connectivity-config revision in version 0.2) |
 | `0x0010` | `JOIN_REQUEST` | C to S | network ID, (join token) |
-| `0x0011` | `JOIN_RESULT` | S to C | status code, (status message), controller epoch, network ID, (grant), (policy), (revision) |
+| `0x0011` | `JOIN_RESULT` | S to C | status code, (status message), controller epoch, network ID, (membership created on successful status zero), (grant), (policy), (revision) |
 | `0x0012` | `LEAVE_REQUEST` | C to S | network ID |
 | `0x0013` | `LEAVE_RESULT` | S to C | status code, (status message), controller epoch, network ID |
 | `0x0020` | `ENDPOINT_UPDATE` | C to S | network ID, endpoint set |
@@ -454,10 +455,12 @@ membership assignment. Join tokens use the same generation, storage, secrecy,
 expiry, and atomic-consumption rules as enrollment tokens but are domain-hashed
 with `stella join token v1`.
 
-Successful `JOIN_RESULT` status zero includes the node's signed membership
-grant, canonical policy, and current snapshot revision. The client validates
-all objects before activating the network. The controller then sends a complete
-`PEER_SNAPSHOT`, even when the peer list is empty.
+Successful `JOIN_RESULT` status zero includes `MEMBERSHIP_CREATED`, the node's
+signed membership grant, canonical policy, and current snapshot revision.
+`MEMBERSHIP_CREATED` is `1` only when this request created the node's active
+membership; an idempotent join of an existing active membership carries `0`.
+The client validates all objects before activating the network. The controller
+then sends a complete `PEER_SNAPSHOT`, even when the peer list is empty.
 
 A successful leave increments the controller epoch, removes authorization,
 responds with `LEAVE_RESULT`, and distributes updated state. The leaving client
