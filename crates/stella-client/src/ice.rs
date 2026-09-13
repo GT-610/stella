@@ -375,6 +375,9 @@ impl IceAgent {
             })
             .collect::<Vec<_>>();
         for (peer_node_id, target) in nomination_due {
+            if self.transactions.len() >= MAX_ACTIVE_TRANSACTIONS {
+                break;
+            }
             self.create_transaction(peer_node_id, target, TransactionKind::Nomination, now)?;
         }
 
@@ -1103,7 +1106,10 @@ mod tests {
         StunAttributeType, StunClass, StunMessageView,
     };
 
-    use super::{encode_signed_binding, IceAgent, IcePeerConfig, OwnedAttribute};
+    use super::{
+        encode_signed_binding, IceAgent, IcePeerConfig, OwnedAttribute, TransactionKind,
+        MAX_ACTIVE_TRANSACTIONS,
+    };
 
     fn candidate(address: &str, priority: u32) -> IceCandidate {
         IceCandidate {
@@ -1176,6 +1182,58 @@ mod tests {
             remote_candidates[2].address
         );
         assert_eq!(agent.transactions.len(), 3);
+    }
+
+    #[test]
+    fn nomination_waits_when_transaction_capacity_is_full() {
+        let local_id = NodeId::from_bytes([0x43; 16]);
+        let peer_id = NodeId::from_bytes([0x44; 16]);
+        let local_candidate = candidate("192.0.2.44:40000", 2_130_706_431);
+        let remote_candidate = candidate("192.0.2.45:40001", 300);
+        let mut agent = IceAgent::new(
+            local_id,
+            10,
+            b"LocalUfr",
+            b"LocalPassword123456789",
+            &[local_candidate],
+        )
+        .expect("local agent");
+        agent
+            .upsert_peer(IcePeerConfig {
+                node_id: peer_id,
+                generation_id: 2,
+                tie_breaker: 20,
+                username_fragment: b"PeerUfrag",
+                password: b"PeerPassword1234567890",
+                candidates: &[remote_candidate],
+            })
+            .expect("configure peer candidate");
+        agent
+            .peers
+            .get_mut(&peer_id)
+            .expect("configured peer")
+            .succeeded
+            .insert(remote_candidate.address);
+        for _ in 0..MAX_ACTIVE_TRANSACTIONS {
+            agent
+                .create_transaction(
+                    peer_id,
+                    remote_candidate.address,
+                    TransactionKind::Connectivity,
+                    Duration::ZERO,
+                )
+                .expect("fill transaction capacity");
+        }
+
+        agent
+            .poll(Duration::ZERO)
+            .expect("capacity defers nomination without failing poll");
+        assert!(agent
+            .peers
+            .get(&peer_id)
+            .expect("configured peer")
+            .nomination_target
+            .is_none());
     }
 
     #[test]
