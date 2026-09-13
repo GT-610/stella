@@ -1065,7 +1065,9 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
         if let Err(persistence_error) =
             persist_network_intent(config_path, network_id, &tap.adapter, tap.peer.as_deref())
         {
-            if membership_created == Some(true) {
+            // Only an explicit false proves that membership pre-existed;
+            // unknown legacy status must use the safe rollback policy too.
+            if membership_created != Some(false) {
                 if let Err(leave_error) = active.leave_network(network_id).await {
                     return Err(persistence_error.context(format!(
                         "controller membership rollback also failed: {leave_error:#}"
