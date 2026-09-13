@@ -1045,6 +1045,10 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
     let enrollment = enrollment_token
         .as_ref()
         .map(|credential| Enrollment::new(credential, &config.display_name));
+    // The controller join contract uses a one-shot join token only when this
+    // invocation is creating membership; an already active membership joins
+    // without a token and must remain untouched if local persistence fails.
+    let membership_created = join_token.is_some();
     let join_result: Result<_> = async {
         let identity = load_node_identity(&config.identity_path).with_context(|| {
             format!(
@@ -1062,7 +1066,18 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
             .context("controller network join failed")?;
         let epoch = state.controller_epoch();
         let revision = state.snapshot_revision();
-        persist_network_intent(config_path, network_id, &tap.adapter, tap.peer.as_deref())?;
+        if let Err(persistence_error) =
+            persist_network_intent(config_path, network_id, &tap.adapter, tap.peer.as_deref())
+        {
+            if membership_created {
+                if let Err(leave_error) = active.leave_network(network_id).await {
+                    return Err(persistence_error.context(format!(
+                        "controller membership rollback also failed: {leave_error:#}"
+                    )));
+                }
+            }
+            return Err(persistence_error);
+        }
         Ok((active, epoch, revision))
     }
     .await;
