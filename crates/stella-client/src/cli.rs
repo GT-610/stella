@@ -213,6 +213,7 @@ struct JoinTapProvision {
 }
 
 impl JoinTapProvision {
+    #[cfg_attr(not(target_os = "windows"), allow(clippy::unnecessary_wraps))]
     fn prepare(selection: &JoinTapSelection) -> Result<Self> {
         #[cfg(target_os = "windows")]
         {
@@ -232,6 +233,8 @@ impl JoinTapProvision {
     }
 
     fn rollback(self, error: anyhow::Error) -> anyhow::Error {
+        #[cfg(not(target_os = "windows"))]
+        let _ = self;
         #[cfg(target_os = "windows")]
         if let Some(adapter) = self.newly_created_adapter {
             if let Err(cleanup) = WindowsTapDevice::remove_adapter(&adapter) {
@@ -1087,6 +1090,7 @@ fn join_tap_selection(network_id: NetworkId, args: &JoinArgs) -> Result<JoinTapS
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = network_id;
         validate_join_tap(args)?;
         Ok(JoinTapSelection {
             adapter: args
