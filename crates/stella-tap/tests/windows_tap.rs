@@ -10,6 +10,14 @@ use std::{
 
 use stella_tap::{TapConfig, TapDevice, TapError, WindowsTapDevice, DEFAULT_MAX_FRAME_SIZE};
 
+struct ProvisionedAdapterCleanup(String);
+
+impl Drop for ProvisionedAdapterCleanup {
+    fn drop(&mut self) {
+        let _ = WindowsTapDevice::remove_adapter(&self.0);
+    }
+}
+
 #[test]
 #[ignore = "requires exclusive access to an installed TAP-Windows Adapter V9"]
 fn installed_adapter_supports_lifecycle_frame_write_and_cancellation() {
@@ -91,6 +99,42 @@ fn installed_adapter_supports_lifecycle_frame_write_and_cancellation() {
     cancellation
         .cancel_pending_io()
         .expect("post-close cancellation remains idempotent");
+}
+
+#[test]
+#[ignore = "creates and removes a TAP-Windows adapter and requires administrator privileges"]
+fn provisioning_creates_reuses_opens_and_removes_adapter() {
+    let name = format!("Stella provisioning test {}", std::process::id());
+    let stale = WindowsTapDevice::remove_adapter(&name).expect("remove stale test adapter");
+    assert!(!stale.reboot_required());
+
+    let created = WindowsTapDevice::ensure_adapter(&name).expect("create TAP-Windows adapter");
+    assert!(created.created());
+    assert_eq!(created.adapter().friendly_name, name);
+    let interface_id = created.adapter().interface_id.clone();
+    let _cleanup = ProvisionedAdapterCleanup(name.clone());
+
+    let reused = WindowsTapDevice::ensure_adapter(&name).expect("reuse TAP-Windows adapter");
+    assert!(!reused.created());
+    assert_eq!(reused.adapter().interface_id, interface_id);
+
+    let mtu = u16::try_from(created.adapter().system_mtu).expect("adapter MTU fits u16");
+    let device = WindowsTapDevice::create(&TapConfig {
+        name: Some(name.clone()),
+        peer_name: None,
+        mtu,
+        max_frame_size: DEFAULT_MAX_FRAME_SIZE.max(mtu + 14),
+    })
+    .expect("open provisioned TAP-Windows adapter");
+    device.destroy().expect("close provisioned adapter");
+
+    let removed = WindowsTapDevice::remove_adapter(&name).expect("remove provisioned adapter");
+    assert!(removed.removed());
+    assert!(!removed.reboot_required());
+    assert!(WindowsTapDevice::installed_adapters()
+        .expect("enumerate after removal")
+        .iter()
+        .all(|adapter| !adapter.friendly_name.eq_ignore_ascii_case(&name)));
 }
 
 fn test_frame(source: [u8; 6]) -> [u8; 60] {
