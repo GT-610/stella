@@ -1,16 +1,23 @@
-# ADR 0012: Open pre-installed TAP-Windows adapters by stable identity
+# ADR 0012: Provision per-network TAP-Windows adapters from Driver Store
 
 - Status: Accepted
 - Date: 2026-08-30
+- Updated: 2026-09-13
 
 ## Context
 
-The Windows reference client needs a Layer-2 adapter, but installing, removing,
-renaming, or restarting a kernel network driver is a machine-administration
-operation with rollback and signing requirements. TAP-Windows exposes an
-exclusive userspace device path derived from the adapter GUID, while the
-connection name shown by Windows is mutable. Its packet I/O can remain pending
-indefinitely, and its driver MTU is fixed when the miniport starts.
+The Windows reference client needs one isolated Layer-2 adapter per joined
+network. Requiring users to create and name every adapter makes multi-network
+membership depend on Windows driver tooling that ordinary users should not need
+to understand. Installing or removing a signed kernel driver package and
+changing its persistent settings still have machine-wide signing, rollback, and
+restart consequences, but creating a root device from an already installed
+package has a narrower lifecycle that the client can own.
+
+TAP-Windows exposes an exclusive userspace device path derived from the adapter
+GUID, while the connection name shown by Windows is mutable. Its packet I/O can
+remain pending indefinitely, and its driver MTU is fixed when the miniport
+starts.
 
 The library must preserve complete Ethernet frames, support orderly client
 shutdown, and avoid silently selecting the wrong adapter on machines with
@@ -18,14 +25,31 @@ multiple VPN products.
 
 ## Decision
 
-`stella-tap` opens an already installed TAP-Windows Adapter V9. Driver
-installation, adapter creation, removal, rename, enable/disable, persistent MAC
-changes, and driver restart remain installer or administrator responsibilities.
+The signed TAP-Windows Adapter V9 package must already be present in Windows
+Driver Store. Stella does not install or remove that package, persist a MAC,
+edit the driver MTU, or restart a miniport.
 
-Windows adapters are enumerated through the IP Helper API. An explicit selector
-matches either the connection-friendly name or the canonical interface GUID,
-case-insensitively. Without a selector, exactly one TAP-Windows candidate must
-exist; zero and multiple candidates are typed errors. The chosen device path is
+`stella-tap` owns creation, naming, reuse, and removal of Stella's root devices.
+For a missing friendly name, it creates a network-class device with hardware ID
+`tap0901`, registers it through SetupAPI, calls `DiInstallDevice` without an
+explicit driver list so Windows selects the existing signed package, waits for
+`NetCfgInstanceId`, and assigns the requested connection name. Any failure after
+registration removes the partial device. Removal uses SetupAPI and waits for
+the interface to disappear unless Windows reports that a reboot is required.
+
+`stella-client` deterministically maps each network to
+`Stella <32-character-network-id>`. `join` ensures the adapter before consuming
+join credentials and removes a device newly created by that attempt if joining
+or persistence fails. `run` recreates a missing configured adapter before
+controller traffic starts. Normal shutdown keeps the persistent device for
+reuse and only sets media disconnected; `leave` removes the managed device.
+Creation and removal require elevation.
+
+Windows adapters are enumerated through the IP Helper API. The lower-level
+library selector matches either the connection-friendly name or the canonical
+interface GUID, case-insensitively. A missing GUID is never treated as a name to
+create. Without a selector, exactly one TAP-Windows candidate must exist; zero
+and multiple candidates are typed errors. The chosen device path is
 `\\.\Global\{interface-guid}.tap`, and the implementation accepts it only after
 the TAP driver answers its version, MAC, and MTU control requests.
 
@@ -54,12 +78,14 @@ invariants.
 
 ## Consequences
 
-Runtime code cannot unexpectedly install or reconfigure a kernel driver, and
-adapter selection is deterministic. Client shutdown can wake a blocked TAP
-worker without terminating the process. Complete-frame semantics are enforced
-before bytes enter protocol processing.
+Users install the TAP-Windows driver package once; Stella provisions one stable,
+persistent adapter per network without exposing adapter selection in the Windows
+CLI. Joining multiple networks therefore creates multiple isolated adapters,
+and leaving a network removes only its deterministic managed device. A failed
+join does not leave a newly created orphan.
 
-Users must install and provision one TAP-Windows V9 adapter per Stella network.
-Changing the driver MTU or persistent MAC still needs elevated administrative
-tooling and a miniport restart. Machines with several candidate adapters must
-name the intended one explicitly.
+Stella still cannot silently install or reconfigure a kernel driver package.
+Changing the driver MTU or persistent MAC needs external elevated tooling and a
+miniport restart. Client shutdown can wake a blocked TAP worker without
+terminating the process, and complete-frame semantics are enforced before bytes
+enter protocol processing.

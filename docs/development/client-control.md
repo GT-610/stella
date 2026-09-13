@@ -15,8 +15,9 @@ accepted inline in the file. Persistent configuration includes:
 - the expected Stella controller ID and one or more `sha256/` SPKI pins;
 - the protected node PKCS#8 identity path and display name;
 - the UDP bind address, optional explicit HTTPS proxy, and advertised endpoints;
-- one platform TAP selection and desired network ID per network entry; macOS
-  selections include both host-visible and packet-I/O feth names.
+- one desired network ID and its resolved platform TAP selection per entry;
+  Windows records the automatically derived managed name, while macOS records
+  both explicit host-visible and packet-I/O feth names.
 
 An explicit initialization command creates the node identity with create-new
 semantics. On Windows its DACL is protected from inheritance and grants access
@@ -55,7 +56,7 @@ max_datagram_size = 1200
 
 [[networks]]
 id = "fedcba9876543210fedcba9876543210"
-tap_adapter = "Stella LAN"
+tap_adapter = "Stella fedcba9876543210fedcba9876543210"
 
 [logging]
 filter = "info,stella_client=info"
@@ -73,9 +74,11 @@ tap_peer = "feth101"
 Relative paths are rooted beside the configuration file. Endpoint and network
 entries are normalized into protocol order, duplicate network IDs are rejected,
 and unknown keys, including any attempted inline enrollment or join token, make
-the complete file invalid. macOS additionally rejects missing, equal, or
-non-`feth<N>` TAP names. The `networks` array may be absent immediately after
-`init`; each successful `join` adds one durable entry. The proxy field is
+the complete file invalid. Windows derives `Stella <network-id>`, provisions it
+before consuming join credentials, and recreates it during `run` if necessary.
+macOS additionally rejects missing, equal, or non-`feth<N>` TAP names. The
+`networks` array may be absent immediately after `init`; each successful `join`
+adds one durable entry. The proxy field is
 optional, numeric, and local to controller TLS bootstrap and secure WebSocket
 relay fallback. It contains no credentials and is never distributed by the
 controller.

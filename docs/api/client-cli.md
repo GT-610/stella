@@ -6,13 +6,15 @@ runtime. Commands use `--config client.toml` unless another path is supplied.
 
 ## Prerequisites and reachability
 
-Windows clients need one pre-installed TAP-Windows Adapter V9 per configured
-network and run from an elevated PowerShell session. macOS clients need two
-distinct numeric feth names per network that are not owned by another active
-process. A matching Stella-owned persistent pair may already exist and is
-reused when the client starts. The normal client remains unprivileged; a
-separately started root `stella-tap-helper` creates or reuses the pair and
-performs only bounded TAP operations.
+Windows clients need the signed TAP-Windows Adapter V9 driver package in the
+Windows Driver Store and run from an elevated PowerShell session. Stella
+creates and names one persistent adapter per joined network automatically;
+users do not pre-create or select adapters. macOS clients need two distinct
+numeric feth names per network that are not owned by another active process. A
+matching Stella-owned persistent pair may already exist and is reused when the
+client starts. The normal macOS client remains unprivileged; a separately
+started root `stella-tap-helper` creates or reuses the pair and performs only
+bounded TAP operations.
 
 The controller must be reachable over its configured TLS/TCP address, either
 directly or through the optional explicit HTTPS proxy. The runtime gathers
@@ -96,8 +98,7 @@ the administrator:
 $Invitation = Read-Host 'Stella invitation'
 $Invitation | stella-client --config C:\Stella\client.toml join `
   --invite-file - `
-  --display-name "Gaming PC" `
-  --tap-adapter "Stella LAN"
+  --display-name "Gaming PC"
 $Invitation = $null
 ```
 
@@ -130,13 +131,13 @@ permission-protected invitation file.
 The detailed form below remains available for an existing configuration,
 existing membership, or separately managed tokens.
 
-Windows selects the exact pre-installed adapter:
+Windows derives the adapter name from the network ID and provisions it before
+using join credentials:
 
 ```powershell
 stella-client --config C:\Stella\client.toml join `
   --network <id> `
-  --token <unpadded-base64url-token> `
-  --tap-adapter "Stella LAN"
+  --token <unpadded-base64url-token>
 ```
 
 macOS selects both ends of one feth pair. The first name is host-visible; the
@@ -155,11 +156,25 @@ For a node not yet enrolled with the controller, add the one-use
 decode to exactly 32 bytes. They remain process-local, are redacted from debug
 output, and are never written to the configuration.
 
-`join` validates the local TAP selection, authenticates, and waits for a
-complete validated controller snapshot before atomically persisting the
+On Windows, `join` creates or reuses `Stella <network-id>` from the installed
+driver package before authenticating. If authentication, joining, or
+configuration persistence fails, an adapter newly created by that attempt is
+removed. The stable name makes repeated joins idempotent and gives every network
+its own persistent Layer-2 interface. `--tap-adapter` is not a Windows option.
+
+On macOS, `join` validates the explicit local TAP pair. Both platforms wait for
+a complete validated controller snapshot before atomically persisting the
 network ID and selection. Repeating an already accepted join may omit
-`--token`; the same Windows adapter or same complete macOS pair is idempotent.
-A conflicting adapter or peer is rejected before contacting the controller.
+`--token`; a conflicting macOS adapter or peer is rejected before contacting
+the controller.
+
+The resulting Windows entry records the managed name:
+
+```toml
+[[networks]]
+id = "fedcba9876543210fedcba9876543210"
+tap_adapter = "Stella fedcba9876543210fedcba9876543210"
+```
 
 The resulting macOS entry remains configuration version 1:
 
@@ -190,9 +205,10 @@ stella-client --config C:\Stella\client.toml leave --network <id>
 
 `leave` requires an existing desired-network entry. It starts with no active
 forwarding state, authenticates without accepting token material, validates the
-controller's authoritative `LEAVE_RESULT`, and only then atomically removes the
-network from local configuration. A failed or ambiguous request never enables
-forwarding and preserves durable intent for recovery or retry.
+controller's authoritative `LEAVE_RESULT`, and only then removes the managed
+Windows adapter and atomically removes the network from local configuration.
+macOS retains its persistent feth pair. A failed or ambiguous request never
+enables forwarding and preserves durable intent for recovery or retry.
 
 ## Run
 
@@ -226,10 +242,12 @@ policy heartbeat periods elapse without its acknowledgement. Ctrl+C interrupts
 the control loop and waits for TAP, UDP, and Relay cleanup before the process
 exits.
 
-Windows opens each exact TAP-Windows adapter and sets it media-disconnected on
-shutdown. On macOS the root helper creates or reuses each exact feth pair, uses
-BPF receive and AF_NDRV transmit, and sets the host-visible interface down
-without deleting the pair. The client and helper authenticate each other with
+Windows creates any missing configured managed adapter before controller
+traffic starts, then opens each exact TAP-Windows adapter and sets it
+media-disconnected on shutdown without deleting it. The persistent adapter is
+deleted by `leave`. On macOS the root helper creates or reuses each exact feth
+pair, uses BPF receive and AF_NDRV transmit, and sets the host-visible interface
+down without deleting the pair. The client and helper authenticate each other with
 Unix peer credentials. Invalid peer datagrams are dropped without reconnecting the controller;
 TAP, UDP, or worker failures close the data runtime and use the normal
 fail-closed reconnect path.

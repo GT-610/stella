@@ -10,7 +10,7 @@
 
 - `stella-client`，以及 macOS 所需的 `stella-tap-helper`；
 - 一个以 `stella1:` 开头的一次性邀请；
-- Windows TAP-Windows 适配器名称，或两个未占用的 macOS feth 名称；
+- Windows 上已安装的 TAP-Windows Adapter V9 驱动包，或两个未占用的 macOS feth 名称；
 - 管理员为该二层网络安排的 IP 地址和子网掩码。
 
 邀请包含一次性 Bearer 凭据，默认一小时后过期。请使用可信私密渠道传递，不要发布到
@@ -22,8 +22,7 @@ Windows 在提升权限的 PowerShell 中执行：
 $Invitation = Read-Host 'Stella invitation'
 $Invitation | C:\Stella\stella-client.exe --config C:\Stella\client.toml join `
   --invite-file - `
-  --display-name $env:COMPUTERNAME `
-  --tap-adapter 'Stella LAN'
+  --display-name $env:COMPUTERNAME
 $Invitation = $null
 ```
 
@@ -45,8 +44,10 @@ unset invitation
 也可以改为提供一个权限受保护的邀请文件路径。
 
 当配置不存在时，`join` 会从邀请创建受保护的节点身份和严格的控制器信任配置，然后
-注册节点并加入网络。配置已经存在时，它要求邀请中的控制器地址、TLS 名称、Controller
-ID 和 SPKI pin 与现有信任完全匹配。成功后可查看本地配置状态：
+注册节点并加入网络。Windows 会先从已安装驱动包创建或复用持久适配器
+`Stella <网络ID>`；若加入失败，本次新建的适配器会被删除。配置已经存在时，它要求邀请
+中的控制器地址、TLS 名称、Controller ID 和 SPKI pin 与现有信任完全匹配。成功后可查看
+本地配置状态：
 
 ```powershell
 C:\Stella\stella-client.exe --config C:\Stella\client.toml status
@@ -54,9 +55,9 @@ C:\Stella\stella-client.exe --config C:\Stella\client.toml status
 
 ## 配置二层接口
 
-Stella 透明传输以太网帧，不分配 IP，也不提供 DHCP。请按管理员安排，在 Windows 的
-`Stella LAN` 或 macOS 的宿主可见端 `feth100` 上配置地址。不同节点必须位于同一虚拟
-子网且地址不能冲突。
+Stella 透明传输以太网帧，不分配 IP，也不提供 DHCP。请按管理员安排，在 `status` 输出的
+Windows 适配器（名称为 `Stella <网络ID>`）或 macOS 的宿主可见端 `feth100` 上配置地址。
+不同节点必须位于同一虚拟子网且地址不能冲突。
 
 macOS 还需要先在一个终端启动特权范围受限的 helper：
 

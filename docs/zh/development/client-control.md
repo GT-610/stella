@@ -6,11 +6,21 @@
 客户端使用严格、带版本的 TOML。路径相对配置文件解析，未知字段被拒绝，凭据不能内嵌在
 文件中。持久配置包括控制器数值 TCP 地址和 TLS 名称、预期控制器 ID 与 SPKI 固定值、受
 保护的节点 PKCS#8 路径和显示名、UDP 绑定与公布端点，以及每个网络的平台 TAP 选择和
-目标网络 ID。macOS 选择同时包含宿主可见 feth 与报文 I/O peer。初始化以仅创建语义生成
+目标网络 ID。Windows 记录自动派生的托管名称；macOS 选择同时包含宿主可见 feth 与报文
+I/O peer。初始化以仅创建语义生成
 身份，且不会替换已有身份或配置。Windows 使用受保护的精确 DACL；macOS 要求普通、单
 hard-link、非 symlink、权限为 `0600` 的文件。
 
-版本 1 的 Windows 网络条目只含 `tap_adapter`；macOS 仍使用版本 1，但增加必填 peer：
+版本 1 的 Windows 网络条目记录由网络 ID 派生的适配器名称：
+
+```toml
+[[networks]]
+id = "fedcba9876543210fedcba9876543210"
+tap_adapter = "Stella fedcba9876543210fedcba9876543210"
+```
+
+Windows 在使用加入凭据前创建或复用该设备，`run` 会补建丢失设备，`leave` 会删除。macOS
+仍使用版本 1，但增加必填 peer：
 
 ```toml
 [[networks]]

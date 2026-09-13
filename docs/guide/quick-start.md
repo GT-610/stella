@@ -12,7 +12,8 @@ Obtain these items from the administrator:
 
 - `stella-client`, plus `stella-tap-helper` on macOS;
 - one single-use invitation beginning with `stella1:`;
-- the Windows TAP-Windows adapter name or two unused macOS feth names;
+- the TAP-Windows Adapter V9 driver package on Windows, or two unused macOS
+  feth names;
 - the IP address and subnet mask assigned for this Layer-2 network.
 
 An invitation contains single-use bearer credentials and expires after one hour
@@ -25,8 +26,7 @@ Run this from an elevated PowerShell on Windows:
 $Invitation = Read-Host 'Stella invitation'
 $Invitation | C:\Stella\stella-client.exe --config C:\Stella\client.toml join `
   --invite-file - `
-  --display-name $env:COMPUTERNAME `
-  --tap-adapter 'Stella LAN'
+  --display-name $env:COMPUTERNAME
 $Invitation = $null
 ```
 
@@ -50,9 +50,11 @@ file may be supplied instead.
 
 When no configuration exists, `join` creates a protected node identity and a
 strict controller trust configuration from the invitation, then enrolls the
-node and joins the network. With an existing configuration, the invitation's
-controller address, TLS name, controller ID, and SPKI pin must match the stored
-trust. After a successful join, inspect local state with:
+node and joins the network. On Windows it first creates or reuses the persistent
+adapter `Stella <network-id>` from the installed driver package; a failed join
+removes an adapter created by that attempt. With an existing configuration, the
+invitation's controller address, TLS name, controller ID, and SPKI pin must
+match the stored trust. After a successful join, inspect local state with:
 
 ```powershell
 C:\Stella\stella-client.exe --config C:\Stella\client.toml status
@@ -61,9 +63,10 @@ C:\Stella\stella-client.exe --config C:\Stella\client.toml status
 ## Configure the Layer-2 interface
 
 Stella transparently carries Ethernet frames; it does not allocate IP addresses
-or provide DHCP. Configure the administrator-assigned address on `Stella LAN`
-on Windows or the host-visible `feth100` end on macOS. Nodes must use the same
-virtual subnet without address conflicts.
+or provide DHCP. Configure the administrator-assigned address on the Windows
+adapter reported by `status` (named `Stella <network-id>`) or the host-visible
+`feth100` end on macOS. Nodes must use the same virtual subnet without address
+conflicts.
 
 macOS also needs the narrowly privileged helper in one terminal:
 

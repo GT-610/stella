@@ -6,10 +6,24 @@ the asynchronous client runtime must not call frame I/O on a Tokio worker.
 
 ## Ownership boundary
 
-The library opens a pre-installed adapter. It does not install or remove a
-driver, create or delete adapters, rename a Windows connection, persist a MAC
-address, or restart a miniport. Those operations belong to installation and
-administrator tooling because interruption can affect unrelated VPN software.
+The library requires the signed TAP-Windows Adapter V9 driver package to be
+present in Windows Driver Store. It does not install or remove that package,
+persist a MAC address, edit the driver MTU, or restart a miniport. Package and
+miniport configuration remain installer or administrator responsibilities
+because they can affect unrelated VPN software.
+
+Stella does own root-device lifecycle for its named adapters. `ensure_adapter`
+reuses a matching TAP adapter or creates one through SetupAPI with hardware ID
+`tap0901`, lets `DiInstallDevice` select the existing signed package, waits for
+its `NetCfgInstanceId`, and assigns the requested Windows connection name.
+Failure after registration removes the partial device. `remove_adapter` removes
+the matching device through SetupAPI and waits for it to disappear unless
+Windows reports that a reboot is required.
+
+The client maps each network to `Stella <32-character-network-id>`. `join`
+ensures that persistent adapter before using credentials, `run` recreates it if
+it is missing, ordinary shutdown leaves it media-disconnected for later reuse,
+and `leave` removes it. These device-management operations require elevation.
 
 One open `WindowsTapDevice` exclusively owns one TAP-Windows device handle. The
 handle is closed by `destroy` or `Drop`; both first request media-disconnected
@@ -24,9 +38,10 @@ The backend enumerates network adapters with the Windows IP Helper API. A
 - the Windows connection-friendly name, such as `Local Area Connection`; or
 - the interface GUID, with or without surrounding braces.
 
-Matching is case-insensitive. If no selector is supplied, creation succeeds
-only when exactly one TAP-Windows candidate is installed. Ambiguity is reported
-instead of depending on enumeration order.
+Matching is case-insensitive. A missing friendly-name selector is provisioned;
+a missing GUID selector remains a not-found error. If no selector is supplied,
+creation succeeds only when exactly one TAP-Windows candidate is installed.
+Ambiguity is reported instead of depending on enumeration order.
 
 The selected adapter GUID forms the documented TAP device path:
 
@@ -103,8 +118,9 @@ GUIDs, sizes, and stable operation names, but never frame contents.
 ## Verification
 
 Portable unit tests cover configuration, frame bounds, selection, and error
-classification. Windows unit tests additionally verify the control-code ABI and
-GUID normalization. An opt-in platform test opens a real installed TAP-Windows
-adapter, checks driver metadata and lifecycle, exercises one complete write,
-and cancels pending overlapped I/O. It restores media-disconnected state before
-returning.
+classification. Windows unit tests additionally verify the control-code ABI,
+GUID normalization, managed-name bounds, and hardware-ID encoding. One opt-in
+platform test opens a real installed TAP-Windows adapter, checks driver metadata
+and lifecycle, exercises one complete write, and cancels pending overlapped I/O.
+A second elevated test creates, reuses, opens, and removes a uniquely named
+adapter. Both tests clean up their owned state before returning.
