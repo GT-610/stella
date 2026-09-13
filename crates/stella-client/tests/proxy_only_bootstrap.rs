@@ -319,7 +319,7 @@ async fn allocate_from_controller(
         service.spki_pins().to_vec(),
     );
     config.proxy_address = Some(proxy_address);
-    config.server_hostname = service.hostname().to_owned();
+    service.hostname().clone_into(&mut config.server_hostname);
     config.max_datagram_size = usize::try_from(service.max_datagram_size())
         .expect("relay datagram size fits this platform");
     config.allocation_lifetime_seconds = service.allocation_lifetime_seconds();
