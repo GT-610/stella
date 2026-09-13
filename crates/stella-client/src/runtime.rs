@@ -912,16 +912,8 @@ impl ClientDataRuntime {
             })?;
         #[cfg(target_os = "windows")]
         let mtu = {
-            let installed_mtu = WindowsTapDevice::installed_adapters()?
-                .into_iter()
-                .find(|adapter| {
-                    adapter
-                        .friendly_name
-                        .eq_ignore_ascii_case(&configured.tap_adapter)
-                })
-                .ok_or_else(|| TapError::AdapterNotFound {
-                    selector: Some(configured.tap_adapter.clone()),
-                })?
+            let installed_mtu = WindowsTapDevice::ensure_adapter(&configured.tap_adapter)?
+                .adapter()
                 .system_mtu;
             effective_tap_mtu(policy_mtu, installed_mtu)?
         };

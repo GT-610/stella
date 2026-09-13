@@ -15,6 +15,8 @@ use atomic_write_file::AtomicWriteFile;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde::Serialize;
+#[cfg(target_os = "windows")]
+use stella_client::windows_tap_adapter_name;
 use stella_client::{
     authenticate_controller, create_node_identity, load_node_identity, ActiveControl,
     BearerCredential, ClientConfig, Enrollment, SpkiPin,
@@ -23,6 +25,8 @@ use stella_client::{
 use stella_client::{ClientDataRuntime, RuntimeError};
 use stella_common::{ControllerId, JoinInvitation, NetworkId};
 use stella_crypto::derive_node_id;
+#[cfg(target_os = "windows")]
+use stella_tap::WindowsTapDevice;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zeroize::Zeroizing;
 
@@ -169,8 +173,9 @@ struct JoinArgs {
     #[arg(long)]
     enrollment_token: Option<CliCredential>,
     /// Exact TAP adapter or host-visible interface name for this network.
-    #[arg(long)]
-    tap_adapter: String,
+    #[cfg_attr(target_os = "windows", arg(skip))]
+    #[cfg_attr(not(target_os = "windows"), arg(long, required = true))]
+    tap_adapter: Option<String>,
     /// Exact macOS packet-I/O peer feth interface for this network.
     #[cfg_attr(target_os = "macos", arg(long, required = true))]
     #[cfg_attr(not(target_os = "macos"), arg(skip))]
@@ -194,6 +199,49 @@ struct LeaveArgs {
     /// Configured virtual network to leave.
     #[arg(long)]
     network: NetworkId,
+}
+
+#[derive(Debug)]
+struct JoinTapSelection {
+    adapter: String,
+    peer: Option<String>,
+}
+
+struct JoinTapProvision {
+    #[cfg(target_os = "windows")]
+    newly_created_adapter: Option<String>,
+}
+
+impl JoinTapProvision {
+    fn prepare(selection: &JoinTapSelection) -> Result<Self> {
+        #[cfg(target_os = "windows")]
+        {
+            let provision =
+                WindowsTapDevice::ensure_adapter(&selection.adapter).with_context(|| {
+                    format!("could not provision TAP adapter {:?}", selection.adapter)
+                })?;
+            Ok(Self {
+                newly_created_adapter: provision.created().then(|| selection.adapter.clone()),
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = selection;
+            Ok(Self {})
+        }
+    }
+
+    fn rollback(self, error: anyhow::Error) -> anyhow::Error {
+        #[cfg(target_os = "windows")]
+        if let Some(adapter) = self.newly_created_adapter {
+            if let Err(cleanup) = WindowsTapDevice::remove_adapter(&adapter) {
+                return error.context(format!(
+                    "the newly created TAP adapter {adapter:?} also could not be removed: {cleanup}"
+                ));
+            }
+        }
+        error
+    }
 }
 
 #[derive(Clone)]
@@ -259,6 +307,8 @@ pub(crate) async fn run() -> Result<()> {
 
 async fn run_client(config_path: &Path) -> Result<()> {
     let config = ClientConfig::load(config_path).context("could not load client configuration")?;
+    #[cfg(target_os = "windows")]
+    ensure_configured_windows_taps(&config)?;
     let identity = load_node_identity(&config.identity_path).with_context(|| {
         format!(
             "could not load node identity {}",
@@ -293,6 +343,19 @@ async fn run_client(config_path: &Path) -> Result<()> {
             }
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_configured_windows_taps(config: &ClientConfig) -> Result<()> {
+    for network in &config.networks {
+        WindowsTapDevice::ensure_adapter(&network.tap_adapter).with_context(|| {
+            format!(
+                "could not provision TAP adapter {:?} for network {}",
+                network.tap_adapter, network.network_id
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -845,13 +908,12 @@ fn full_jitter(cap: Duration) -> Result<Duration> {
 
 async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Write) -> Result<()> {
     let config = ClientConfig::load(config_path).context("could not load client configuration")?;
-    if !config
+    let configured = config
         .networks
         .iter()
-        .any(|network| network.network_id == args.network)
-    {
-        anyhow::bail!("network {} is not configured", args.network);
-    }
+        .find(|network| network.network_id == args.network)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("network {} is not configured", args.network))?;
     let identity = load_node_identity(&config.identity_path).with_context(|| {
         format!(
             "could not load node identity {}",
@@ -863,12 +925,28 @@ async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Wr
         .context("controller authentication failed")?;
     let mut active = ActiveControl::new(connection);
     let epoch = active
-        .leave_network(args.network)
+        .leave_network(configured.network_id)
         .await
         .context("controller network leave failed")?;
-    remove_network_intent(config_path, args.network)?;
+    #[cfg(target_os = "windows")]
+    {
+        let managed_name = windows_tap_adapter_name(configured.network_id);
+        let removal = WindowsTapDevice::remove_adapter(&managed_name).with_context(|| {
+            format!(
+                "could not remove managed TAP adapter {managed_name:?} for network {}",
+                configured.network_id
+            )
+        })?;
+        if removal.reboot_required() {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "warning: Windows requires a reboot to finish removing TAP adapter {managed_name:?}"
+            );
+        }
+    }
+    remove_network_intent(config_path, configured.network_id)?;
     report_control_shutdown(active.shutdown().await, &mut std::io::stderr().lock());
-    writeln!(output, "network_id={}", args.network)?;
+    writeln!(output, "network_id={}", configured.network_id)?;
     writeln!(output, "controller_epoch={epoch}")?;
     Ok(())
 }
@@ -916,18 +994,13 @@ fn status(config_path: &Path, output: &mut dyn Write) -> Result<()> {
 }
 
 async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Write) -> Result<()> {
-    validate_join_tap(args)?;
     let invitation = load_join_invitation(args)?;
     prepare_invitation_configuration(config_path, args, invitation.as_ref(), output)?;
     let config = ClientConfig::load(config_path).context("could not load client configuration")?;
     let network_id = join_network_id(args, invitation.as_ref())?;
-    validate_intent_compatibility(&config, network_id, args)?;
-    let identity = load_node_identity(&config.identity_path).with_context(|| {
-        format!(
-            "could not load node identity {}",
-            config.identity_path.display()
-        )
-    })?;
+    let tap = join_tap_selection(network_id, args)?;
+    validate_intent_compatibility(&config, network_id, &tap)?;
+    let provision = JoinTapProvision::prepare(&tap)?;
     let invitation_join_token = invitation
         .as_ref()
         .map(|value| BearerCredential::from_bytes(*value.join_token()));
@@ -945,22 +1018,31 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
     let enrollment = enrollment_token
         .as_ref()
         .map(|credential| Enrollment::new(credential, &config.display_name));
-    let connection = authenticate_controller(&config.controller, &identity, enrollment)
-        .await
-        .context("controller authentication failed")?;
-    let mut active = ActiveControl::new(connection);
-    let state = active
-        .join_network(network_id, join_token)
-        .await
-        .context("controller network join failed")?;
-    let epoch = state.controller_epoch();
-    let revision = state.snapshot_revision();
-    persist_network_intent(
-        config_path,
-        network_id,
-        &args.tap_adapter,
-        args.tap_peer.as_deref(),
-    )?;
+    let join_result: Result<_> = async {
+        let identity = load_node_identity(&config.identity_path).with_context(|| {
+            format!(
+                "could not load node identity {}",
+                config.identity_path.display()
+            )
+        })?;
+        let connection = authenticate_controller(&config.controller, &identity, enrollment)
+            .await
+            .context("controller authentication failed")?;
+        let mut active = ActiveControl::new(connection);
+        let state = active
+            .join_network(network_id, join_token)
+            .await
+            .context("controller network join failed")?;
+        let epoch = state.controller_epoch();
+        let revision = state.snapshot_revision();
+        persist_network_intent(config_path, network_id, &tap.adapter, tap.peer.as_deref())?;
+        Ok((active, epoch, revision))
+    }
+    .await;
+    let (active, epoch, revision) = match join_result {
+        Ok(success) => success,
+        Err(error) => return Err(provision.rollback(error)),
+    };
     report_control_shutdown(active.shutdown().await, &mut std::io::stderr().lock());
     writeln!(output, "network_id={network_id}")?;
     writeln!(output, "controller_epoch={epoch}")?;
@@ -971,15 +1053,15 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
 fn validate_intent_compatibility(
     config: &ClientConfig,
     network_id: NetworkId,
-    args: &JoinArgs,
+    tap: &JoinTapSelection,
 ) -> Result<()> {
     if let Some(existing) = config
         .networks
         .iter()
         .find(|network| network.network_id == network_id)
     {
-        if existing.tap_adapter != args.tap_adapter
-            || existing.tap_peer.as_deref() != args.tap_peer.as_deref()
+        if existing.tap_adapter != tap.adapter
+            || existing.tap_peer.as_deref() != tap.peer.as_deref()
         {
             anyhow::bail!(
                 "network {} is already configured for TAP selection {:?}/{:?}",
@@ -990,6 +1072,30 @@ fn validate_intent_compatibility(
         }
     }
     Ok(())
+}
+
+fn join_tap_selection(network_id: NetworkId, args: &JoinArgs) -> Result<JoinTapSelection> {
+    #[cfg(target_os = "windows")]
+    {
+        if args.tap_adapter.is_some() || args.tap_peer.is_some() {
+            anyhow::bail!("TAP selection is managed automatically on Windows");
+        }
+        Ok(JoinTapSelection {
+            adapter: windows_tap_adapter_name(network_id),
+            peer: None,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        validate_join_tap(args)?;
+        Ok(JoinTapSelection {
+            adapter: args
+                .tap_adapter
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--tap-adapter is required"))?,
+            peer: args.tap_peer.clone(),
+        })
+    }
 }
 
 fn report_control_shutdown<E: std::fmt::Display>(
@@ -1160,21 +1266,28 @@ fn persist_network_intent(
 
 #[cfg(target_os = "macos")]
 fn validate_join_tap(args: &JoinArgs) -> Result<()> {
-    validate_feth_name(&args.tap_adapter, "--tap-adapter")?;
+    let tap_adapter = args
+        .tap_adapter
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--tap-adapter is required on macOS"))?;
+    validate_feth_name(tap_adapter, "--tap-adapter")?;
     let tap_peer = args
         .tap_peer
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--tap-peer is required on macOS"))?;
     validate_feth_name(tap_peer, "--tap-peer")?;
-    if args.tap_adapter == tap_peer {
+    if tap_adapter == tap_peer {
         anyhow::bail!("--tap-peer must differ from --tap-adapter");
     }
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[allow(clippy::unnecessary_wraps)]
-const fn validate_join_tap(_args: &JoinArgs) -> Result<()> {
+fn validate_join_tap(args: &JoinArgs) -> Result<()> {
+    if args.tap_adapter.is_none() {
+        anyhow::bail!("--tap-adapter is required");
+    }
     Ok(())
 }
 
@@ -1553,7 +1666,7 @@ mod tests {
             network: None,
             token: None,
             enrollment_token: None,
-            tap_adapter,
+            tap_adapter: (!cfg!(target_os = "windows")).then_some(tap_adapter),
             tap_peer,
             display_name: Some("Invited node".to_owned()),
             udp_bind: None,
@@ -1626,7 +1739,7 @@ mod tests {
 
     #[test]
     fn cli_accepts_stdin_invitation_without_exposing_it_as_an_argument() {
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        #[cfg_attr(target_os = "windows", allow(unused_mut))]
         let mut arguments = vec![
             "stella-client",
             "join",
@@ -1634,9 +1747,9 @@ mod tests {
             "-",
             "--display-name",
             "Invited node",
-            "--tap-adapter",
-            "feth400",
         ];
+        #[cfg(not(target_os = "windows"))]
+        arguments.extend(["--tap-adapter", "feth400"]);
         #[cfg(target_os = "macos")]
         arguments.extend(["--tap-peer", "feth401"]);
         let cli = Cli::try_parse_from(arguments).expect("parse stdin invitation input");
@@ -1666,6 +1779,33 @@ mod tests {
         .expect("load invitation from standard input")
         .expect("stdin invitation is present");
         assert_eq!(loaded.network_id(), invitation.network_id());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_join_derives_and_hides_the_managed_tap_adapter() {
+        let network_id = NetworkId::from_bytes([0x66; 16]);
+        let network = network_id.to_string();
+        let cli = Cli::try_parse_from(["stella-client", "join", "--network", &network])
+            .expect("parse Windows join without a TAP selector");
+        let Command::Join(args) = cli.command else {
+            panic!("expected join command");
+        };
+        assert!(args.tap_adapter.is_none());
+        let tap = super::join_tap_selection(network_id, &args)
+            .expect("derive the managed Windows TAP name");
+        assert_eq!(tap.adapter, format!("Stella {network_id}"));
+        assert!(tap.peer.is_none());
+
+        assert!(Cli::try_parse_from([
+            "stella-client",
+            "join",
+            "--network",
+            &network,
+            "--tap-adapter",
+            "Custom TAP",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1989,7 +2129,7 @@ mod tests {
             network: Some(network_id),
             token: None,
             enrollment_token: None,
-            tap_adapter: "en0".to_owned(),
+            tap_adapter: Some("en0".to_owned()),
             tap_peer: Some("feth301".to_owned()),
             display_name: None,
             udp_bind: None,
@@ -2006,7 +2146,9 @@ mod tests {
         persist_network_intent(&config_path, network_id, "feth300", Some("feth301"))
             .expect("persist macOS pair");
         let config = ClientConfig::load(&config_path).expect("load macOS pair");
-        validate_intent_compatibility(&config, network_id, &args)
+        let selection = super::join_tap_selection(network_id, &args)
+            .expect("resolve the complete macOS feth pair");
+        validate_intent_compatibility(&config, network_id, &selection)
             .expect("identical pair is idempotent");
 
         let conflict = JoinArgs {
@@ -2015,13 +2157,15 @@ mod tests {
             network: Some(network_id),
             token: None,
             enrollment_token: None,
-            tap_adapter: "feth300".to_owned(),
+            tap_adapter: Some("feth300".to_owned()),
             tap_peer: Some("feth302".to_owned()),
             display_name: None,
             udp_bind: None,
             https_proxy: None,
             identity: None,
         };
+        let conflict = super::join_tap_selection(network_id, &conflict)
+            .expect("resolve the conflicting macOS feth pair");
         assert!(validate_intent_compatibility(&config, network_id, &conflict).is_err());
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }

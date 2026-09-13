@@ -189,6 +189,13 @@ pub struct ConfiguredNetwork {
     pub tap_peer: Option<String>,
 }
 
+/// Returns the stable TAP-Windows adapter name managed for `network_id`.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn windows_tap_adapter_name(network_id: NetworkId) -> String {
+    format!("Stella {network_id}")
+}
+
 /// Client configuration loading or semantic validation failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]

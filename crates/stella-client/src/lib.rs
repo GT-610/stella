@@ -24,6 +24,8 @@ mod tls;
 mod turn;
 
 pub use active::{ActiveControl, ControlUpdate, HeartbeatReport};
+#[cfg(target_os = "windows")]
+pub use config::windows_tap_adapter_name;
 pub use config::{ClientConfig, ClientConfigError, ConfiguredNetwork, CONFIG_VERSION};
 pub use connectivity::{ConnectivityConfigState, RelayServiceState};
 pub use control::{
