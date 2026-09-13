@@ -387,9 +387,12 @@ datagram queues. The one-megabyte control-record ceiling belongs to the control
 plane and does not increase any TURN queue. Relayed datagrams retain the 65,507
 byte absolute ceiling and the lower advertised default of 1,200 bytes.
 
-When a client data or inbound channel is full, the new datagram is dropped. The
-separate control channel prevents a queued data backlog from consuming capacity
-needed for permission work, credential refresh, or shutdown.
+`try_send_to` is nonblocking: it drops the complete datagram when the client
+egress channel is full, and the receive path drops an inbound datagram when the
+inbound channel is full. Blocking `send_to` and `send_indication_to` use the
+`data_command` path and await egress capacity before returning. The separate
+control channel prevents a queued data backlog from consuming capacity needed
+for permission work, credential refresh, or shutdown.
 
 Stream carriers inherently introduce head-of-line blocking. Implementations do
 not build an unbounded reorder layer above them. Direct paths remain preferred,

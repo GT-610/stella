@@ -43,7 +43,7 @@ use crate::{
     ice::looks_like_stun,
     stun::{
         discover_server_reflexive, discover_server_reflexive_with_timeout, gather_host_candidates,
-        server_reflexive_candidates, DeferredUdpDatagram, StunDiscovery,
+        server_reflexive_candidates, DeferredUdpDatagram, StunDiscovery, StunDiscoveryFailure,
     },
     ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
     NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState, StunDiscoveryError,
@@ -2603,14 +2603,24 @@ fn replace_server_reflexive_candidates(
 }
 
 fn recover_stun_discovery(
-    result: Result<StunDiscovery, StunDiscoveryError>,
+    result: Result<StunDiscovery, StunDiscoveryFailure>,
     local_address: Option<SocketAddr>,
 ) -> StunDiscovery {
     match result {
         Ok(discovery) => discovery,
-        Err(error) => {
-            tracing::warn!(?local_address, %error, "same-socket STUN discovery failed");
-            StunDiscovery::default()
+        Err(failure) => {
+            tracing::warn!(
+                ?local_address,
+                error = %failure.error,
+                dropped = failure.dropped_datagrams,
+                deferred = failure.deferred.len(),
+                "same-socket STUN discovery failed"
+            );
+            StunDiscovery {
+                deferred: failure.deferred,
+                dropped_datagrams: failure.dropped_datagrams,
+                ..StunDiscovery::default()
+            }
         }
     }
 }
@@ -2772,7 +2782,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use crate::stun::{StunDiscovery, StunMapping};
+    use crate::stun::{DeferredUdpDatagram, StunDiscovery, StunDiscoveryFailure, StunMapping};
     use stella_common::{NodeId, RelayId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
     use stella_proto::{
@@ -2791,15 +2801,37 @@ mod tests {
         allocate_preferred_relays, allocate_relay_selections, complementary_bind_address,
         excluded_tap_interfaces, matching_relay_selection, next_relay_dns_result,
         normalize_direct_candidates, preferred_relay_settings, random_ice_credential,
-        relay_reconnect_cap, relay_reconnect_delay, relay_selections, replace_host_candidates,
-        replace_server_reflexive_candidates, turn_bind_address, unix_time, ClientDataRuntime,
-        ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture, RelayPathKey,
-        RuntimeError, RuntimeRelayCarrier, TurnUdpError, WarmRelay,
-        HOST_CANDIDATE_REFRESH_INTERVAL, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
-        MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY,
-        TURN_UDP_MAX_DATAGRAM_SIZE,
+        recover_stun_discovery, relay_reconnect_cap, relay_reconnect_delay, relay_selections,
+        replace_host_candidates, replace_server_reflexive_candidates, turn_bind_address, unix_time,
+        ClientDataRuntime, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
+        RelayPathKey, RuntimeError, RuntimeRelayCarrier, StunDiscoveryError, TurnUdpError,
+        WarmRelay, HOST_CANDIDATE_REFRESH_INTERVAL, ICE_PASSWORD_RANDOM_LENGTH,
+        ICE_USERNAME_RANDOM_LENGTH, MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY,
+        TAP_EVENT_QUEUE_CAPACITY, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
     use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
+
+    #[test]
+    fn failed_stun_refresh_retains_deferred_datagrams() {
+        let deferred = DeferredUdpDatagram {
+            source: stella_transport::Endpoint::Udp(
+                "192.0.2.80:47000".parse().expect("deferred source"),
+            ),
+            bytes: vec![0x42, 0x43],
+        };
+        let recovered = recover_stun_discovery(
+            Err(StunDiscoveryFailure {
+                error: StunDiscoveryError::DeadlineOverflow,
+                deferred: vec![deferred.clone()],
+                dropped_datagrams: 2,
+            }),
+            Some("192.0.2.81:47001".parse().expect("local address")),
+        );
+
+        assert_eq!(recovered.deferred, vec![deferred]);
+        assert_eq!(recovered.dropped_datagrams, 2);
+        assert!(recovered.mappings.is_empty());
+    }
 
     #[test]
     fn ice_excludes_both_sides_of_configured_tap_pairs() {

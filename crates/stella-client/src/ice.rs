@@ -353,7 +353,11 @@ impl IceAgent {
             .filter_map(|(peer_node_id, target)| target.map(|target| (peer_node_id, target)))
             .collect::<Vec<_>>();
         for (peer_node_id, target) in consent_due {
-            self.create_transaction(peer_node_id, target, TransactionKind::Consent, now)?;
+            match self.create_transaction(peer_node_id, target, TransactionKind::Consent, now) {
+                Ok(_) => {}
+                Err(IceError::TransactionCapacity) => break,
+                Err(error) => return Err(error),
+            }
         }
 
         let nomination_due = self
@@ -1234,6 +1238,52 @@ mod tests {
             .expect("configured peer")
             .nomination_target
             .is_none());
+    }
+
+    #[test]
+    fn consent_waits_when_transaction_capacity_is_full() {
+        let local_id = NodeId::from_bytes([0x45; 16]);
+        let peer_id = NodeId::from_bytes([0x46; 16]);
+        let local_candidate = candidate("192.0.2.46:40000", 2_130_706_431);
+        let remote_candidate = candidate("192.0.2.47:40001", 300);
+        let mut agent = IceAgent::new(
+            local_id,
+            10,
+            b"LocalUfr",
+            b"LocalPassword123456789",
+            &[local_candidate],
+        )
+        .expect("local agent");
+        agent
+            .upsert_peer(IcePeerConfig {
+                node_id: peer_id,
+                generation_id: 2,
+                tie_breaker: 20,
+                username_fragment: b"PeerUfrag",
+                password: b"PeerPassword1234567890",
+                candidates: &[remote_candidate],
+            })
+            .expect("configure peer candidate");
+        let peer = agent.peers.get_mut(&peer_id).expect("configured peer");
+        peer.nominated = Some(remote_candidate.address);
+        peer.next_consent_at = Some(Duration::ZERO);
+        for _ in 0..MAX_ACTIVE_TRANSACTIONS {
+            agent
+                .create_transaction(
+                    peer_id,
+                    remote_candidate.address,
+                    TransactionKind::Connectivity,
+                    Duration::ZERO,
+                )
+                .expect("fill transaction capacity");
+        }
+
+        agent
+            .poll(Duration::ZERO)
+            .expect("capacity defers consent without failing poll");
+        let peer = agent.peers.get(&peer_id).expect("configured peer");
+        assert!(peer.consent_target.is_none());
+        assert_eq!(peer.next_consent_at, Some(Duration::ZERO));
     }
 
     #[test]

@@ -66,6 +66,14 @@ pub(crate) struct StunDiscovery {
     pub(crate) dropped_datagrams: usize,
 }
 
+/// A failed discovery together with traffic received before the failure.
+#[derive(Debug)]
+pub(crate) struct StunDiscoveryFailure {
+    pub(crate) error: StunDiscoveryError,
+    pub(crate) deferred: Vec<DeferredUdpDatagram>,
+    pub(crate) dropped_datagrams: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StunMapping {
     pub(crate) mapped_address: SocketAddr,
@@ -122,7 +130,7 @@ pub(crate) fn gather_host_candidates(
 pub(crate) async fn discover_server_reflexive(
     transport: &UdpTransport,
     servers: &[StunServer],
-) -> Result<StunDiscovery, StunDiscoveryError> {
+) -> Result<StunDiscovery, StunDiscoveryFailure> {
     discover_server_reflexive_with_timeout(transport, servers, TRANSACTION_TIMEOUT).await
 }
 
@@ -131,22 +139,28 @@ pub(crate) async fn discover_server_reflexive_with_timeout(
     transport: &UdpTransport,
     servers: &[StunServer],
     transaction_timeout: Duration,
-) -> Result<StunDiscovery, StunDiscoveryError> {
+) -> Result<StunDiscovery, StunDiscoveryFailure> {
     let mut deferred = Vec::new();
     let mut dropped_datagrams = 0;
     let started_at = Instant::now();
-    let deadline = started_at
-        .checked_add(transaction_timeout)
-        .ok_or(StunDiscoveryError::DeadlineOverflow)?;
+    let deadline = preserve_discovery_error(
+        started_at
+            .checked_add(transaction_timeout)
+            .ok_or(StunDiscoveryError::DeadlineOverflow),
+        &mut deferred,
+        dropped_datagrams,
+    )?;
     let mut seen_servers = BTreeSet::new();
-    let mut transactions = servers
+    let transactions = servers
         .iter()
         .copied()
         .filter(|server| server.address.is_ipv4() == transport.local_address().is_ipv4())
         .filter(|server| seen_servers.insert(server.address))
         .take(MAX_STUN_SERVERS)
         .map(|server| BindingTransaction::new(server.address, started_at, deadline))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>();
+    let mut transactions =
+        preserve_discovery_error(transactions, &mut deferred, dropped_datagrams)?;
     let mut mappings = Vec::new();
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_SIZE];
     while !transactions.is_empty() {
@@ -157,12 +171,21 @@ pub(crate) async fn discover_server_reflexive_with_timeout(
         }
         for transaction in &mut transactions {
             if now >= transaction.next_send {
-                transport
-                    .send_to(&Endpoint::Udp(transaction.server), &transaction.request)
-                    .await?;
-                transaction.next_send = now
-                    .checked_add(transaction.retransmit)
-                    .ok_or(StunDiscoveryError::DeadlineOverflow)?;
+                preserve_discovery_error(
+                    transport
+                        .send_to(&Endpoint::Udp(transaction.server), &transaction.request)
+                        .await
+                        .map_err(StunDiscoveryError::from),
+                    &mut deferred,
+                    dropped_datagrams,
+                )?;
+                let next_send = preserve_discovery_error(
+                    now.checked_add(transaction.retransmit)
+                        .ok_or(StunDiscoveryError::DeadlineOverflow),
+                    &mut deferred,
+                    dropped_datagrams,
+                )?;
+                transaction.next_send = next_send;
                 transaction.retransmit = transaction
                     .retransmit
                     .saturating_mul(2)
@@ -173,18 +196,27 @@ pub(crate) async fn discover_server_reflexive_with_timeout(
             .iter()
             .map(|transaction| transaction.next_send.min(transaction.deadline))
             .min()
-            .ok_or(StunDiscoveryError::DeadlineOverflow)?;
+            .ok_or(StunDiscoveryError::DeadlineOverflow);
+        let wake_at = preserve_discovery_error(wake_at, &mut deferred, dropped_datagrams)?;
         let received = match timeout_at(wake_at, transport.receive(&mut receive_buffer)).await {
-            Ok(result) => result?,
+            Ok(result) => preserve_discovery_error(
+                result.map_err(StunDiscoveryError::from),
+                &mut deferred,
+                dropped_datagrams,
+            )?,
             Err(_elapsed) => continue,
         };
         let bytes = receive_buffer[..received.length].to_vec();
-        if !accept_binding_response(
-            transport.local_address(),
-            &received.source,
-            &bytes,
-            &mut transactions,
-            &mut mappings,
+        if !preserve_discovery_error(
+            accept_binding_response(
+                transport.local_address(),
+                &received.source,
+                &bytes,
+                &mut transactions,
+                &mut mappings,
+            ),
+            &mut deferred,
+            dropped_datagrams,
         )? {
             defer_datagram(
                 &mut deferred,
@@ -197,6 +229,18 @@ pub(crate) async fn discover_server_reflexive_with_timeout(
     Ok(StunDiscovery {
         mappings,
         deferred,
+        dropped_datagrams,
+    })
+}
+
+fn preserve_discovery_error<T>(
+    result: Result<T, StunDiscoveryError>,
+    deferred: &mut Vec<DeferredUdpDatagram>,
+    dropped_datagrams: usize,
+) -> Result<T, StunDiscoveryFailure> {
+    result.map_err(|error| StunDiscoveryFailure {
+        error,
+        deferred: std::mem::take(deferred),
         dropped_datagrams,
     })
 }

@@ -41,6 +41,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
       - name: Run Clippy

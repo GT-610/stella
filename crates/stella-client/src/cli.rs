@@ -1491,8 +1491,8 @@ mod tests {
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
 
     use super::{
-        configuration_document, full_jitter, persist_network_intent,
-        load_join_invitation_with_stdin, prepare_invitation_configuration, read_join_invitation,
+        configuration_document, full_jitter, load_join_invitation_with_stdin,
+        persist_network_intent, prepare_invitation_configuration, read_join_invitation,
         reconnect_cap, remove_network_intent, report_control_shutdown, Cli, CliCredential,
         CliInvitation, Command, InitArgs, JoinArgs, MAXIMUM_RECONNECT_DELAY,
     };
