@@ -42,8 +42,8 @@ use zeroize::Zeroizing;
 use crate::{
     ice::looks_like_stun,
     stun::{
-        discover_server_reflexive, gather_host_candidates, server_reflexive_candidates,
-        DeferredUdpDatagram, StunDiscovery,
+        discover_server_reflexive, discover_server_reflexive_with_timeout, gather_host_candidates,
+        server_reflexive_candidates, DeferredUdpDatagram, StunDiscovery,
     },
     ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
     NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState, StunDiscoveryError,
@@ -61,6 +61,7 @@ const ICE_GENERATION_REFRESH_LEAD: u64 = 120;
 const ICE_USERNAME_RANDOM_LENGTH: usize = 6;
 const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
 const HOST_CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const STUN_REFRESH_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(250);
 const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
 const RELAY_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_CARRIER_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -580,12 +581,23 @@ impl ClientDataRuntime {
             });
         let secondary_discovery = async {
             match &self.secondary_udp {
-                Some(secondary) => discover_server_reflexive(secondary, &stun_servers).await,
+                Some(secondary) => {
+                    discover_server_reflexive_with_timeout(
+                        secondary,
+                        &stun_servers,
+                        STUN_REFRESH_TRANSACTION_TIMEOUT,
+                    )
+                    .await
+                }
                 None => Ok(StunDiscovery::default()),
             }
         };
         let (primary_discovery, secondary_discovery) = tokio::join!(
-            discover_server_reflexive(&self.udp, &stun_servers),
+            discover_server_reflexive_with_timeout(
+                &self.udp,
+                &stun_servers,
+                STUN_REFRESH_TRANSACTION_TIMEOUT,
+            ),
             secondary_discovery,
         );
         let primary_discovery =
@@ -2566,12 +2578,28 @@ fn replace_server_reflexive_candidates(
     discoveries: [&StunDiscovery; 2],
     max_datagram_size: u32,
     reserved_relays: usize,
-) {
-    candidates.retain(|candidate| candidate.class != IceCandidateClass::ServerReflexive);
+) -> bool {
+    let mut replacements = Vec::new();
     for discovery in discoveries {
-        candidates.extend(server_reflexive_candidates(discovery, max_datagram_size));
+        replacements.extend(server_reflexive_candidates(discovery, max_datagram_size));
     }
+    if replacements.is_empty() {
+        return false;
+    }
+    let replace_ipv4 = replacements
+        .iter()
+        .any(|candidate| candidate.address.is_ipv4());
+    let replace_ipv6 = replacements
+        .iter()
+        .any(|candidate| candidate.address.is_ipv6());
+    candidates.retain(|candidate| {
+        candidate.class != IceCandidateClass::ServerReflexive
+            || (candidate.address.is_ipv4() && !replace_ipv4)
+            || (candidate.address.is_ipv6() && !replace_ipv6)
+    });
+    candidates.extend(replacements);
     normalize_direct_candidates(candidates, reserved_relays);
+    true
 }
 
 fn recover_stun_discovery(
@@ -3704,7 +3732,12 @@ mod tests {
         };
         let empty = StunDiscovery::default();
         let mut candidates = vec![host, stale];
-        replace_server_reflexive_candidates(&mut candidates, [&discovery, &empty], 1_200, 0);
+        assert!(replace_server_reflexive_candidates(
+            &mut candidates,
+            [&discovery, &empty],
+            1_200,
+            0
+        ));
         assert!(candidates.iter().any(|candidate| {
             candidate.class == IceCandidateClass::ServerReflexive
                 && candidate.address == refreshed_address
@@ -3712,6 +3745,40 @@ mod tests {
         assert!(!candidates
             .iter()
             .any(|candidate| candidate.address == stale.address));
+    }
+
+    #[test]
+    fn empty_stun_refresh_preserves_last_valid_mapping() {
+        let host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let server_reflexive = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000"
+                .parse()
+                .expect("server-reflexive candidate"),
+            related_address: Some(host.address),
+            ..host
+        };
+        let empty = StunDiscovery::default();
+        let mut candidates = vec![host, server_reflexive];
+
+        assert!(!replace_server_reflexive_candidates(
+            &mut candidates,
+            [&empty, &empty],
+            1_200,
+            0
+        ));
+        assert!(candidates.contains(&server_reflexive));
     }
 
     #[test]
