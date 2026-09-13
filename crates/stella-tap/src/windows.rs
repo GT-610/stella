@@ -5,6 +5,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     io,
+    marker::PhantomData,
     mem::{align_of, size_of, MaybeUninit},
     os::windows::{
         ffi::OsStringExt,
@@ -13,7 +14,8 @@ use std::{
     },
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex, Weak},
+    rc::Rc,
+    sync::{Arc, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -35,7 +37,7 @@ use windows::{
         Foundation::{
             ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NOT_FOUND,
             ERROR_NO_DATA, ERROR_NO_MORE_ITEMS, ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND,
-            HANDLE, NO_ERROR, WIN32_ERROR,
+            HANDLE, NO_ERROR, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WIN32_ERROR,
         },
         NetworkManagement::{
             IpHelper::{
@@ -49,9 +51,12 @@ use windows::{
         Networking::WinSock::{ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC},
         Storage::FileSystem::{ReadFile, WriteFile, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_OVERLAPPED},
         System::{
-            Registry::{RegCloseKey, RegGetValueW, HKEY, KEY_READ, RRF_RT_REG_SZ},
+            Registry::{
+                RegCloseKey, RegGetValueW, RegSetValueExW, HKEY, KEY_READ, KEY_SET_VALUE, REG_SZ,
+                RRF_RT_REG_SZ,
+            },
             SystemInformation::GetSystemDirectoryW,
-            Threading::CreateEventW,
+            Threading::{CreateEventW, CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE},
             IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED},
         },
     },
@@ -67,12 +72,13 @@ const TAP_DEVICE_SUFFIX: &str = ".tap";
 const TAP_DESCRIPTION_PREFIX: &str = "tap-windows adapter";
 const TAP_HARDWARE_ID: &str = "tap0901";
 const TAP_DEVICE_DESCRIPTION: &str = "Stella Virtual Ethernet";
+const STELLA_OWNERSHIP_MARKER: &str = "StellaNetCfgInstanceId";
+const DEVICE_MANAGEMENT_MUTEX_NAME: &str = r"Global\GT-610.Stella.Tap.DeviceManagement.v1";
 const MINIMUM_DRIVER_MAJOR: u32 = 9;
 const TAP_VLAN_ALLOWANCE: u32 = 18;
 const DEVICE_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_APPEARANCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-static DEVICE_MANAGEMENT: Mutex<()> = Mutex::new(());
 static NETWORK_DEVICE_CLASS: GUID = GUID_DEVCLASS_NET;
 
 const FILE_DEVICE_UNKNOWN: u32 = 0x22;
@@ -137,6 +143,32 @@ impl WindowsTapProvision {
 pub struct WindowsTapRemoval {
     removed: bool,
     reboot_required: bool,
+}
+
+/// Cross-process guard for one complete Stella TAP management transaction.
+///
+/// The guard must be dropped on the thread that acquired it. The reference
+/// client uses a current-thread Tokio runtime so it can retain this guard
+/// across the complete asynchronous Join, Run, or Leave command.
+pub struct WindowsTapManagementTransaction {
+    handle: OwnedHandle,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for WindowsTapManagementTransaction {
+    fn drop(&mut self) {
+        // SAFETY: This thread owns one recursive acquisition of the mutex and
+        // the handle remains live until the field is dropped after this call.
+        let _ = unsafe { ReleaseMutex(HANDLE(self.handle.as_raw_handle())) };
+    }
+}
+
+impl fmt::Debug for WindowsTapManagementTransaction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WindowsTapManagementTransaction")
+            .finish_non_exhaustive()
+    }
 }
 
 impl WindowsTapRemoval {
@@ -205,6 +237,19 @@ pub struct WindowsTapDevice {
 }
 
 impl WindowsTapDevice {
+    /// Acquires the machine-wide Stella TAP device-management transaction.
+    ///
+    /// Windows mutex ownership is thread-affine, so the returned guard is not
+    /// sendable and must be dropped on the acquiring thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when the named mutex cannot be
+    /// created or acquired.
+    pub fn begin_management_transaction() -> Result<WindowsTapManagementTransaction> {
+        lock_device_management()
+    }
+
     /// Enumerates installed adapters whose driver description identifies
     /// TAP-Windows.
     ///
@@ -258,7 +303,7 @@ impl WindowsTapDevice {
             }
             Err(error) => return Err(error),
         };
-        remove_interface_device(&candidate.metadata.interface_id)
+        remove_interface_device(&candidate.metadata)
     }
 
     fn disconnect(&mut self) -> Result<()> {
@@ -413,12 +458,30 @@ impl Drop for RegistryKey {
     }
 }
 
-fn lock_device_management() -> Result<std::sync::MutexGuard<'static, ()>> {
-    DEVICE_MANAGEMENT.lock().map_err(|_| {
-        TapError::io(
-            TapOperation::CreateDevice,
-            io::Error::other("TAP device-management lock was poisoned"),
-        )
+fn lock_device_management() -> Result<WindowsTapManagementTransaction> {
+    let name = HSTRING::from(DEVICE_MANAGEMENT_MUTEX_NAME);
+    // SAFETY: Null security attributes select the process token's default
+    // descriptor. The returned named mutex handle is newly owned here.
+    let handle = unsafe { CreateMutexW(None, false, &name) }.map_err(|error| {
+        TapError::io(TapOperation::AcquireDeviceLock, windows_error_to_io(&error))
+    })?;
+    // SAFETY: `CreateMutexW` returned a new owned handle that has not been
+    // transferred elsewhere. `OwnedHandle` closes it exactly once.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    // SAFETY: The mutex handle remains live for the wait and is released by
+    // the returned guard on this same thread.
+    let wait = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), INFINITE) };
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        let source = if wait == WAIT_FAILED {
+            io::Error::last_os_error()
+        } else {
+            io::Error::other(format!("unexpected Windows mutex wait result {}", wait.0))
+        };
+        return Err(TapError::io(TapOperation::AcquireDeviceLock, source));
+    }
+    Ok(WindowsTapManagementTransaction {
+        handle,
+        _not_send: PhantomData,
     })
 }
 
@@ -427,7 +490,10 @@ fn ensure_named_candidate(name: &str) -> Result<(AdapterCandidate, bool)> {
     let _management = lock_device_management()?;
     let candidates = enumerate_candidates()?;
     match select_candidate(candidates, Some(name)) {
-        Ok(candidate) => return Ok((candidate, false)),
+        Ok(candidate) => {
+            verify_adapter_ownership(&candidate.metadata)?;
+            return Ok((candidate, false));
+        }
         Err(TapError::AdapterNotFound { .. }) => {}
         Err(error) => return Err(error),
     }
@@ -448,6 +514,7 @@ fn provision_named_adapter(name: &str) -> Result<AdapterCandidate> {
         registered = true;
         install_tap_device(&set, &device)?;
         let interface_id = wait_for_net_cfg_instance_id(&set, &device)?;
+        record_device_ownership(&set, &device, &interface_id)?;
         let candidate = wait_for_interface_candidate(&interface_id)?;
         rename_interface(&candidate.metadata.friendly_name, name)?;
         wait_for_named_interface_candidate(&interface_id, name)
@@ -555,22 +622,41 @@ fn wait_for_net_cfg_instance_id(set: &DeviceInfoSet, device: &SP_DEVINFO_DATA) -
 }
 
 fn read_net_cfg_instance_id(set: &DeviceInfoSet, device: &SP_DEVINFO_DATA) -> Result<String> {
-    // SAFETY: `device` belongs to the live set. The returned driver key is
-    // closed by `RegistryKey`.
-    let key = unsafe {
-        SetupDiOpenDevRegKey(set.0, device, DICS_FLAG_GLOBAL.0, 0, DIREG_DRV, KEY_READ.0)
-    }
-    .map(RegistryKey)
-    .map_err(|error| {
-        TapError::io(
-            TapOperation::QueryDeviceIdentity,
-            windows_error_to_io(&error),
-        )
-    })?;
-    read_registry_string(&key, "NetCfgInstanceId")
+    let key = open_device_registry_key(set, device, KEY_READ.0, TapOperation::QueryDeviceIdentity)?;
+    read_registry_string(&key, "NetCfgInstanceId", TapOperation::QueryDeviceIdentity)
 }
 
-fn read_registry_string(key: &RegistryKey, value_name: &str) -> Result<String> {
+fn open_device_registry_key(
+    set: &DeviceInfoSet,
+    device: &SP_DEVINFO_DATA,
+    access: u32,
+    operation: TapOperation,
+) -> Result<RegistryKey> {
+    // SAFETY: `device` belongs to the live set. The returned driver key is
+    // closed by `RegistryKey`.
+    unsafe { SetupDiOpenDevRegKey(set.0, device, DICS_FLAG_GLOBAL.0, 0, DIREG_DRV, access) }
+        .map(RegistryKey)
+        .map_err(|error| TapError::io(operation, windows_error_to_io(&error)))
+}
+
+fn read_registry_string(
+    key: &RegistryKey,
+    value_name: &str,
+    operation: TapOperation,
+) -> Result<String> {
+    read_optional_registry_string(key, value_name, operation)?.ok_or_else(|| {
+        TapError::io(
+            operation,
+            io::Error::from_raw_os_error(u32_to_i32_bits(ERROR_FILE_NOT_FOUND.0)),
+        )
+    })
+}
+
+fn read_optional_registry_string(
+    key: &RegistryKey,
+    value_name: &str,
+    operation: TapOperation,
+) -> Result<Option<String>> {
     let value_name = HSTRING::from(value_name);
     let mut byte_length = 0_u32;
     // SAFETY: This sizing call supplies no output pointer and a live byte-count
@@ -586,15 +672,15 @@ fn read_registry_string(key: &RegistryKey, value_name: &str) -> Result<String> {
             Some(&raw mut byte_length),
         )
     };
+    if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+        return Ok(None);
+    }
     if status != NO_ERROR {
-        return Err(TapError::io(
-            TapOperation::QueryDeviceIdentity,
-            win32_error_to_io(status),
-        ));
+        return Err(TapError::io(operation, win32_error_to_io(status)));
     }
     if byte_length < 2 || byte_length % 2 != 0 {
         return Err(TapError::io(
-            TapOperation::QueryDeviceIdentity,
+            operation,
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Windows returned an invalid UTF-16 registry string length",
@@ -604,10 +690,7 @@ fn read_registry_string(key: &RegistryKey, value_name: &str) -> Result<String> {
     let mut words = vec![
         0_u16;
         usize::try_from(byte_length / 2).map_err(|error| {
-            TapError::io(
-                TapOperation::QueryDeviceIdentity,
-                io::Error::new(io::ErrorKind::InvalidData, error),
-            )
+            TapError::io(operation, io::Error::new(io::ErrorKind::InvalidData, error))
         })?
     ];
     // SAFETY: `words` owns exactly `byte_length` writable bytes, and the
@@ -624,21 +707,117 @@ fn read_registry_string(key: &RegistryKey, value_name: &str) -> Result<String> {
         )
     };
     if status != NO_ERROR {
-        return Err(TapError::io(
-            TapOperation::QueryDeviceIdentity,
-            win32_error_to_io(status),
-        ));
+        return Err(TapError::io(operation, win32_error_to_io(status)));
     }
     let length = words
         .iter()
         .position(|word| *word == 0)
         .unwrap_or(words.len());
-    String::from_utf16(&words[..length]).map_err(|error| {
-        TapError::io(
-            TapOperation::QueryDeviceIdentity,
-            io::Error::new(io::ErrorKind::InvalidData, error),
+    String::from_utf16(&words[..length])
+        .map(Some)
+        .map_err(|error| TapError::io(operation, io::Error::new(io::ErrorKind::InvalidData, error)))
+}
+
+fn record_device_ownership(
+    set: &DeviceInfoSet,
+    device: &SP_DEVINFO_DATA,
+    interface_id: &str,
+) -> Result<()> {
+    let key = open_device_registry_key(
+        set,
+        device,
+        KEY_SET_VALUE.0,
+        TapOperation::RecordDeviceOwnership,
+    )?;
+    let bytes = canonical_interface_id(interface_id)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    // SAFETY: The key is open for value writes and `bytes` contains a
+    // null-terminated UTF-16 REG_SZ value for the duration of this call.
+    let status = unsafe {
+        RegSetValueExW(
+            key.0,
+            &HSTRING::from(STELLA_OWNERSHIP_MARKER),
+            None,
+            REG_SZ,
+            Some(&bytes),
         )
-    })
+    };
+    if status == NO_ERROR {
+        Ok(())
+    } else {
+        Err(TapError::io(
+            TapOperation::RecordDeviceOwnership,
+            win32_error_to_io(status),
+        ))
+    }
+}
+
+fn verify_adapter_ownership(adapter: &WindowsTapAdapter) -> Result<()> {
+    let set = present_network_device_info_set(TapOperation::VerifyDeviceOwnership)?;
+    let device_info_size = structure_size::<SP_DEVINFO_DATA>(TapOperation::VerifyDeviceOwnership)?;
+    let mut index = 0_u32;
+    loop {
+        let mut device = SP_DEVINFO_DATA {
+            cbSize: device_info_size,
+            ..SP_DEVINFO_DATA::default()
+        };
+        // SAFETY: `device` is writable and initialized with the required size;
+        // `index` advances monotonically through the live set.
+        match unsafe { SetupDiEnumDeviceInfo(set.0, index, &raw mut device) } {
+            Ok(()) => {}
+            Err(error) if is_win32_error(&error, ERROR_NO_MORE_ITEMS) => {
+                return Err(TapError::AdapterNotFound {
+                    selector: Some(adapter.interface_id.clone()),
+                });
+            }
+            Err(error) => {
+                return Err(TapError::io(
+                    TapOperation::VerifyDeviceOwnership,
+                    windows_error_to_io(&error),
+                ));
+            }
+        }
+        index = index.saturating_add(1);
+        let current_id = match read_net_cfg_instance_id(&set, &device) {
+            Ok(value) => value,
+            Err(error) if is_missing_device_identity(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !normalize_interface_id(&current_id)
+            .eq_ignore_ascii_case(normalize_interface_id(&adapter.interface_id))
+        {
+            continue;
+        }
+        return verify_device_ownership_marker(&set, &device, &adapter.friendly_name, &current_id);
+    }
+}
+
+fn verify_device_ownership_marker(
+    set: &DeviceInfoSet,
+    device: &SP_DEVINFO_DATA,
+    name: &str,
+    interface_id: &str,
+) -> Result<()> {
+    let key =
+        open_device_registry_key(set, device, KEY_READ.0, TapOperation::VerifyDeviceOwnership)?;
+    let marker = read_optional_registry_string(
+        &key,
+        STELLA_OWNERSHIP_MARKER,
+        TapOperation::VerifyDeviceOwnership,
+    )?;
+    if marker.as_deref().is_some_and(|value| {
+        normalize_interface_id(value).eq_ignore_ascii_case(normalize_interface_id(interface_id))
+    }) {
+        Ok(())
+    } else {
+        Err(TapError::WindowsAdapterOwnershipConflict {
+            name: name.to_owned(),
+            interface_id: canonical_interface_id(interface_id),
+        })
+    }
 }
 
 fn wait_for_interface_candidate(interface_id: &str) -> Result<AdapterCandidate> {
@@ -726,10 +905,10 @@ fn system_directory() -> Result<PathBuf> {
     }
 }
 
-fn remove_interface_device(interface_id: &str) -> Result<WindowsTapRemoval> {
+fn present_network_device_info_set(operation: TapOperation) -> Result<DeviceInfoSet> {
     // SAFETY: The class GUID and flags request a local snapshot of present
     // network devices; the returned set is owned by `DeviceInfoSet`.
-    let set = unsafe {
+    unsafe {
         SetupDiGetClassDevsW(
             Some(&raw const NETWORK_DEVICE_CLASS),
             PCWSTR::null(),
@@ -738,7 +917,11 @@ fn remove_interface_device(interface_id: &str) -> Result<WindowsTapRemoval> {
         )
     }
     .map(DeviceInfoSet)
-    .map_err(|error| TapError::io(TapOperation::RemoveDevice, windows_error_to_io(&error)))?;
+    .map_err(|error| TapError::io(operation, windows_error_to_io(&error)))
+}
+
+fn remove_interface_device(adapter: &WindowsTapAdapter) -> Result<WindowsTapRemoval> {
+    let set = present_network_device_info_set(TapOperation::RemoveDevice)?;
     let device_info_size = structure_size::<SP_DEVINFO_DATA>(TapOperation::RemoveDevice)?;
     let mut index = 0_u32;
     loop {
@@ -770,11 +953,12 @@ fn remove_interface_device(interface_id: &str) -> Result<WindowsTapRemoval> {
             Err(error) => return Err(error),
         };
         if normalize_interface_id(&current_id)
-            .eq_ignore_ascii_case(normalize_interface_id(interface_id))
+            .eq_ignore_ascii_case(normalize_interface_id(&adapter.interface_id))
         {
+            verify_device_ownership_marker(&set, &device, &adapter.friendly_name, &current_id)?;
             let reboot_required = remove_device_info(&set, &device)?;
             if !reboot_required {
-                wait_for_interface_removal(interface_id)?;
+                wait_for_interface_removal(&adapter.interface_id)?;
             }
             return Ok(WindowsTapRemoval {
                 removed: true,

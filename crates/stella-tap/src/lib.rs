@@ -24,7 +24,7 @@ pub use macos::{
 #[cfg(target_os = "windows")]
 pub use windows::{
     WindowsTapAdapter, WindowsTapCancellation, WindowsTapDevice, WindowsTapDriverVersion,
-    WindowsTapProvision, WindowsTapRemoval,
+    WindowsTapManagementTransaction, WindowsTapProvision, WindowsTapRemoval,
 };
 
 /// Native TAP implementation selected for this Windows build.

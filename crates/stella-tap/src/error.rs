@@ -185,6 +185,14 @@ pub enum TapError {
         /// Packet-I/O peer interface name.
         peer_name: String,
     },
+    /// A TAP-Windows adapter lacks Stella ownership metadata for its GUID.
+    #[error("refusing to manage unowned TAP-Windows adapter {name:?} ({interface_id})")]
+    WindowsAdapterOwnershipConflict {
+        /// Host-visible Windows interface name.
+        name: String,
+        /// Canonical Windows interface GUID.
+        interface_id: String,
+    },
     /// The helper peer is not the privileged service Stella expected.
     #[error("macOS TAP helper peer has unexpected effective user ID {actual_uid}")]
     HelperIdentityMismatch {

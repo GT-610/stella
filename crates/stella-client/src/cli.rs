@@ -298,12 +298,23 @@ pub(crate) async fn run() -> Result<()> {
     match cli.command {
         Command::Init(args) => initialize(&cli.config, &args, &mut std::io::stdout().lock()),
         Command::Join(args) => {
+            #[cfg(target_os = "windows")]
+            let _tap_management = WindowsTapDevice::begin_management_transaction()
+                .context("could not acquire the Windows TAP management transaction")?;
             join_network(&cli.config, &args, &mut std::io::stdout().lock()).await
         }
         Command::Leave(args) => {
+            #[cfg(target_os = "windows")]
+            let _tap_management = WindowsTapDevice::begin_management_transaction()
+                .context("could not acquire the Windows TAP management transaction")?;
             leave_network(&cli.config, &args, &mut std::io::stdout().lock()).await
         }
-        Command::Run => Box::pin(run_client(&cli.config)).await,
+        Command::Run => {
+            #[cfg(target_os = "windows")]
+            let _tap_management = WindowsTapDevice::begin_management_transaction()
+                .context("could not acquire the Windows TAP management transaction")?;
+            Box::pin(run_client(&cli.config)).await
+        }
         Command::Status => status(&cli.config, &mut std::io::stdout().lock()),
     }
 }

@@ -19,18 +19,16 @@ impl Drop for ProvisionedAdapterCleanup {
 }
 
 #[test]
-#[ignore = "requires exclusive access to an installed TAP-Windows Adapter V9"]
+#[ignore = "creates a TAP-Windows adapter and requires administrator privileges"]
 fn installed_adapter_supports_lifecycle_frame_write_and_cancellation() {
-    let selector = std::env::var("STELLA_TAP_WINDOWS_ADAPTER")
-        .expect("set STELLA_TAP_WINDOWS_ADAPTER to a TAP-Windows connection name or GUID");
-    let adapters = WindowsTapDevice::installed_adapters().expect("enumerate TAP-Windows adapters");
-    let adapter = adapters
-        .iter()
-        .find(|adapter| {
-            adapter.friendly_name.eq_ignore_ascii_case(&selector)
-                || adapter.interface_id.eq_ignore_ascii_case(&selector)
-        })
-        .expect("selected TAP-Windows adapter is installed");
+    let _management =
+        WindowsTapDevice::begin_management_transaction().expect("lock TAP management");
+    let selector = format!("Stella lifecycle test {}", std::process::id());
+    let provision = WindowsTapDevice::ensure_adapter(&selector).expect("ensure test adapter");
+    let _cleanup = provision
+        .created()
+        .then(|| ProvisionedAdapterCleanup(selector.clone()));
+    let adapter = provision.adapter();
     let mtu = u16::try_from(adapter.system_mtu).expect("installed adapter MTU fits u16");
     assert!((576..=9_202).contains(&mtu));
 
@@ -104,15 +102,19 @@ fn installed_adapter_supports_lifecycle_frame_write_and_cancellation() {
 #[test]
 #[ignore = "creates and removes a TAP-Windows adapter and requires administrator privileges"]
 fn provisioning_creates_reuses_opens_and_removes_adapter() {
+    let _management =
+        WindowsTapDevice::begin_management_transaction().expect("lock TAP management");
     let name = format!("Stella provisioning test {}", std::process::id());
     let stale = WindowsTapDevice::remove_adapter(&name).expect("remove stale test adapter");
     assert!(!stale.reboot_required());
 
     let created = WindowsTapDevice::ensure_adapter(&name).expect("create TAP-Windows adapter");
+    let _cleanup = created
+        .created()
+        .then(|| ProvisionedAdapterCleanup(name.clone()));
     assert!(created.created());
     assert_eq!(created.adapter().friendly_name, name);
     let interface_id = created.adapter().interface_id.clone();
-    let _cleanup = ProvisionedAdapterCleanup(name.clone());
 
     let reused = WindowsTapDevice::ensure_adapter(&name).expect("reuse TAP-Windows adapter");
     assert!(!reused.created());
