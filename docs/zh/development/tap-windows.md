@@ -9,13 +9,16 @@
 
 Stella 会管理自己命名的 root 设备生命周期。`ensure_adapter` 会复用匹配适配器，或通过
 SetupAPI 以硬件 ID `tap0901` 创建设备，让 `DiInstallDevice` 从 Driver Store 选择已有签名
-驱动包，等待 `NetCfgInstanceId` 出现，再设置 Windows 连接名称；注册后的任一步失败都会
-删除半成品。`remove_adapter` 通过 SetupAPI 删除匹配设备；若 Windows 不要求重启，还会
-等待接口消失。
+驱动包，等待 `NetCfgInstanceId` 出现，把该 GUID 写入 Stella 专用的驱动注册表标记，再设置
+Windows 连接名称；注册后的任一步失败都会删除半成品。复用和 `remove_adapter` 都要求该
+标记与当前接口 GUID 一致，仅友好名称匹配的设备会被拒绝；若 Windows 不要求重启，删除后
+还会等待接口消失。
 
-客户端将每个网络映射为 `Stella <32位网络ID>`。`join` 在使用凭据前确保该持久适配器，
+客户端将每个网络映射为 `Stella <32 个字符的网络 ID>`。`join` 在使用凭据前确保该持久适配器，
 `run` 会补建丢失设备，普通关闭只把它置为 media-disconnected 以便复用，`leave` 才删除。
-这些设备管理操作需要提升权限。一个打开的 `WindowsTapDevice` 独占一个设备句柄；
+这些设备管理操作需要提升权限。客户端会在完整的 `join`、`run` 或 `leave` 命令期间持有
+Windows 命名 mutex，避免多个 Stella 进程在设备启动、配置提交、回滚或删除时互相竞争。
+一个打开的 `WindowsTapDevice` 独占一个设备句柄；
 `destroy` 或 `Drop` 都会先请求介质断开状态。
 
 后端通过 Windows IP Helper API 枚举适配器。`TapConfig::name` 可指定连接友好名称或接口

@@ -15,15 +15,20 @@ because they can affect unrelated VPN software.
 Stella does own root-device lifecycle for its named adapters. `ensure_adapter`
 reuses a matching TAP adapter or creates one through SetupAPI with hardware ID
 `tap0901`, lets `DiInstallDevice` select the existing signed package, waits for
-its `NetCfgInstanceId`, and assigns the requested Windows connection name.
-Failure after registration removes the partial device. `remove_adapter` removes
-the matching device through SetupAPI and waits for it to disappear unless
-Windows reports that a reboot is required.
+its `NetCfgInstanceId`, records that GUID in a Stella-specific driver registry
+value, and assigns the requested Windows connection name. Failure after
+registration removes the partial device. Reuse and `remove_adapter` require the
+marker to match the current interface GUID; a friendly-name match alone is
+rejected. Removal waits for the interface to disappear unless Windows reports
+that a reboot is required.
 
 The client maps each network to `Stella <32-character-network-id>`. `join`
 ensures that persistent adapter before using credentials, `run` recreates it if
 it is missing, ordinary shutdown leaves it media-disconnected for later reuse,
 and `leave` removes it. These device-management operations require elevation.
+The client holds a named Windows mutex across each complete `join`, `run`, or
+`leave` command so separate Stella processes cannot race device startup,
+configuration commit, rollback, or removal.
 
 One open `WindowsTapDevice` exclusively owns one TAP-Windows device handle. The
 handle is closed by `destroy` or `Drop`; both first request media-disconnected

@@ -18,7 +18,7 @@ ADR 记录约束 Stella 协议或其参考实现的决策。已接受的记录�
 - [0009：使用 Stella 0.1 密码学套件](./0009-cryptographic-suite.md)
 - [0010：对泛洪流量使用有界头端复制](./0010-head-end-flooding.md)
 - [0011：使用 TOML 进行本地配置](./0011-toml-configuration.md)
-- [0012：从 Driver Store 配置每网络 TAP-Windows 适配器](./0012-preinstalled-tap-windows-adapters.md)
+- [0012：按稳定身份打开预安装的 TAP-Windows 适配器](./0012-preinstalled-tap-windows-adapters.md)
 - [0013：在专用 crate 中共享控制通道机制](./0013-shared-control-channel-crate.md)
 - [0014：在 redb 中存储控制器授权状态](./0014-redb-controller-state.md)
 - [0015：使用原生 ACL 保护控制器身份文件](./0015-protect-controller-identity-files.md)
@@ -43,3 +43,4 @@ ADR 记录约束 Stella 协议或其参考实现的决策。已接受的记录�
 - [0035：控制器重连期间保留有效转发](./0035-preserve-forwarding-during-controller-reconnect.md)
 - [0036：在 macOS 上使用持久 feth pair 提供二层接入](./0036-use-persistent-feth-pairs-on-macos.md)
 - [0037：在特权 helper 后维护自有 macOS TAP 后端](./0037-own-macos-tap-helper.md)
+- [0039：自动配置有所有权证明的每网络 TAP-Windows 适配器](./0039-provision-owned-tap-windows-adapters.md)

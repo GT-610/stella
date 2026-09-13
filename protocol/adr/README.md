@@ -21,7 +21,7 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0009: Use the Stella version 0.1 cryptographic suite](./0009-cryptographic-suite.md)
 - [0010: Use head-end replication for flooded traffic](./0010-head-end-flooding.md)
 - [0011: Use TOML for local configuration](./0011-toml-configuration.md)
-- [0012: Provision per-network TAP-Windows adapters](./0012-preinstalled-tap-windows-adapters.md)
+- [0012: Open pre-installed TAP-Windows adapters](./0012-preinstalled-tap-windows-adapters.md)
 - [0013: Share control-channel mechanics in a dedicated crate](./0013-shared-control-channel-crate.md)
 - [0014: Store controller authority state in redb](./0014-redb-controller-state.md)
 - [0015: Protect controller identity files with native ACLs](./0015-protect-controller-identity-files.md)
@@ -48,3 +48,4 @@ Statuses used in this directory are `Proposed`, `Accepted`, `Superseded`, and
 - [0036: Use persistent feth pairs for macOS Layer-2 access](./0036-use-persistent-feth-pairs-on-macos.md)
 - [0037: Own the macOS TAP backend behind a privileged helper](./0037-own-macos-tap-helper.md)
 - [0038: Keep bounded relay hot standby paths](./0038-keep-bounded-relay-hot-standby.md)
+- [0039: Provision owned per-network TAP-Windows adapters](./0039-provision-owned-tap-windows-adapters.md)

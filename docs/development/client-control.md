@@ -30,10 +30,10 @@ into redacted zeroizing values, never logs them, and never stores them in TOML.
 After a successful join, the network ID is durable intent; reconnect joins that
 existing membership without a token.
 
-The version 1 configuration schema is:
+The current version 2 configuration schema is:
 
 ```toml
-version = 1
+version = 2
 
 [controller]
 address = "203.0.113.10:44900"
@@ -74,7 +74,10 @@ tap_peer = "feth101"
 Relative paths are rooted beside the configuration file. Endpoint and network
 entries are normalized into protocol order, duplicate network IDs are rejected,
 and unknown keys, including any attempted inline enrollment or join token, make
-the complete file invalid. Windows derives `Stella <network-id>`, provisions it
+the complete file invalid. On Windows, version 1 network entries are normalized
+to the derived adapter name and rewritten as version 2 on the next membership
+change. Version 2 rejects any other adapter name. Windows derives
+`Stella <network-id>`, provisions it
 before consuming join credentials, and recreates it during `run` if necessary.
 macOS additionally rejects missing, equal, or non-`feth<N>` TAP names. The
 `networks` array may be absent immediately after `init`; each successful `join`

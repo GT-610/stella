@@ -85,7 +85,8 @@ export default defineConfig({
                 { text: '0033：Relay 刷新', link: '/zh/protocol/adr/0033-preserve-relay-carrier-on-refresh' },
                 { text: '0034：Relay 热恢复', link: '/zh/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' },
                 { text: '0035：控制重连保活', link: '/zh/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' },
-                { text: '0036：macOS feth', link: '/zh/protocol/adr/0036-use-persistent-feth-pairs-on-macos' }
+                { text: '0036：macOS feth', link: '/zh/protocol/adr/0036-use-persistent-feth-pairs-on-macos' },
+                { text: '0039：自动配置 TAP-Windows', link: '/zh/protocol/adr/0039-provision-owned-tap-windows-adapters' }
               ]
             }
           ],
@@ -206,7 +207,8 @@ export default defineConfig({
             { text: '0033: Preserve relay carrier', link: '/protocol/adr/0033-preserve-relay-carrier-on-refresh' },
             { text: '0034: Hot relay recovery', link: '/protocol/adr/0034-recover-relay-without-restarting-direct-sessions' },
             { text: '0035: Preserve reconnect forwarding', link: '/protocol/adr/0035-preserve-forwarding-during-controller-reconnect' },
-            { text: '0036: macOS feth pairs', link: '/protocol/adr/0036-use-persistent-feth-pairs-on-macos' }
+            { text: '0036: macOS feth pairs', link: '/protocol/adr/0036-use-persistent-feth-pairs-on-macos' },
+            { text: '0039: Automatic TAP-Windows provisioning', link: '/protocol/adr/0039-provision-owned-tap-windows-adapters' }
           ]
         }
       ],
