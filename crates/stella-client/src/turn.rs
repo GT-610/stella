@@ -54,7 +54,8 @@ use crate::{
 
 type HmacSha256 = Hmac<Sha256>;
 
-const TURN_UDP_COMMAND_CAPACITY: usize = 64;
+const TURN_UDP_CONTROL_COMMAND_CAPACITY: usize = 64;
+const TURN_UDP_DATA_COMMAND_CAPACITY: usize = 64;
 const TURN_UDP_RECEIVE_CAPACITY: usize = 256;
 const TURN_UDP_RECEIVE_BUFFER_SIZE: usize = u16::MAX as usize;
 const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -835,6 +836,7 @@ pub struct TurnUdpClient {
     local_address: SocketAddr,
     capabilities: TransportCapabilities,
     commands: mpsc::Sender<Command>,
+    data_commands: mpsc::Sender<DataCommand>,
     inbound: Mutex<mpsc::Receiver<InboundEvent>>,
     task: Mutex<Option<JoinHandle<()>>>,
     shutdown: AtomicBool,
@@ -891,9 +893,11 @@ impl TurnUdpClient {
         let relayed_address = allocation.relayed_address;
         let mapped_address = allocation.mapped_address;
         actor.schedule_allocation_refresh(allocation.lifetime)?;
-        let (commands, command_receiver) = mpsc::channel(TURN_UDP_COMMAND_CAPACITY);
+        let (commands, command_receiver) = mpsc::channel(TURN_UDP_CONTROL_COMMAND_CAPACITY);
+        let (data_commands, data_command_receiver) = mpsc::channel(TURN_UDP_DATA_COMMAND_CAPACITY);
         let (inbound_sender, inbound) = mpsc::channel(TURN_UDP_RECEIVE_CAPACITY);
         actor.commands = Some(command_receiver);
+        actor.data_commands = Some(data_command_receiver);
         actor.inbound = Some(inbound_sender);
         let task = tokio::spawn(actor.run());
         Ok(Self {
@@ -906,6 +910,7 @@ impl TurnUdpClient {
                 max_datagram_size: config.max_datagram_size,
             },
             commands,
+            data_commands,
             inbound: Mutex::new(inbound),
             task: Mutex::new(Some(task)),
             shutdown: AtomicBool::new(false),
@@ -1009,7 +1014,7 @@ impl TurnUdpClient {
         }
         let endpoint = endpoint.clone();
         let datagram = datagram.to_vec();
-        self.command(|response| Command::Send {
+        self.data_command(|response| DataCommand::Send {
             endpoint,
             datagram,
             response,
@@ -1020,7 +1025,7 @@ impl TurnUdpClient {
     /// Enqueues one complete datagram without waiting for relay I/O.
     ///
     /// Delivery failures stop the allocation actor and are reported by
-    /// [`Self::receive`]. The bounded command queue keeps a slow reliable
+    /// [`Self::receive`]. The bounded data queue keeps a slow reliable
     /// carrier from applying backpressure to unrelated runtime paths.
     ///
     /// # Errors
@@ -1040,11 +1045,11 @@ impl TurnUdpClient {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(TurnUdpError::ActorStopped);
         }
-        let command = Command::SendQueued {
+        let command = DataCommand::SendQueued {
             endpoint: endpoint.clone(),
             datagram: datagram.to_vec(),
         };
-        self.commands
+        self.data_commands
             .try_send(command)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => TurnUdpError::CommandQueueFull,
@@ -1075,7 +1080,7 @@ impl TurnUdpClient {
         }
         let endpoint = endpoint.clone();
         let datagram = datagram.to_vec();
-        self.command(|response| Command::SendIndication {
+        self.data_command(|response| DataCommand::SendIndication {
             endpoint,
             datagram,
             response,
@@ -1163,6 +1168,21 @@ impl TurnUdpClient {
     ) -> Result<(), TurnUdpError> {
         let (response, receiver) = oneshot::channel();
         self.commands
+            .send(create(response))
+            .await
+            .map_err(|_| TurnUdpError::ActorStopped)?;
+        receiver.await.map_err(|_| TurnUdpError::ActorStopped)?
+    }
+
+    async fn data_command<F>(&self, create: F) -> Result<(), TurnUdpError>
+    where
+        F: FnOnce(oneshot::Sender<Result<(), TurnUdpError>>) -> DataCommand,
+    {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(TurnUdpError::ActorStopped);
+        }
+        let (response, receiver) = oneshot::channel();
+        self.data_commands
             .send(create(response))
             .await
             .map_err(|_| TurnUdpError::ActorStopped)?;
@@ -1927,6 +1947,16 @@ enum Command {
         endpoint: TransportEndpoint,
         response: oneshot::Sender<Result<(), TurnUdpError>>,
     },
+    ReplaceCredentials {
+        credentials: TurnCredentials,
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+    Shutdown {
+        response: oneshot::Sender<Result<(), TurnUdpError>>,
+    },
+}
+
+enum DataCommand {
     Send {
         endpoint: TransportEndpoint,
         datagram: Vec<u8>,
@@ -1939,13 +1969,6 @@ enum Command {
     SendIndication {
         endpoint: TransportEndpoint,
         datagram: Vec<u8>,
-        response: oneshot::Sender<Result<(), TurnUdpError>>,
-    },
-    ReplaceCredentials {
-        credentials: TurnCredentials,
-        response: oneshot::Sender<Result<(), TurnUdpError>>,
-    },
-    Shutdown {
         response: oneshot::Sender<Result<(), TurnUdpError>>,
     },
 }
@@ -1991,6 +2014,7 @@ struct Actor {
     credentials: TurnCredentials,
     auth: AuthContext,
     commands: Option<mpsc::Receiver<Command>>,
+    data_commands: Option<mpsc::Receiver<DataCommand>>,
     inbound: Option<mpsc::Sender<InboundEvent>>,
     allocation_refresh_at: Instant,
     permissions: BTreeMap<IpAddr, Permission>,
@@ -2019,6 +2043,7 @@ impl Actor {
             credentials,
             auth,
             commands: None,
+            data_commands: None,
             inbound: None,
             allocation_refresh_at: deadline_after(MIN_REFRESH_INTERVAL, "initial refresh")?,
             permissions: BTreeMap::new(),
@@ -2069,6 +2094,9 @@ impl Actor {
         let Some(mut commands) = self.commands.take() else {
             return;
         };
+        let Some(mut data_commands) = self.data_commands.take() else {
+            return;
+        };
         loop {
             tokio::select! {
                 command = commands.recv() => {
@@ -2076,6 +2104,12 @@ impl Actor {
                         break;
                     };
                     if self.handle_command(command).await {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep_until(self.allocation_refresh_at) => {
+                    if let Err(error) = self.refresh_allocation(self.config.allocation_lifetime_seconds).await {
+                        self.fail(error).await;
                         break;
                     }
                 }
@@ -2088,9 +2122,11 @@ impl Actor {
                         }
                     }
                 }
-                () = tokio::time::sleep_until(self.allocation_refresh_at) => {
-                    if let Err(error) = self.refresh_allocation(self.config.allocation_lifetime_seconds).await {
-                        self.fail(error).await;
+                data_command = data_commands.recv() => {
+                    let Some(data_command) = data_command else {
+                        break;
+                    };
+                    if self.handle_data_command(data_command).await {
                         break;
                     }
                 }
@@ -2110,33 +2146,6 @@ impl Actor {
                 let _result = response.send(result);
                 false
             }
-            Command::SendIndication {
-                endpoint,
-                datagram,
-                response,
-            } => {
-                let result = self.send_indication_to_peer(&endpoint, &datagram).await;
-                let _result = response.send(result);
-                false
-            }
-            Command::Send {
-                endpoint,
-                datagram,
-                response,
-            } => {
-                let result = self.send_to_peer(&endpoint, &datagram).await;
-                let _result = response.send(result);
-                false
-            }
-            Command::SendQueued { endpoint, datagram } => {
-                match self.send_to_peer(&endpoint, &datagram).await {
-                    Ok(()) => false,
-                    Err(error) => {
-                        self.fail(error).await;
-                        true
-                    }
-                }
-            }
             Command::ReplaceCredentials {
                 credentials,
                 response,
@@ -2152,6 +2161,38 @@ impl Actor {
                 let result = self.refresh_allocation(0).await;
                 let _result = response.send(result);
                 true
+            }
+        }
+    }
+
+    async fn handle_data_command(&mut self, command: DataCommand) -> bool {
+        match command {
+            DataCommand::Send {
+                endpoint,
+                datagram,
+                response,
+            } => {
+                let result = self.send_to_peer(&endpoint, &datagram).await;
+                let _result = response.send(result);
+                false
+            }
+            DataCommand::SendQueued { endpoint, datagram } => {
+                match self.send_to_peer(&endpoint, &datagram).await {
+                    Ok(()) => false,
+                    Err(error) => {
+                        self.fail(error).await;
+                        true
+                    }
+                }
+            }
+            DataCommand::SendIndication {
+                endpoint,
+                datagram,
+                response,
+            } => {
+                let result = self.send_indication_to_peer(&endpoint, &datagram).await;
+                let _result = response.send(result);
+                false
             }
         }
     }
@@ -2905,8 +2946,9 @@ mod tests {
 
     use super::{
         encode_message, transact_initial, validate_websocket_upgrade_response,
-        websocket_upgrade_request, ClientIo, TurnCredentials, TurnTcpClient, TurnTcpClientConfig,
-        TurnUdpClient, TurnUdpClientConfig, TurnUdpError, TurnWebSocketClientConfig,
+        websocket_upgrade_request, ClientIo, Command, TurnCredentials, TurnTcpClient,
+        TurnTcpClientConfig, TurnUdpClient, TurnUdpClientConfig, TurnUdpError,
+        TurnWebSocketClientConfig,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{TurnTlsClient, TurnTlsClientConfig, TurnWebSocketClient};
@@ -2918,6 +2960,7 @@ mod tests {
     fn queued_relay_send_applies_bounded_backpressure() {
         let relay_id = RelayId::from_bytes([0x31; 16]);
         let (commands, _command_receiver) = tokio::sync::mpsc::channel(1);
+        let (data_commands, _data_command_receiver) = tokio::sync::mpsc::channel(1);
         let (_inbound_sender, inbound) = tokio::sync::mpsc::channel(1);
         let client = TurnUdpClient {
             carrier: stella_transport::RelayCarrier::TurnUdp,
@@ -2929,6 +2972,7 @@ mod tests {
                 max_datagram_size: 1_200,
             },
             commands,
+            data_commands,
             inbound: tokio::sync::Mutex::new(inbound),
             task: tokio::sync::Mutex::new(None),
             shutdown: std::sync::atomic::AtomicBool::new(false),
@@ -2944,6 +2988,11 @@ mod tests {
             client.try_send_to(&endpoint, b"second"),
             Err(TurnUdpError::CommandQueueFull)
         ));
+        let (response, _receiver) = tokio::sync::oneshot::channel();
+        client
+            .commands
+            .try_send(Command::Shutdown { response })
+            .expect("data saturation preserves control capacity");
     }
 
     #[tokio::test]
