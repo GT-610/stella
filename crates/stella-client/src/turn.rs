@@ -2933,12 +2933,11 @@ mod tests {
     use stella_transport::{
         Endpoint as TransportEndpoint, TurnStream, MAX_TURN_STREAM_RECORD_SIZE,
     };
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-        sync::oneshot,
-        time::timeout,
-    };
+    #[cfg(any(windows, target_os = "macos"))]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(any(windows, target_os = "macos"))]
+    use tokio::net::TcpStream;
+    use tokio::{net::TcpListener, sync::oneshot, time::timeout};
     use tokio_tungstenite::tungstenite::http::{
         header::{AUTHORIZATION, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL},
         Response,

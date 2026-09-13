@@ -1490,11 +1490,13 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
 
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::prepare_invitation_configuration;
     use super::{
         configuration_document, full_jitter, load_join_invitation_with_stdin,
-        persist_network_intent, prepare_invitation_configuration, read_join_invitation,
-        reconnect_cap, remove_network_intent, report_control_shutdown, Cli, CliCredential,
-        CliInvitation, Command, InitArgs, JoinArgs, MAXIMUM_RECONNECT_DELAY,
+        persist_network_intent, read_join_invitation, reconnect_cap, remove_network_intent,
+        report_control_shutdown, Cli, CliCredential, CliInvitation, Command, InitArgs, JoinArgs,
+        MAXIMUM_RECONNECT_DELAY,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
@@ -1541,6 +1543,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn invitation_join_args(invitation: JoinInvitation) -> JoinArgs {
         let (tap_adapter, tap_peer) = tap_selection(130);
         JoinArgs {
