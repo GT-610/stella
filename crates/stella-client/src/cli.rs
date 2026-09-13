@@ -36,6 +36,7 @@ const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAXIMUM_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const PENDING_NETWORK_REMOVALS_SUFFIX: &str = ".pending-network-removals";
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const DATA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "windows")]
@@ -320,6 +321,7 @@ pub(crate) async fn run() -> Result<()> {
 }
 
 async fn run_client(config_path: &Path) -> Result<()> {
+    ensure_no_pending_network_removals(config_path)?;
     let config = ClientConfig::load(config_path).context("could not load client configuration")?;
     #[cfg(target_os = "windows")]
     ensure_configured_windows_taps(&config)?;
@@ -938,10 +940,12 @@ async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Wr
         .await
         .context("controller authentication failed")?;
     let mut active = ActiveControl::new(connection);
+    record_pending_network_removal(config_path, configured.network_id)
+        .context("could not persist network leave recovery state")?;
     let epoch = active
         .leave_network(configured.network_id)
         .await
-        .context("controller network leave failed")?;
+        .context("controller network leave failed; network removal recovery state was kept")?;
     #[cfg(target_os = "windows")]
     let adapter_cleanup: Result<()> = (|| {
         let managed_name = windows_tap_adapter_name(configured.network_id);
@@ -961,7 +965,15 @@ async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Wr
     })();
     #[cfg(not(target_os = "windows"))]
     let adapter_cleanup: Result<()> = Ok(());
-    let intent_cleanup = remove_network_intent(config_path, configured.network_id);
+    let intent_cleanup = match remove_network_intent(config_path, configured.network_id) {
+        Ok(()) => clear_pending_network_removal(config_path, configured.network_id),
+        Err(first_error) => match remove_network_intent(config_path, configured.network_id) {
+            Ok(()) => clear_pending_network_removal(config_path, configured.network_id),
+            Err(retry_error) => Err(retry_error.context(format!(
+                "initial durable network removal also failed: {first_error:#}; recovery state was kept"
+            ))),
+        },
+    };
     report_control_shutdown(active.shutdown().await, &mut std::io::stderr().lock());
     match (adapter_cleanup, intent_cleanup) {
         (Ok(()), Ok(())) => {}
@@ -1355,6 +1367,105 @@ fn remove_network_intent(config_path: &Path, network_id: NetworkId) -> Result<()
     })
 }
 
+fn pending_network_removals_path(config_path: &Path) -> PathBuf {
+    let mut path = config_path.as_os_str().to_owned();
+    path.push(PENDING_NETWORK_REMOVALS_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn read_pending_network_removals(config_path: &Path) -> Result<Vec<NetworkId>> {
+    let path = pending_network_removals_path(config_path);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not read network removal recovery state {}",
+                    path.display()
+                )
+            })
+        }
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.trim().parse::<NetworkId>().with_context(|| {
+                format!("network removal recovery state contains invalid network ID {line:?}")
+            })
+        })
+        .collect()
+}
+
+fn write_pending_network_removals(config_path: &Path, pending: &[NetworkId]) -> Result<()> {
+    let path = pending_network_removals_path(config_path);
+    if pending.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not clear network removal recovery state {}",
+                        path.display()
+                    )
+                })
+            }
+        }
+    }
+    let mut encoded = String::new();
+    for network_id in pending {
+        encoded.push_str(&network_id.to_string());
+        encoded.push('\n');
+    }
+    let mut file = AtomicWriteFile::open(&path).with_context(|| {
+        format!(
+            "could not open network removal recovery state {}",
+            path.display()
+        )
+    })?;
+    file.write_all(encoded.as_bytes()).with_context(|| {
+        format!(
+            "could not write network removal recovery state {}",
+            path.display()
+        )
+    })?;
+    file.commit()
+        .context("could not atomically commit network removal recovery state")?;
+    Ok(())
+}
+
+fn record_pending_network_removal(config_path: &Path, network_id: NetworkId) -> Result<()> {
+    let mut pending = read_pending_network_removals(config_path)?;
+    if !pending.contains(&network_id) {
+        pending.push(network_id);
+        pending.sort_unstable();
+        write_pending_network_removals(config_path, &pending)?;
+    }
+    Ok(())
+}
+
+fn clear_pending_network_removal(config_path: &Path, network_id: NetworkId) -> Result<()> {
+    let mut pending = read_pending_network_removals(config_path)?;
+    pending.retain(|pending_id| *pending_id != network_id);
+    write_pending_network_removals(config_path, &pending)
+}
+
+fn ensure_no_pending_network_removals(config_path: &Path) -> Result<()> {
+    let pending = read_pending_network_removals(config_path)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let ids = pending
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "network removal recovery is pending for {ids}; refusing to start and rejoin configured networks"
+    );
+}
+
 fn mutate_network_intents(
     config_path: &Path,
     operation: &'static str,
@@ -1695,9 +1806,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::JoinTapSelection;
     use super::{
-        configuration_document, full_jitter, load_join_invitation_with_stdin,
-        persist_network_intent, read_join_invitation, reconnect_cap, remove_network_intent,
-        report_control_shutdown, Cli, CliCredential, Command, InitArgs, MAXIMUM_RECONNECT_DELAY,
+        clear_pending_network_removal, configuration_document, ensure_no_pending_network_removals,
+        full_jitter, load_join_invitation_with_stdin, pending_network_removals_path,
+        persist_network_intent, read_join_invitation, reconnect_cap,
+        record_pending_network_removal, remove_network_intent, report_control_shutdown, Cli,
+        CliCredential, Command, InitArgs, MAXIMUM_RECONNECT_DELAY,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
@@ -2113,6 +2226,27 @@ mod tests {
             std::fs::read_to_string(&config_path).expect("read after missing removal"),
             after_removal
         );
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn pending_network_removal_blocks_rejoin_until_cleared() {
+        let directory = directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let config_path = directory.join("client.toml");
+        let first = NetworkId::from_bytes([0x41; 16]);
+        let second = NetworkId::from_bytes([0x42; 16]);
+
+        record_pending_network_removal(&config_path, first).expect("record first removal");
+        record_pending_network_removal(&config_path, second).expect("record second removal");
+        assert!(ensure_no_pending_network_removals(&config_path).is_err());
+
+        clear_pending_network_removal(&config_path, first).expect("clear first removal");
+        assert!(ensure_no_pending_network_removals(&config_path).is_err());
+        clear_pending_network_removal(&config_path, second).expect("clear second removal");
+        ensure_no_pending_network_removals(&config_path).expect("all removals are clear");
+        assert!(!pending_network_removals_path(&config_path).exists());
+
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
