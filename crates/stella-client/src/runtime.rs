@@ -328,7 +328,7 @@ impl ClientDataRuntime {
                 Ready::Tap(event.ok_or(RuntimeError::TapEventChannelClosed)?)
             }
         };
-        let result = match ready {
+        match ready {
             Ready::Udp(received) => self.process_udp(received, false, signing_key).await,
             Ready::SecondaryUdp(received) => self.process_udp(received, true, signing_key).await,
             Ready::Relay((index, _key, Ok(received))) => {
@@ -345,8 +345,7 @@ impl ClientDataRuntime {
                 Ok(())
             }
             Ready::Tap(event) => self.process_tap_event(event).await,
-        };
-        result
+        }
     }
 
     async fn process_tap_event(&mut self, event: TapEvent) -> Result<(), RuntimeError> {

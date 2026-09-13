@@ -1495,8 +1495,7 @@ mod tests {
     use super::{
         configuration_document, full_jitter, load_join_invitation_with_stdin,
         persist_network_intent, read_join_invitation, reconnect_cap, remove_network_intent,
-        report_control_shutdown, Cli, CliCredential, CliInvitation, Command, InitArgs, JoinArgs,
-        MAXIMUM_RECONNECT_DELAY,
+        report_control_shutdown, Cli, CliCredential, Command, InitArgs, MAXIMUM_RECONNECT_DELAY,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
@@ -1504,6 +1503,8 @@ mod tests {
     use super::{initialize, status};
     #[cfg(target_os = "macos")]
     use super::{validate_intent_compatibility, validate_join_tap};
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::{CliInvitation, JoinArgs};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
