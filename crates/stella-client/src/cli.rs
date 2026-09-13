@@ -943,7 +943,7 @@ async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Wr
         .await
         .context("controller network leave failed")?;
     #[cfg(target_os = "windows")]
-    {
+    let adapter_cleanup: Result<()> = (|| {
         let managed_name = windows_tap_adapter_name(configured.network_id);
         let removal = WindowsTapDevice::remove_adapter(&managed_name).with_context(|| {
             format!(
@@ -957,9 +957,22 @@ async fn leave_network(config_path: &Path, args: &LeaveArgs, output: &mut dyn Wr
                 "warning: Windows requires a reboot to finish removing TAP adapter {managed_name:?}"
             );
         }
-    }
-    remove_network_intent(config_path, configured.network_id)?;
+        Ok(())
+    })();
+    #[cfg(not(target_os = "windows"))]
+    let adapter_cleanup: Result<()> = Ok(());
+    let intent_cleanup = remove_network_intent(config_path, configured.network_id);
     report_control_shutdown(active.shutdown().await, &mut std::io::stderr().lock());
+    match (adapter_cleanup, intent_cleanup) {
+        (Ok(()), Ok(())) => {}
+        (Err(adapter_error), Ok(())) => return Err(adapter_error),
+        (Ok(()), Err(intent_error)) => return Err(intent_error),
+        (Err(adapter_error), Err(intent_error)) => {
+            return Err(intent_error.context(format!(
+                "managed TAP cleanup also failed: {adapter_error:#}"
+            )))
+        }
+    }
     writeln!(output, "network_id={}", configured.network_id)?;
     writeln!(output, "controller_epoch={epoch}")?;
     Ok(())
@@ -1339,12 +1352,27 @@ fn mutate_network_intents(
     let mut document = text
         .parse::<toml::Table>()
         .with_context(|| format!("could not decode configuration for {operation}"))?;
+    let schema_version = document
+        .get("version")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| anyhow::anyhow!("configuration version is missing or invalid"))?;
     let networks = document
         .entry("networks")
         .or_insert_with(|| toml::Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("configuration networks field is not an array"))?;
-    if !mutate(networks)? {
+    #[cfg(target_os = "windows")]
+    let normalized = if schema_version == 1 {
+        normalize_legacy_windows_network_intents(networks)?
+    } else {
+        false
+    };
+    #[cfg(not(target_os = "windows"))]
+    let normalized = false;
+    let changed = mutate(networks)?;
+    let upgraded = schema_version != stella_client::CONFIG_VERSION;
+    if !changed && !normalized && !upgraded {
         return Ok(());
     }
     networks.sort_by(|left, right| {
@@ -1352,6 +1380,10 @@ fn mutate_network_intents(
             .and_then(toml::Value::as_str)
             .cmp(&right.get("id").and_then(toml::Value::as_str))
     });
+    document.insert(
+        "version".to_owned(),
+        toml::Value::Integer(i64::from(stella_client::CONFIG_VERSION)),
+    );
     let encoded = toml::to_string_pretty(&document)
         .with_context(|| format!("could not encode configuration after {operation}"))?;
     let base = config_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1363,6 +1395,29 @@ fn mutate_network_intents(
     file.commit()
         .context("could not atomically commit updated client configuration")?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_legacy_windows_network_intents(networks: &mut [toml::Value]) -> Result<bool> {
+    let mut changed = false;
+    for entry in networks {
+        let table = entry
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("configuration network entry is not a table"))?;
+        let id = table
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("configuration network ID is missing or invalid"))?;
+        let network_id = id
+            .parse::<NetworkId>()
+            .with_context(|| format!("configuration network ID {id:?} is invalid"))?;
+        let expected = windows_tap_adapter_name(network_id);
+        if table.get("tap_adapter").and_then(toml::Value::as_str) != Some(expected.as_str()) {
+            table.insert("tap_adapter".to_owned(), toml::Value::String(expected));
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 fn initialize(config_path: &Path, args: &InitArgs, output: &mut dyn Write) -> Result<()> {
@@ -1406,7 +1461,7 @@ fn initialize_inner(
 
 fn configuration_document(args: &InitArgs) -> Result<String> {
     let document = InitialDocument {
-        version: 1,
+        version: stella_client::CONFIG_VERSION,
         controller: InitialController {
             address: args.controller,
             tls_name: &args.tls_name,
@@ -1620,6 +1675,12 @@ mod tests {
 
     #[cfg(any(windows, target_os = "macos"))]
     use super::prepare_invitation_configuration;
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    use super::validate_intent_compatibility;
+    #[cfg(target_os = "macos")]
+    use super::validate_join_tap;
+    #[cfg(target_os = "windows")]
+    use super::JoinTapSelection;
     use super::{
         configuration_document, full_jitter, load_join_invitation_with_stdin,
         persist_network_intent, read_join_invitation, reconnect_cap, remove_network_intent,
@@ -1629,8 +1690,6 @@ mod tests {
     use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
     #[cfg(any(windows, target_os = "macos"))]
     use super::{initialize, status};
-    #[cfg(target_os = "macos")]
-    use super::{validate_intent_compatibility, validate_join_tap};
     #[cfg(any(windows, target_os = "macos"))]
     use super::{CliInvitation, JoinArgs};
 
@@ -1657,24 +1716,31 @@ mod tests {
         }
     }
 
-    fn tap_selection(index: u16) -> (String, Option<String>) {
+    fn tap_selection(network_id: NetworkId, index: u16) -> (String, Option<String>) {
         #[cfg(target_os = "macos")]
         {
+            let _ = network_id;
             let visible = index.saturating_mul(2);
             (
                 format!("feth{visible}"),
                 Some(format!("feth{}", visible.saturating_add(1))),
             )
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
         {
+            let _ = index;
+            (stella_client::windows_tap_adapter_name(network_id), None)
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            let _ = network_id;
             (format!("Stella LAN {index}"), None)
         }
     }
 
     #[cfg(any(windows, target_os = "macos"))]
     fn invitation_join_args(invitation: JoinInvitation) -> JoinArgs {
-        let (tap_adapter, tap_peer) = tap_selection(130);
+        let (tap_adapter, tap_peer) = tap_selection(invitation.network_id(), 130);
         JoinArgs {
             invitation: Some(CliInvitation(invitation)),
             invite_file: None,
@@ -1823,6 +1889,46 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_windows_intent_normalizes_before_join_and_persistence() {
+        let directory = directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let config_path = directory.join("client.toml");
+        let network_id = NetworkId::from_bytes([0x67; 16]);
+        let mut legacy = configuration_document(&init_args())
+            .expect("encode configuration")
+            .replace("version = 2", "version = 1")
+            .replace("networks = []\n\n", "");
+        std::fmt::Write::write_fmt(
+            &mut legacy,
+            format_args!("\n[[networks]]\nid = \"{network_id}\"\ntap_adapter = \"Legacy TAP\"\n"),
+        )
+        .expect("append legacy network intent");
+        std::fs::write(&config_path, legacy).expect("write legacy configuration");
+
+        let expected = stella_client::windows_tap_adapter_name(network_id);
+        let config = ClientConfig::load(&config_path).expect("load migrated legacy intent");
+        assert_eq!(config.networks[0].tap_adapter, expected);
+        validate_intent_compatibility(
+            &config,
+            network_id,
+            &JoinTapSelection {
+                adapter: expected.clone(),
+                peer: None,
+            },
+        )
+        .expect("legacy intent matches the derived Windows selection");
+
+        persist_network_intent(&config_path, network_id, &expected, None)
+            .expect("persist migrated intent");
+        let migrated = std::fs::read_to_string(&config_path).expect("read migrated configuration");
+        assert!(migrated.contains("version = 2"));
+        assert!(migrated.contains(&format!("tap_adapter = \"{expected}\"")));
+        assert!(!migrated.contains("Legacy TAP"));
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
     #[test]
     fn short_control_shutdown_failure_is_only_a_warning() {
         let mut warnings = Vec::new();
@@ -1923,7 +2029,7 @@ mod tests {
         let initial = configuration_document(&init_args()).expect("encode configuration");
         std::fs::write(&config_path, initial).expect("write configuration");
         let network_id = NetworkId::from_bytes([0x33; 16]);
-        let (tap, tap_peer) = tap_selection(100);
+        let (tap, tap_peer) = tap_selection(network_id, 100);
 
         persist_network_intent(&config_path, network_id, &tap, tap_peer.as_deref())
             .expect("persist network intent");
@@ -1945,7 +2051,7 @@ mod tests {
             std::fs::read_to_string(&config_path).expect("reread configuration"),
             first
         );
-        let (other_tap, other_peer) = tap_selection(101);
+        let (other_tap, other_peer) = tap_selection(NetworkId::from_bytes([0x34; 16]), 101);
         assert!(persist_network_intent(
             &config_path,
             network_id,
@@ -1977,8 +2083,8 @@ mod tests {
         std::fs::write(&config_path, initial).expect("write configuration");
         let first = NetworkId::from_bytes([0x31; 16]);
         let second = NetworkId::from_bytes([0x32; 16]);
-        let (first_tap, first_peer) = tap_selection(110);
-        let (second_tap, second_peer) = tap_selection(111);
+        let (first_tap, first_peer) = tap_selection(first, 110);
+        let (second_tap, second_peer) = tap_selection(second, 111);
         persist_network_intent(&config_path, first, &first_tap, first_peer.as_deref())
             .expect("persist first network");
         persist_network_intent(&config_path, second, &second_tap, second_peer.as_deref())
@@ -2082,14 +2188,10 @@ mod tests {
         let config_path = directory.join("client.toml");
         let args = init_args();
         initialize(&config_path, &args, &mut Vec::new()).expect("initialize client");
-        let (tap, tap_peer) = tap_selection(120);
-        persist_network_intent(
-            &config_path,
-            NetworkId::from_bytes([0x55; 16]),
-            &tap,
-            tap_peer.as_deref(),
-        )
-        .expect("persist network");
+        let network_id = NetworkId::from_bytes([0x55; 16]);
+        let (tap, tap_peer) = tap_selection(network_id, 120);
+        persist_network_intent(&config_path, network_id, &tap, tap_peer.as_deref())
+            .expect("persist network");
 
         let mut output = Vec::new();
         status(&config_path, &mut output).expect("read status");
