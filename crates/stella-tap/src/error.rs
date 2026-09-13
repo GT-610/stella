@@ -311,6 +311,7 @@ pub enum TapError {
 }
 
 impl TapError {
+    #[allow(dead_code, reason = "used by platform-specific TAP backends")]
     pub(crate) fn io(operation: TapOperation, source: io::Error) -> Self {
         Self::Io { operation, source }
     }

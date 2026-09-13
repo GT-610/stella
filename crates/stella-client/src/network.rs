@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use stella_common::{MacAddress, NetworkId, NodeId};
+use stella_common::{MacAddress, NetworkId, NodeId, RelayId};
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
     CommonHeader, ConnectivityCarrier, Endpoint, HandshakeHeader, IceCandidate, IceCandidateClass,
@@ -172,11 +172,11 @@ struct PeerPath {
 /// Active, isolated state for one TAP-backed virtual network.
 pub struct NetworkDataPlane {
     state: NetworkState,
-    udp_family: IpFamily,
+    udp_families: u8,
     max_datagram_size: usize,
     switch: L2Switch,
     handshakes: PeerHandshakeManager,
-    available_relay_carriers: u16,
+    available_relay_carriers: BTreeMap<RelayId, u16>,
     nominated_direct_paths: BTreeMap<NodeId, SocketAddr>,
     pending_path_upgrades: BTreeMap<NodeId, PathId>,
     paths: BTreeMap<PathId, PeerPath>,
@@ -201,6 +201,30 @@ impl NetworkDataPlane {
         signing_key: &IdentitySigningKey,
         now: Duration,
     ) -> Result<Self, NetworkDataError> {
+        Self::new_with_udp_addresses(
+            state,
+            primary_mac,
+            &[udp_bind],
+            max_datagram_size,
+            signing_key,
+            now,
+        )
+    }
+
+    /// Creates a network router that can use every supplied direct UDP family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkDataError`] when the primary TAP MAC, authoritative
+    /// peer state, or handshake configuration is invalid.
+    pub fn new_with_udp_addresses(
+        state: NetworkState,
+        primary_mac: MacAddress,
+        udp_addresses: &[SocketAddr],
+        max_datagram_size: usize,
+        signing_key: &IdentitySigningKey,
+        now: Duration,
+    ) -> Result<Self, NetworkDataError> {
         let local_node_id = state.local_grant().node_id;
         let mut handshakes = PeerHandshakeManager::new(local_node_id);
         for peer in state.peers().keys().copied() {
@@ -214,11 +238,13 @@ impl NetworkDataPlane {
         let switch = L2Switch::new(state.policy(), primary_mac, now)?;
         let mut plane = Self {
             state,
-            udp_family: IpFamily::from(udp_bind.ip()),
+            udp_families: udp_addresses.iter().fold(0_u8, |families, address| {
+                families | IpFamily::from(address.ip()).bit()
+            }),
             max_datagram_size,
             switch,
             handshakes,
-            available_relay_carriers: 0,
+            available_relay_carriers: BTreeMap::new(),
             nominated_direct_paths: BTreeMap::new(),
             pending_path_upgrades: BTreeMap::new(),
             paths: BTreeMap::new(),
@@ -249,7 +275,7 @@ impl NetworkDataPlane {
             .collect()
     }
 
-    /// Enables or disables one local relay carrier and rebuilds affected paths.
+    /// Replaces the locally allocated relay carriers and rebuilds affected paths.
     ///
     /// Existing sessions are withdrawn because changing local carrier
     /// availability changes which exact `PathId` can send and receive packets.
@@ -258,19 +284,20 @@ impl NetworkDataPlane {
     ///
     /// Returns [`NetworkDataError`] if rebuilding the current peer path set
     /// exhausts local path identifiers.
-    pub fn set_relay_carrier_available(
+    pub fn set_available_relay_carriers(
         &mut self,
-        carrier: ConnectivityCarrier,
-        available: bool,
+        relays: &[(RelayId, ConnectivityCarrier)],
     ) -> Result<(), NetworkDataError> {
-        let Some(bit) = relay_carrier_bit(carrier) else {
-            return Ok(());
-        };
-        let updated = if available {
-            self.available_relay_carriers | bit
-        } else {
-            self.available_relay_carriers & !bit
-        };
+        let mut updated = BTreeMap::new();
+        for &(relay_id, carrier) in relays {
+            let Some(bit) = relay_carrier_bit(carrier) else {
+                continue;
+            };
+            updated
+                .entry(relay_id)
+                .and_modify(|carriers| *carriers |= bit)
+                .or_insert(bit);
+        }
         if self.available_relay_carriers == updated {
             return Ok(());
         }
@@ -303,7 +330,7 @@ impl NetworkDataPlane {
         if !self.state.peers().contains_key(&peer) {
             return Err(NetworkDataError::NoPeerPath { peer_node_id: peer });
         }
-        if !self.udp_family.matches_socket(address) || !usable_direct_address(address) {
+        if !self.udp_family_available(address) || !usable_direct_address(address) {
             return Err(NetworkDataError::UnauthorizedEndpoint {
                 peer_node_id: peer,
                 endpoint: TransportEndpoint::Udp(address),
@@ -961,7 +988,7 @@ impl NetworkDataPlane {
             .flat_map(|connectivity| connectivity.candidates().iter().copied())
             .filter(|candidate| {
                 candidate.class == IceCandidateClass::Relay
-                    && self.relay_carrier_available(candidate.carrier)
+                    && self.relay_candidate_available(candidate)
             })
             .collect::<Vec<_>>();
         relay_candidates.sort_by_key(|candidate| {
@@ -984,7 +1011,9 @@ impl NetworkDataPlane {
                     .endpoints()
                     .iter()
                     .copied()
-                    .filter(|endpoint| self.udp_family.matches(*endpoint))
+                    .filter(|endpoint| {
+                        self.udp_family_available(endpoint_socket_address(*endpoint))
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1045,11 +1074,20 @@ impl NetworkDataPlane {
         Ok(())
     }
 
-    const fn relay_carrier_available(&self, carrier: ConnectivityCarrier) -> bool {
-        match relay_carrier_bit(carrier) {
-            Some(bit) => self.available_relay_carriers & bit != 0,
-            None => false,
-        }
+    fn relay_candidate_available(&self, candidate: &IceCandidate) -> bool {
+        let Some(relay_id) = candidate.relay_id else {
+            return false;
+        };
+        let Some(bit) = relay_carrier_bit(candidate.carrier) else {
+            return false;
+        };
+        self.available_relay_carriers
+            .get(&relay_id)
+            .is_some_and(|carriers| carriers & bit != 0)
+    }
+
+    fn udp_family_available(&self, address: SocketAddr) -> bool {
+        self.udp_families & IpFamily::from(address.ip()).bit() != 0
     }
 
     fn remove_peer_paths(&mut self, peer: NodeId) {
@@ -1216,18 +1254,11 @@ enum IpFamily {
 }
 
 impl IpFamily {
-    const fn matches(self, endpoint: Endpoint) -> bool {
-        matches!(
-            (self, endpoint),
-            (Self::V4, Endpoint::UdpIpv4 { .. }) | (Self::V6, Endpoint::UdpIpv6 { .. })
-        )
-    }
-
-    const fn matches_socket(self, endpoint: SocketAddr) -> bool {
-        matches!(
-            (self, endpoint),
-            (Self::V4, SocketAddr::V4(_)) | (Self::V6, SocketAddr::V6(_))
-        )
+    const fn bit(self) -> u8 {
+        match self {
+            Self::V4 => 1 << 0,
+            Self::V6 => 1 << 1,
+        }
     }
 }
 
@@ -1338,11 +1369,14 @@ mod tests {
     fn enable_and_assert_relay_carrier(
         plane: &mut NetworkDataPlane,
         peer: NodeId,
+        relay_id: RelayId,
+        available: &mut Vec<(RelayId, ConnectivityCarrier)>,
         carrier: ConnectivityCarrier,
         expected: RelayCarrier,
     ) {
+        available.push((relay_id, carrier));
         plane
-            .set_relay_carrier_available(carrier, true)
+            .set_available_relay_carriers(available)
             .expect("enable relay carrier");
         let selected = plane.select_peer_path(peer).expect("selected relay path");
         assert_eq!(
@@ -1534,10 +1568,13 @@ mod tests {
             TransportEndpoint::Udp("127.0.0.1:46001".parse().expect("primary alice address"));
         let alternate =
             TransportEndpoint::Udp("127.0.0.1:46003".parse().expect("alternate alice address"));
-        let plane = NetworkDataPlane::new(
+        let mut plane = NetworkDataPlane::new_with_udp_addresses(
             state(&store, &controller, &bob_key, network_id),
             MacAddress::from_bytes([0x02, 0, 0, 0, 1, 4]),
-            bob_address,
+            &[
+                bob_address,
+                "[::]:46002".parse().expect("Bob IPv6 bind address"),
+            ],
             1_200,
             &bob_key,
             Duration::ZERO,
@@ -1563,6 +1600,13 @@ mod tests {
                 .expect("resolve alternate path"),
             &alternate
         );
+        let ipv6_address: SocketAddr = "[2001:db8::10]:46001".parse().expect("Alice IPv6 address");
+        plane
+            .nominate_direct_path(alice_id, ipv6_address)
+            .expect("nominate IPv6 direct path");
+        assert!(plane
+            .resolve_peer_path(alice_id, &TransportEndpoint::Udp(ipv6_address))
+            .is_ok());
 
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
@@ -1628,7 +1672,14 @@ mod tests {
         )
         .expect("relay-aware data plane");
         plane
-            .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, true)
+            .set_available_relay_carriers(&[(
+                RelayId::from_bytes([0x56; 16]),
+                ConnectivityCarrier::TurnUdp,
+            )])
+            .expect("enable unrelated TURN UDP relay");
+        assert!(plane.relay_endpoints().is_empty());
+        plane
+            .set_available_relay_carriers(&[(relay_id, ConnectivityCarrier::TurnUdp)])
             .expect("enable TURN UDP paths");
         let relay_endpoint = TransportEndpoint::TurnUdp {
             relay_id,
@@ -1779,7 +1830,7 @@ mod tests {
         )
         .expect("remote data plane");
         local
-            .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, true)
+            .set_available_relay_carriers(&[(relay_id, ConnectivityCarrier::TurnUdp)])
             .expect("enable TURN UDP path");
         let relay_endpoint = TransportEndpoint::TurnUdp {
             relay_id,
@@ -1903,6 +1954,7 @@ mod tests {
         .expect("relay-aware data plane");
         assert!(plane.relay_endpoints().is_empty());
 
+        let mut available = Vec::new();
         for (carrier, expected) in [
             (
                 ConnectivityCarrier::SecureWebSocket,
@@ -1912,11 +1964,19 @@ mod tests {
             (ConnectivityCarrier::TurnTcp, RelayCarrier::TurnTcp),
             (ConnectivityCarrier::TurnUdp, RelayCarrier::TurnUdp),
         ] {
-            enable_and_assert_relay_carrier(&mut plane, alice_id, carrier, expected);
+            enable_and_assert_relay_carrier(
+                &mut plane,
+                alice_id,
+                relay_id,
+                &mut available,
+                carrier,
+                expected,
+            );
         }
 
+        available.retain(|(_, carrier)| *carrier != ConnectivityCarrier::TurnUdp);
         plane
-            .set_relay_carrier_available(ConnectivityCarrier::TurnUdp, false)
+            .set_available_relay_carriers(&available)
             .expect("disable TURN UDP");
         let selected = plane
             .select_peer_path(alice_id)

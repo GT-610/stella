@@ -18,11 +18,14 @@ use tokio::time::{timeout_at, Instant};
 const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(3);
+const POST_SUCCESS_GRACE: Duration = Duration::from_millis(250);
 const RECEIVE_BUFFER_SIZE: usize = 1_200;
 const MAX_DEFERRED_DATAGRAMS: usize = 32;
 const MAX_HOST_CANDIDATES: usize = 16;
+const MAX_STUN_SERVERS: usize = 8;
 const HOST_TYPE_PREFERENCE: u32 = 126;
 const SERVER_REFLEXIVE_TYPE_PREFERENCE: u32 = 100;
+const STUN_FINGERPRINT_XOR: u32 = 0x5354_554e;
 
 /// Failure while gathering direct UDP connectivity candidates.
 #[derive(Debug, Error)]
@@ -43,6 +46,9 @@ pub enum StunDiscoveryError {
     /// A matching STUN response was malformed.
     #[error(transparent)]
     Codec(#[from] stella_proto::CodecError),
+    /// A supplied STUN fingerprint did not authenticate the received record.
+    #[error("STUN FINGERPRINT validation failed")]
+    InvalidFingerprint,
 }
 
 /// One unrelated UDP datagram retained while STUN owned the receive loop.
@@ -53,12 +59,26 @@ pub(crate) struct DeferredUdpDatagram {
 }
 
 /// Successful same-socket server-reflexive discovery and deferred traffic.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct StunDiscovery {
-    pub(crate) mapped_address: Option<SocketAddr>,
-    pub(crate) base_address: Option<SocketAddr>,
+    pub(crate) mappings: Vec<StunMapping>,
     pub(crate) deferred: Vec<DeferredUdpDatagram>,
     pub(crate) dropped_datagrams: usize,
+}
+
+/// A failed discovery together with mappings and traffic received before the failure.
+#[derive(Debug)]
+pub(crate) struct StunDiscoveryFailure {
+    pub(crate) error: StunDiscoveryError,
+    pub(crate) mappings: Vec<StunMapping>,
+    pub(crate) deferred: Vec<DeferredUdpDatagram>,
+    pub(crate) dropped_datagrams: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StunMapping {
+    pub(crate) mapped_address: SocketAddr,
+    pub(crate) base_address: SocketAddr,
 }
 
 /// Enumerates bounded host candidates for the socket family and port.
@@ -107,125 +127,282 @@ pub(crate) fn gather_host_candidates(
         .collect())
 }
 
-/// Performs Binding discovery against configured services in preference order.
+/// Performs Binding discovery against bounded configured services in parallel.
 pub(crate) async fn discover_server_reflexive(
     transport: &UdpTransport,
     servers: &[StunServer],
-) -> Result<StunDiscovery, StunDiscoveryError> {
+) -> Result<StunDiscovery, Box<StunDiscoveryFailure>> {
+    discover_server_reflexive_with_timeout(transport, servers, TRANSACTION_TIMEOUT).await
+}
+
+/// Performs bounded Binding discovery with a caller-selected transaction deadline.
+pub(crate) async fn discover_server_reflexive_with_timeout(
+    transport: &UdpTransport,
+    servers: &[StunServer],
+    transaction_timeout: Duration,
+) -> Result<StunDiscovery, Box<StunDiscoveryFailure>> {
     let mut deferred = Vec::new();
     let mut dropped_datagrams = 0;
-    for server in servers
+    let mut mappings = Vec::new();
+    let started_at = Instant::now();
+    let deadline = preserve_discovery_error(
+        started_at
+            .checked_add(transaction_timeout)
+            .ok_or(StunDiscoveryError::DeadlineOverflow),
+        &mut deferred,
+        &mut mappings,
+        dropped_datagrams,
+    )?;
+    let mut seen_servers = BTreeSet::new();
+    let transactions = servers
         .iter()
         .copied()
         .filter(|server| server.address.is_ipv4() == transport.local_address().is_ipv4())
-    {
-        if let Some(mapped_address) = binding_transaction(
-            transport,
-            server.address,
-            &mut deferred,
-            &mut dropped_datagrams,
-        )
-        .await?
-        {
-            return Ok(StunDiscovery {
-                mapped_address: Some(mapped_address),
-                base_address: routed_base_address(transport.local_address(), server.address),
-                deferred,
+        .filter(|server| seen_servers.insert(server.address))
+        .take(MAX_STUN_SERVERS)
+        .map(|server| BindingTransaction::new(server.address, started_at, deadline))
+        .collect::<Result<Vec<_>, _>>();
+    let mut transactions = preserve_discovery_error(
+        transactions,
+        &mut deferred,
+        &mut mappings,
+        dropped_datagrams,
+    )?;
+    let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_SIZE];
+    while !transactions.is_empty() {
+        let now = Instant::now();
+        transactions.retain(|transaction| now < transaction.deadline);
+        if transactions.is_empty() {
+            break;
+        }
+        for transaction in &mut transactions {
+            if now >= transaction.next_send {
+                preserve_discovery_error(
+                    transport
+                        .send_to(&Endpoint::Udp(transaction.server), &transaction.request)
+                        .await
+                        .map_err(StunDiscoveryError::from),
+                    &mut deferred,
+                    &mut mappings,
+                    dropped_datagrams,
+                )?;
+                let next_send = preserve_discovery_error(
+                    now.checked_add(transaction.retransmit)
+                        .ok_or(StunDiscoveryError::DeadlineOverflow),
+                    &mut deferred,
+                    &mut mappings,
+                    dropped_datagrams,
+                )?;
+                transaction.next_send = next_send;
+                transaction.retransmit = transaction
+                    .retransmit
+                    .saturating_mul(2)
+                    .min(MAX_RETRANSMIT_TIMEOUT);
+            }
+        }
+        let wake_at = transactions
+            .iter()
+            .map(|transaction| transaction.next_send.min(transaction.deadline))
+            .min()
+            .ok_or(StunDiscoveryError::DeadlineOverflow);
+        let wake_at =
+            preserve_discovery_error(wake_at, &mut deferred, &mut mappings, dropped_datagrams)?;
+        let received = match timeout_at(wake_at, transport.receive(&mut receive_buffer)).await {
+            Ok(result) => preserve_discovery_error(
+                result.map_err(StunDiscoveryError::from),
+                &mut deferred,
+                &mut mappings,
                 dropped_datagrams,
-            });
+            )?,
+            Err(_elapsed) => continue,
+        };
+        let bytes = receive_buffer[..received.length].to_vec();
+        let accepted = accept_binding_response(
+            transport.local_address(),
+            &received.source,
+            &bytes,
+            &mut transactions,
+            &mut mappings,
+        );
+        if !preserve_discovery_error(accepted, &mut deferred, &mut mappings, dropped_datagrams)? {
+            defer_datagram(
+                &mut deferred,
+                received.source,
+                bytes,
+                &mut dropped_datagrams,
+            );
         }
     }
     Ok(StunDiscovery {
-        mapped_address: None,
-        base_address: None,
+        mappings,
         deferred,
         dropped_datagrams,
     })
 }
 
-/// Builds one validated server-reflexive candidate from discovery output.
-pub(crate) fn server_reflexive_candidate(
-    discovery: &StunDiscovery,
-    max_datagram_size: u32,
-) -> Option<IceCandidate> {
-    let mapped = discovery.mapped_address?;
-    let base = discovery.base_address?;
-    let candidate = IceCandidate {
-        class: IceCandidateClass::ServerReflexive,
-        carrier: ConnectivityCarrier::DirectUdp,
-        priority: candidate_priority(SERVER_REFLEXIVE_TYPE_PREFERENCE, u16::MAX),
-        foundation: candidate_foundation(IceCandidateClass::ServerReflexive, mapped.ip()),
-        max_datagram_size,
-        address: mapped,
-        related_address: Some(base),
-        relay_id: None,
-    };
-    candidate.validate().is_ok().then_some(candidate)
+fn preserve_discovery_error<T>(
+    result: Result<T, StunDiscoveryError>,
+    deferred: &mut Vec<DeferredUdpDatagram>,
+    mappings: &mut Vec<StunMapping>,
+    dropped_datagrams: usize,
+) -> Result<T, Box<StunDiscoveryFailure>> {
+    result.map_err(|error| {
+        Box::new(StunDiscoveryFailure {
+            error,
+            mappings: std::mem::take(mappings),
+            deferred: std::mem::take(deferred),
+            dropped_datagrams,
+        })
+    })
 }
 
-async fn binding_transaction(
-    transport: &UdpTransport,
-    server: SocketAddr,
-    deferred: &mut Vec<DeferredUdpDatagram>,
-    dropped_datagrams: &mut usize,
-) -> Result<Option<SocketAddr>, StunDiscoveryError> {
-    let transaction_id = random_transaction_id()?;
-    let request = StunMessageRef {
-        message_type: StunMessageType::new(StunMethod::Binding, StunClass::Request),
-        transaction_id,
-        attributes: &[],
+fn accept_binding_response(
+    local_address: SocketAddr,
+    source: &Endpoint,
+    bytes: &[u8],
+    transactions: &mut Vec<BindingTransaction>,
+    mappings: &mut Vec<StunMapping>,
+) -> Result<bool, StunDiscoveryError> {
+    let Some(source) = source.as_udp() else {
+        return Ok(false);
     };
-    let mut encoded = vec![0_u8; request.encoded_len()?];
-    let length = encode_stun_message(request, &mut encoded)?;
-    encoded.truncate(length);
-    let endpoint = Endpoint::Udp(server);
-    let deadline = Instant::now()
-        .checked_add(TRANSACTION_TIMEOUT)
-        .ok_or(StunDiscoveryError::DeadlineOverflow)?;
-    let mut retransmit = INITIAL_RETRANSMIT_TIMEOUT;
-    let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_SIZE];
-    loop {
-        transport.send_to(&endpoint, &encoded).await?;
-        let attempt_deadline = deadline.min(
-            Instant::now()
-                .checked_add(retransmit)
-                .ok_or(StunDiscoveryError::DeadlineOverflow)?,
-        );
-        loop {
-            let received =
-                match timeout_at(attempt_deadline, transport.receive(&mut receive_buffer)).await {
-                    Ok(result) => result?,
-                    Err(_elapsed) => break,
-                };
-            let bytes = receive_buffer[..received.length].to_vec();
-            if received.source != endpoint {
-                defer_datagram(deferred, received.source, bytes, dropped_datagrams);
-                continue;
-            }
-            let Ok(message) = StunMessageView::decode(&bytes) else {
-                continue;
+    if !transactions
+        .iter()
+        .any(|transaction| transaction.server == source)
+    {
+        return Ok(false);
+    }
+    let Ok(message) = StunMessageView::decode(bytes) else {
+        return Ok(true);
+    };
+    let Some(index) = transactions.iter().position(|transaction| {
+        transaction.server == source && transaction.transaction_id == message.transaction_id()
+    }) else {
+        return Ok(true);
+    };
+    if message.message_type().method != StunMethod::Binding {
+        return Ok(true);
+    }
+    if message.message_type().class != StunClass::SuccessResponse
+        || validate_optional_fingerprint(&message).is_err()
+    {
+        transactions.swap_remove(index);
+        return Ok(true);
+    }
+    let Ok(Some(mapped)) = unique_attribute(&message, StunAttributeType::XOR_MAPPED_ADDRESS) else {
+        transactions.swap_remove(index);
+        return Ok(true);
+    };
+    let Ok(mapped_address) = decode_stun_xor_address(mapped, transactions[index].transaction_id)
+    else {
+        transactions.swap_remove(index);
+        return Ok(true);
+    };
+    if mapped_address.is_ipv4() == local_address.is_ipv4() {
+        record_stun_mapping(
+            local_address,
+            transactions[index].server,
+            mapped_address,
+            transactions,
+            mappings,
+        )?;
+    }
+    transactions.swap_remove(index);
+    Ok(true)
+}
+
+fn record_stun_mapping(
+    local_address: SocketAddr,
+    server: SocketAddr,
+    mapped_address: SocketAddr,
+    transactions: &mut [BindingTransaction],
+    mappings: &mut Vec<StunMapping>,
+) -> Result<(), StunDiscoveryError> {
+    let Some(base_address) = routed_base_address(local_address, server) else {
+        return Ok(());
+    };
+    let mapping = StunMapping {
+        mapped_address,
+        base_address,
+    };
+    let first_success = mappings.is_empty();
+    if !mappings.contains(&mapping) {
+        mappings.push(mapping);
+    }
+    if first_success {
+        let completion_deadline = Instant::now()
+            .checked_add(POST_SUCCESS_GRACE)
+            .ok_or(StunDiscoveryError::DeadlineOverflow)?;
+        for transaction in transactions {
+            transaction.deadline = transaction.deadline.min(completion_deadline);
+        }
+    }
+    Ok(())
+}
+
+/// Builds validated server-reflexive candidates from discovery output.
+pub(crate) fn server_reflexive_candidates(
+    discovery: &StunDiscovery,
+    max_datagram_size: u32,
+) -> Vec<IceCandidate> {
+    discovery
+        .mappings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mapping)| {
+            let candidate = IceCandidate {
+                class: IceCandidateClass::ServerReflexive,
+                carrier: ConnectivityCarrier::DirectUdp,
+                priority: candidate_priority(
+                    SERVER_REFLEXIVE_TYPE_PREFERENCE,
+                    u16::MAX.saturating_sub(u16::try_from(index).unwrap_or(u16::MAX)),
+                ),
+                foundation: candidate_foundation(
+                    IceCandidateClass::ServerReflexive,
+                    mapping.mapped_address.ip(),
+                ),
+                max_datagram_size,
+                address: mapping.mapped_address,
+                related_address: Some(mapping.base_address),
+                relay_id: None,
             };
-            if message.transaction_id() != transaction_id
-                || message.message_type().method != StunMethod::Binding
-            {
-                continue;
-            }
-            if message.message_type().class != StunClass::SuccessResponse {
-                return Ok(None);
-            }
-            let mapped = unique_attribute(&message, StunAttributeType::XOR_MAPPED_ADDRESS)?.ok_or(
-                stella_proto::CodecError::MissingStunAttribute {
-                    attribute_type: StunAttributeType::XOR_MAPPED_ADDRESS.as_u16(),
-                },
-            )?;
-            return decode_stun_xor_address(mapped, transaction_id)
-                .map(Some)
-                .map_err(Into::into);
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        retransmit = retransmit.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
+            candidate.validate().is_ok().then_some(candidate)
+        })
+        .collect()
+}
+
+struct BindingTransaction {
+    server: SocketAddr,
+    transaction_id: StunTransactionId,
+    request: Vec<u8>,
+    next_send: Instant,
+    retransmit: Duration,
+    deadline: Instant,
+}
+
+impl BindingTransaction {
+    fn new(
+        server: SocketAddr,
+        started_at: Instant,
+        deadline: Instant,
+    ) -> Result<Self, StunDiscoveryError> {
+        let transaction_id = random_transaction_id()?;
+        let request = StunMessageRef {
+            message_type: StunMessageType::new(StunMethod::Binding, StunClass::Request),
+            transaction_id,
+            attributes: &[],
+        };
+        let mut encoded = vec![0_u8; request.encoded_len()?];
+        let length = encode_stun_message(request, &mut encoded)?;
+        encoded.truncate(length);
+        Ok(Self {
+            server,
+            transaction_id,
+            request: encoded,
+            next_send: started_at,
+            retransmit: INITIAL_RETRANSMIT_TIMEOUT,
+            deadline,
+        })
     }
 }
 
@@ -259,6 +436,51 @@ fn unique_attribute<'a>(
         }
     }
     Ok(found)
+}
+
+fn validate_optional_fingerprint(message: &StunMessageView<'_>) -> Result<(), StunDiscoveryError> {
+    let mut fingerprint = None;
+    for attribute in message.attributes() {
+        let attribute = attribute?;
+        if attribute.attribute_type() != StunAttributeType::FINGERPRINT {
+            continue;
+        }
+        if fingerprint.is_some() || attribute.value().len() != 4 {
+            return Err(StunDiscoveryError::InvalidFingerprint);
+        }
+        fingerprint = Some((
+            attribute.encoded_offset(),
+            attribute.encoded_len(),
+            attribute.value(),
+        ));
+    }
+    let Some((offset, encoded_len, value)) = fingerprint else {
+        return Ok(());
+    };
+    if offset.saturating_add(encoded_len) != message.encoded().len() {
+        return Err(StunDiscoveryError::InvalidFingerprint);
+    }
+    let expected = crc32(&message.encoded()[..offset]) ^ STUN_FINGERPRINT_XOR;
+    let actual = u32::from_be_bytes(
+        <[u8; 4]>::try_from(value).map_err(|_| StunDiscoveryError::InvalidFingerprint)?,
+    );
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(StunDiscoveryError::InvalidFingerprint)
+    }
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let polynomial = 0xedb8_8320 & 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ polynomial;
+        }
+    }
+    !crc
 }
 
 fn random_transaction_id() -> Result<StunTransactionId, StunDiscoveryError> {
@@ -335,7 +557,11 @@ mod tests {
     use std::{collections::BTreeSet, net::IpAddr, time::Duration};
 
     use stella_common::RelayId;
-    use stella_proto::{IceCandidateClass, StunServer};
+    use stella_proto::{
+        encode_stun_message, IceCandidateClass, StunAttributeRef, StunAttributeType, StunClass,
+        StunMessageRef, StunMessageType, StunMessageView, StunMethod, StunServer,
+        StunTransactionId,
+    };
     use stella_server::{
         relay_credentials::RelayCredentialAuthority,
         turn_relay::{TurnUdpRelay, TurnUdpRelayConfig},
@@ -344,9 +570,57 @@ mod tests {
     use tokio::{sync::oneshot, time::timeout};
 
     use super::{
-        defer_datagram, discover_server_reflexive, gather_host_candidates,
-        server_reflexive_candidate, MAX_DEFERRED_DATAGRAMS,
+        crc32, defer_datagram, discover_server_reflexive, discover_server_reflexive_with_timeout,
+        gather_host_candidates, server_reflexive_candidates, validate_optional_fingerprint,
+        MAX_DEFERRED_DATAGRAMS, STUN_FINGERPRINT_XOR,
     };
+
+    #[test]
+    fn optional_fingerprint_is_verified_when_present() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        let placeholder = [0_u8; 4];
+        let attributes = [StunAttributeRef {
+            attribute_type: StunAttributeType::FINGERPRINT,
+            value: &placeholder,
+        }];
+        let message = StunMessageRef {
+            message_type: StunMessageType::new(StunMethod::Binding, StunClass::SuccessResponse),
+            transaction_id: StunTransactionId::from_bytes([0x45; 12]),
+            attributes: &attributes,
+        };
+        let mut encoded = vec![0_u8; message.encoded_len().expect("message length")];
+        let length = encode_stun_message(message, &mut encoded).expect("encode fingerprint");
+        encoded.truncate(length);
+        let attribute_offset = encoded.len() - 8;
+        let value_offset = encoded.len() - 4;
+        let fingerprint = crc32(&encoded[..attribute_offset]) ^ STUN_FINGERPRINT_XOR;
+        encoded[value_offset..].copy_from_slice(&fingerprint.to_be_bytes());
+
+        let view = StunMessageView::decode(&encoded).expect("decode fingerprint");
+        validate_optional_fingerprint(&view).expect("valid fingerprint");
+        let last = encoded.len() - 1;
+        encoded[last] ^= 1;
+        let view = StunMessageView::decode(&encoded).expect("decode mutated fingerprint");
+        assert!(validate_optional_fingerprint(&view).is_err());
+    }
+
+    #[test]
+    fn rfc5769_fingerprint_vector_is_accepted() {
+        const EXPECTED_FINGERPRINT: [u8; 4] = [0xe5, 0x7a, 0x3b, 0xcf];
+        let encoded = [
+            0x00, 0x01, 0x00, 0x58, 0x21, 0x12, 0xa4, 0x42, 0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34,
+            0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae, 0x80, 0x22, 0x00, 0x10, 0x53, 0x54, 0x55, 0x4e,
+            0x20, 0x74, 0x65, 0x73, 0x74, 0x20, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x00, 0x24,
+            0x00, 0x04, 0x6e, 0x00, 0x01, 0xff, 0x80, 0x29, 0x00, 0x08, 0x93, 0x2f, 0xf9, 0xb1,
+            0x51, 0x26, 0x3b, 0x36, 0x00, 0x06, 0x00, 0x09, 0x65, 0x76, 0x74, 0x6a, 0x3a, 0x68,
+            0x36, 0x76, 0x59, 0x20, 0x20, 0x20, 0x00, 0x08, 0x00, 0x14, 0x9a, 0xea, 0xa7, 0x0c,
+            0xbf, 0xd8, 0xcb, 0x56, 0x78, 0x1e, 0xf2, 0xb5, 0xb2, 0xd3, 0xf2, 0x49, 0xc1, 0xb5,
+            0x71, 0xa2, 0x80, 0x28, 0x00, 0x04, 0xe5, 0x7a, 0x3b, 0xcf,
+        ];
+        assert_eq!(encoded[encoded.len() - 4..], EXPECTED_FINGERPRINT);
+        let view = StunMessageView::decode(&encoded).expect("decode RFC 5769 request");
+        validate_optional_fingerprint(&view).expect("validate RFC 5769 fingerprint");
+    }
 
     #[test]
     fn specified_host_candidate_is_valid_and_tap_exclusions_are_case_insensitive() {
@@ -414,20 +688,40 @@ mod tests {
         ))
         .await
         .expect("bind data transport");
-        let discovery = discover_server_reflexive(
-            &transport,
-            &[StunServer {
-                priority: 0,
-                address: relay_address,
-            }],
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole STUN server");
+        let discovery = timeout(
+            Duration::from_secs(1),
+            discover_server_reflexive(
+                &transport,
+                &[
+                    StunServer {
+                        priority: 0,
+                        address: blackhole.local_addr().expect("blackhole address"),
+                    },
+                    StunServer {
+                        priority: 1,
+                        address: relay_address,
+                    },
+                ],
+            ),
         )
         .await
+        .expect("parallel STUN discovery timeout")
         .expect("STUN discovery");
-        assert_eq!(discovery.mapped_address, Some(transport.local_address()));
-        assert_eq!(discovery.base_address, Some(transport.local_address()));
+        assert_eq!(discovery.mappings.len(), 1);
+        assert_eq!(
+            discovery.mappings[0].mapped_address,
+            transport.local_address()
+        );
+        assert_eq!(
+            discovery.mappings[0].base_address,
+            transport.local_address()
+        );
         assert!(discovery.deferred.is_empty());
         assert_eq!(discovery.dropped_datagrams, 0);
-        assert!(server_reflexive_candidate(&discovery, 1_200).is_none());
+        assert!(server_reflexive_candidates(&discovery, 1_200).is_empty());
 
         transport.shutdown().await.expect("shutdown transport");
         let _result = shutdown_sender.send(());
@@ -436,5 +730,32 @@ mod tests {
             .expect("relay shutdown timeout")
             .expect("relay task join")
             .expect("relay run");
+    }
+
+    #[tokio::test]
+    async fn caller_selected_deadline_bounds_blackhole_discovery() {
+        let transport = UdpTransport::bind(UdpConfig::new(
+            "127.0.0.1:0".parse().expect("transport bind"),
+        ))
+        .await
+        .expect("bind data transport");
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole STUN server");
+        let started_at = tokio::time::Instant::now();
+        let discovery = discover_server_reflexive_with_timeout(
+            &transport,
+            &[StunServer {
+                priority: 0,
+                address: blackhole.local_addr().expect("blackhole address"),
+            }],
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("bounded STUN discovery");
+
+        assert!(discovery.mappings.is_empty());
+        assert!(started_at.elapsed() < Duration::from_millis(500));
+        transport.shutdown().await.expect("shutdown transport");
     }
 }

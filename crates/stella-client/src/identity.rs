@@ -635,9 +635,12 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     use std::{fs::OpenOptions, io::Write};
 
+    #[cfg(any(windows, target_os = "macos"))]
     use stella_crypto::MAX_IDENTITY_PKCS8_LENGTH;
 
-    use super::{create_node_identity, load_node_identity, NodeIdentityFileError};
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::load_node_identity;
+    use super::{create_node_identity, NodeIdentityFileError};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 

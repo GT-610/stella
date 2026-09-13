@@ -20,14 +20,15 @@ use stella_common::{MacAddress, NetworkId};
 use stella_crypto::IdentitySigningKey;
 use stella_proto::{
     CommonHeader, ConnectivityCarrier, ConnectivityGenerationRef, IceCandidate, IceCandidateClass,
-    RelayCarrierMask, RelayTrustRequirements, MAX_RELAY_ADDRESSES,
+    RelayCarrierMask, RelayTrustRequirements, MAX_ICE_CANDIDATES, MAX_RELAY_ADDRESSES,
 };
 #[cfg(target_os = "windows")]
 use stella_tap::WindowsTapDevice;
 use stella_tap::{PlatformTapDevice, TapCancellationHandle, TapConfig, TapDevice, TapError};
 use stella_transport::{
-    DatagramTransport, Endpoint as TransportEndpoint, ReceivedDatagram, TransportError, UdpConfig,
-    UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
+    DatagramTransport, Endpoint as TransportEndpoint, ReceivedDatagram,
+    RelayCarrier as TransportRelayCarrier, TransportError, UdpConfig, UdpTransport,
+    DEFAULT_UDP_DATAGRAM_SIZE, MAX_UDP_DATAGRAM_SIZE,
 };
 use thiserror::Error;
 use tokio::{
@@ -41,8 +42,8 @@ use zeroize::Zeroizing;
 use crate::{
     ice::looks_like_stun,
     stun::{
-        discover_server_reflexive, gather_host_candidates, server_reflexive_candidate,
-        DeferredUdpDatagram, StunDiscovery,
+        discover_server_reflexive, discover_server_reflexive_with_timeout, gather_host_candidates,
+        server_reflexive_candidates, DeferredUdpDatagram, StunDiscovery, StunDiscoveryFailure,
     },
     ClientConfig, ConnectivityConfigState, IceAgent, IceError, IceOutput, IcePeerConfig,
     NetworkDataError, NetworkDataPlane, NetworkOutput, NetworkState, StunDiscoveryError,
@@ -59,9 +60,12 @@ const ICE_GENERATION_MAX_LIFETIME: u64 = 600;
 const ICE_GENERATION_REFRESH_LEAD: u64 = 120;
 const ICE_USERNAME_RANDOM_LENGTH: usize = 6;
 const ICE_PASSWORD_RANDOM_LENGTH: usize = 18;
+const HOST_CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const STUN_REFRESH_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(250);
 const RELAY_CANDIDATE_PRIORITY: u32 = 1_000_000;
 const RELAY_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_CARRIER_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_WARM_RELAYS: usize = 2;
 const MINIMUM_RELAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAXIMUM_RELAY_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
@@ -171,21 +175,26 @@ pub enum RuntimeError {
     },
 }
 
-/// A complete native client data plane sharing one bounded UDP socket.
+/// A complete native client data plane sharing bounded IPv4 and IPv6 UDP sockets.
 pub struct ClientDataRuntime {
     udp: UdpTransport,
     udp_buffer: Vec<u8>,
+    secondary_udp: Option<UdpTransport>,
+    secondary_udp_buffer: Vec<u8>,
+    excluded_interfaces: BTreeSet<String>,
+    next_host_candidate_refresh_at: Duration,
     deferred_udp: VecDeque<DeferredUdpDatagram>,
     direct_candidates: Vec<IceCandidate>,
     https_proxy: Option<SocketAddr>,
     connectivity_revision: Option<u64>,
     connectivity: Option<ConnectivityConfigState>,
-    relay: Option<WarmRelay>,
+    relays: Vec<WarmRelay>,
     relay_recovery: Option<RelayRecoveryTask>,
     relay_retry_at: Option<Instant>,
     relay_recovery_attempt: u32,
     connectivity_changed: bool,
-    relay_buffer: Vec<u8>,
+    relay_buffers: Vec<Vec<u8>>,
+    relay_receive_cursor: usize,
     connectivity_generations: BTreeMap<NetworkId, LocalConnectivityGeneration>,
     ice_agents: BTreeMap<NetworkId, RuntimeIceAgent>,
     networks: BTreeMap<NetworkId, ActiveNetwork>,
@@ -195,7 +204,7 @@ pub struct ClientDataRuntime {
 }
 
 impl ClientDataRuntime {
-    /// Binds UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
+    /// Binds direct UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
     ///
     /// # Errors
     ///
@@ -214,68 +223,37 @@ impl ClientDataRuntime {
             max_datagram_size,
         })
         .await?;
-        let excluded_interfaces = excluded_tap_interfaces(&config.networks);
-        let candidate_datagram_size = u32::try_from(max_datagram_size).unwrap_or(65_507);
-        let host_candidates = match gather_host_candidates(
-            udp.local_address(),
-            &excluded_interfaces,
-            candidate_datagram_size,
-        ) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                tracing::warn!(%error, "could not enumerate host ICE candidates");
-                Vec::new()
-            }
-        };
-        let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
-        let (discovery, relay) = tokio::join!(
-            discover_server_reflexive(&udp, stun_servers),
-            allocate_preferred_relay(config.udp_bind, config.https_proxy, connectivity,),
-        );
-        let discovery = match discovery {
-            Ok(discovery) => discovery,
-            Err(error) => {
-                tracing::warn!(%error, "same-socket STUN discovery failed");
-                StunDiscovery {
-                    mapped_address: None,
-                    base_address: None,
-                    deferred: Vec::new(),
-                    dropped_datagrams: 0,
-                }
-            }
-        };
-        if discovery.dropped_datagrams > 0 {
-            tracing::warn!(
-                dropped = discovery.dropped_datagrams,
-                retained = discovery.deferred.len(),
-                "dropped UDP datagrams while the STUN discovery queue was full"
-            );
-        }
-        let relay = relay?;
-        let mut direct_candidates = host_candidates;
-        if let Some(candidate) = server_reflexive_candidate(&discovery, candidate_datagram_size) {
-            direct_candidates.push(candidate);
-        }
-        direct_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
-        let relay_buffer_size = relay.as_ref().map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
-            relay.client.capabilities().max_datagram_size
-        });
+        let initial =
+            gather_initial_connectivity(config, &udp, max_datagram_size, connectivity).await?;
+        let InitialConnectivity {
+            secondary_udp,
+            excluded_interfaces,
+            deferred_udp,
+            direct_candidates,
+            relays,
+        } = initial;
+        let relay_buffers = relay_buffers(&relays);
         let (tap_event_sender, tap_events) = mpsc::channel(TAP_EVENT_QUEUE_CAPACITY);
         let started_at = std::time::Instant::now();
         let mut runtime = Self {
             udp,
             udp_buffer: vec![0_u8; max_datagram_size],
-            deferred_udp: discovery.deferred.into(),
+            secondary_udp,
+            secondary_udp_buffer: vec![0_u8; max_datagram_size],
+            excluded_interfaces,
+            next_host_candidate_refresh_at: HOST_CANDIDATE_REFRESH_INTERVAL,
+            deferred_udp,
             direct_candidates,
             https_proxy: config.https_proxy,
             connectivity_revision: connectivity.map(ConnectivityConfigState::revision),
             connectivity: connectivity.cloned(),
-            relay,
+            relays,
             relay_recovery: None,
             relay_retry_at: None,
             relay_recovery_attempt: 0,
             connectivity_changed: false,
-            relay_buffer: vec![0_u8; relay_buffer_size],
+            relay_buffers,
+            relay_receive_cursor: 0,
             connectivity_generations: BTreeMap::new(),
             ice_agents: BTreeMap::new(),
             networks: BTreeMap::new(),
@@ -318,7 +296,8 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         enum Ready {
             Udp(stella_transport::ReceivedDatagram),
-            Relay(Result<ReceivedDatagram, RuntimeError>),
+            SecondaryUdp(stella_transport::ReceivedDatagram),
+            Relay(RelayReceiveResult),
             RelayRecovery(Box<RelayRecoveryResult>),
             RelayRetry,
             Tap(TapEvent),
@@ -330,7 +309,15 @@ impl ClientDataRuntime {
         }
         let ready = tokio::select! {
             received = self.udp.receive(&mut self.udp_buffer) => Ready::Udp(received?),
-            received = receive_relay(self.relay.as_ref(), &mut self.relay_buffer) => {
+            received = receive_optional_udp(
+                self.secondary_udp.as_ref(),
+                &mut self.secondary_udp_buffer,
+            ) => Ready::SecondaryUdp(received?),
+            received = receive_relay(
+                &self.relays,
+                &mut self.relay_buffers,
+                self.relay_receive_cursor,
+            ) => {
                 Ready::Relay(received)
             }
             recovery = receive_relay_recovery(self.relay_recovery.as_mut()) => {
@@ -341,30 +328,23 @@ impl ClientDataRuntime {
                 Ready::Tap(event.ok_or(RuntimeError::TapEventChannelClosed)?)
             }
         };
-        let result = match ready {
-            Ready::Udp(received) => self.process_udp(received, signing_key).await,
-            Ready::Relay(Ok(received)) => self.process_relay(received, signing_key).await,
-            Ready::Relay(Err(error)) => Err(error),
+        match ready {
+            Ready::Udp(received) => self.process_udp(received, false, signing_key).await,
+            Ready::SecondaryUdp(received) => self.process_udp(received, true, signing_key).await,
+            Ready::Relay((index, _key, Ok(received))) => {
+                self.relay_receive_cursor = index.saturating_add(1);
+                self.process_relay(index, received, signing_key).await
+            }
+            Ready::Relay((index, key, Err(error))) => {
+                self.relay_receive_cursor = index.saturating_add(1);
+                self.handle_relay_failure(key, &error)
+            }
             Ready::RelayRecovery(result) => self.handle_relay_recovery(*result),
             Ready::RelayRetry => {
                 self.start_relay_recovery();
                 Ok(())
             }
             Ready::Tap(event) => self.process_tap_event(event).await,
-        };
-        self.handle_runtime_result(result)
-    }
-
-    fn handle_runtime_result(
-        &mut self,
-        result: Result<(), RuntimeError>,
-    ) -> Result<(), RuntimeError> {
-        match result {
-            Err(error @ RuntimeError::Turn(_)) => {
-                self.handle_relay_failure(&error)?;
-                Ok(())
-            }
-            result => result,
         }
     }
 
@@ -394,10 +374,15 @@ impl ClientDataRuntime {
     async fn process_udp(
         &mut self,
         received: stella_transport::ReceivedDatagram,
+        secondary: bool,
         signing_key: &IdentitySigningKey,
     ) -> Result<(), RuntimeError> {
-        let datagram = self
-            .udp_buffer
+        let buffer = if secondary {
+            &self.secondary_udp_buffer
+        } else {
+            &self.udp_buffer
+        };
+        let datagram = buffer
             .get(..received.length)
             .ok_or(TransportError::ReceiveTruncated {
                 source: std::io::Error::new(
@@ -468,11 +453,14 @@ impl ClientDataRuntime {
 
     async fn process_relay(
         &mut self,
+        relay_index: usize,
         received: ReceivedDatagram,
         signing_key: &IdentitySigningKey,
     ) -> Result<(), RuntimeError> {
         let datagram = self
-            .relay_buffer
+            .relay_buffers
+            .get(relay_index)
+            .ok_or(TurnUdpError::ActorStopped)?
             .get(..received.length)
             .ok_or(TransportError::ReceiveTruncated {
                 source: std::io::Error::new(
@@ -508,6 +496,7 @@ impl ClientDataRuntime {
     pub async fn maintain(&mut self, signing_key: &IdentitySigningKey) -> Result<(), RuntimeError> {
         let wall_time = unix_time()?;
         let now = self.monotonic_now();
+        self.refresh_host_candidates(wall_time, now).await?;
         let ice_network_ids = self.ice_agents.keys().copied().collect::<Vec<_>>();
         for network_id in ice_network_ids {
             let Some(runtime_agent) = self.ice_agents.get_mut(&network_id) else {
@@ -528,6 +517,103 @@ impl ClientDataRuntime {
             self.apply_output(network_id, output).await?;
         }
         Ok(())
+    }
+
+    async fn refresh_host_candidates(
+        &mut self,
+        wall_time: u64,
+        now: Duration,
+    ) -> Result<(), RuntimeError> {
+        if now < self.next_host_candidate_refresh_at {
+            return Ok(());
+        }
+        self.next_host_candidate_refresh_at = now.saturating_add(HOST_CANDIDATE_REFRESH_INTERVAL);
+        let candidate_datagram_size =
+            u32::try_from(self.udp.capabilities().max_datagram_size).unwrap_or(65_507);
+        let mut refreshed = Vec::new();
+        for local_address in self.direct_udp_addresses() {
+            match gather_host_candidates(
+                local_address,
+                &self.excluded_interfaces,
+                candidate_datagram_size,
+            ) {
+                Ok(candidates) => refreshed.extend(candidates),
+                Err(error) => {
+                    tracing::warn!(%local_address, %error, "could not refresh host ICE candidates");
+                    return Ok(());
+                }
+            }
+        }
+        let previous_count = self
+            .direct_candidates
+            .iter()
+            .filter(|candidate| candidate.class == IceCandidateClass::Host)
+            .count();
+        if !replace_host_candidates(&mut self.direct_candidates, refreshed, self.relays.len()) {
+            return Ok(());
+        }
+        self.refresh_server_reflexive_candidates(candidate_datagram_size)
+            .await;
+        let states = self.current_network_states();
+        self.replace_local_connectivity_generations(&states)?;
+        self.reconcile_ice_agents(&states, wall_time)?;
+        self.connectivity_changed = true;
+        let current_count = self
+            .direct_candidates
+            .iter()
+            .filter(|candidate| candidate.class == IceCandidateClass::Host)
+            .count();
+        tracing::info!(
+            previous = previous_count,
+            current = current_count,
+            "host ICE candidates changed"
+        );
+        Ok(())
+    }
+
+    async fn refresh_server_reflexive_candidates(&mut self, max_datagram_size: u32) {
+        let stun_servers = self
+            .connectivity
+            .as_ref()
+            .map_or_else(Vec::new, |connectivity| {
+                connectivity.stun_servers().to_vec()
+            });
+        let secondary_discovery = async {
+            match &self.secondary_udp {
+                Some(secondary) => {
+                    discover_server_reflexive_with_timeout(
+                        secondary,
+                        &stun_servers,
+                        STUN_REFRESH_TRANSACTION_TIMEOUT,
+                    )
+                    .await
+                }
+                None => Ok(StunDiscovery::default()),
+            }
+        };
+        let (primary_discovery, secondary_discovery) = tokio::join!(
+            discover_server_reflexive_with_timeout(
+                &self.udp,
+                &stun_servers,
+                STUN_REFRESH_TRANSACTION_TIMEOUT,
+            ),
+            secondary_discovery,
+        );
+        let primary_discovery =
+            recover_stun_discovery(primary_discovery, Some(self.udp.local_address()));
+        let secondary_discovery = recover_stun_discovery(
+            secondary_discovery,
+            self.secondary_udp.as_ref().map(UdpTransport::local_address),
+        );
+        report_stun_discovery_drops(&primary_discovery, &secondary_discovery);
+        replace_server_reflexive_candidates(
+            &mut self.direct_candidates,
+            [&primary_discovery, &secondary_discovery],
+            max_datagram_size,
+            self.relays.len(),
+        );
+        self.deferred_udp.extend(primary_discovery.deferred);
+        self.deferred_udp.extend(secondary_discovery.deferred);
     }
 
     /// Reconciles all active control snapshots and tears down removed networks first.
@@ -631,8 +717,7 @@ impl ClientDataRuntime {
         }
         let wall_time = unix_time()?;
         let refresh_deadline = wall_time.saturating_add(ICE_GENERATION_REFRESH_LEAD);
-        let prospective_expiry =
-            LocalConnectivityGeneration::expiry_at(wall_time, self.relay.as_ref())?;
+        let prospective_expiry = LocalConnectivityGeneration::expiry_at(wall_time, &self.relays)?;
         let due = self
             .connectivity_generations
             .iter()
@@ -645,7 +730,7 @@ impl ClientDataRuntime {
         for network_id in due {
             let replacement = LocalConnectivityGeneration::new_at(
                 wall_time,
-                self.relay.as_ref(),
+                &self.relays,
                 &self.direct_candidates,
             )?;
             self.connectivity_generations
@@ -693,24 +778,55 @@ impl ClientDataRuntime {
         self.cancel_relay_recovery().await;
         let selections =
             relay_selections(self.udp.local_address(), self.https_proxy, connectivity).await?;
-        let refreshed = refresh_matching_relay(self.relay.as_mut(), &selections).await;
-        let previous = if refreshed {
-            None
-        } else {
-            match allocate_relay_selections(
+        let mut refreshed_keys = BTreeSet::new();
+        for relay in &mut self.relays {
+            if refresh_matching_relay(Some(relay), &selections).await {
+                refreshed_keys.insert(relay.path_key());
+            }
+        }
+        let mut previous = Vec::new();
+        if refreshed_keys.is_empty() {
+            let replacements = allocate_relay_selections(
                 selections,
                 RELAY_CARRIER_ESTABLISHMENT_TIMEOUT,
+                MAX_WARM_RELAYS,
                 allocate_relay,
             )
-            .await?
-            {
-                Some(replacement) => self.relay.replace(replacement),
-                None => self.relay.take(),
+            .await?;
+            previous = std::mem::replace(&mut self.relays, replacements);
+        } else {
+            let current = std::mem::take(&mut self.relays);
+            for relay in current {
+                if refreshed_keys.contains(&relay.path_key()) {
+                    self.relays.push(relay);
+                } else {
+                    previous.push(relay);
+                }
             }
-        };
+            let remaining = MAX_WARM_RELAYS.saturating_sub(self.relays.len());
+            let selections = selections
+                .into_iter()
+                .filter(|selection| !refreshed_keys.contains(&selection.settings.path_key()))
+                .collect();
+            if remaining > 0 {
+                match allocate_relay_selections(
+                    selections,
+                    RELAY_CARRIER_ESTABLISHMENT_TIMEOUT,
+                    remaining,
+                    allocate_relay,
+                )
+                .await
+                {
+                    Ok(mut additions) => self.relays.append(&mut additions),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not replenish standby relay allocation");
+                    }
+                }
+            }
+        }
         self.update_relay_dependent_state(states)?;
         self.prepare_relay_paths().await?;
-        if let Some(previous) = previous {
+        for previous in previous {
             previous.client.shutdown().await?;
         }
         self.connectivity = connectivity.cloned();
@@ -728,14 +844,24 @@ impl ClientDataRuntime {
             recovery.abort();
             let _recovery_result = recovery.await;
         }
-        let mut first_error = if let Some(relay) = self.relay.take() {
-            relay.client.shutdown().await.err().map(RuntimeError::Turn)
-        } else {
-            None
-        };
+        let mut first_error = None;
+        for relay in std::mem::take(&mut self.relays) {
+            if let Err(error) = relay.client.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(RuntimeError::Turn(error));
+                }
+            }
+        }
         if let Err(error) = self.udp.shutdown().await {
             if first_error.is_none() {
                 first_error = Some(RuntimeError::Transport(error));
+            }
+        }
+        if let Some(secondary) = self.secondary_udp.take() {
+            if let Err(error) = secondary.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(RuntimeError::Transport(error));
+                }
             }
         }
         let networks = std::mem::take(&mut self.networks);
@@ -756,6 +882,12 @@ impl ClientDataRuntime {
     #[must_use]
     pub const fn local_udp_address(&self) -> std::net::SocketAddr {
         self.udp.local_address()
+    }
+
+    /// Returns every direct UDP socket address owned by this runtime.
+    #[must_use]
+    pub fn local_udp_addresses(&self) -> Vec<SocketAddr> {
+        self.direct_udp_addresses()
     }
 
     fn insert_network(
@@ -803,18 +935,16 @@ impl ClientDataRuntime {
         };
         let tap = TapWorker::spawn(network_id, &tap_config, self.tap_event_sender.clone())?;
         let primary_mac = tap.primary_mac();
-        let mut plane = NetworkDataPlane::new(
+        let udp_addresses = self.direct_udp_addresses();
+        let mut plane = NetworkDataPlane::new_with_udp_addresses(
             state.clone(),
             primary_mac,
-            self.udp.local_address(),
+            &udp_addresses,
             self.udp.capabilities().max_datagram_size,
             signing_key,
             self.monotonic_now(),
         )?;
-        if let Some(relay) = &self.relay {
-            plane
-                .set_relay_carrier_available(relay.settings.carrier.connectivity_carrier(), true)?;
-        }
+        plane.set_available_relay_carriers(&available_relay_carriers(&self.relays))?;
         self.networks.insert(
             network_id,
             ActiveNetwork {
@@ -835,11 +965,7 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         let (transmissions, nominations, failures) = output.into_all_parts();
         for transmission in transmissions {
-            self.udp
-                .send_to(
-                    &TransportEndpoint::Udp(transmission.target()),
-                    transmission.bytes(),
-                )
+            self.send_direct(transmission.target(), transmission.bytes())
                 .await?;
         }
         let mut path_changed = false;
@@ -902,23 +1028,31 @@ impl ClientDataRuntime {
                 .plane
                 .transport_endpoint(datagram.path_id())?
                 .clone();
-            match &endpoint {
-                TransportEndpoint::Udp(_) => {
-                    self.udp.send_to(&endpoint, datagram.bytes()).await?;
+            if let Some(target) = endpoint.as_udp() {
+                self.send_direct(target, datagram.bytes()).await?;
+            } else if let Some((carrier, relay_id, _address)) = endpoint.as_relay() {
+                let key = RelayPathKey { relay_id, carrier };
+                let relay = self
+                    .relays
+                    .iter()
+                    .find(|relay| relay.path_key() == key)
+                    .ok_or(TurnUdpError::ActorStopped)?;
+                match relay.client.try_send_to(&endpoint, datagram.bytes()) {
+                    Ok(()) => {}
+                    Err(TurnUdpError::CommandQueueFull) => {
+                        tracing::debug!(
+                            relay_id = %key.relay_id,
+                            carrier = ?key.carrier,
+                            "dropping relayed datagram because the carrier queue is full"
+                        );
+                    }
+                    Err(error) => {
+                        let error = RuntimeError::Turn(error);
+                        return self.handle_relay_failure(key, &error);
+                    }
                 }
-                TransportEndpoint::TurnUdp { .. }
-                | TransportEndpoint::TurnTcp { .. }
-                | TransportEndpoint::TurnTls { .. } => {
-                    self.relay
-                        .as_ref()
-                        .ok_or(TurnUdpError::ActorStopped)?
-                        .client
-                        .send_to(&endpoint, datagram.bytes())
-                        .await?;
-                }
-                _ => {
-                    return Err(RuntimeError::UnsupportedTransportEndpoint { endpoint });
-                }
+            } else {
+                return Err(RuntimeError::UnsupportedTransportEndpoint { endpoint });
             }
         }
         if let Some(frame) = tap_frame {
@@ -931,15 +1065,44 @@ impl ClientDataRuntime {
         Ok(())
     }
 
+    async fn send_direct(&self, target: SocketAddr, datagram: &[u8]) -> Result<(), RuntimeError> {
+        let transport = self.direct_udp_transport(target).ok_or_else(|| {
+            RuntimeError::UnsupportedTransportEndpoint {
+                endpoint: TransportEndpoint::Udp(target),
+            }
+        })?;
+        transport
+            .send_to(&TransportEndpoint::Udp(target), datagram)
+            .await?;
+        Ok(())
+    }
+
+    fn direct_udp_transport(&self, target: SocketAddr) -> Option<&UdpTransport> {
+        if self.udp.local_address().is_ipv4() == target.is_ipv4() {
+            return Some(&self.udp);
+        }
+        self.secondary_udp
+            .as_ref()
+            .filter(|transport| transport.local_address().is_ipv4() == target.is_ipv4())
+    }
+
+    fn direct_udp_addresses(&self) -> Vec<SocketAddr> {
+        let mut addresses = vec![self.udp.local_address()];
+        if let Some(secondary) = &self.secondary_udp {
+            addresses.push(secondary.local_address());
+        }
+        addresses
+    }
+
     fn monotonic_now(&self) -> Duration {
         self.started_at.elapsed()
     }
 
     async fn prepare_relay_paths(&self) -> Result<(), RuntimeError> {
-        let Some(relay) = &self.relay else {
-            return Ok(());
-        };
-        self.prepare_relay_paths_for(relay).await
+        for relay in &self.relays {
+            self.prepare_relay_paths_for(relay).await?;
+        }
+        Ok(())
     }
 
     async fn prepare_relay_paths_for(&self, relay: &WarmRelay) -> Result<(), RuntimeError> {
@@ -961,30 +1124,11 @@ impl ClientDataRuntime {
         &mut self,
         states: &BTreeMap<NetworkId, NetworkState>,
     ) -> Result<(), RuntimeError> {
+        let available = available_relay_carriers(&self.relays);
         for network in self.networks.values_mut() {
-            for carrier in [
-                ConnectivityCarrier::TurnUdp,
-                ConnectivityCarrier::TurnTcp,
-                ConnectivityCarrier::TurnTls,
-                ConnectivityCarrier::SecureWebSocket,
-            ] {
-                let available = self
-                    .relay
-                    .as_ref()
-                    .is_some_and(|relay| relay.settings.carrier.connectivity_carrier() == carrier);
-                network
-                    .plane
-                    .set_relay_carrier_available(carrier, available)?;
-            }
+            network.plane.set_available_relay_carriers(&available)?;
         }
-        self.relay_buffer.resize(
-            self.relay
-                .as_ref()
-                .map_or(DEFAULT_UDP_DATAGRAM_SIZE, |relay| {
-                    relay.client.capabilities().max_datagram_size
-                }),
-            0,
-        );
+        self.relay_buffers = relay_buffers(&self.relays);
         self.replace_local_connectivity_generations(states)?;
         self.reconcile_ice_agents(states, unix_time()?)
     }
@@ -996,9 +1140,18 @@ impl ClientDataRuntime {
             .collect()
     }
 
-    fn handle_relay_failure(&mut self, error: &RuntimeError) -> Result<(), RuntimeError> {
-        tracing::warn!(%error, "relay failed; preserving direct sessions during recovery");
-        drop(self.relay.take());
+    fn handle_relay_failure(
+        &mut self,
+        key: RelayPathKey,
+        error: &RuntimeError,
+    ) -> Result<(), RuntimeError> {
+        tracing::warn!(
+            %error,
+            relay_id = %key.relay_id,
+            carrier = ?key.carrier,
+            "relay failed; preserving direct and standby sessions during recovery"
+        );
+        self.relays.retain(|relay| relay.path_key() != key);
         let states = self.current_network_states();
         self.update_relay_dependent_state(&states)?;
         self.connectivity_changed = true;
@@ -1007,7 +1160,7 @@ impl ClientDataRuntime {
     }
 
     fn start_relay_recovery(&mut self) {
-        if self.relay.is_some() || self.relay_recovery.is_some() {
+        if self.relays.len() >= MAX_WARM_RELAYS || self.relay_recovery.is_some() {
             return;
         }
         let Some(connectivity) = self.connectivity.clone() else {
@@ -1019,14 +1172,30 @@ impl ClientDataRuntime {
         let bind_address = self.udp.local_address();
         let https_proxy = self.https_proxy;
         let endpoints = self.relay_endpoints();
+        let active_keys = self
+            .relays
+            .iter()
+            .map(WarmRelay::path_key)
+            .collect::<BTreeSet<_>>();
+        let remaining = MAX_WARM_RELAYS.saturating_sub(active_keys.len());
         self.relay_retry_at = None;
         self.relay_recovery = Some(tokio::spawn(async move {
-            let relay =
-                allocate_preferred_relay(bind_address, https_proxy, Some(&connectivity)).await?;
-            if let Some(relay) = &relay {
+            let selections = relay_selections(bind_address, https_proxy, Some(&connectivity))
+                .await?
+                .into_iter()
+                .filter(|selection| !active_keys.contains(&selection.settings.path_key()))
+                .collect();
+            let relays = allocate_relay_selections(
+                selections,
+                RELAY_CARRIER_ESTABLISHMENT_TIMEOUT,
+                remaining,
+                allocate_relay,
+            )
+            .await?;
+            for relay in &relays {
                 prepare_relay_endpoints(relay, &endpoints).await?;
             }
-            Ok(relay)
+            Ok(relays)
         }));
         tracing::info!("started background relay recovery");
     }
@@ -1034,8 +1203,8 @@ impl ClientDataRuntime {
     fn handle_relay_recovery(&mut self, result: RelayRecoveryResult) -> Result<(), RuntimeError> {
         self.relay_recovery.take();
         match result {
-            Ok(Ok(Some(replacement))) => {
-                self.relay = Some(replacement);
+            Ok(Ok(mut replacements)) if !replacements.is_empty() => {
+                self.relays.append(&mut replacements);
                 let states = self.current_network_states();
                 self.update_relay_dependent_state(&states)?;
                 self.relay_recovery_attempt = 0;
@@ -1043,7 +1212,7 @@ impl ClientDataRuntime {
                 self.connectivity_changed = true;
                 tracing::info!("background relay recovery succeeded");
             }
-            Ok(Ok(None)) => {
+            Ok(Ok(_)) => {
                 tracing::warn!("relay recovery produced no usable selection");
                 self.schedule_relay_recovery()?;
             }
@@ -1084,13 +1253,13 @@ impl ClientDataRuntime {
         states: &BTreeMap<NetworkId, NetworkState>,
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations.clear();
-        if self.relay.is_none() && self.direct_candidates.is_empty() {
+        if self.relays.is_empty() && self.direct_candidates.is_empty() {
             return Ok(());
         }
         for network_id in states.keys().copied() {
             self.connectivity_generations.insert(
                 network_id,
-                LocalConnectivityGeneration::new(self.relay.as_ref(), &self.direct_candidates)?,
+                LocalConnectivityGeneration::new(&self.relays, &self.direct_candidates)?,
             );
         }
         Ok(())
@@ -1102,7 +1271,7 @@ impl ClientDataRuntime {
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations
             .retain(|network_id, _| states.contains_key(network_id));
-        if self.relay.is_none() && self.direct_candidates.is_empty() {
+        if self.relays.is_empty() && self.direct_candidates.is_empty() {
             self.connectivity_generations.clear();
             return Ok(());
         }
@@ -1111,7 +1280,7 @@ impl ClientDataRuntime {
                 self.connectivity_generations.entry(network_id)
             {
                 entry.insert(LocalConnectivityGeneration::new(
-                    self.relay.as_ref(),
+                    &self.relays,
                     &self.direct_candidates,
                 )?);
             }
@@ -1197,8 +1366,16 @@ impl std::fmt::Debug for ClientDataRuntime {
             .debug_struct("ClientDataRuntime")
             .field("local_udp_address", &self.udp.local_address())
             .field(
-                "relay_id",
-                &self.relay.as_ref().map(|relay| relay.client.relay_id()),
+                "secondary_udp_address",
+                &self.secondary_udp.as_ref().map(UdpTransport::local_address),
+            )
+            .field(
+                "relay_ids",
+                &self
+                    .relays
+                    .iter()
+                    .map(|relay| relay.client.relay_id())
+                    .collect::<Vec<_>>(),
             )
             .field("ice_agents", &self.ice_agents.len())
             .field("networks", &self.networks.len())
@@ -1218,14 +1395,34 @@ struct RuntimeIceAgent {
     agent: IceAgent,
 }
 
+struct InitialConnectivity {
+    secondary_udp: Option<UdpTransport>,
+    excluded_interfaces: BTreeSet<String>,
+    deferred_udp: VecDeque<DeferredUdpDatagram>,
+    direct_candidates: Vec<IceCandidate>,
+    relays: Vec<WarmRelay>,
+}
+
 struct WarmRelay {
     settings: RelaySettings,
     credential_expires_at: u64,
     client: WarmRelayClient,
 }
 
-type RelayRecoveryTask = TokioJoinHandle<Result<Option<WarmRelay>, RuntimeError>>;
-type RelayRecoveryResult = Result<Result<Option<WarmRelay>, RuntimeError>, tokio::task::JoinError>;
+impl WarmRelay {
+    const fn path_key(&self) -> RelayPathKey {
+        self.settings.path_key()
+    }
+}
+
+type RelayRecoveryTask = TokioJoinHandle<Result<Vec<WarmRelay>, RuntimeError>>;
+type RelayRecoveryResult = Result<Result<Vec<WarmRelay>, RuntimeError>, tokio::task::JoinError>;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RelayPathKey {
+    relay_id: stella_common::RelayId,
+    carrier: TransportRelayCarrier,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RelaySettings {
@@ -1261,6 +1458,15 @@ impl RuntimeRelayCarrier {
         }
     }
 
+    const fn transport_carrier(self) -> TransportRelayCarrier {
+        match self {
+            Self::Udp => TransportRelayCarrier::TurnUdp,
+            Self::Tcp => TransportRelayCarrier::TurnTcp,
+            Self::Tls => TransportRelayCarrier::TurnTls,
+            Self::Websocket => TransportRelayCarrier::SecureWebSocket,
+        }
+    }
+
     const fn mask(self) -> RelayCarrierMask {
         match self {
             Self::Udp => RelayCarrierMask::TURN_UDP,
@@ -1285,6 +1491,13 @@ impl RuntimeRelayCarrier {
 }
 
 impl RelaySettings {
+    const fn path_key(&self) -> RelayPathKey {
+        RelayPathKey {
+            relay_id: self.relay_id,
+            carrier: self.carrier.transport_carrier(),
+        }
+    }
+
     const fn udp_client_config(&self) -> TurnUdpClientConfig {
         let mut config =
             TurnUdpClientConfig::new(self.relay_id, self.server_address, self.bind_address);
@@ -1413,16 +1626,16 @@ impl WarmRelayClient {
         }
     }
 
-    async fn send_to(
+    fn try_send_to(
         &self,
         endpoint: &TransportEndpoint,
         datagram: &[u8],
     ) -> Result<(), TurnUdpError> {
         match self {
-            Self::Udp(client) => client.send_to(endpoint, datagram).await,
-            Self::Tcp(client) => client.send_to(endpoint, datagram).await,
-            Self::Tls(client) => client.send_to(endpoint, datagram).await,
-            Self::Websocket(client) => client.send_to(endpoint, datagram).await,
+            Self::Udp(client) => client.try_send_to(endpoint, datagram),
+            Self::Tcp(client) => client.try_send_to(endpoint, datagram),
+            Self::Tls(client) => client.try_send_to(endpoint, datagram),
+            Self::Websocket(client) => client.try_send_to(endpoint, datagram),
         }
     }
 
@@ -1456,39 +1669,36 @@ struct LocalConnectivityGeneration {
 }
 
 impl LocalConnectivityGeneration {
-    fn new(
-        relay: Option<&WarmRelay>,
-        direct_candidates: &[IceCandidate],
-    ) -> Result<Self, RuntimeError> {
+    fn new(relays: &[WarmRelay], direct_candidates: &[IceCandidate]) -> Result<Self, RuntimeError> {
         let created_at = unix_time()?;
-        Self::new_at(created_at, relay, direct_candidates)
+        Self::new_at(created_at, relays, direct_candidates)
     }
 
     fn new_at(
         created_at: u64,
-        relay: Option<&WarmRelay>,
+        relays: &[WarmRelay],
         direct_candidates: &[IceCandidate],
     ) -> Result<Self, RuntimeError> {
-        let expires_at = Self::expiry_at(created_at, relay)?;
+        let expires_at = Self::expiry_at(created_at, relays)?;
         let generation_id = random_nonzero_u64()?;
         let tie_breaker = random_nonzero_u64()?;
         let username_fragment = random_ice_credential(ICE_USERNAME_RANDOM_LENGTH)?;
         let password = random_ice_credential(ICE_PASSWORD_RANDOM_LENGTH)?;
         let mut candidates = direct_candidates.to_vec();
-        if let Some(relay) = relay {
+        for (index, relay) in relays.iter().enumerate() {
             let relay_id = relay.client.relay_id();
             let relay_bytes = relay_id.into_bytes();
-            let foundation = u32::from_be_bytes([
+            let foundation = (u32::from_be_bytes([
                 relay_bytes[0],
                 relay_bytes[1],
                 relay_bytes[2],
                 relay_bytes[3],
-            ])
+            ]) ^ u32::from(relay.client.carrier().as_u8()))
             .max(1);
             candidates.push(IceCandidate {
                 class: IceCandidateClass::Relay,
                 carrier: relay.client.carrier(),
-                priority: RELAY_CANDIDATE_PRIORITY,
+                priority: relay_candidate_priority(index),
                 foundation,
                 max_datagram_size: u32::try_from(relay.client.capabilities().max_datagram_size)
                     .unwrap_or(65_503),
@@ -1510,11 +1720,12 @@ impl LocalConnectivityGeneration {
         Ok(generation)
     }
 
-    fn expiry_at(created_at: u64, relay: Option<&WarmRelay>) -> Result<u64, RuntimeError> {
+    fn expiry_at(created_at: u64, relays: &[WarmRelay]) -> Result<u64, RuntimeError> {
         let maximum_expiry = created_at
             .checked_add(ICE_GENERATION_MAX_LIFETIME)
             .ok_or(RuntimeError::ConnectivityExpiryOverflow)?;
-        if let Some(relay) = relay {
+        let mut expires_at = maximum_expiry;
+        for relay in relays {
             if relay.credential_expires_at <= created_at {
                 return Err(TurnUdpError::CredentialExpired {
                     expires_at: relay.credential_expires_at,
@@ -1522,10 +1733,9 @@ impl LocalConnectivityGeneration {
                 }
                 .into());
             }
-            Ok(relay.credential_expires_at.min(maximum_expiry))
-        } else {
-            Ok(maximum_expiry)
+            expires_at = expires_at.min(relay.credential_expires_at);
         }
+        Ok(expires_at)
     }
 
     fn as_ref(&self) -> Result<ConnectivityGenerationRef<'_>, stella_proto::CodecError> {
@@ -1539,6 +1749,10 @@ impl LocalConnectivityGeneration {
             &self.candidates,
         )
     }
+}
+
+fn relay_candidate_priority(index: usize) -> u32 {
+    RELAY_CANDIDATE_PRIORITY.saturating_sub(u32::try_from(index).unwrap_or(u32::MAX))
 }
 
 struct TapWorker {
@@ -1751,15 +1965,16 @@ fn excluded_tap_interfaces(networks: &[crate::ConfiguredNetwork]) -> BTreeSet<St
     excluded
 }
 
-async fn allocate_preferred_relay(
+async fn allocate_preferred_relays(
     bind_address: SocketAddr,
     https_proxy: Option<SocketAddr>,
     connectivity: Option<&ConnectivityConfigState>,
-) -> Result<Option<WarmRelay>, RuntimeError> {
+) -> Result<Vec<WarmRelay>, RuntimeError> {
     let selections = relay_selections(bind_address, https_proxy, connectivity).await?;
     allocate_relay_selections(
         selections,
         RELAY_CARRIER_ESTABLISHMENT_TIMEOUT,
+        MAX_WARM_RELAYS,
         allocate_relay,
     )
     .await
@@ -1768,17 +1983,27 @@ async fn allocate_preferred_relay(
 async fn allocate_relay_selections<T, F, Fut>(
     selections: Vec<SelectedRelay>,
     carrier_timeout: Duration,
+    limit: usize,
     mut allocator: F,
-) -> Result<Option<T>, RuntimeError>
+) -> Result<Vec<T>, RuntimeError>
 where
     F: FnMut(SelectedRelay) -> Fut,
     Fut: Future<Output = Result<T, RuntimeError>>,
 {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut last_error = None;
+    let mut allocated = Vec::with_capacity(limit);
+    let mut allocated_keys = BTreeSet::new();
     let mut current_carrier = None;
     let mut carrier_deadline = Instant::now();
     let mut timed_out_carrier = None;
     for selected in selections {
+        let key = selected.settings.path_key();
+        if allocated_keys.contains(&key) {
+            continue;
+        }
         let carrier = selected.settings.carrier;
         if timed_out_carrier == Some(carrier) {
             continue;
@@ -1789,7 +2014,13 @@ where
         }
         let relay_id = selected.settings.relay_id;
         match timeout_at(carrier_deadline, allocator(selected)).await {
-            Ok(Ok(relay)) => return Ok(Some(relay)),
+            Ok(Ok(relay)) => {
+                allocated_keys.insert(key);
+                allocated.push(relay);
+                if allocated.len() == limit {
+                    return Ok(allocated);
+                }
+            }
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
                 timed_out_carrier = Some(carrier);
@@ -1800,9 +2031,13 @@ where
             }
         }
     }
-    match last_error {
-        Some(error) => Err(error),
-        None => Ok(None),
+    if allocated.is_empty() {
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(Vec::new()),
+        }
+    } else {
+        Ok(allocated)
     }
 }
 
@@ -2165,18 +2400,295 @@ const fn turn_bind_address(configured: SocketAddr, relay: IpAddr) -> Option<Sock
     }
 }
 
-async fn receive_relay(
-    relay: Option<&WarmRelay>,
+async fn gather_initial_connectivity(
+    config: &ClientConfig,
+    udp: &UdpTransport,
+    max_datagram_size: usize,
+    connectivity: Option<&ConnectivityConfigState>,
+) -> Result<InitialConnectivity, RuntimeError> {
+    let secondary_udp = bind_complementary_udp(config.udp_bind, udp, max_datagram_size).await;
+    let excluded_interfaces = excluded_tap_interfaces(&config.networks);
+    let candidate_datagram_size = u32::try_from(max_datagram_size).unwrap_or(65_507);
+    let mut host_candidates = gather_runtime_host_candidates(
+        udp.local_address(),
+        &excluded_interfaces,
+        candidate_datagram_size,
+    );
+    if let Some(secondary) = &secondary_udp {
+        host_candidates.extend(gather_runtime_host_candidates(
+            secondary.local_address(),
+            &excluded_interfaces,
+            candidate_datagram_size,
+        ));
+    }
+    let stun_servers = connectivity.map_or(&[][..], ConnectivityConfigState::stun_servers);
+    let secondary_discovery = async {
+        match &secondary_udp {
+            Some(secondary) => discover_server_reflexive(secondary, stun_servers).await,
+            None => Ok(StunDiscovery::default()),
+        }
+    };
+    let (primary_discovery, secondary_discovery, relays) = tokio::join!(
+        discover_server_reflexive(udp, stun_servers),
+        secondary_discovery,
+        allocate_preferred_relays(config.udp_bind, config.https_proxy, connectivity,),
+    );
+    let primary_discovery = recover_stun_discovery(primary_discovery, Some(udp.local_address()));
+    let secondary_discovery = recover_stun_discovery(
+        secondary_discovery,
+        secondary_udp.as_ref().map(UdpTransport::local_address),
+    );
+    report_stun_discovery_drops(&primary_discovery, &secondary_discovery);
+    let relays = relays?;
+    let mut direct_candidates = host_candidates;
+    direct_candidates.extend(server_reflexive_candidates(
+        &primary_discovery,
+        candidate_datagram_size,
+    ));
+    direct_candidates.extend(server_reflexive_candidates(
+        &secondary_discovery,
+        candidate_datagram_size,
+    ));
+    normalize_direct_candidates(&mut direct_candidates, relays.len());
+    let mut deferred_udp = VecDeque::from(primary_discovery.deferred);
+    deferred_udp.extend(secondary_discovery.deferred);
+    Ok(InitialConnectivity {
+        secondary_udp,
+        excluded_interfaces,
+        deferred_udp,
+        direct_candidates,
+        relays,
+    })
+}
+
+fn report_stun_discovery_drops(primary: &StunDiscovery, secondary: &StunDiscovery) {
+    let dropped = primary
+        .dropped_datagrams
+        .saturating_add(secondary.dropped_datagrams);
+    if dropped == 0 {
+        return;
+    }
+    let retained = primary
+        .deferred
+        .len()
+        .saturating_add(secondary.deferred.len());
+    tracing::warn!(
+        dropped,
+        retained,
+        "dropped UDP datagrams while the STUN discovery queue was full"
+    );
+}
+
+async fn bind_complementary_udp(
+    configured: SocketAddr,
+    primary: &UdpTransport,
+    max_datagram_size: usize,
+) -> Option<UdpTransport> {
+    let bind_address = complementary_bind_address(configured, primary.local_address())?;
+    match UdpTransport::bind(UdpConfig {
+        bind_address,
+        max_datagram_size,
+    })
+    .await
+    {
+        Ok(transport) => {
+            tracing::info!(address = %transport.local_address(), "bound complementary direct UDP socket");
+            Some(transport)
+        }
+        Err(error) => {
+            tracing::warn!(%bind_address, %error, "could not bind complementary direct UDP socket");
+            None
+        }
+    }
+}
+
+fn complementary_bind_address(configured: SocketAddr, primary: SocketAddr) -> Option<SocketAddr> {
+    if !configured.ip().is_unspecified() {
+        return None;
+    }
+    if primary.is_ipv4() {
+        Some(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            primary.port(),
+        ))
+    } else {
+        Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            primary.port(),
+        ))
+    }
+}
+
+fn gather_runtime_host_candidates(
+    local_address: SocketAddr,
+    excluded_interfaces: &BTreeSet<String>,
+    max_datagram_size: u32,
+) -> Vec<IceCandidate> {
+    match gather_host_candidates(local_address, excluded_interfaces, max_datagram_size) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%local_address, %error, "could not enumerate host ICE candidates");
+            Vec::new()
+        }
+    }
+}
+
+fn normalize_direct_candidates(candidates: &mut Vec<IceCandidate>, reserved_relays: usize) {
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.priority));
+    let mut addresses = BTreeSet::new();
+    candidates.retain(|candidate| addresses.insert(candidate.address));
+    let mut previous_priority = None;
+    for candidate in candidates.iter_mut() {
+        if let Some(previous) = previous_priority {
+            if candidate.priority >= previous {
+                candidate.priority = previous.saturating_sub(1).max(1);
+            }
+        }
+        previous_priority = Some(candidate.priority);
+    }
+    candidates.truncate(usize::from(MAX_ICE_CANDIDATES).saturating_sub(reserved_relays));
+}
+
+fn replace_host_candidates(
+    candidates: &mut Vec<IceCandidate>,
+    refreshed: Vec<IceCandidate>,
+    reserved_relays: usize,
+) -> bool {
+    let previous_addresses = candidates
+        .iter()
+        .filter(|candidate| candidate.class == IceCandidateClass::Host)
+        .map(|candidate| candidate.address)
+        .collect::<BTreeSet<_>>();
+    let refreshed_addresses = refreshed
+        .iter()
+        .map(|candidate| candidate.address)
+        .collect::<BTreeSet<_>>();
+    if previous_addresses == refreshed_addresses {
+        return false;
+    }
+    candidates.retain(|candidate| candidate.class != IceCandidateClass::Host);
+    candidates.extend(refreshed);
+    normalize_direct_candidates(candidates, reserved_relays);
+    true
+}
+
+fn replace_server_reflexive_candidates(
+    candidates: &mut Vec<IceCandidate>,
+    discoveries: [&StunDiscovery; 2],
+    max_datagram_size: u32,
+    reserved_relays: usize,
+) -> bool {
+    let host_addresses = candidates
+        .iter()
+        .filter(|candidate| candidate.class == IceCandidateClass::Host)
+        .map(|candidate| candidate.address)
+        .collect::<BTreeSet<_>>();
+    let previous_len = candidates.len();
+    candidates.retain(|candidate| {
+        candidate.class != IceCandidateClass::ServerReflexive
+            || candidate
+                .related_address
+                .is_some_and(|related| host_addresses.contains(&related))
+    });
+    let mut changed = candidates.len() != previous_len;
+    let mut replacements = Vec::new();
+    for discovery in discoveries {
+        replacements.extend(server_reflexive_candidates(discovery, max_datagram_size));
+    }
+    replacements.retain(|candidate| {
+        candidate
+            .related_address
+            .is_some_and(|related| host_addresses.contains(&related))
+    });
+    if replacements.is_empty() {
+        return changed;
+    }
+    let replace_ipv4 = replacements
+        .iter()
+        .any(|candidate| candidate.address.is_ipv4());
+    let replace_ipv6 = replacements
+        .iter()
+        .any(|candidate| candidate.address.is_ipv6());
+    candidates.retain(|candidate| {
+        candidate.class != IceCandidateClass::ServerReflexive
+            || (candidate.address.is_ipv4() && !replace_ipv4)
+            || (candidate.address.is_ipv6() && !replace_ipv6)
+    });
+    candidates.extend(replacements);
+    normalize_direct_candidates(candidates, reserved_relays);
+    changed = true;
+    changed
+}
+
+fn recover_stun_discovery(
+    result: Result<StunDiscovery, Box<StunDiscoveryFailure>>,
+    local_address: Option<SocketAddr>,
+) -> StunDiscovery {
+    match result {
+        Ok(discovery) => discovery,
+        Err(failure) => {
+            tracing::warn!(
+                ?local_address,
+                error = %failure.error,
+                dropped = failure.dropped_datagrams,
+                deferred = failure.deferred.len(),
+                "same-socket STUN discovery failed"
+            );
+            StunDiscovery {
+                mappings: failure.mappings,
+                deferred: failure.deferred,
+                dropped_datagrams: failure.dropped_datagrams,
+            }
+        }
+    }
+}
+
+async fn receive_optional_udp(
+    transport: Option<&UdpTransport>,
     output: &mut [u8],
-) -> Result<ReceivedDatagram, RuntimeError> {
-    match relay {
-        Some(relay) => relay
-            .client
-            .receive(output)
-            .await
-            .map_err(RuntimeError::Turn),
+) -> Result<ReceivedDatagram, TransportError> {
+    match transport {
+        Some(transport) => transport.receive(output).await,
         None => pending().await,
     }
+}
+
+type RelayReceiveResult = (usize, RelayPathKey, Result<ReceivedDatagram, RuntimeError>);
+
+async fn receive_relay(
+    relays: &[WarmRelay],
+    outputs: &mut [Vec<u8>],
+    start_index: usize,
+) -> RelayReceiveResult {
+    let mut receives = relays
+        .iter()
+        .zip(outputs.iter_mut())
+        .enumerate()
+        .map(|(index, (relay, output))| {
+            let key = relay.path_key();
+            Box::pin(async move {
+                (
+                    index,
+                    key,
+                    relay
+                        .client
+                        .receive(output)
+                        .await
+                        .map_err(RuntimeError::Turn),
+                )
+            }) as Pin<Box<dyn Future<Output = RelayReceiveResult> + '_>>
+        })
+        .collect::<Vec<_>>();
+    poll_fn(|context| {
+        for offset in 0..receives.len() {
+            let index = start_index.saturating_add(offset) % receives.len();
+            if let Poll::Ready(result) = receives[index].as_mut().poll(context) {
+                return Poll::Ready(result);
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 async fn prepare_relay_endpoints(
@@ -2184,9 +2696,34 @@ async fn prepare_relay_endpoints(
     endpoints: &[TransportEndpoint],
 ) -> Result<(), RuntimeError> {
     for endpoint in endpoints {
-        relay.client.prepare_peer(endpoint).await?;
+        if endpoint.as_relay().is_some_and(|(carrier, relay_id, _)| {
+            relay.path_key() == RelayPathKey { relay_id, carrier }
+        }) {
+            relay.client.prepare_peer(endpoint).await?;
+        }
     }
     Ok(())
+}
+
+fn available_relay_carriers(
+    relays: &[WarmRelay],
+) -> Vec<(stella_common::RelayId, ConnectivityCarrier)> {
+    relays
+        .iter()
+        .map(|relay| {
+            (
+                relay.settings.relay_id,
+                relay.settings.carrier.connectivity_carrier(),
+            )
+        })
+        .collect()
+}
+
+fn relay_buffers(relays: &[WarmRelay]) -> Vec<Vec<u8>> {
+    relays
+        .iter()
+        .map(|relay| vec![0_u8; relay.client.capabilities().max_datagram_size])
+        .collect()
 }
 
 async fn receive_relay_recovery(task: Option<&mut RelayRecoveryTask>) -> RelayRecoveryResult {
@@ -2256,13 +2793,14 @@ fn unix_time() -> Result<u64, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, BTreeSet, VecDeque},
         future::pending,
         net::{IpAddr, SocketAddr},
         sync::{Arc, Mutex},
         time::{Duration, SystemTime},
     };
 
+    use crate::stun::{DeferredUdpDatagram, StunDiscovery, StunDiscoveryFailure, StunMapping};
     use stella_common::{NodeId, RelayId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
     use stella_proto::{
@@ -2278,16 +2816,44 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::effective_tap_mtu;
     use super::{
-        allocate_preferred_relay, allocate_relay_selections, excluded_tap_interfaces,
-        matching_relay_selection, next_relay_dns_result, preferred_relay_settings,
-        random_ice_credential, relay_reconnect_cap, relay_reconnect_delay, relay_selections,
-        turn_bind_address, unix_time, ClientDataRuntime, ConnectivityConfigState,
-        LocalConnectivityGeneration, RelayDnsFuture, RuntimeError, RuntimeRelayCarrier,
-        TurnUdpError, WarmRelay, ICE_PASSWORD_RANDOM_LENGTH, ICE_USERNAME_RANDOM_LENGTH,
-        MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY, TAP_EVENT_QUEUE_CAPACITY,
-        TURN_UDP_MAX_DATAGRAM_SIZE,
+        allocate_preferred_relays, allocate_relay_selections, complementary_bind_address,
+        excluded_tap_interfaces, matching_relay_selection, next_relay_dns_result,
+        normalize_direct_candidates, preferred_relay_settings, random_ice_credential,
+        recover_stun_discovery, relay_reconnect_cap, relay_reconnect_delay, relay_selections,
+        replace_host_candidates, replace_server_reflexive_candidates, turn_bind_address, unix_time,
+        ClientDataRuntime, ConnectivityConfigState, LocalConnectivityGeneration, RelayDnsFuture,
+        RelayPathKey, RuntimeError, RuntimeRelayCarrier, StunDiscoveryError, TurnUdpError,
+        WarmRelay, HOST_CANDIDATE_REFRESH_INTERVAL, ICE_PASSWORD_RANDOM_LENGTH,
+        ICE_USERNAME_RANDOM_LENGTH, MAXIMUM_RELAY_RECONNECT_DELAY, MINIMUM_RELAY_RECONNECT_DELAY,
+        TAP_EVENT_QUEUE_CAPACITY, TURN_UDP_MAX_DATAGRAM_SIZE,
     };
     use stella_transport::{UdpConfig, UdpTransport, DEFAULT_UDP_DATAGRAM_SIZE};
+
+    #[test]
+    fn failed_stun_refresh_retains_deferred_datagrams() {
+        let deferred = DeferredUdpDatagram {
+            source: stella_transport::Endpoint::Udp(
+                "192.0.2.80:47000".parse().expect("deferred source"),
+            ),
+            bytes: vec![0x42, 0x43],
+        };
+        let recovered = recover_stun_discovery(
+            Err(Box::new(StunDiscoveryFailure {
+                error: StunDiscoveryError::DeadlineOverflow,
+                mappings: vec![StunMapping {
+                    mapped_address: "198.51.100.81:47001".parse().expect("mapped address"),
+                    base_address: "192.0.2.81:47001".parse().expect("base address"),
+                }],
+                deferred: vec![deferred.clone()],
+                dropped_datagrams: 2,
+            })),
+            Some("192.0.2.81:47001".parse().expect("local address")),
+        );
+
+        assert_eq!(recovered.deferred, vec![deferred]);
+        assert_eq!(recovered.dropped_datagrams, 2);
+        assert_eq!(recovered.mappings.len(), 1);
+    }
 
     #[test]
     fn ice_excludes_both_sides_of_configured_tap_pairs() {
@@ -2313,17 +2879,22 @@ mod tests {
         ClientDataRuntime {
             udp,
             udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            secondary_udp: None,
+            secondary_udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            excluded_interfaces: BTreeSet::new(),
+            next_host_candidate_refresh_at: HOST_CANDIDATE_REFRESH_INTERVAL,
             deferred_udp: VecDeque::new(),
             direct_candidates: Vec::new(),
             https_proxy: None,
             connectivity_revision: None,
             connectivity: None,
-            relay: None,
+            relays: Vec::new(),
             relay_recovery: Some(tokio::spawn(pending())),
             relay_retry_at: None,
             relay_recovery_attempt: 0,
             connectivity_changed: false,
-            relay_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            relay_buffers: Vec::new(),
+            relay_receive_cursor: 0,
             connectivity_generations: BTreeMap::new(),
             ice_agents: BTreeMap::new(),
             networks: BTreeMap::new(),
@@ -2333,9 +2904,9 @@ mod tests {
         }
     }
 
-    async fn runtime_with_live_relay(
+    async fn runtime_with_live_relays(
         connectivity: ConnectivityConfigState,
-        relay: WarmRelay,
+        relays: Vec<WarmRelay>,
     ) -> ClientDataRuntime {
         let udp = UdpTransport::bind(UdpConfig {
             bind_address: "127.0.0.1:0".parse().expect("loopback bind"),
@@ -2343,22 +2914,27 @@ mod tests {
         })
         .await
         .expect("bind runtime UDP");
-        let relay_buffer_size = relay.client.capabilities().max_datagram_size;
         let (tap_event_sender, tap_events) = tokio::sync::mpsc::channel(TAP_EVENT_QUEUE_CAPACITY);
+        let relay_buffers = super::relay_buffers(&relays);
         ClientDataRuntime {
             udp,
             udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            secondary_udp: None,
+            secondary_udp_buffer: vec![0_u8; DEFAULT_UDP_DATAGRAM_SIZE],
+            excluded_interfaces: BTreeSet::new(),
+            next_host_candidate_refresh_at: HOST_CANDIDATE_REFRESH_INTERVAL,
             deferred_udp: VecDeque::new(),
             direct_candidates: Vec::new(),
             https_proxy: None,
             connectivity_revision: Some(connectivity.revision()),
             connectivity: Some(connectivity),
-            relay: Some(relay),
+            relays,
             relay_recovery: None,
             relay_retry_at: None,
             relay_recovery_attempt: 0,
             connectivity_changed: false,
-            relay_buffer: vec![0_u8; relay_buffer_size],
+            relay_buffers,
+            relay_receive_cursor: 0,
             connectivity_generations: BTreeMap::new(),
             ice_agents: BTreeMap::new(),
             networks: BTreeMap::new(),
@@ -2408,44 +2984,70 @@ mod tests {
         relay_address: SocketAddr,
         credential: &RelayCredential,
     ) -> ConnectivityConfigState {
+        live_udp_relay_connectivity_config_set(&[(relay_id, relay_address, credential)])
+    }
+
+    fn live_udp_relay_connectivity_config_set(
+        configured: &[(RelayId, SocketAddr, &RelayCredential)],
+    ) -> ConnectivityConfigState {
         let stun_servers = [StunServer {
             priority: 0,
             address: "192.0.2.10:3478".parse().expect("test STUN address"),
         }];
         let mut stun_bytes = vec![0_u8; 28];
         encode_stun_server_list(&stun_servers, &mut stun_bytes).expect("encode live STUN list");
-        let addresses = [RelayAddress {
-            priority: 0,
-            address: relay_address.ip(),
-        }];
-        let service = RelayServiceRef {
-            relay_id,
-            carriers: RelayCarrierMask::TURN_UDP,
-            priority: 0,
-            max_datagram_size: 1_200,
-            allocation_lifetime_seconds: 60,
-            idle_timeout_seconds: 30,
-            credential_issued_at: credential.issued_at(),
-            credential_expires_at: credential.expires_at(),
-            hostname: "",
-            tls_server_name: "",
-            credential_username: credential.username(),
-            credential_secret: credential.secret(),
-            region: "test",
-            trust: RelayTrustRequirements::NONE,
-            ports: RelayPorts {
-                turn_udp: relay_address.port(),
-                turn_tcp: 0,
-                turn_tls: 0,
-                secure_websocket: 0,
-            },
-            addresses: &addresses,
-            spki_pins: &[],
-        };
-        let mut relay_bytes = vec![0_u8; 4 + service.encoded_len().expect("service length")];
-        encode_relay_service_list(&[service], &mut relay_bytes).expect("encode live relay list");
-        ConnectivityConfigState::from_wire(11, &stun_bytes, &relay_bytes, credential.issued_at())
-            .expect("decode live relay connectivity config")
+        let addresses = configured
+            .iter()
+            .map(|(_, relay_address, _)| {
+                [RelayAddress {
+                    priority: 0,
+                    address: relay_address.ip(),
+                }]
+            })
+            .collect::<Vec<_>>();
+        let services = configured
+            .iter()
+            .zip(&addresses)
+            .enumerate()
+            .map(
+                |(index, ((relay_id, relay_address, credential), addresses))| RelayServiceRef {
+                    relay_id: *relay_id,
+                    carriers: RelayCarrierMask::TURN_UDP,
+                    priority: u16::try_from(index).expect("test relay priority"),
+                    max_datagram_size: 1_200,
+                    allocation_lifetime_seconds: 60,
+                    idle_timeout_seconds: 30,
+                    credential_issued_at: credential.issued_at(),
+                    credential_expires_at: credential.expires_at(),
+                    hostname: "",
+                    tls_server_name: "",
+                    credential_username: credential.username(),
+                    credential_secret: credential.secret(),
+                    region: "test",
+                    trust: RelayTrustRequirements::NONE,
+                    ports: RelayPorts {
+                        turn_udp: relay_address.port(),
+                        turn_tcp: 0,
+                        turn_tls: 0,
+                        secure_websocket: 0,
+                    },
+                    addresses,
+                    spki_pins: &[],
+                },
+            )
+            .collect::<Vec<_>>();
+        let relay_length = services.iter().try_fold(4_usize, |length, service| {
+            length.checked_add(service.encoded_len().ok()?)
+        });
+        let mut relay_bytes = vec![0_u8; relay_length.expect("relay list length")];
+        encode_relay_service_list(&services, &mut relay_bytes).expect("encode live relay list");
+        ConnectivityConfigState::from_wire(
+            11,
+            &stun_bytes,
+            &relay_bytes,
+            configured[0].2.issued_at(),
+        )
+        .expect("decode live relay connectivity config")
     }
 
     fn connectivity_config() -> ConnectivityConfigState {
@@ -2602,10 +3204,16 @@ mod tests {
             .expect("pending recovery task");
         recovery.abort();
         runtime
-            .handle_runtime_result(Err(RuntimeError::Turn(TurnUdpError::ActorStopped)))
+            .handle_relay_failure(
+                RelayPathKey {
+                    relay_id: RelayId::from_bytes([0x55; 16]),
+                    carrier: stella_transport::RelayCarrier::TurnUdp,
+                },
+                &RuntimeError::Turn(TurnUdpError::ActorStopped),
+            )
             .expect("TURN failure enters recovery");
         assert!(runtime.take_connectivity_changed());
-        assert!(runtime.relay.is_none());
+        assert!(runtime.relays.is_empty());
         runtime.shutdown().await.expect("shutdown test runtime");
     }
 
@@ -2627,15 +3235,16 @@ mod tests {
         )
         .await;
         let connectivity = live_udp_relay_connectivity_config(relay_id, relay_address, &credential);
-        let initial = allocate_preferred_relay(
+        let mut initial = allocate_preferred_relays(
             "127.0.0.1:0".parse().expect("initial relay client bind"),
             None,
             Some(&connectivity),
         )
         .await
-        .expect("allocate initial live relay")
-        .expect("configured initial relay");
-        let mut runtime = runtime_with_live_relay(connectivity, initial).await;
+        .expect("allocate initial live relay");
+        let initial = initial.pop().expect("configured initial relay");
+        let mut runtime = runtime_with_live_relays(connectivity, vec![initial]).await;
+        let failed_key = runtime.relays[0].path_key();
 
         first_shutdown.send(()).expect("stop first live relay");
         tokio::time::timeout(Duration::from_secs(2), first_task)
@@ -2647,9 +3256,9 @@ mod tests {
         assert_eq!(restarted_address, relay_address);
 
         runtime
-            .handle_relay_failure(&RuntimeError::Turn(TurnUdpError::ActorStopped))
+            .handle_relay_failure(failed_key, &RuntimeError::Turn(TurnUdpError::ActorStopped))
             .expect("start live relay recovery");
-        assert!(runtime.relay.is_none());
+        assert!(runtime.relays.is_empty());
         assert!(runtime.take_connectivity_changed());
         let recovery = runtime
             .relay_recovery
@@ -2662,7 +3271,7 @@ mod tests {
             .handle_relay_recovery(recovery_result)
             .expect("install replacement relay allocation");
 
-        let replacement = runtime.relay.as_ref().expect("replacement live relay");
+        let replacement = runtime.relays.first().expect("replacement live relay");
         assert_eq!(replacement.client.relay_id(), relay_id);
         assert_eq!(replacement.client.carrier(), ConnectivityCarrier::TurnUdp);
         assert_eq!(replacement.settings.server_address, relay_address);
@@ -2893,7 +3502,7 @@ mod tests {
         let recorded_attempts = Arc::clone(&attempts);
         let selected = tokio::time::timeout(
             Duration::from_secs(1),
-            allocate_relay_selections(selections, Duration::from_millis(20), move |selection| {
+            allocate_relay_selections(selections, Duration::from_millis(20), 1, move |selection| {
                 let attempts = Arc::clone(&recorded_attempts);
                 let carrier = selection.settings.carrier;
                 async move {
@@ -2908,13 +3517,92 @@ mod tests {
         )
         .await
         .expect("bounded fallback")
-        .expect("next carrier succeeds")
-        .expect("selected relay carrier");
+        .expect("next carrier succeeds");
+        let selected = selected[0];
         assert_eq!(selected, RuntimeRelayCarrier::Tcp);
         assert_eq!(
             *attempts.lock().expect("attempt log"),
             [RuntimeRelayCarrier::Udp, RuntimeRelayCarrier::Tcp]
         );
+    }
+
+    #[tokio::test]
+    async fn relay_allocator_keeps_two_distinct_hot_paths() {
+        let selections = relay_selections(
+            "0.0.0.0:51820".parse().expect("wildcard bind"),
+            None,
+            Some(&connectivity_config()),
+        )
+        .await
+        .expect("relay selections");
+        let selected = allocate_relay_selections(
+            selections,
+            Duration::from_secs(1),
+            2,
+            |selection| async move { Ok(selection.settings.path_key()) },
+        )
+        .await
+        .expect("select two relay paths");
+        assert_eq!(selected.len(), 2);
+        assert_ne!(selected[0], selected[1]);
+        assert_eq!(selected[0].carrier, stella_transport::RelayCarrier::TurnUdp);
+        assert_eq!(selected[1].carrier, stella_transport::RelayCarrier::TurnTcp);
+    }
+
+    #[tokio::test]
+    async fn live_standby_relay_survives_primary_failure() {
+        let first_id = RelayId::from_bytes([0x71; 16]);
+        let second_id = RelayId::from_bytes([0x72; 16]);
+        let issuer =
+            RelayCredentialAuthority::new([0x67; 32], 300).expect("live relay credential issuer");
+        let now = unix_time().expect("test clock");
+        let first_credential = issuer
+            .issue(first_id, NodeId::from_bytes([0x73; 16]), now)
+            .expect("issue first relay credential");
+        let second_credential = issuer
+            .issue(second_id, NodeId::from_bytes([0x73; 16]), now)
+            .expect("issue second relay credential");
+        let (first_address, first_shutdown, first_task) =
+            start_live_udp_relay(first_id, "127.0.0.1:0".parse().expect("first relay bind")).await;
+        let (second_address, second_shutdown, second_task) =
+            start_live_udp_relay(second_id, "127.0.0.1:0".parse().expect("second relay bind"))
+                .await;
+        let connectivity = live_udp_relay_connectivity_config_set(&[
+            (first_id, first_address, &first_credential),
+            (second_id, second_address, &second_credential),
+        ]);
+        let relays = allocate_preferred_relays(
+            "127.0.0.1:0".parse().expect("relay client bind"),
+            None,
+            Some(&connectivity),
+        )
+        .await
+        .expect("allocate live relay set");
+        assert_eq!(relays.len(), 2);
+
+        let mut runtime = runtime_with_live_relays(connectivity, relays).await;
+        let failed_key = runtime.relays[0].path_key();
+        runtime
+            .handle_relay_failure(failed_key, &RuntimeError::Turn(TurnUdpError::ActorStopped))
+            .expect("withdraw only failed relay");
+        assert_eq!(runtime.relays.len(), 1);
+        assert_ne!(runtime.relays[0].path_key(), failed_key);
+        assert!(runtime.take_connectivity_changed());
+
+        runtime
+            .shutdown()
+            .await
+            .expect("shutdown multi-relay runtime");
+        first_shutdown.send(()).expect("stop first live relay");
+        second_shutdown.send(()).expect("stop second live relay");
+        tokio::time::timeout(Duration::from_secs(2), first_task)
+            .await
+            .expect("first relay stops")
+            .expect("join first relay");
+        tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("second relay stops")
+            .expect("join second relay");
     }
 
     #[tokio::test]
@@ -2930,7 +3618,7 @@ mod tests {
         let recorded_attempts = Arc::clone(&attempts);
         let error = tokio::time::timeout(
             Duration::from_secs(1),
-            allocate_relay_selections(selections, Duration::from_millis(20), move |selection| {
+            allocate_relay_selections(selections, Duration::from_millis(20), 1, move |selection| {
                 let attempts = Arc::clone(&recorded_attempts);
                 let carrier = selection.settings.carrier;
                 async move {
@@ -2976,6 +3664,222 @@ mod tests {
     }
 
     #[test]
+    fn unspecified_udp_bind_enables_the_complementary_address_family() {
+        assert_eq!(
+            complementary_bind_address(
+                "0.0.0.0:45100".parse().expect("configured IPv4 bind"),
+                "0.0.0.0:45100".parse().expect("active IPv4 bind"),
+            ),
+            Some("[::]:45100".parse().expect("complementary IPv6 bind"))
+        );
+        assert_eq!(
+            complementary_bind_address(
+                "[::]:45100".parse().expect("configured IPv6 bind"),
+                "[::]:45100".parse().expect("active IPv6 bind"),
+            ),
+            Some("0.0.0.0:45100".parse().expect("complementary IPv4 bind"))
+        );
+        assert!(complementary_bind_address(
+            "127.0.0.1:45100".parse().expect("specific IPv4 bind"),
+            "127.0.0.1:45100".parse().expect("active IPv4 bind"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn dual_stack_candidates_are_deduplicated_bounded_and_strictly_ordered() {
+        let base = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("IPv4 candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let mut candidates = vec![
+            base,
+            IceCandidate {
+                address: "[2001:db8::70]:47000".parse().expect("IPv6 candidate"),
+                ..base
+            },
+            base,
+        ];
+        normalize_direct_candidates(&mut candidates, 2);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].priority > candidates[1].priority);
+    }
+
+    #[test]
+    fn host_candidate_refresh_preserves_server_reflexive_paths() {
+        let host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("old host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let server_reflexive = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000"
+                .parse()
+                .expect("server-reflexive candidate"),
+            related_address: Some(host.address),
+            ..host
+        };
+        let replacement = IceCandidate {
+            address: "192.0.2.71:47000".parse().expect("new host candidate"),
+            foundation: 9,
+            ..host
+        };
+        let mut candidates = vec![host, server_reflexive];
+        assert!(replace_host_candidates(
+            &mut candidates,
+            vec![replacement],
+            0
+        ));
+        assert!(candidates.contains(&replacement));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.address == server_reflexive.address));
+        assert!(!replace_host_candidates(
+            &mut candidates,
+            vec![replacement],
+            0
+        ));
+    }
+
+    #[test]
+    fn interface_change_replaces_stale_server_reflexive_mapping() {
+        let host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let stale = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000".parse().expect("stale mapping"),
+            related_address: Some(host.address),
+            ..host
+        };
+        let refreshed_address = "203.0.113.70:48000".parse().expect("refreshed mapping");
+        let discovery = StunDiscovery {
+            mappings: vec![StunMapping {
+                mapped_address: refreshed_address,
+                base_address: host.address,
+            }],
+            deferred: Vec::new(),
+            dropped_datagrams: 0,
+        };
+        let empty = StunDiscovery::default();
+        let mut candidates = vec![host, stale];
+        assert!(replace_server_reflexive_candidates(
+            &mut candidates,
+            [&discovery, &empty],
+            1_200,
+            0
+        ));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.class == IceCandidateClass::ServerReflexive
+                && candidate.address == refreshed_address
+        }));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.address == stale.address));
+    }
+
+    #[test]
+    fn empty_stun_refresh_preserves_last_valid_mapping() {
+        let host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.70:47000".parse().expect("host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let server_reflexive = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000"
+                .parse()
+                .expect("server-reflexive candidate"),
+            related_address: Some(host.address),
+            ..host
+        };
+        let empty = StunDiscovery::default();
+        let mut candidates = vec![host, server_reflexive];
+
+        assert!(!replace_server_reflexive_candidates(
+            &mut candidates,
+            [&empty, &empty],
+            1_200,
+            0
+        ));
+        assert!(candidates.contains(&server_reflexive));
+    }
+
+    #[test]
+    fn stale_server_reflexive_mapping_is_removed_without_replacement() {
+        let current_host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.71:47000".parse().expect("current host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let stale_server_reflexive = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000".parse().expect("stale mapping"),
+            related_address: Some("192.0.2.70:47000".parse().expect("stale host address")),
+            ..current_host
+        };
+        let valid_server_reflexive = IceCandidate {
+            address: "198.51.100.71:47000".parse().expect("valid mapping"),
+            related_address: Some(current_host.address),
+            ..stale_server_reflexive
+        };
+        let stale_address = stale_server_reflexive.address;
+        let valid_address = valid_server_reflexive.address;
+        let empty = StunDiscovery::default();
+        let mut candidates = vec![current_host, stale_server_reflexive, valid_server_reflexive];
+
+        assert!(replace_server_reflexive_candidates(
+            &mut candidates,
+            [&empty, &empty],
+            1_200,
+            0
+        ));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.address == stale_address));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.address == valid_address));
+    }
+
+    #[test]
     fn generated_ice_credentials_are_canonical_and_secret_owned() {
         let username = random_ice_credential(ICE_USERNAME_RANDOM_LENGTH).expect("ICE username");
         let password = random_ice_credential(ICE_PASSWORD_RANDOM_LENGTH).expect("ICE password");
@@ -3000,7 +3904,7 @@ mod tests {
             relay_id: None,
         };
         let generation =
-            LocalConnectivityGeneration::new(None, &[candidate]).expect("direct-only generation");
+            LocalConnectivityGeneration::new(&[], &[candidate]).expect("direct-only generation");
         let generation = generation.as_ref().expect("validated generation");
         assert_eq!(generation.candidates(), &[candidate]);
         assert!(generation.expires_at() > generation.created_at());
@@ -3018,9 +3922,9 @@ mod tests {
             related_address: None,
             relay_id: None,
         };
-        let initial = LocalConnectivityGeneration::new_at(100, None, &[candidate])
+        let initial = LocalConnectivityGeneration::new_at(100, &[], &[candidate])
             .expect("initial direct generation");
-        let replacement = LocalConnectivityGeneration::new_at(581, None, &[candidate])
+        let replacement = LocalConnectivityGeneration::new_at(581, &[], &[candidate])
             .expect("replacement direct generation");
         assert_eq!(initial.expires_at, 700);
         assert_eq!(replacement.expires_at, 1_181);

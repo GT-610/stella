@@ -275,7 +275,12 @@ async fn run_client(config_path: &Path) -> Result<()> {
     tracing::info!(config = %config_path.display(), "starting client runtime");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        supervise_control(&config, &identity, tokio::spawn(tokio::signal::ctrl_c())).await
+        Box::pin(supervise_control(
+            &config,
+            &identity,
+            tokio::spawn(tokio::signal::ctrl_c()),
+        ))
+        .await
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
@@ -614,6 +619,9 @@ async fn run_active_io(
                     .await
                     .context("data-plane maintenance failed")
                     .map_err(ActiveRuntimeFailure::data)?;
+                if data.take_connectivity_changed() {
+                    publish_current_connectivity(active, data).await?;
+                }
             }
             result = data.receive_next(identity) => {
                 handle_data_runtime_result(result)
@@ -1165,6 +1173,7 @@ fn validate_join_tap(args: &JoinArgs) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
 const fn validate_join_tap(_args: &JoinArgs) -> Result<()> {
     Ok(())
 }
@@ -1481,11 +1490,12 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
 
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::prepare_invitation_configuration;
     use super::{
-        configuration_document, full_jitter, persist_network_intent,
-        load_join_invitation_with_stdin, prepare_invitation_configuration, read_join_invitation,
-        reconnect_cap, remove_network_intent, report_control_shutdown, Cli, CliCredential,
-        CliInvitation, Command, InitArgs, JoinArgs, MAXIMUM_RECONNECT_DELAY,
+        configuration_document, full_jitter, load_join_invitation_with_stdin,
+        persist_network_intent, read_join_invitation, reconnect_cap, remove_network_intent,
+        report_control_shutdown, Cli, CliCredential, Command, InitArgs, MAXIMUM_RECONNECT_DELAY,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
@@ -1493,6 +1503,8 @@ mod tests {
     use super::{initialize, status};
     #[cfg(target_os = "macos")]
     use super::{validate_intent_compatibility, validate_join_tap};
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::{CliInvitation, JoinArgs};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1532,6 +1544,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn invitation_join_args(invitation: JoinInvitation) -> JoinArgs {
         let (tap_adapter, tap_peer) = tap_selection(130);
         JoinArgs {
@@ -1613,6 +1626,7 @@ mod tests {
 
     #[test]
     fn cli_accepts_stdin_invitation_without_exposing_it_as_an_argument() {
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut arguments = vec![
             "stella-client",
             "join",

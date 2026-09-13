@@ -17,6 +17,7 @@ mod network;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod runtime;
 mod state;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod stun;
 mod switch;
 mod tls;
@@ -45,6 +46,7 @@ pub use state::{
     GrantRefreshInput, NetworkState, PeerConnectivityState, PeerDeltaInput, PeerDeltaOperation,
     PeerState, SnapshotInput, StateError,
 };
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub use stun::StunDiscoveryError;
 pub use switch::{FloodClass, L2Switch, PeerIngress, SwitchError, TapForwarding};
 pub use tls::{SpkiPin, SpkiPinParseError};

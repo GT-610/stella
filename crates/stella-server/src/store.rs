@@ -743,6 +743,7 @@ impl AuthorityStore {
         let present = {
             let memberships = write.open_table(MEMBERSHIPS)?;
             let present = memberships.get(key.as_slice())?.is_some();
+            drop(memberships);
             present
         };
         if !present {
@@ -900,6 +901,7 @@ impl AuthorityStore {
                 .get(key.as_slice())?
                 .map(|value| EndpointLeaseRecord::decode(value.value()))
                 .transpose()?;
+            drop(endpoint_table);
             record
         };
 
@@ -1071,6 +1073,7 @@ impl AuthorityStore {
                 .get(key.as_slice())?
                 .map(|value| EndpointLeaseRecord::decode(value.value()))
                 .transpose()?;
+            drop(endpoints);
             record
         };
         if let Some(record) = &existing_lease {
@@ -1082,6 +1085,7 @@ impl AuthorityStore {
                 .get(key.as_slice())?
                 .map(|value| ConnectivityAuthorityRecord::decode(value.value()))
                 .transpose()?;
+            drop(connectivity);
             record
         };
         if let Some(record) = &existing_connectivity {

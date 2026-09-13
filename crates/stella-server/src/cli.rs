@@ -1001,6 +1001,7 @@ const fn membership_status(status: MembershipStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(windows, target_os = "macos"))]
     use std::{
         ffi::OsString,
         path::PathBuf,
@@ -1008,26 +1009,35 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    #[cfg(any(windows, target_os = "macos"))]
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use clap::Parser;
+    #[cfg(any(windows, target_os = "macos"))]
     use stella_common::JoinInvitation;
+    #[cfg(any(windows, target_os = "macos"))]
     use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
+    #[cfg(any(windows, target_os = "macos"))]
     use stella_server::{
         config::ServerConfig,
         identity::create_controller_identity,
         store::{AuthorityStore, NodeRecord},
     };
 
-    use super::{execute, Cli, Command, RelayCarrierArg, RelayCommand};
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::execute;
+    use super::{Cli, Command, RelayCarrierArg, RelayCommand};
 
+    #[cfg(any(windows, target_os = "macos"))]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    #[cfg(any(windows, target_os = "macos"))]
     struct Fixture {
         directory: PathBuf,
         config: PathBuf,
         node_id: stella_common::NodeId,
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     impl Fixture {
         fn new(seed: u8) -> Self {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1219,6 +1229,7 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove relay key test directory");
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test(flavor = "current_thread")]
     async fn init_command_creates_deployment_and_prints_public_trust_material() {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1295,6 +1306,7 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove init test directory");
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test(flavor = "current_thread")]
     async fn network_member_node_and_state_commands_execute() {
         let fixture = Fixture::new(41);
@@ -1347,6 +1359,7 @@ mod tests {
         fixture.cleanup();
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test(flavor = "current_thread")]
     async fn token_and_network_delete_outputs_are_canonical() {
         let fixture = Fixture::new(43);

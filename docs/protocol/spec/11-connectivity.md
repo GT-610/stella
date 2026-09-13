@@ -102,17 +102,31 @@ Gathering runs in parallel:
 1. enumerate permitted host addresses;
 2. request server-reflexive addresses from at least one configured STUN service;
 3. optionally request automatic mappings using PCP, NAT-PMP, or UPnP;
-4. establish at least one relay allocation or carrier; and
+4. establish up to two distinct relay allocation/carrier paths; and
 5. publish the complete generation after initial relay readiness or the bounded
    startup deadline, whichever occurs first.
 
 Late candidates replace the published generation. They do not mutate an
 already published encoding in place.
 
-A STUN response is accepted only when its transaction ID, message integrity,
-fingerprint requirements, source service, address family, length, and timeout
-match the outstanding transaction. STUN never allocates Stella handshake or
-frame-reassembly state.
+A STUN response is accepted only when its transaction ID, Binding success
+message type, fingerprint requirements, source service, address family, length,
+and timeout match the outstanding transaction. Unauthenticated Binding discovery
+does not require MESSAGE-INTEGRITY; authenticated ICE checks and relay traffic
+must enforce it with their negotiated credentials. STUN never allocates Stella
+handshake or frame-reassembly state.
+
+The reference client checks the host-interface candidate set every five
+seconds. When that set changes, it repeats same-socket STUN discovery for both
+address families with a 250-millisecond refresh deadline. A validated mapping
+replaces the prior server-reflexive candidates for its address family; an empty
+or failed discovery retains the last validated candidates. The client then
+rotates the local generation and republishes it.
+
+Each same-socket discovery has a separate deferred queue holding at most 32
+eligible unassociated STUN datagrams and non-STUN datagrams for normal
+processing. Once that queue is full, newly received eligible datagrams are
+dropped until discovery completes.
 
 ## 7. Controller signaling
 
@@ -196,7 +210,9 @@ Direct checks continue at a low bounded rate. When a better direct path is
 nominated, peers establish a fresh Stella session there. After confirmation,
 new sends use the direct session and the old relay session follows the normal
 receive-only rekey grace before erasure. The relay allocation remains warm while
-the network is active.
+the network is active. The reference client keeps at most two distinct
+`(relay-id, carrier)` allocations warm and publishes both with strictly
+decreasing candidate priorities.
 
 ## 12. Failure, rebinding, and recovery
 
@@ -208,7 +224,7 @@ On path failure the client:
 
 1. stops selecting the failed session for new TAP frames;
 2. selects an already confirmed alternate session when available;
-3. otherwise handshakes on the ready relay path;
+3. otherwise handshakes on an already ready alternate relay path;
 4. starts or refreshes direct checks; and
 5. drops frames rather than creating an unbounded recovery queue.
 

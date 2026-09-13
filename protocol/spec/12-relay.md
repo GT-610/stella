@@ -372,18 +372,27 @@ specification.
 
 ## 8. Queueing and backpressure
 
-Per allocation, the reference limits are:
+The client allocation actor owns three separate bounded channels:
 
-- 256 queued datagrams total;
-- 128 queued datagrams per destination peer;
-- one megabyte of queued encoded data;
-- 65,507 bytes absolute datagram ceiling; and
-- a lower advertised default of 1,200 bytes.
+- a 64-entry control channel from client APIs to the allocation actor;
+- a 64-entry egress data channel from the data-plane runtime to the allocation
+  actor, where every entry is one complete datagram; and
+- a 256-entry inbound channel from the allocation actor to the data-plane
+  runtime, where every entry is one complete received datagram.
 
-The first reached limit wins. Overflow drops new data datagrams for the affected
-destination and increments a safe counter. Control, allocation refresh, and
-permission traffic use separate bounded queues and cannot be starved by game
-data.
+The relay service separately uses a 256-entry command channel from its listener
+to each server-side allocation actor. Its limits of 128 permissions and 128
+channel bindings per allocation bound authorized peer state, not per-destination
+datagram queues. The one-megabyte control-record ceiling belongs to the control
+plane and does not increase any TURN queue. Relayed datagrams retain the 65,507
+byte absolute ceiling and the lower advertised default of 1,200 bytes.
+
+`try_send_to` is nonblocking: it drops the complete datagram when the client
+egress channel is full, and the receive path drops an inbound datagram when the
+inbound channel is full. Blocking `send_to` and `send_indication_to` use the
+`data_command` path and await egress capacity before returning. The separate
+control channel prevents a queued data backlog from consuming capacity needed
+for permission work, credential refresh, or shutdown.
 
 Stream carriers inherently introduce head-of-line blocking. Implementations do
 not build an unbounded reorder layer above them. Direct paths remain preferred,
@@ -408,14 +417,19 @@ flood limits.
 
 ## 10. Availability and selection
 
-A client keeps at least one relay ready while any virtual network is active.
-When multiple relays exist, it prefers an operator-compatible region with a
-healthy carrier and lower measured latency. It may keep a second allocation as
-standby, subject to deployment resource policy.
+A client keeps up to two distinct `(relay-id, carrier)` allocations ready while
+any virtual network is active. It publishes every allocation that is currently
+ready, up to that limit, following controller order and carrier fallback order.
+If only one allocation is ready, the client publishes that candidate and keeps
+recovering the empty slot. Once a second distinct allocation becomes ready, the
+client republishes it as hot standby. Duplicate addresses for the same relay and
+carrier do not consume the second slot.
 
 Relay failure triggers bounded reconnect with full jitter. Direct sessions
-continue unaffected. If no direct session exists, the client reports degraded
-connectivity and drops rather than indefinitely queues TAP frames.
+and a surviving standby relay continue unaffected. A bounded per-allocation
+client queue prevents reliable-carrier I/O from blocking direct UDP or another
+relay. If no usable session exists, the client reports degraded connectivity
+and drops rather than indefinitely queues TAP frames.
 
 ## 11. Deployment profile
 
