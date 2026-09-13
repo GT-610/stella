@@ -2578,12 +2578,30 @@ fn replace_server_reflexive_candidates(
     max_datagram_size: u32,
     reserved_relays: usize,
 ) -> bool {
+    let host_addresses = candidates
+        .iter()
+        .filter(|candidate| candidate.class == IceCandidateClass::Host)
+        .map(|candidate| candidate.address)
+        .collect::<BTreeSet<_>>();
+    let previous_len = candidates.len();
+    candidates.retain(|candidate| {
+        candidate.class != IceCandidateClass::ServerReflexive
+            || candidate
+                .related_address
+                .is_some_and(|related| host_addresses.contains(&related))
+    });
+    let mut changed = candidates.len() != previous_len;
     let mut replacements = Vec::new();
     for discovery in discoveries {
         replacements.extend(server_reflexive_candidates(discovery, max_datagram_size));
     }
+    replacements.retain(|candidate| {
+        candidate
+            .related_address
+            .is_some_and(|related| host_addresses.contains(&related))
+    });
     if replacements.is_empty() {
-        return false;
+        return changed;
     }
     let replace_ipv4 = replacements
         .iter()
@@ -2598,11 +2616,12 @@ fn replace_server_reflexive_candidates(
     });
     candidates.extend(replacements);
     normalize_direct_candidates(candidates, reserved_relays);
-    true
+    changed = true;
+    changed
 }
 
 fn recover_stun_discovery(
-    result: Result<StunDiscovery, StunDiscoveryFailure>,
+    result: Result<StunDiscovery, Box<StunDiscoveryFailure>>,
     local_address: Option<SocketAddr>,
 ) -> StunDiscovery {
     match result {
@@ -2616,9 +2635,9 @@ fn recover_stun_discovery(
                 "same-socket STUN discovery failed"
             );
             StunDiscovery {
+                mappings: failure.mappings,
                 deferred: failure.deferred,
                 dropped_datagrams: failure.dropped_datagrams,
-                ..StunDiscovery::default()
             }
         }
     }
@@ -2819,17 +2838,21 @@ mod tests {
             bytes: vec![0x42, 0x43],
         };
         let recovered = recover_stun_discovery(
-            Err(StunDiscoveryFailure {
+            Err(Box::new(StunDiscoveryFailure {
                 error: StunDiscoveryError::DeadlineOverflow,
+                mappings: vec![StunMapping {
+                    mapped_address: "198.51.100.81:47001".parse().expect("mapped address"),
+                    base_address: "192.0.2.81:47001".parse().expect("base address"),
+                }],
                 deferred: vec![deferred.clone()],
                 dropped_datagrams: 2,
-            }),
+            })),
             Some("192.0.2.81:47001".parse().expect("local address")),
         );
 
         assert_eq!(recovered.deferred, vec![deferred]);
         assert_eq!(recovered.dropped_datagrams, 2);
-        assert!(recovered.mappings.is_empty());
+        assert_eq!(recovered.mappings.len(), 1);
     }
 
     #[test]
@@ -3810,6 +3833,50 @@ mod tests {
             0
         ));
         assert!(candidates.contains(&server_reflexive));
+    }
+
+    #[test]
+    fn stale_server_reflexive_mapping_is_removed_without_replacement() {
+        let current_host = IceCandidate {
+            class: IceCandidateClass::Host,
+            carrier: ConnectivityCarrier::DirectUdp,
+            priority: 2_130_706_431,
+            foundation: 7,
+            max_datagram_size: 1_200,
+            address: "192.0.2.71:47000".parse().expect("current host candidate"),
+            related_address: None,
+            relay_id: None,
+        };
+        let stale_server_reflexive = IceCandidate {
+            class: IceCandidateClass::ServerReflexive,
+            priority: 1_700_000_000,
+            foundation: 8,
+            address: "198.51.100.70:47000".parse().expect("stale mapping"),
+            related_address: Some("192.0.2.70:47000".parse().expect("stale host address")),
+            ..current_host
+        };
+        let valid_server_reflexive = IceCandidate {
+            address: "198.51.100.71:47000".parse().expect("valid mapping"),
+            related_address: Some(current_host.address),
+            ..stale_server_reflexive
+        };
+        let stale_address = stale_server_reflexive.address;
+        let valid_address = valid_server_reflexive.address;
+        let empty = StunDiscovery::default();
+        let mut candidates = vec![current_host, stale_server_reflexive, valid_server_reflexive];
+
+        assert!(replace_server_reflexive_candidates(
+            &mut candidates,
+            [&empty, &empty],
+            1_200,
+            0
+        ));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.address == stale_address));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.address == valid_address));
     }
 
     #[test]
