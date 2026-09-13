@@ -372,19 +372,24 @@ specification.
 
 ## 8. Queueing and backpressure
 
-Per allocation, the reference limits are:
+The client allocation actor owns three separate bounded channels:
 
-- 64 queued client egress commands;
-- 256 queued datagrams total;
-- 128 queued datagrams per destination peer;
-- one megabyte of queued encoded data;
-- 65,507 bytes absolute datagram ceiling; and
-- a lower advertised default of 1,200 bytes.
+- a 64-entry control channel from client APIs to the allocation actor;
+- a 64-entry egress data channel from the data-plane runtime to the allocation
+  actor, where every entry is one complete datagram; and
+- a 256-entry inbound channel from the allocation actor to the data-plane
+  runtime, where every entry is one complete received datagram.
 
-The first reached limit wins. Overflow drops new data datagrams for the affected
-destination and increments a safe counter. Control, allocation refresh, and
-permission traffic use separate bounded queues and cannot be starved by game
-data.
+The relay service separately uses a 256-entry command channel from its listener
+to each server-side allocation actor. Its limits of 128 permissions and 128
+channel bindings per allocation bound authorized peer state, not per-destination
+datagram queues. The one-megabyte control-record ceiling belongs to the control
+plane and does not increase any TURN queue. Relayed datagrams retain the 65,507
+byte absolute ceiling and the lower advertised default of 1,200 bytes.
+
+When a client data or inbound channel is full, the new datagram is dropped. The
+separate control channel prevents a queued data backlog from consuming capacity
+needed for permission work, credential refresh, or shutdown.
 
 Stream carriers inherently introduce head-of-line blocking. Implementations do
 not build an unbounded reorder layer above them. Direct paths remain preferred,
@@ -410,10 +415,12 @@ flood limits.
 ## 10. Availability and selection
 
 A client keeps up to two distinct `(relay-id, carrier)` allocations ready while
-any virtual network is active. When multiple relays exist, it prefers the
-controller order and carrier fallback order, publishes both candidates, and
-keeps the second allocation as hot standby. Duplicate addresses for the same
-relay and carrier do not consume the second slot.
+any virtual network is active. It publishes every allocation that is currently
+ready, up to that limit, following controller order and carrier fallback order.
+If only one allocation is ready, the client publishes that candidate and keeps
+recovering the empty slot. Once a second distinct allocation becomes ready, the
+client republishes it as hot standby. Duplicate addresses for the same relay and
+carrier do not consume the second slot.
 
 Relay failure triggers bounded reconnect with full jitter. Direct sessions
 and a surviving standby relay continue unaffected. A bounded per-allocation

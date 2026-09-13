@@ -109,16 +109,22 @@ Gathering runs in parallel:
 Late candidates replace the published generation. They do not mutate an
 already published encoding in place.
 
-A STUN response is accepted only when its transaction ID, message integrity,
-fingerprint requirements, source service, address family, length, and timeout
-match the outstanding transaction. STUN never allocates Stella handshake or
-frame-reassembly state.
+A STUN response is accepted only when its transaction ID, Binding success
+message type, fingerprint requirements, source service, address family, length,
+and timeout match the outstanding transaction. This unauthenticated discovery
+profile does not require MESSAGE-INTEGRITY. STUN never allocates Stella handshake
+or frame-reassembly state.
 
 The reference client checks the host-interface candidate set every five
 seconds. When that set changes, it repeats same-socket STUN discovery for both
-address families, replaces every prior server-reflexive candidate, rotates the
-local generation, and republishes it. Non-STUN datagrams received during that
-bounded discovery window are retained for normal processing.
+address families with a 250-millisecond refresh deadline. A validated mapping
+replaces the prior server-reflexive candidates for its address family; an empty
+or failed discovery retains the last validated candidates. The client then
+rotates the local generation and republishes it.
+
+Each same-socket discovery has a separate deferred queue holding at most 32
+non-STUN datagrams for normal processing. Once that queue is full, newly received
+non-STUN datagrams are dropped until discovery completes.
 
 ## 7. Controller signaling
 
