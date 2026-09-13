@@ -149,7 +149,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .join_network(network_id, Some(&join_credential))
         .await
         .expect("join network and activate initial snapshot");
-    assert!(first_membership_created);
+    assert_eq!(first_membership_created, Some(true));
     let first_epoch = first_state.controller_epoch();
     assert!(first
         .network(network_id)
@@ -300,7 +300,7 @@ async fn pinned_client_enrolls_and_reauthenticates_existing_node() {
         .join_network(network_id, None)
         .await
         .expect("existing membership rejoins without a token");
-    assert!(!repeated_membership_created);
+    assert_eq!(repeated_membership_created, Some(false));
     assert_eq!(repeated_state.controller_epoch(), reconciled_epoch);
     assert!(matches!(
         second

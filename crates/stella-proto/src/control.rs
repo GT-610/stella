@@ -374,7 +374,8 @@ impl ControlFieldType {
             | Self::ConnectivityList
             | Self::ConnectivityRecord
             | Self::StunServerList
-            | Self::RelayServiceList => ProtocolVersion::V0_2,
+            | Self::RelayServiceList
+            | Self::MembershipCreated => ProtocolVersion::V0_2,
             _ => ProtocolVersion::V0_1,
         }
     }
@@ -1466,9 +1467,9 @@ mod tests {
 
     use super::{
         control_fields_encoded_len, decode_control_record_length, encode_control_fields,
-        encode_control_message, encode_control_record_length, field_required, ControlFieldIter,
-        ControlFieldRef, ControlFieldType, ControlHeader, ControlMessageType, ControlMessageView,
-        CONTROL_HEADER_LENGTH,
+        encode_control_message, encode_control_record_length, field_allowed, field_required,
+        ControlFieldIter, ControlFieldRef, ControlFieldType, ControlHeader, ControlMessageType,
+        ControlMessageView, CONTROL_HEADER_LENGTH,
     };
     use crate::{
         encode_connectivity_record, encode_relay_service_list, encode_stun_server_list, CodecError,
@@ -1913,6 +1914,16 @@ mod tests {
             ProtocolVersion::V0_2,
             ControlMessageType::PeerSnapshot,
             ControlFieldType::ConnectivityList,
+        ));
+        assert!(!field_allowed(
+            ProtocolVersion::V0_1,
+            ControlMessageType::JoinResult,
+            ControlFieldType::MembershipCreated,
+        ));
+        assert!(field_allowed(
+            ProtocolVersion::V0_2,
+            ControlMessageType::JoinResult,
+            ControlFieldType::MembershipCreated,
         ));
     }
 

@@ -515,13 +515,14 @@ async fn resolve_join(
                     close: false,
                 });
             };
-            if let Err(error) = authority
+            let (_, membership_created) = match authority
                 .join_with_token(&token, node_id, request.network_id, now)
                 .await
             {
-                return map_join_authority_error(error, network);
-            }
-            true
+                Ok(result) => result,
+                Err(error) => return map_join_authority_error(error, network),
+            };
+            membership_created
         }
     };
 
@@ -1068,10 +1069,12 @@ async fn send_join_result(
         ControlFieldType::SnapshotRevision,
         &encoded.snapshot_revision().to_be_bytes(),
     )?;
-    builder.push_field(
-        ControlFieldType::MembershipCreated,
-        &[u8::from(membership_created)],
-    )?;
+    if state.protocol_version >= ProtocolVersion::V0_2 {
+        builder.push_field(
+            ControlFieldType::MembershipCreated,
+            &[u8::from(membership_created)],
+        )?;
+    }
     write_message(state, builder).await
 }
 

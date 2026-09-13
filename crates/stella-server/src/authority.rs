@@ -229,7 +229,7 @@ impl AuthorityHandle {
         node_id: NodeId,
         network_id: NetworkId,
         now: u64,
-    ) -> Result<AuthorityRevision, AuthorityError> {
+    ) -> Result<(AuthorityRevision, bool), AuthorityError> {
         let token = token.duplicate();
         self.request(|reply| Command::JoinWithToken {
             token,
@@ -709,7 +709,7 @@ enum Command {
         node_id: NodeId,
         network_id: NetworkId,
         now: u64,
-        reply: StoreReply<AuthorityRevision>,
+        reply: StoreReply<(AuthorityRevision, bool)>,
     },
     AddMember {
         node_id: NodeId,
@@ -860,7 +860,7 @@ impl Command {
                 reply,
             } => respond(
                 reply,
-                store.join_with_token(&token, node_id, network_id, now),
+                store.join_with_token_with_status(&token, node_id, network_id, now),
             ),
             Self::AddMember {
                 node_id,
