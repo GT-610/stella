@@ -95,6 +95,7 @@ impl TapConfig {
         Ok(())
     }
 
+    #[allow(dead_code, reason = "used by platform-specific TAP backends")]
     pub(crate) fn validate_read_buffer(&self, length: usize) -> Result<()> {
         let needed = usize::from(self.max_frame_size);
         if length < needed {
@@ -106,6 +107,7 @@ impl TapConfig {
         Ok(())
     }
 
+    #[allow(dead_code, reason = "used by platform-specific TAP backends")]
     pub(crate) fn validate_frame(&self, length: usize) -> Result<()> {
         let minimum = usize::from(MIN_ETHERNET_FRAME_LENGTH);
         let maximum = usize::from(self.max_frame_size);
