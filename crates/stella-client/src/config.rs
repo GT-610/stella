@@ -16,8 +16,10 @@ use thiserror::Error;
 
 use crate::{ControllerTrust, SpkiPin, SpkiPinParseError};
 
-/// Supported client configuration schema version.
-pub const CONFIG_VERSION: u32 = 1;
+/// Current client configuration schema version.
+pub const CONFIG_VERSION: u32 = 2;
+
+const LEGACY_CONFIG_VERSION: u32 = 1;
 
 /// Largest accepted UTF-8 client configuration file.
 pub const MAX_CONFIG_BYTES: u64 = 1_048_576;
@@ -95,7 +97,7 @@ impl ClientConfig {
     /// Returns [`ClientConfigError`] for strict schema or semantic failure.
     pub fn parse(text: &str, base_directory: &Path) -> Result<Self, ClientConfigError> {
         let raw: RawClientConfig = toml::from_str(text).map_err(ClientConfigError::Parse)?;
-        if raw.version != CONFIG_VERSION {
+        if !(LEGACY_CONFIG_VERSION..=CONFIG_VERSION).contains(&raw.version) {
             return Err(ClientConfigError::UnsupportedVersion {
                 actual: raw.version,
                 supported: CONFIG_VERSION,
@@ -156,7 +158,7 @@ impl ClientConfig {
         let mut networks = raw
             .networks
             .into_iter()
-            .map(RawNetwork::validate)
+            .map(|network| network.validate(raw.version))
             .collect::<Result<Vec<_>, _>>()?;
         networks.sort_by_key(|network| network.network_id);
         for pair in networks.windows(2) {
@@ -165,7 +167,7 @@ impl ClientConfig {
             }
         }
         Ok(Self {
-            version: raw.version,
+            version: CONFIG_VERSION,
             controller,
             identity_path: resolve_path(base_directory, &raw.identity.node_key),
             display_name: raw.identity.display_name,
@@ -187,6 +189,13 @@ pub struct ConfiguredNetwork {
     pub tap_adapter: String,
     /// Optional packet-I/O peer interface required by the macOS backend.
     pub tap_peer: Option<String>,
+}
+
+/// Returns the stable TAP-Windows adapter name managed for `network_id`.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn windows_tap_adapter_name(network_id: NetworkId) -> String {
+    format!("Stella {network_id}")
 }
 
 /// Client configuration loading or semantic validation failure.
@@ -215,7 +224,9 @@ pub enum ClientConfigError {
     #[error("invalid client configuration: {0}")]
     Parse(toml::de::Error),
     /// The schema version is not implemented.
-    #[error("unsupported client configuration version {actual}; supported version is {supported}")]
+    #[error(
+        "unsupported client configuration version {actual}; newest supported version is {supported}"
+    )]
     UnsupportedVersion {
         /// Version found in TOML.
         actual: u32,
@@ -338,7 +349,7 @@ struct RawNetwork {
 }
 
 impl RawNetwork {
-    fn validate(self) -> Result<ConfiguredNetwork, ClientConfigError> {
+    fn validate(self, schema_version: u32) -> Result<ConfiguredNetwork, ClientConfigError> {
         let network_id =
             NetworkId::from_str(&self.id).map_err(|source| ClientConfigError::Identifier {
                 field: "networks.id",
@@ -353,11 +364,30 @@ impl RawNetwork {
             MAX_ADAPTER_NAME_BYTES,
             "networks.tap_adapter",
         )?;
+        #[cfg(target_os = "windows")]
+        let tap_adapter = {
+            let expected = windows_tap_adapter_name(network_id);
+            if schema_version == LEGACY_CONFIG_VERSION {
+                expected
+            } else if self.tap_adapter == expected {
+                self.tap_adapter
+            } else {
+                return Err(invalid(
+                    "networks.tap_adapter",
+                    "must equal the managed adapter name derived from networks.id",
+                ));
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let tap_adapter = {
+            let _ = schema_version;
+            self.tap_adapter
+        };
         #[cfg(target_os = "macos")]
-        validate_macos_feth_name(&self.tap_adapter, "networks.tap_adapter")?;
+        validate_macos_feth_name(&tap_adapter, "networks.tap_adapter")?;
         if let Some(tap_peer) = &self.tap_peer {
             validate_text(tap_peer, 1, MAX_ADAPTER_NAME_BYTES, "networks.tap_peer")?;
-            if tap_peer == &self.tap_adapter {
+            if tap_peer == &tap_adapter {
                 return Err(invalid(
                     "networks.tap_peer",
                     "must differ from networks.tap_adapter",
@@ -375,7 +405,7 @@ impl RawNetwork {
         }
         Ok(ConfiguredNetwork {
             network_id,
-            tap_adapter: self.tap_adapter,
+            tap_adapter,
             tap_peer: self.tap_peer,
         })
     }
@@ -575,10 +605,10 @@ tap_peer = "feth101"
 
     #[test]
     fn versions_pins_addresses_and_text_are_strict() {
-        let future = VALID.replace("version = 1", "version = 2");
+        let future = VALID.replace("version = 1", "version = 3");
         assert!(matches!(
             ClientConfig::parse(&future, Path::new(".")),
-            Err(ClientConfigError::UnsupportedVersion { actual: 2, .. })
+            Err(ClientConfigError::UnsupportedVersion { actual: 3, .. })
         ));
         let pin = VALID.replace("sha256/AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", "bad");
         assert!(matches!(
@@ -600,14 +630,49 @@ tap_peer = "feth101"
         ));
         let bad_name = VALID.replace("Stella node", "Stella\\nnode");
         assert!(ClientConfig::parse(&bad_name, Path::new(".")).is_err());
+        #[cfg(not(target_os = "windows"))]
         let duplicate_pair = VALID.replace(
             "tap_adapter = \"feth100\"\ntap_peer = \"feth101\"",
             "tap_adapter = \"feth100\"\ntap_peer = \"feth100\"",
         );
+        #[cfg(target_os = "windows")]
+        let duplicate_pair = VALID
+            .replace("version = 1", "version = 2")
+            .replace(
+                "tap_adapter = \"feth100\"\ntap_peer = \"feth101\"",
+                "tap_adapter = \"Stella 22222222222222222222222222222222\"\ntap_peer = \"Stella 22222222222222222222222222222222\"",
+            );
         assert!(matches!(
             ClientConfig::parse(&duplicate_pair, Path::new(".")),
             Err(ClientConfigError::InvalidValue {
                 field: "networks.tap_peer",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_legacy_names_migrate_but_current_names_are_strict() {
+        let network_id = "22222222222222222222222222222222";
+        let expected = format!("Stella {network_id}");
+        let legacy = ClientConfig::parse(VALID, Path::new("."))
+            .expect("legacy Windows adapter name migrates in memory");
+        assert_eq!(legacy.version, CONFIG_VERSION);
+        assert_eq!(legacy.networks[0].tap_adapter, expected);
+
+        let current = VALID.replace("version = 1", "version = 2").replace(
+            "tap_adapter = \"feth100\"",
+            &format!("tap_adapter = \"{expected}\""),
+        );
+        ClientConfig::parse(&current, Path::new("."))
+            .expect("current managed Windows adapter name is accepted");
+
+        let invalid = current.replace(&expected, "Custom TAP");
+        assert!(matches!(
+            ClientConfig::parse(&invalid, Path::new(".")),
+            Err(ClientConfigError::InvalidValue {
+                field: "networks.tap_adapter",
                 ..
             })
         ));

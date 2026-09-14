@@ -6,10 +6,12 @@
 
 ## 前置条件与可达性
 
-Windows 每个已配置网络需要一个预安装 TAP-Windows Adapter V9，并从提升权限的 PowerShell
-运行。macOS 每个网络需要两个互不相同的数值型 feth 名称，且不能由另一个活动进程持有。
-由 Stella 管理且匹配的持久 pair 可以继续存在，并会在客户端启动时复用。普通客户端保持
-无特权；另行启动的 root `stella-tap-helper` 创建或复用 pair，并且只执行有界 TAP 操作。
+Windows 需要把已签名的 TAP-Windows Adapter V9 驱动包安装到 Driver Store，并从提升权限的
+PowerShell 运行。Stella 会为每个已加入网络自动创建和命名一个持久适配器，用户无需预建
+或选择适配器。macOS 每个网络需要两个互不相同的数值型 feth 名称，且不能由另一个活动
+进程持有。由 Stella 管理且匹配的持久 pair 可以继续存在，并会在客户端启动时复用。普通
+macOS 客户端保持无特权；另行启动的 root `stella-tap-helper` 创建或复用 pair，并且只执行
+有界 TAP 操作。
 
 控制器必须能通过配置的
 TLS/TCP 地址直接访问，或能通过可选的显式 HTTPS 代理访问。运行时会收集直连 UDP 候选，
@@ -77,8 +79,7 @@ TLS 1.3、服务器名与 SPKI 验证、Stella 控制器认证以及 Relay TLS/W
 $Invitation = Read-Host 'Stella invitation'
 $Invitation | stella-client --config C:\Stella\client.toml join `
   --invite-file - `
-  --display-name "Gaming PC" `
-  --tap-adapter "Stella LAN"
+  --display-name "Gaming PC"
 $Invitation = $null
 ```
 
@@ -105,13 +106,12 @@ unset invitation
 
 以下精细形式继续用于已有配置、已有成员关系或独立令牌工作流。
 
-Windows 选择准确的预安装适配器：
+Windows 根据网络 ID 派生适配器名称，并在使用加入凭据前完成配置：
 
 ```powershell
 stella-client --config C:\Stella\client.toml join `
   --network <id> `
-  --token <unpadded-base64url-token> `
-  --tap-adapter "Stella LAN"
+  --token <unpadded-base64url-token>
 ```
 
 macOS 必须选择 feth pair 两端。第一项是宿主可见端，第二项只供 Stella 报文 I/O：
@@ -128,9 +128,22 @@ stella-client --config /etc/stella/client.toml join \
 `--enrollment-token <unpadded-base64url-token>`。两类令牌都必须解码为恰好 32 字节。
 它们只存在于进程内，会从调试输出中脱敏，也不会写入配置。
 
-`join` 先验证本地 TAP 选择，再认证并等待完整、已验证的控制器快照，然后原子持久化
-网络 ID 与选择。重复已接受的加入可省略 `--token`；相同 Windows 适配器或完整相同的
-macOS pair 是幂等的，冲突的 adapter 或 peer 会在连接控制器前被拒绝。
+Windows 上，`join` 会在认证前从已安装驱动包创建或复用
+`Stella <网络ID>`。如果认证、加入或配置持久化失败，本次新建的适配器会被删除。稳定名称
+使重复加入保持幂等，并为每个网络提供独立的持久二层接口；Windows 不提供
+`--tap-adapter` 选项。
+
+macOS 上，`join` 会验证显式 TAP pair。两个平台都会等待完整、已验证的控制器快照，再
+原子持久化网络 ID 与选择。重复已接受的加入可省略 `--token`；macOS 上冲突的 adapter
+或 peer 会在连接控制器前被拒绝。
+
+生成的 Windows 条目记录托管名称：
+
+```toml
+[[networks]]
+id = "fedcba9876543210fedcba9876543210"
+tap_adapter = "Stella fedcba9876543210fedcba9876543210"
+```
 
 macOS 条目继续使用配置版本 1：
 
@@ -159,8 +172,9 @@ stella-client --config C:\Stella\client.toml leave --network <id>
 ```
 
 `leave` 需要已有的目标网络条目。它从无活动转发状态开始，在不接受令牌材料的前提下
-认证，验证控制器权威的 `LEAVE_RESULT`，然后才从本地配置中原子移除网络。失败或结果
-不明确的请求不会启用转发，并会保留持久意图以便恢复或重试。
+认证，验证控制器权威的 `LEAVE_RESULT`，然后删除 Windows 托管适配器并从本地配置中
+原子移除网络；macOS 保留持久 feth pair。失败或结果不明确的请求不会启用转发，并会
+保留持久意图以便恢复或重试。
 
 ## 运行
 
@@ -186,7 +200,9 @@ stella-client --config /etc/stella/client.toml run
 同时按 250 ms 到 30 秒的完整抖动退避重连。只有连续三个策略心跳周期未收到确认，心跳
 才视为丢失。Ctrl+C 会中断控制循环，并等待 TAP、UDP 和 Relay 有序关闭。
 
-Windows 会打开准确的 TAP-Windows，并在关闭时设置 media-disconnected。macOS 上由 root
-helper 创建或复用准确 feth pair，通过 BPF 收包、AF_NDRV 发包，并在关闭时把宿主可见端置
-down 而不删除 pair；客户端与 helper 使用 Unix peer credential 双向认证。无效对等数据报会被丢弃且不重连控制器；TAP、UDP 或 worker 故障会关闭数据
+Windows 会在控制器通信开始前补建任何缺失的已配置托管适配器，然后打开准确的
+TAP-Windows，并在关闭时设置 media-disconnected 而不删除；持久适配器由 `leave` 删除。
+macOS 上由 root helper 创建或复用准确 feth pair，通过 BPF 收包、AF_NDRV 发包，并在关闭
+时把宿主可见端置 down 而不删除 pair；客户端与 helper 使用 Unix peer credential 双向
+认证。无效对等数据报会被丢弃且不重连控制器；TAP、UDP 或 worker 故障会关闭数据
 运行时并进入正常的失败关闭重连路径。

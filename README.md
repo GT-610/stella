@@ -11,9 +11,10 @@ implementation. Its initial scope includes:
 
 The project is in pre-standard development and is not usable for production
 networking yet. The self-hosted controller and authenticated TAP-to-UDP client
-data plane are implemented on Windows and macOS. Windows uses pre-installed
-TAP-Windows adapters; macOS uses persistent built-in feth pairs with BPF receive
-and AF_NDRV transmit through Stella's own backend. A narrow root helper owns
+data plane are implemented on Windows and macOS. Windows creates one persistent
+TAP-Windows adapter per joined network from a pre-installed driver package;
+macOS uses persistent built-in feth pairs with BPF receive and AF_NDRV transmit
+through Stella's own backend. A narrow root helper owns
 only the feth lifecycle and frame I/O; `stella-client` remains unprivileged.
 Windows end-to-end verification has passed with two real adapters. macOS
 includes root-only lifecycle and helper-backed two-node verification, but this

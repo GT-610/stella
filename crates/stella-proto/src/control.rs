@@ -356,6 +356,8 @@ pub enum ControlFieldType {
     StunServerList = 0x8022,
     /// Version 0.2 relay service and credential list.
     RelayServiceList = 0x8023,
+    /// Whether this successful join request created the membership.
+    MembershipCreated = 0x8024,
 }
 
 impl ControlFieldType {
@@ -372,7 +374,8 @@ impl ControlFieldType {
             | Self::ConnectivityList
             | Self::ConnectivityRecord
             | Self::StunServerList
-            | Self::RelayServiceList => ProtocolVersion::V0_2,
+            | Self::RelayServiceList
+            | Self::MembershipCreated => ProtocolVersion::V0_2,
             _ => ProtocolVersion::V0_1,
         }
     }
@@ -418,6 +421,7 @@ impl TryFrom<u16> for ControlFieldType {
             0x8021 => Ok(Self::ConnectivityRecord),
             0x8022 => Ok(Self::StunServerList),
             0x8023 => Ok(Self::RelayServiceList),
+            0x8024 => Ok(Self::MembershipCreated),
             _ => Err(CodecError::UnknownCriticalControlField {
                 field_type: value,
                 offset: 0,
@@ -988,6 +992,7 @@ fn validate_control_field_value(
         }
         ControlFieldType::DisplayName => validate_text(value, 1, 64, "display name"),
         ControlFieldType::StatusCode => validate_exact_width(value, 2, "status code"),
+        ControlFieldType::MembershipCreated => validate_membership_created(value),
         ControlFieldType::StatusMessage => validate_text(value, 0, 256, "status message"),
         ControlFieldType::ControllerEpoch => validate_nonzero_u64(value, "controller epoch"),
         ControlFieldType::NetworkId => {
@@ -1045,6 +1050,17 @@ fn validate_control_field_value(
             validate_connectivity_control_field_value(field_type, value)
         }
     }
+}
+
+fn validate_membership_created(value: &[u8]) -> Result<(), CodecError> {
+    validate_exact_width(value, 1, "membership created")?;
+    if value[0] > 1 {
+        return Err(CodecError::InvalidEnumValue {
+            field: "membership created",
+            value: u64::from(value[0]),
+        });
+    }
+    Ok(())
 }
 
 fn validate_retry_after(value: &[u8]) -> Result<(), CodecError> {
@@ -1198,7 +1214,7 @@ fn decode_control_node_id(value: &[u8]) -> Result<NodeId, CodecError> {
     Ok(NodeId::from_bytes(bytes))
 }
 
-const ALL_CONTROL_FIELDS: [ControlFieldType; 35] = [
+const ALL_CONTROL_FIELDS: [ControlFieldType; 36] = [
     ControlFieldType::SupportedVersions,
     ControlFieldType::SelectedVersion,
     ControlFieldType::ServerNonce,
@@ -1234,6 +1250,7 @@ const ALL_CONTROL_FIELDS: [ControlFieldType; 35] = [
     ControlFieldType::ConnectivityRecord,
     ControlFieldType::StunServerList,
     ControlFieldType::RelayServiceList,
+    ControlFieldType::MembershipCreated,
 ];
 
 const fn field_bit(field_type: ControlFieldType) -> u64 {
@@ -1269,6 +1286,7 @@ fn field_allowed(
                     ControlFieldType::MembershipGrant
                         | ControlFieldType::NetworkPolicy
                         | ControlFieldType::SnapshotRevision
+                        | ControlFieldType::MembershipCreated
                 )
                 | (
                     ControlMessageType::PeerDelta,
@@ -1449,9 +1467,9 @@ mod tests {
 
     use super::{
         control_fields_encoded_len, decode_control_record_length, encode_control_fields,
-        encode_control_message, encode_control_record_length, field_required, ControlFieldIter,
-        ControlFieldRef, ControlFieldType, ControlHeader, ControlMessageType, ControlMessageView,
-        CONTROL_HEADER_LENGTH,
+        encode_control_message, encode_control_record_length, field_allowed, field_required,
+        ControlFieldIter, ControlFieldRef, ControlFieldType, ControlHeader, ControlMessageType,
+        ControlMessageView, CONTROL_HEADER_LENGTH,
     };
     use crate::{
         encode_connectivity_record, encode_relay_service_list, encode_stun_server_list, CodecError,
@@ -1682,9 +1700,9 @@ mod tests {
         );
 
         assert_eq!(
-            ControlFieldIter::decode(&[0x80, 0x24, 0, 0]).map(|_| ()),
+            ControlFieldIter::decode(&[0x80, 0x25, 0, 0]).map(|_| ()),
             Err(CodecError::UnknownCriticalControlField {
-                field_type: 0x8024,
+                field_type: 0x8025,
                 offset: 0,
             })
         );
@@ -1896,6 +1914,16 @@ mod tests {
             ProtocolVersion::V0_2,
             ControlMessageType::PeerSnapshot,
             ControlFieldType::ConnectivityList,
+        ));
+        assert!(!field_allowed(
+            ProtocolVersion::V0_1,
+            ControlMessageType::JoinResult,
+            ControlFieldType::MembershipCreated,
+        ));
+        assert!(field_allowed(
+            ProtocolVersion::V0_2,
+            ControlMessageType::JoinResult,
+            ControlFieldType::MembershipCreated,
         ));
     }
 

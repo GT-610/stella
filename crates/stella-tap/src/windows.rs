@@ -1,24 +1,43 @@
 //! TAP-Windows Adapter V9 backend.
 
 use std::{
-    ffi::c_void,
+    ffi::{c_void, OsString},
     fmt,
     fs::{File, OpenOptions},
     io,
+    marker::PhantomData,
     mem::{align_of, size_of, MaybeUninit},
     os::windows::{
+        ffi::OsStringExt,
         fs::OpenOptionsExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
+    path::PathBuf,
+    process::Command,
+    rc::Rc,
     sync::{Arc, Weak},
+    thread,
+    time::{Duration, Instant},
 };
 
 use windows::{
-    core::{Error as WindowsError, HRESULT, PCWSTR, PSTR, PWSTR},
+    core::{Error as WindowsError, BOOL, GUID, HRESULT, HSTRING, PCWSTR, PSTR, PWSTR},
     Win32::{
+        Devices::DeviceAndDriverInstallation::{
+            DiInstallDevice, SetupDiCallClassInstaller, SetupDiClassNameFromGuidW,
+            SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
+            SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstallParamsW,
+            SetupDiOpenDevRegKey, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
+            SetupDiSetSelectedDevice, DICD_GENERATE_ID, DICS_FLAG_GLOBAL, DIF_REGISTERDEVICE,
+            DIF_REMOVE, DIGCF_PRESENT, DIINSTALLDEVICE_FLAGS, DIREG_DRV, DI_NEEDREBOOT,
+            DI_NEEDRESTART, DI_REMOVEDEVICE_GLOBAL, GUID_DEVCLASS_NET, HDEVINFO, SPDRP_HARDWAREID,
+            SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W,
+            SP_REMOVEDEVICE_PARAMS,
+        },
         Foundation::{
-            ERROR_BUFFER_OVERFLOW, ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_NO_DATA,
-            ERROR_OPERATION_ABORTED, HANDLE, NO_ERROR, WIN32_ERROR,
+            ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NOT_FOUND,
+            ERROR_NO_DATA, ERROR_NO_MORE_ITEMS, ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND,
+            HANDLE, NO_ERROR, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WIN32_ERROR,
         },
         NetworkManagement::{
             IpHelper::{
@@ -32,7 +51,12 @@ use windows::{
         Networking::WinSock::{ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC},
         Storage::FileSystem::{ReadFile, WriteFile, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_OVERLAPPED},
         System::{
-            Threading::CreateEventW,
+            Registry::{
+                RegCloseKey, RegGetValueW, RegSetValueExW, HKEY, KEY_READ, KEY_SET_VALUE, REG_SZ,
+                RRF_RT_REG_SZ,
+            },
+            SystemInformation::GetSystemDirectoryW,
+            Threading::{CreateEventW, CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE},
             IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED},
         },
     },
@@ -46,8 +70,16 @@ use crate::{
 const TAP_DEVICE_PREFIX: &str = r"\\.\Global\";
 const TAP_DEVICE_SUFFIX: &str = ".tap";
 const TAP_DESCRIPTION_PREFIX: &str = "tap-windows adapter";
+const TAP_HARDWARE_ID: &str = "tap0901";
+const TAP_DEVICE_DESCRIPTION: &str = "Stella Virtual Ethernet";
+const STELLA_OWNERSHIP_MARKER: &str = "StellaNetCfgInstanceId";
+const DEVICE_MANAGEMENT_MUTEX_NAME: &str = r"Global\GT-610.Stella.Tap.DeviceManagement.v1";
 const MINIMUM_DRIVER_MAJOR: u32 = 9;
 const TAP_VLAN_ALLOWANCE: u32 = 18;
+const DEVICE_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEVICE_APPEARANCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+static NETWORK_DEVICE_CLASS: GUID = GUID_DEVCLASS_NET;
 
 const FILE_DEVICE_UNKNOWN: u32 = 0x22;
 const METHOD_BUFFERED: u32 = 0;
@@ -83,6 +115,74 @@ pub struct WindowsTapDriverVersion {
     pub minor: u32,
     /// Whether the installed driver is a debug build.
     pub debug: bool,
+}
+
+/// Result of ensuring that one named TAP-Windows adapter exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsTapProvision {
+    adapter: WindowsTapAdapter,
+    created: bool,
+}
+
+impl WindowsTapProvision {
+    /// Returns the adapter selected or created for the requested name.
+    #[must_use]
+    pub const fn adapter(&self) -> &WindowsTapAdapter {
+        &self.adapter
+    }
+
+    /// Returns whether this call created a new persistent Windows device.
+    #[must_use]
+    pub const fn created(&self) -> bool {
+        self.created
+    }
+}
+
+/// Result of removing one named TAP-Windows adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsTapRemoval {
+    removed: bool,
+    reboot_required: bool,
+}
+
+/// Cross-process guard for one complete Stella TAP management transaction.
+///
+/// The guard must be dropped on the thread that acquired it. The reference
+/// client uses a current-thread Tokio runtime so it can retain this guard
+/// across the complete asynchronous Join, Run, or Leave command.
+pub struct WindowsTapManagementTransaction {
+    handle: OwnedHandle,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for WindowsTapManagementTransaction {
+    fn drop(&mut self) {
+        // SAFETY: This thread owns one recursive acquisition of the mutex and
+        // the handle remains live until the field is dropped after this call.
+        let _ = unsafe { ReleaseMutex(HANDLE(self.handle.as_raw_handle())) };
+    }
+}
+
+impl fmt::Debug for WindowsTapManagementTransaction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WindowsTapManagementTransaction")
+            .finish_non_exhaustive()
+    }
+}
+
+impl WindowsTapRemoval {
+    /// Returns whether a matching adapter existed and was removed.
+    #[must_use]
+    pub const fn removed(self) -> bool {
+        self.removed
+    }
+
+    /// Returns whether Windows requires a reboot to finish the removal.
+    #[must_use]
+    pub const fn reboot_required(self) -> bool {
+        self.reboot_required
+    }
 }
 
 #[derive(Clone)]
@@ -137,6 +237,19 @@ pub struct WindowsTapDevice {
 }
 
 impl WindowsTapDevice {
+    /// Acquires the machine-wide Stella TAP device-management transaction.
+    ///
+    /// Windows mutex ownership is thread-affine, so the returned guard is not
+    /// sendable and must be dropped on the acquiring thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when the named mutex cannot be
+    /// created or acquired.
+    pub fn begin_management_transaction() -> Result<WindowsTapManagementTransaction> {
+        lock_device_management()
+    }
+
     /// Enumerates installed adapters whose driver description identifies
     /// TAP-Windows.
     ///
@@ -148,6 +261,49 @@ impl WindowsTapDevice {
             .into_iter()
             .map(|candidate| candidate.metadata)
             .collect())
+    }
+
+    /// Ensures that a persistent TAP-Windows adapter with `name` exists.
+    ///
+    /// The TAP-Windows driver package must already be installed in the Windows
+    /// driver store. Creating a new device requires administrator privileges.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed configuration or operating-system error when the name is
+    /// invalid, the driver is unavailable, or Windows cannot create or rename
+    /// the device.
+    pub fn ensure_adapter(name: &str) -> Result<WindowsTapProvision> {
+        let (candidate, created) = ensure_named_candidate(name)?;
+        Ok(WindowsTapProvision {
+            adapter: candidate.metadata,
+            created,
+        })
+    }
+
+    /// Removes the TAP-Windows adapter matching `selector` when it exists.
+    ///
+    /// The selector may be the friendly name or interface GUID returned by
+    /// [`Self::installed_adapters`]. Removal requires administrator privileges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when enumeration or device removal
+    /// fails, or an ambiguity error when more than one adapter matches.
+    pub fn remove_adapter(selector: &str) -> Result<WindowsTapRemoval> {
+        let _management = lock_device_management()?;
+        let candidates = enumerate_candidates()?;
+        let candidate = match select_candidate(candidates, Some(selector)) {
+            Ok(candidate) => candidate,
+            Err(TapError::AdapterNotFound { .. }) => {
+                return Ok(WindowsTapRemoval {
+                    removed: false,
+                    reboot_required: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        remove_interface_device(&candidate.metadata)
     }
 
     fn disconnect(&mut self) -> Result<()> {
@@ -163,8 +319,10 @@ impl WindowsTapDevice {
 impl TapDevice for WindowsTapDevice {
     fn create(config: &TapConfig) -> Result<Self> {
         config.validate()?;
-        let candidates = enumerate_candidates()?;
-        let candidate = select_candidate(candidates, config.name.as_deref())?;
+        let candidate = match config.name.as_deref() {
+            Some(name) => ensure_named_candidate(name)?.0,
+            None => select_candidate(enumerate_candidates()?, None)?,
+        };
         let file = Arc::new(open_device(&candidate.metadata.interface_id)?);
         let driver_version = query_driver_version(&file)?;
         if driver_version.major < MINIMUM_DRIVER_MAJOR {
@@ -279,6 +437,663 @@ impl fmt::Debug for WindowsTapDevice {
 
 const fn tap_control_code(request: u32) -> u32 {
     (FILE_DEVICE_UNKNOWN << 16) | (FILE_ANY_ACCESS << 14) | (request << 2) | METHOD_BUFFERED
+}
+
+struct DeviceInfoSet(HDEVINFO);
+
+impl Drop for DeviceInfoSet {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was returned by a SetupAPI creation function and is
+        // owned by this guard until it is destroyed exactly once here.
+        let _ = unsafe { SetupDiDestroyDeviceInfoList(self.0) };
+    }
+}
+
+struct RegistryKey(HKEY);
+
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is an open registry key owned by this guard.
+        let _ = unsafe { RegCloseKey(self.0) };
+    }
+}
+
+fn lock_device_management() -> Result<WindowsTapManagementTransaction> {
+    let name = HSTRING::from(DEVICE_MANAGEMENT_MUTEX_NAME);
+    // SAFETY: Null security attributes select the process token's default
+    // descriptor. The returned named mutex handle is newly owned here.
+    let handle = unsafe { CreateMutexW(None, false, &name) }.map_err(|error| {
+        TapError::io(TapOperation::AcquireDeviceLock, windows_error_to_io(&error))
+    })?;
+    // SAFETY: `CreateMutexW` returned a new owned handle that has not been
+    // transferred elsewhere. `OwnedHandle` closes it exactly once.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    // SAFETY: The mutex handle remains live for the wait and is released by
+    // the returned guard on this same thread.
+    let wait = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), INFINITE) };
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        let source = if wait == WAIT_FAILED {
+            io::Error::last_os_error()
+        } else {
+            io::Error::other(format!("unexpected Windows mutex wait result {}", wait.0))
+        };
+        return Err(TapError::io(TapOperation::AcquireDeviceLock, source));
+    }
+    Ok(WindowsTapManagementTransaction {
+        handle,
+        _not_send: PhantomData,
+    })
+}
+
+fn ensure_named_candidate(name: &str) -> Result<(AdapterCandidate, bool)> {
+    validate_windows_adapter_name(name)?;
+    let _management = lock_device_management()?;
+    let candidates = enumerate_candidates()?;
+    match select_candidate(candidates, Some(name)) {
+        Ok(candidate) => {
+            verify_adapter_ownership(&candidate.metadata)?;
+            return Ok((candidate, false));
+        }
+        Err(TapError::AdapterNotFound { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    if looks_like_interface_id(name) {
+        return Err(TapError::AdapterNotFound {
+            selector: Some(name.to_owned()),
+        });
+    }
+    provision_named_adapter(name).map(|candidate| (candidate, true))
+}
+
+fn provision_named_adapter(name: &str) -> Result<AdapterCandidate> {
+    let set = create_network_device_info_set()?;
+    let mut device = create_tap_device_info(&set)?;
+    let mut registered = false;
+    let result = (|| {
+        register_tap_device(&set, &mut device)?;
+        registered = true;
+        install_tap_device(&set, &device)?;
+        let interface_id = wait_for_net_cfg_instance_id(&set, &device)?;
+        record_device_ownership(&set, &device, &interface_id)?;
+        let candidate = wait_for_interface_candidate(&interface_id)?;
+        rename_interface(&candidate.metadata.friendly_name, name)?;
+        wait_for_named_interface_candidate(&interface_id, name)
+    })();
+    if result.is_err() && registered {
+        if let Err(cleanup) = remove_device_info(&set, &device) {
+            return Err(TapError::io(
+                TapOperation::RemoveDevice,
+                io::Error::other(format!(
+                    "TAP provisioning failed and the partial device could not be removed: {cleanup}"
+                )),
+            ));
+        }
+    }
+    result
+}
+
+fn create_network_device_info_set() -> Result<DeviceInfoSet> {
+    // SAFETY: The class GUID is a valid static network-device GUID and no
+    // parent window is required for noninteractive provisioning.
+    unsafe { SetupDiCreateDeviceInfoList(Some(&raw const NETWORK_DEVICE_CLASS), None) }
+        .map(DeviceInfoSet)
+        .map_err(|error| TapError::io(TapOperation::CreateDevice, windows_error_to_io(&error)))
+}
+
+fn create_tap_device_info(set: &DeviceInfoSet) -> Result<SP_DEVINFO_DATA> {
+    let mut class_name = [0_u16; 256];
+    // SAFETY: `class_name` is writable for its complete length and the class
+    // GUID is the network adapter class used to create `set`.
+    unsafe { SetupDiClassNameFromGuidW(&raw const NETWORK_DEVICE_CLASS, &mut class_name, None) }
+        .map_err(|error| TapError::io(TapOperation::CreateDevice, windows_error_to_io(&error)))?;
+    let mut device = SP_DEVINFO_DATA {
+        cbSize: structure_size::<SP_DEVINFO_DATA>(TapOperation::CreateDevice)?,
+        ..SP_DEVINFO_DATA::default()
+    };
+    // SAFETY: `set` is live, both UTF-16 inputs remain valid for the call,
+    // and `device` is initialized with the required structure size.
+    unsafe {
+        SetupDiCreateDeviceInfoW(
+            set.0,
+            PCWSTR(class_name.as_ptr()),
+            &raw const NETWORK_DEVICE_CLASS,
+            &HSTRING::from(TAP_DEVICE_DESCRIPTION),
+            None,
+            DICD_GENERATE_ID,
+            Some(&raw mut device),
+        )
+    }
+    .map_err(|error| TapError::io(TapOperation::CreateDevice, windows_error_to_io(&error)))?;
+    // SAFETY: `device` belongs to the live device information set.
+    unsafe { SetupDiSetSelectedDevice(set.0, &raw const device) }
+        .map_err(|error| TapError::io(TapOperation::CreateDevice, windows_error_to_io(&error)))?;
+    Ok(device)
+}
+
+fn register_tap_device(set: &DeviceInfoSet, device: &mut SP_DEVINFO_DATA) -> Result<()> {
+    let hardware_ids = utf16_multi_string(TAP_HARDWARE_ID);
+    // SAFETY: `device` belongs to `set`; the property bytes encode one
+    // double-null-terminated UTF-16 hardware ID for the duration of the call.
+    unsafe {
+        SetupDiSetDeviceRegistryPropertyW(set.0, device, SPDRP_HARDWAREID, Some(&hardware_ids))
+    }
+    .map_err(|error| TapError::io(TapOperation::CreateDevice, windows_error_to_io(&error)))?;
+    // SAFETY: The device information element is complete and selected in the
+    // live set; the class installer owns registration side effects.
+    unsafe { SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set.0, Some(device)) }
+        .map_err(|error| TapError::io(TapOperation::CreateDevice, windows_error_to_io(&error)))
+}
+
+fn install_tap_device(set: &DeviceInfoSet, device: &SP_DEVINFO_DATA) -> Result<()> {
+    let mut reboot_required = BOOL::default();
+    // SAFETY: `device` is registered in `set`; a null driver-info pointer asks
+    // Windows to select the best matching package already in the driver store.
+    unsafe {
+        DiInstallDevice(
+            None,
+            set.0,
+            device,
+            None,
+            DIINSTALLDEVICE_FLAGS::default(),
+            Some(&raw mut reboot_required),
+        )
+    }
+    .map_err(|error| TapError::io(TapOperation::InstallDevice, windows_error_to_io(&error)))?;
+    if reboot_required.as_bool() {
+        return Err(TapError::io(
+            TapOperation::InstallDevice,
+            io::Error::other("Windows requires a reboot before the TAP device can be used"),
+        ));
+    }
+    Ok(())
+}
+
+fn wait_for_net_cfg_instance_id(set: &DeviceInfoSet, device: &SP_DEVINFO_DATA) -> Result<String> {
+    let deadline = Instant::now() + DEVICE_APPEARANCE_TIMEOUT;
+    loop {
+        match read_net_cfg_instance_id(set, device) {
+            Ok(interface_id) => return Ok(canonical_interface_id(&interface_id)),
+            Err(error) if is_missing_device_identity(&error) && Instant::now() < deadline => {
+                thread::sleep(DEVICE_APPEARANCE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn read_net_cfg_instance_id(set: &DeviceInfoSet, device: &SP_DEVINFO_DATA) -> Result<String> {
+    let key = open_device_registry_key(set, device, KEY_READ.0, TapOperation::QueryDeviceIdentity)?;
+    read_registry_string(&key, "NetCfgInstanceId", TapOperation::QueryDeviceIdentity)
+}
+
+fn open_device_registry_key(
+    set: &DeviceInfoSet,
+    device: &SP_DEVINFO_DATA,
+    access: u32,
+    operation: TapOperation,
+) -> Result<RegistryKey> {
+    // SAFETY: `device` belongs to the live set. The returned driver key is
+    // closed by `RegistryKey`.
+    unsafe { SetupDiOpenDevRegKey(set.0, device, DICS_FLAG_GLOBAL.0, 0, DIREG_DRV, access) }
+        .map(RegistryKey)
+        .map_err(|error| TapError::io(operation, windows_error_to_io(&error)))
+}
+
+fn read_registry_string(
+    key: &RegistryKey,
+    value_name: &str,
+    operation: TapOperation,
+) -> Result<String> {
+    read_optional_registry_string(key, value_name, operation)?.ok_or_else(|| {
+        TapError::io(
+            operation,
+            io::Error::from_raw_os_error(u32_to_i32_bits(ERROR_FILE_NOT_FOUND.0)),
+        )
+    })
+}
+
+fn read_optional_registry_string(
+    key: &RegistryKey,
+    value_name: &str,
+    operation: TapOperation,
+) -> Result<Option<String>> {
+    let value_name = HSTRING::from(value_name);
+    let mut byte_length = 0_u32;
+    // SAFETY: This sizing call supplies no output pointer and a live byte-count
+    // pointer. The registry key and value name remain valid throughout.
+    let status = unsafe {
+        RegGetValueW(
+            key.0,
+            PCWSTR::null(),
+            &value_name,
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&raw mut byte_length),
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != NO_ERROR {
+        return Err(TapError::io(operation, win32_error_to_io(status)));
+    }
+    if byte_length < 2 || byte_length % 2 != 0 {
+        return Err(TapError::io(
+            operation,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows returned an invalid UTF-16 registry string length",
+            ),
+        ));
+    }
+    let mut words = vec![
+        0_u16;
+        usize::try_from(byte_length / 2).map_err(|error| {
+            TapError::io(operation, io::Error::new(io::ErrorKind::InvalidData, error))
+        })?
+    ];
+    // SAFETY: `words` owns exactly `byte_length` writable bytes, and the
+    // registry call is constrained to REG_SZ data.
+    let status = unsafe {
+        RegGetValueW(
+            key.0,
+            PCWSTR::null(),
+            &value_name,
+            RRF_RT_REG_SZ,
+            None,
+            Some(words.as_mut_ptr().cast()),
+            Some(&raw mut byte_length),
+        )
+    };
+    if status != NO_ERROR {
+        return Err(TapError::io(operation, win32_error_to_io(status)));
+    }
+    let length = words
+        .iter()
+        .position(|word| *word == 0)
+        .unwrap_or(words.len());
+    String::from_utf16(&words[..length])
+        .map(Some)
+        .map_err(|error| TapError::io(operation, io::Error::new(io::ErrorKind::InvalidData, error)))
+}
+
+fn record_device_ownership(
+    set: &DeviceInfoSet,
+    device: &SP_DEVINFO_DATA,
+    interface_id: &str,
+) -> Result<()> {
+    let key = open_device_registry_key(
+        set,
+        device,
+        KEY_SET_VALUE.0,
+        TapOperation::RecordDeviceOwnership,
+    )?;
+    let bytes = canonical_interface_id(interface_id)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    // SAFETY: The key is open for value writes and `bytes` contains a
+    // null-terminated UTF-16 REG_SZ value for the duration of this call.
+    let status = unsafe {
+        RegSetValueExW(
+            key.0,
+            &HSTRING::from(STELLA_OWNERSHIP_MARKER),
+            None,
+            REG_SZ,
+            Some(&bytes),
+        )
+    };
+    if status == NO_ERROR {
+        Ok(())
+    } else {
+        Err(TapError::io(
+            TapOperation::RecordDeviceOwnership,
+            win32_error_to_io(status),
+        ))
+    }
+}
+
+fn verify_adapter_ownership(adapter: &WindowsTapAdapter) -> Result<()> {
+    let set = present_network_device_info_set(TapOperation::VerifyDeviceOwnership)?;
+    let device_info_size = structure_size::<SP_DEVINFO_DATA>(TapOperation::VerifyDeviceOwnership)?;
+    let mut index = 0_u32;
+    loop {
+        let mut device = SP_DEVINFO_DATA {
+            cbSize: device_info_size,
+            ..SP_DEVINFO_DATA::default()
+        };
+        // SAFETY: `device` is writable and initialized with the required size;
+        // `index` advances monotonically through the live set.
+        match unsafe { SetupDiEnumDeviceInfo(set.0, index, &raw mut device) } {
+            Ok(()) => {}
+            Err(error) if is_win32_error(&error, ERROR_NO_MORE_ITEMS) => {
+                return Err(TapError::AdapterNotFound {
+                    selector: Some(adapter.interface_id.clone()),
+                });
+            }
+            Err(error) => {
+                return Err(TapError::io(
+                    TapOperation::VerifyDeviceOwnership,
+                    windows_error_to_io(&error),
+                ));
+            }
+        }
+        index = index.saturating_add(1);
+        let current_id = match read_net_cfg_instance_id(&set, &device) {
+            Ok(value) => value,
+            Err(error) if is_missing_device_identity(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !normalize_interface_id(&current_id)
+            .eq_ignore_ascii_case(normalize_interface_id(&adapter.interface_id))
+        {
+            continue;
+        }
+        return verify_device_ownership_marker(&set, &device, &adapter.friendly_name, &current_id);
+    }
+}
+
+fn verify_device_ownership_marker(
+    set: &DeviceInfoSet,
+    device: &SP_DEVINFO_DATA,
+    name: &str,
+    interface_id: &str,
+) -> Result<()> {
+    let key =
+        open_device_registry_key(set, device, KEY_READ.0, TapOperation::VerifyDeviceOwnership)?;
+    let marker = read_optional_registry_string(
+        &key,
+        STELLA_OWNERSHIP_MARKER,
+        TapOperation::VerifyDeviceOwnership,
+    )?;
+    if marker.as_deref().is_some_and(|value| {
+        normalize_interface_id(value).eq_ignore_ascii_case(normalize_interface_id(interface_id))
+    }) {
+        Ok(())
+    } else {
+        Err(TapError::WindowsAdapterOwnershipConflict {
+            name: name.to_owned(),
+            interface_id: canonical_interface_id(interface_id),
+        })
+    }
+}
+
+fn wait_for_interface_candidate(interface_id: &str) -> Result<AdapterCandidate> {
+    wait_for_candidate(interface_id, None)
+}
+
+fn wait_for_named_interface_candidate(interface_id: &str, name: &str) -> Result<AdapterCandidate> {
+    wait_for_candidate(interface_id, Some(name))
+}
+
+fn wait_for_candidate(interface_id: &str, name: Option<&str>) -> Result<AdapterCandidate> {
+    let deadline = Instant::now() + DEVICE_APPEARANCE_TIMEOUT;
+    loop {
+        let candidate = enumerate_candidates()?.into_iter().find(|candidate| {
+            normalize_interface_id(&candidate.metadata.interface_id)
+                .eq_ignore_ascii_case(normalize_interface_id(interface_id))
+                && name.is_none_or(|expected| {
+                    candidate
+                        .metadata
+                        .friendly_name
+                        .eq_ignore_ascii_case(expected)
+                })
+        });
+        if let Some(candidate) = candidate {
+            return Ok(candidate);
+        }
+        if Instant::now() >= deadline {
+            return Err(TapError::io(
+                TapOperation::QueryDeviceState,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the TAP adapter did not become visible before the deadline",
+                ),
+            ));
+        }
+        thread::sleep(DEVICE_APPEARANCE_POLL_INTERVAL);
+    }
+}
+
+fn rename_interface(old_name: &str, new_name: &str) -> Result<()> {
+    if old_name.eq_ignore_ascii_case(new_name) {
+        return Ok(());
+    }
+    let netsh = system_directory()?.join("netsh.exe");
+    let status = Command::new(netsh)
+        .args([
+            "interface",
+            "set",
+            "interface",
+            &format!("name={old_name}"),
+            &format!("newname={new_name}"),
+        ])
+        .status()
+        .map_err(|error| TapError::io(TapOperation::RenameDevice, error))?;
+    if !status.success() {
+        return Err(TapError::io(
+            TapOperation::RenameDevice,
+            io::Error::other(format!("netsh exited with status {status}")),
+        ));
+    }
+    Ok(())
+}
+
+fn system_directory() -> Result<PathBuf> {
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        // SAFETY: `buffer` is writable for its full length.
+        let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) };
+        if length == 0 {
+            return Err(TapError::io(
+                TapOperation::RenameDevice,
+                io::Error::last_os_error(),
+            ));
+        }
+        let length = usize::try_from(length).map_err(|error| {
+            TapError::io(
+                TapOperation::RenameDevice,
+                io::Error::new(io::ErrorKind::InvalidData, error),
+            )
+        })?;
+        if length < buffer.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+fn present_network_device_info_set(operation: TapOperation) -> Result<DeviceInfoSet> {
+    // SAFETY: The class GUID and flags request a local snapshot of present
+    // network devices; the returned set is owned by `DeviceInfoSet`.
+    unsafe {
+        SetupDiGetClassDevsW(
+            Some(&raw const NETWORK_DEVICE_CLASS),
+            PCWSTR::null(),
+            None,
+            DIGCF_PRESENT,
+        )
+    }
+    .map(DeviceInfoSet)
+    .map_err(|error| TapError::io(operation, windows_error_to_io(&error)))
+}
+
+fn remove_interface_device(adapter: &WindowsTapAdapter) -> Result<WindowsTapRemoval> {
+    let set = present_network_device_info_set(TapOperation::RemoveDevice)?;
+    let device_info_size = structure_size::<SP_DEVINFO_DATA>(TapOperation::RemoveDevice)?;
+    let mut index = 0_u32;
+    loop {
+        let mut device = SP_DEVINFO_DATA {
+            cbSize: device_info_size,
+            ..SP_DEVINFO_DATA::default()
+        };
+        // SAFETY: `device` is writable and initialized with the required size;
+        // `index` advances monotonically through the live set.
+        match unsafe { SetupDiEnumDeviceInfo(set.0, index, &raw mut device) } {
+            Ok(()) => {}
+            Err(error) if is_win32_error(&error, ERROR_NO_MORE_ITEMS) => {
+                return Ok(WindowsTapRemoval {
+                    removed: false,
+                    reboot_required: false,
+                });
+            }
+            Err(error) => {
+                return Err(TapError::io(
+                    TapOperation::RemoveDevice,
+                    windows_error_to_io(&error),
+                ));
+            }
+        }
+        index = index.saturating_add(1);
+        let current_id = match read_net_cfg_instance_id(&set, &device) {
+            Ok(value) => value,
+            Err(error) if is_missing_device_identity(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if normalize_interface_id(&current_id)
+            .eq_ignore_ascii_case(normalize_interface_id(&adapter.interface_id))
+        {
+            verify_device_ownership_marker(&set, &device, &adapter.friendly_name, &current_id)?;
+            let reboot_required = remove_device_info(&set, &device)?;
+            if !reboot_required {
+                wait_for_interface_removal(&adapter.interface_id)?;
+            }
+            return Ok(WindowsTapRemoval {
+                removed: true,
+                reboot_required,
+            });
+        }
+    }
+}
+
+fn wait_for_interface_removal(interface_id: &str) -> Result<()> {
+    let deadline = Instant::now() + DEVICE_APPEARANCE_TIMEOUT;
+    loop {
+        let present = enumerate_candidates()?.iter().any(|candidate| {
+            normalize_interface_id(&candidate.metadata.interface_id)
+                .eq_ignore_ascii_case(normalize_interface_id(interface_id))
+        });
+        if !present {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(TapError::io(
+                TapOperation::RemoveDevice,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the TAP adapter remained visible after removal",
+                ),
+            ));
+        }
+        thread::sleep(DEVICE_APPEARANCE_POLL_INTERVAL);
+    }
+}
+
+fn remove_device_info(set: &DeviceInfoSet, device: &SP_DEVINFO_DATA) -> Result<bool> {
+    let parameters = SP_REMOVEDEVICE_PARAMS {
+        ClassInstallHeader: SP_CLASSINSTALL_HEADER {
+            cbSize: structure_size::<SP_CLASSINSTALL_HEADER>(TapOperation::RemoveDevice)?,
+            InstallFunction: DIF_REMOVE,
+        },
+        Scope: DI_REMOVEDEVICE_GLOBAL,
+        HwProfile: 0,
+    };
+    // SAFETY: The removal parameters have the correct structure sizes and
+    // remain live while SetupAPI copies them for this device.
+    unsafe {
+        SetupDiSetClassInstallParamsW(
+            set.0,
+            Some(device),
+            Some(&raw const parameters.ClassInstallHeader),
+            structure_size::<SP_REMOVEDEVICE_PARAMS>(TapOperation::RemoveDevice)?,
+        )
+    }
+    .map_err(|error| TapError::io(TapOperation::RemoveDevice, windows_error_to_io(&error)))?;
+    // SAFETY: `device` belongs to the live set and now has DIF_REMOVE class
+    // installer parameters.
+    unsafe { SetupDiCallClassInstaller(DIF_REMOVE, set.0, Some(device)) }
+        .map_err(|error| TapError::io(TapOperation::RemoveDevice, windows_error_to_io(&error)))?;
+    device_reboot_required(set, device)
+}
+
+fn device_reboot_required(set: &DeviceInfoSet, device: &SP_DEVINFO_DATA) -> Result<bool> {
+    let mut parameters = SP_DEVINSTALL_PARAMS_W {
+        cbSize: structure_size::<SP_DEVINSTALL_PARAMS_W>(TapOperation::QueryDeviceState)?,
+        ..SP_DEVINSTALL_PARAMS_W::default()
+    };
+    // SAFETY: `parameters` is writable and initialized with the exact API
+    // structure size; `device` belongs to the live set.
+    unsafe { SetupDiGetDeviceInstallParamsW(set.0, Some(device), &raw mut parameters) }.map_err(
+        |error| TapError::io(TapOperation::QueryDeviceState, windows_error_to_io(&error)),
+    )?;
+    Ok(parameters.Flags.contains(DI_NEEDREBOOT) || parameters.Flags.contains(DI_NEEDRESTART))
+}
+
+fn validate_windows_adapter_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.trim() != name {
+        return Err(TapError::InvalidConfig {
+            field: "name",
+            reason: "must not be empty or have leading or trailing whitespace",
+        });
+    }
+    if name.encode_utf16().count() > 255 {
+        return Err(TapError::InvalidConfig {
+            field: "name",
+            reason: "must fit the 255-character Windows interface-name limit",
+        });
+    }
+    if name
+        .chars()
+        .any(|character| character.is_control() || r#"\/:*?"<>|"#.contains(character))
+    {
+        return Err(TapError::InvalidConfig {
+            field: "name",
+            reason: "contains a character Windows forbids in interface names",
+        });
+    }
+    Ok(())
+}
+
+fn looks_like_interface_id(value: &str) -> bool {
+    let value = normalize_interface_id(value);
+    let groups = value.split('-').collect::<Vec<_>>();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8_usize, 4, 4, 4, 12])
+            .all(|(group, length)| {
+                group.len() == length && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+}
+
+fn utf16_multi_string(value: &str) -> Vec<u8> {
+    value
+        .encode_utf16()
+        .chain([0, 0])
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+fn structure_size<T>(operation: TapOperation) -> Result<u32> {
+    u32::try_from(size_of::<T>())
+        .map_err(|error| TapError::io(operation, io::Error::new(io::ErrorKind::InvalidData, error)))
+}
+
+fn is_missing_device_identity(error: &TapError) -> bool {
+    matches!(
+        error,
+        TapError::Io {
+            operation: TapOperation::QueryDeviceIdentity,
+            source,
+        } if matches!(
+            source.raw_os_error(),
+            Some(code)
+                if code == u32_to_i32_bits(ERROR_FILE_NOT_FOUND.0)
+                    || code == u32_to_i32_bits(ERROR_PATH_NOT_FOUND.0)
+        )
+    )
 }
 
 fn enumerate_candidates() -> Result<Vec<AdapterCandidate>> {
@@ -886,8 +1701,9 @@ fn invalid_adapter_data() -> TapError {
 mod tests {
     use super::{
         candidate_matches, canonical_interface_id, device_path, select_candidate, tap_control_code,
-        AdapterCandidate, WindowsTapAdapter, TAP_IOCTL_GET_MAC, TAP_IOCTL_GET_MTU,
-        TAP_IOCTL_GET_VERSION, TAP_IOCTL_PRIORITY_BEHAVIOR, TAP_IOCTL_SET_MEDIA_STATUS,
+        utf16_multi_string, validate_windows_adapter_name, AdapterCandidate, WindowsTapAdapter,
+        TAP_IOCTL_GET_MAC, TAP_IOCTL_GET_MTU, TAP_IOCTL_GET_VERSION, TAP_IOCTL_PRIORITY_BEHAVIOR,
+        TAP_IOCTL_SET_MEDIA_STATUS,
     };
     use crate::TapError;
     use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
@@ -944,5 +1760,21 @@ mod tests {
                 selector: Some(selector),
             }) if selector == "missing"
         ));
+    }
+
+    #[test]
+    fn provisioning_names_and_hardware_ids_are_strict() {
+        assert!(validate_windows_adapter_name("Stella 00112233").is_ok());
+        assert!(validate_windows_adapter_name("").is_err());
+        assert!(validate_windows_adapter_name(" Stella").is_err());
+        assert!(validate_windows_adapter_name("Stella/TAP").is_err());
+        assert!(validate_windows_adapter_name(&"x".repeat(256)).is_err());
+
+        let encoded = utf16_multi_string("tap0901");
+        let words = encoded
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(words, [116, 97, 112, 48, 57, 48, 49, 0, 0]);
     }
 }

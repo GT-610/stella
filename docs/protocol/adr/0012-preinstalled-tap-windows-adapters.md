@@ -1,6 +1,6 @@
 # ADR 0012: Open pre-installed TAP-Windows adapters by stable identity
 
-- Status: Accepted
+- Status: Superseded by ADR 0039
 - Date: 2026-08-30
 
 ## Context

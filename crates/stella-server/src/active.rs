@@ -431,8 +431,18 @@ async fn handle_join(
     )
     .await?
     {
-        JoinDecision::Accepted(encoded) => {
-            send_join_result(state, correlation_id, STATUS_OK, &encoded).await?;
+        JoinDecision::Accepted {
+            encoded,
+            membership_created,
+        } => {
+            send_join_result(
+                state,
+                correlation_id,
+                STATUS_OK,
+                &encoded,
+                membership_created,
+            )
+            .await?;
             send_peer_snapshot(state, 0, &encoded).await?;
             state.joined_networks.insert(encoded.network_id());
         }
@@ -455,7 +465,10 @@ async fn handle_join(
 }
 
 enum JoinDecision {
-    Accepted(Box<EncodedNetworkState>),
+    Accepted {
+        encoded: Box<EncodedNetworkState>,
+        membership_created: bool,
+    },
     Rejected {
         network: NetworkRecord,
         status: u16,
@@ -475,11 +488,11 @@ async fn resolve_join(
     let Some(network) = authority.get_network(request.network_id).await? else {
         return Ok(JoinDecision::NetworkNotFound);
     };
-    match authority
+    let membership_created = match authority
         .get_membership(node_id, request.network_id)
         .await?
     {
-        Some(membership) if membership.status() == MembershipStatus::Active => {}
+        Some(membership) if membership.status() == MembershipStatus::Active => false,
         Some(_) => {
             return Ok(JoinDecision::Rejected {
                 network,
@@ -502,24 +515,29 @@ async fn resolve_join(
                     close: false,
                 });
             };
-            if let Err(error) = authority
+            let (_, membership_created) = match authority
                 .join_with_token(&token, node_id, request.network_id, now)
                 .await
             {
-                return map_join_authority_error(error, network);
-            }
+                Ok(result) => result,
+                Err(error) => return map_join_authority_error(error, network),
+            };
+            membership_created
         }
-    }
+    };
 
     let view = authority
         .network_session_view(node_id, request.network_id)
         .await?;
-    Ok(JoinDecision::Accepted(Box::new(encode_network_state(
-        controller_identity,
-        &view,
-        now,
-        version,
-    )?)))
+    Ok(JoinDecision::Accepted {
+        encoded: Box::new(encode_network_state(
+            controller_identity,
+            &view,
+            now,
+            version,
+        )?),
+        membership_created,
+    })
 }
 
 fn map_join_authority_error(
@@ -1035,6 +1053,7 @@ async fn send_join_result(
     correlation_id: u64,
     status: u16,
     encoded: &EncodedNetworkState,
+    membership_created: bool,
 ) -> Result<(), ActiveSessionError> {
     let mut builder =
         MessageBuilder::new(ControlMessageType::JoinResult).with_correlation(correlation_id);
@@ -1050,6 +1069,12 @@ async fn send_join_result(
         ControlFieldType::SnapshotRevision,
         &encoded.snapshot_revision().to_be_bytes(),
     )?;
+    if state.protocol_version >= ProtocolVersion::V0_2 {
+        builder.push_field(
+            ControlFieldType::MembershipCreated,
+            &[u8::from(membership_created)],
+        )?;
+    }
     write_message(state, builder).await
 }
 
@@ -1573,12 +1598,16 @@ mod tests {
         )
         .await
         .expect("resolve valid join");
-        let encoded = match accepted {
-            JoinDecision::Accepted(encoded) => encoded,
+        let (encoded, membership_created) = match accepted {
+            JoinDecision::Accepted {
+                encoded,
+                membership_created,
+            } => (encoded, membership_created),
             JoinDecision::Rejected { .. } | JoinDecision::NetworkNotFound => {
                 panic!("valid join should be accepted")
             }
         };
+        assert!(membership_created);
         assert_eq!(
             grant_refresh_delay(&encoded).expect("derive refresh delay"),
             Duration::from_secs(450)
@@ -1596,7 +1625,13 @@ mod tests {
         )
         .await
         .expect("resolve repeated join");
-        assert!(matches!(repeated, JoinDecision::Accepted(_)));
+        assert!(matches!(
+            repeated,
+            JoinDecision::Accepted {
+                membership_created: false,
+                ..
+            }
+        ));
 
         let endpoint = Endpoint::UdpIpv4 {
             priority: 10,

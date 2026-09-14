@@ -33,6 +33,14 @@ pub enum TapOperation {
     RecordDeviceOwnership,
     /// Creating or reusing a platform TAP device.
     CreateDevice,
+    /// Installing a TAP-Windows device from the driver store.
+    InstallDevice,
+    /// Reading the persistent identity of a TAP-Windows device.
+    QueryDeviceIdentity,
+    /// Assigning the host-visible name of a TAP-Windows device.
+    RenameDevice,
+    /// Removing a Stella-managed TAP-Windows device.
+    RemoveDevice,
     /// Pairing two macOS fake-Ethernet interfaces.
     PairInterfaces,
     /// Querying the peer of a macOS fake-Ethernet interface.
@@ -96,6 +104,10 @@ impl fmt::Display for TapOperation {
             Self::VerifyDeviceOwnership => "verify device ownership",
             Self::RecordDeviceOwnership => "record device ownership",
             Self::CreateDevice => "create device",
+            Self::InstallDevice => "install device",
+            Self::QueryDeviceIdentity => "query device identity",
+            Self::RenameDevice => "rename device",
+            Self::RemoveDevice => "remove device",
             Self::PairInterfaces => "pair interfaces",
             Self::QueryPeer => "query interface peer",
             Self::ConnectHelper => "connect TAP helper",
@@ -172,6 +184,14 @@ pub enum TapError {
         name: String,
         /// Packet-I/O peer interface name.
         peer_name: String,
+    },
+    /// A TAP-Windows adapter lacks Stella ownership metadata for its GUID.
+    #[error("refusing to manage unowned TAP-Windows adapter {name:?} ({interface_id})")]
+    WindowsAdapterOwnershipConflict {
+        /// Host-visible Windows interface name.
+        name: String,
+        /// Canonical Windows interface GUID.
+        interface_id: String,
     },
     /// The helper peer is not the privileged service Stella expected.
     #[error("macOS TAP helper peer has unexpected effective user ID {actual_uid}")]

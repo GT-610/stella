@@ -703,6 +703,17 @@ impl AuthorityStore {
         network_id: NetworkId,
         now: u64,
     ) -> Result<AuthorityRevision, StoreError> {
+        self.join_with_token_with_status(token, node_id, network_id, now)
+            .map(|(revision, _)| revision)
+    }
+
+    pub(crate) fn join_with_token_with_status(
+        &self,
+        token: &BearerToken,
+        node_id: NodeId,
+        network_id: NetworkId,
+        now: u64,
+    ) -> Result<(AuthorityRevision, bool), StoreError> {
         let digest = join_token_digest(token);
         self.add_membership_transaction(node_id, network_id, now, Some(digest))
     }
@@ -722,6 +733,7 @@ impl AuthorityStore {
         now: u64,
     ) -> Result<AuthorityRevision, StoreError> {
         self.add_membership_transaction(node_id, network_id, now, None)
+            .map(|(revision, _)| revision)
     }
 
     /// Removes membership, endpoint, and connectivity state in one transaction.
@@ -1348,7 +1360,7 @@ impl AuthorityStore {
         network_id: NetworkId,
         now: u64,
         token_digest: Option<[u8; 32]>,
-    ) -> Result<AuthorityRevision, StoreError> {
+    ) -> Result<(AuthorityRevision, bool), StoreError> {
         let key = membership_key(network_id, node_id);
         let write = self.database.begin_write()?;
         let mut network = load_network_for_write(&write, network_id)?;
@@ -1358,7 +1370,7 @@ impl AuthorityStore {
                 let record = MembershipRecord::decode(value.value())?;
                 validate_membership_key(&record, &key)?;
                 return match record.status {
-                    MembershipStatus::Active => Ok(network.revision()),
+                    MembershipStatus::Active => Ok((network.revision(), false)),
                     MembershipStatus::Suspended => Err(StoreError::MembershipSuspended {
                         network_id,
                         node_id,
@@ -1402,7 +1414,7 @@ impl AuthorityStore {
             }
         }
         write.commit()?;
-        Ok(revision)
+        Ok((revision, true))
     }
 
     pub(crate) fn backup(&self, destination: &Path) -> Result<u64, StoreError> {

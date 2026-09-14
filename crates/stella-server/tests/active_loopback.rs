@@ -27,7 +27,7 @@ use stella_crypto::{derive_node_id, IdentitySigningKey};
 use stella_proto::{
     encode_endpoint_set, encode_network_revision_list, ConfidentialityPolicy, ControlFieldType,
     ControlMessageType, Endpoint, MembershipGrantView, NetworkPolicy, NetworkRevision,
-    NetworkRevisionListView, PeerListView, VersionEntry, VersionListView,
+    NetworkRevisionListView, PeerListView, ProtocolVersion, VersionEntry, VersionListView,
 };
 use stella_server::{
     active::serve_control_session,
@@ -53,7 +53,10 @@ struct ActiveClient {
 
 impl ActiveClient {
     async fn send(&mut self, builder: MessageBuilder) -> u64 {
-        let message = self.outbound.build(builder).expect("build client message");
+        let message = self
+            .outbound
+            .build(builder.with_version(ProtocolVersion::V0_2))
+            .expect("build client message");
         let message_id = message.header().expect("read client header").message_id;
         let mut writer = RecordWriter::new(&mut self.stream);
         writer
@@ -269,10 +272,11 @@ async fn authenticate_client(
     }
     let node_id = derive_node_id(node_key.public_key());
     let mut selected = [0_u8; 4];
-    VersionEntry::V0_1_SUITE_1
+    VersionEntry::V0_2_SUITE_1
         .encode(&mut selected)
         .expect("encode selected version");
     let mut client_hello = MessageBuilder::new(ControlMessageType::ClientHello)
+        .with_version(ProtocolVersion::V0_2)
         .with_correlation(hello_header.message_id);
     client_hello
         .push_field(ControlFieldType::SelectedVersion, &selected)
@@ -330,13 +334,14 @@ async fn authenticate_client(
             &exporter,
             &server_nonce,
             &client_nonce,
-            VersionEntry::V0_1_SUITE_1,
+            VersionEntry::V0_2_SUITE_1,
             controller_id,
             node_id,
         ),
     );
-    let mut node_auth =
-        MessageBuilder::new(ControlMessageType::NodeAuth).with_correlation(proof_header.message_id);
+    let mut node_auth = MessageBuilder::new(ControlMessageType::NodeAuth)
+        .with_version(ProtocolVersion::V0_2)
+        .with_correlation(proof_header.message_id);
     node_auth
         .push_field(ControlFieldType::NodeSignature, &node_signature)
         .expect("node signature field");
@@ -510,6 +515,10 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         join_id
     );
     assert_eq!(status_code(&join_result), 0);
+    assert_eq!(
+        field_value(&join_result, ControlFieldType::MembershipCreated),
+        &[1]
+    );
     MembershipGrantView::decode(field_value(&join_result, ControlFieldType::MembershipGrant))
         .expect("decode join grant");
     NetworkPolicy::decode(field_value(&join_result, ControlFieldType::NetworkPolicy))
@@ -546,6 +555,10 @@ async fn authenticated_loopback_joins_snapshots_and_leaves_idempotently() {
         repeated_join_id
     );
     assert_eq!(status_code(&repeated_join), 0);
+    assert_eq!(
+        field_value(&repeated_join, ControlFieldType::MembershipCreated),
+        &[0]
+    );
     assert_eq!(
         u64_field(&repeated_join, ControlFieldType::ControllerEpoch),
         join_epoch
