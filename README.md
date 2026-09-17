@@ -60,3 +60,6 @@ each development or production build. Controller setup and operation are
 documented in [`docs/guide/server-deployment.md`](docs/guide/server-deployment.md).
 macOS feth setup and privileged verification are documented in
 [`docs/guide/macos-development.md`](docs/guide/macos-development.md).
+
+The [runtime audit report](docs/development/runtime-audit.md) contains the full
+removed Rust API list, performance samples and current verification scope.

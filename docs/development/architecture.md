@@ -45,8 +45,8 @@ panic. Cryptographic algorithms and I/O are injected by callers.
 
 ### `stella-tap`
 
-Owns the safe TAP device contract and platform implementations. This is the
-only crate permitted to contain unsafe code. Windows uses a native TAP-Windows
+Owns the safe TAP device contract and platform implementations. Its native
+backends encapsulate unsafe operating-system calls. Windows uses a native TAP-Windows
 backend. macOS contains Stella's native feth/BPF/AF_NDRV implementation and the
 bounded Unix-socket protocol used by `stella-tap-helper`. The ordinary client
 uses a proxy `TapDevice`; only the helper creates interfaces and opens raw
@@ -68,7 +68,7 @@ it never implements a cryptographic primitive itself.
 ### `stella-control`
 
 Owns the bounded asynchronous record reader and writer, owned control-message
-construction, per-connection sequencing and correlation, and canonical TLS
+construction, per-connection message sequencing, and canonical TLS
 exporter proof transcripts shared by client and server. It delegates wire
 validation to `stella-proto` and cryptographic operations to `stella-crypto`;
 it owns no sockets, TLS trust policy, authority policy, or persistent state.
@@ -107,3 +107,10 @@ expires.
 5. Windows and macOS end-to-end tests use real TAP adapters or feth pairs and
    verify ARP, broadcast, multicast, LAN discovery, and bidirectional IP
    traffic.
+
+### `stella-file-security`
+
+Owns protected identity creation/loading, bounded PKCS#8 reads, secret cleanup,
+and platform file validation shared by client and server. Windows ACLs and macOS
+permissions retain their platform semantics. This crate also encapsulates narrow
+unsafe macOS ACL calls; unsafe code is not exclusive to the TAP crate.

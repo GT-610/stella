@@ -684,3 +684,13 @@ Malformed input before authentication is closed without a detailed protocol
 response. After authentication, a redacted error may identify the invalid field
 type or state transition but MUST NOT echo tokens, signatures, keys, grants, or
 arbitrary attacker-provided text.
+
+## Cancellation-safe stream consumption
+
+A receiver that multiplexes record reads with timers or commands MUST retain
+partially consumed prefix and body bytes across cancellation. The next read
+continues the same record. The reference server retains one reader on a split
+TLS read half for the connection lifetime. No unbounded background queue is
+needed. Existing length validation precedes body allocation; EOF between records
+is distinct from a truncated record. A malformed or truncated record terminates
+the connection; receivers MUST NOT scan for a guessed next boundary.

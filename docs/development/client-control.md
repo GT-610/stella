@@ -120,7 +120,7 @@ it did not commit and allows the retained token to be sent on a later attempt.
 ## Active connection loop
 
 One task owns the framed reader, writer, inbound and outbound sequences, and
-correlation tracker. It selects among:
+pending request correlation. It selects among:
 
 - the next controller message;
 - the next heartbeat deadline;

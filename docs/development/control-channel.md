@@ -15,7 +15,7 @@ The crate owns four related concerns:
 3. `MessageBuilder` owns field bytes, sorts nothing implicitly, and delegates
    canonical header and TLV validation to `stella-proto`.
 4. Connection state allocates outbound message IDs, verifies exact inbound
-   sequence, and tracks at most 256 outstanding correlations.
+   sequence. Each endpoint runtime enforces its own request/response correlations.
 
 The reader and writer are generic over Tokio `AsyncRead` and `AsyncWrite`.
 They therefore work with split TLS streams, TCP test streams, and in-memory
@@ -42,7 +42,7 @@ after a complete message can be encoded. Receiving accepts exactly the expected
 ID and advances only after the full message passes structural validation.
 Zero, gaps, duplicates, lower values, and wrap are fatal connection errors.
 
-A request registers its non-zero message ID in a bounded set. A direct response
+The client runtime retains its pending request ID. A direct response
 must remove the matching ID exactly once. Unknown, duplicate, or already
 completed correlations are protocol errors. Unsolicited messages and requests
 must carry correlation zero.
@@ -66,5 +66,10 @@ Tests split every possible prefix boundary and representative body boundaries,
 coalesce multiple records into one read, truncate each framing component,
 exercise minimum and maximum lengths, reject a one-byte oversize declaration,
 and verify write output byte for byte. State tests cover sequence gaps, wrap,
-correlation exhaustion, duplicate responses, and connection reset. Fixed
+connection reset; endpoint tests cover unexpected and duplicate responses. Fixed
 vectors cover both proof transcripts.
+
+Reads retain prefix/body offsets across future cancellation. Keep the reader
+alive across `select!` iterations, including timer branches. Writes must complete
+or close the stream; read cancellation safety does not make interrupted writes
+safe to replay.

@@ -230,3 +230,21 @@ Broadcast tests include:
 - missing session, fragment loss, duplicate, replay, and reassembly timeout;
 - split horizon with broadcast received from a peer;
 - fairness when one peer send path is blocked.
+
+## Receive-side flood classification
+
+After session authentication and complete frame reassembly, and before source
+MAC learning or TAP delivery, a receiver applies an independent flood budget
+for each peer and traffic class. Broadcast and multicast are classified from
+the destination MAC. A unicast destination outside the receiver's local MAC set
+is charged to its unknown-unicast bucket: the receiver cannot observe the
+sender's forwarding database and MUST NOT infer it from the sender's claim.
+Local unicast is not charged to a flood bucket.
+
+The reference receive rates and bursts are twice the signed policy's respective
+broadcast, multicast and unknown-unicast values, using saturating arithmetic.
+Exhaustion drops the complete authenticated frame without learning its source
+or revoking the session. Per-peer buckets are bounded by authorized membership
+and cleared on peer removal. Replay acceptance still occurs during packet
+authentication; a policy-dropped frame cannot be retried with the same sequence.
+Split horizon and sender-side per-frame accounting remain unchanged.

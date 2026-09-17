@@ -16,7 +16,7 @@
 `stella-tap-helper` 使用的有界 Unix socket 协议。普通客户端使用 proxy `TapDevice`，只有
 helper 创建接口并打开 raw packet descriptor；
 `stella-transport` 提供可替换的有界数据报抽象；`stella-crypto` 管理身份、会话密钥、
-数据包保护、重放窗口和秘密清零；`stella-control` 负责控制通道的分帧、序列、关联和
+数据包保护、重放窗口和秘密清零；`stella-control` 负责控制通道的分帧、序列和
 TLS 导出器证明记录。
 
 `stella-server` 管理控制器配置、持久授权状态、已认证控制会话、成员关系、对等快照和
@@ -33,3 +33,7 @@ TLS 导出器证明记录。
 测试分为值类型、状态机和解析器的单元测试，协议往返和畸形输入的属性测试，TAP 的
 平台测试，回环传输上的控制器与客户端集成测试，以及在 Windows 真实 TAP 或 macOS
 真实 feth pair 上验证 ARP、广播、多播、LAN discovery 和双向 IP 流量的端到端测试。
+
+`stella-file-security` 统一客户端和服务端身份文件的创建、读取、PKCS#8 长度限制、失败清理和
+秘密清零。保留 Windows ACL 与 macOS 文件权限差异；该 crate 封装少量 unsafe macOS ACL
+调用，因此 unsafe 并非只存在于 TAP crate。
