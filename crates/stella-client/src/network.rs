@@ -769,7 +769,9 @@ impl NetworkDataPlane {
                 datagrams: Vec::new(),
                 tap_frame: Some(frame),
             }),
-            PeerIngress::DropLocalMacConflict => Ok(NetworkOutput::default()),
+            PeerIngress::DropLocalMacConflict | PeerIngress::DropFloodLimit => {
+                Ok(NetworkOutput::default())
+            }
         }
     }
 
