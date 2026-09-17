@@ -631,8 +631,8 @@ impl NetworkDataPlane {
 
     /// Replaces authoritative control state and invalidates affected sessions.
     ///
-    /// Epoch, policy, local-grant, peer-grant, or endpoint changes immediately
-    /// remove the corresponding data keys, replay state, and learned MACs.
+    /// Authority changes invalidate affected sessions immediately. Connectivity
+    /// refreshes retain unchanged paths and only withdraw unavailable endpoints.
     ///
     /// # Errors
     ///
@@ -679,23 +679,41 @@ impl NetworkDataPlane {
                 || old_peers.get(&peer).is_none_or(|old| {
                     self.state.peers().get(&peer).is_none_or(|current| {
                         old.endpoints() != current.endpoints()
-                            || old.connectivity() != current.connectivity()
+                            || old
+                                .connectivity()
+                                .map(crate::PeerConnectivityState::candidates)
+                                != current
+                                    .connectivity()
+                                    .map(crate::PeerConnectivityState::candidates)
                     })
                 });
             let changed = old_peers.get(&peer).is_none_or(|old| {
-                self.state.peers().get(&peer).is_none_or(|current| {
-                    old.grant().grant_serial != current.grant().grant_serial
-                        || old.endpoints() != current.endpoints()
-                        || old.connectivity() != current.connectivity()
-                })
+                self.state
+                    .peers()
+                    .get(&peer)
+                    .is_none_or(|current| old.grant().grant_serial != current.grant().grant_serial)
             });
             if changed {
                 self.remove_session(peer);
             }
             if endpoints_changed {
-                self.nominated_direct_paths.remove(&peer);
-                self.pending_path_upgrades.remove(&peer);
-                self.remove_peer_paths(peer);
+                // A nominated peer-reflexive path is governed by consent. An
+                // explicitly removed advertised candidate cannot remain pinned.
+                if let Some(address) = self.nominated_direct_paths.get(&peer).copied() {
+                    let advertised = |state: &crate::PeerState| {
+                        state.connectivity().is_some_and(|connectivity| {
+                            connectivity.candidates().iter().any(|candidate| {
+                                candidate.carrier == ConnectivityCarrier::DirectUdp
+                                    && candidate.address == address
+                            })
+                        })
+                    };
+                    if old_peers.get(&peer).is_some_and(advertised)
+                        && !self.state.peers().get(&peer).is_some_and(advertised)
+                    {
+                        self.nominated_direct_paths.remove(&peer);
+                    }
+                }
                 self.install_peer_paths(peer)?;
             }
             self.handshakes
@@ -2320,6 +2338,61 @@ mod tests {
                 sessions_before
             );
         }
+
+        // Removing an unused advertised endpoint must preserve the active path.
+        store
+            .publish_endpoints(
+                derive_node_id(alice_key.public_key()),
+                network_id,
+                &[Endpoint::UdpIpv4 {
+                    priority: 0,
+                    port: alice_address.port(),
+                    max_datagram_size: 1_200,
+                    address: Ipv4Addr::LOCALHOST,
+                }],
+                130,
+            )
+            .expect("withdraw unused alternate endpoint");
+        let bob_session = bob.sessions.values().next().expect("Bob session");
+        let bob_binding = (bob_session.session_id, bob_session.path_id);
+        bob.reconcile(
+            state(&store, &controller, &bob_key, network_id),
+            &bob_key,
+            bob_mac,
+            Duration::ZERO,
+        )
+        .expect("reconcile partial endpoint withdrawal");
+        let bob_session = bob.sessions.values().next().expect("preserved Bob session");
+        assert_eq!((bob_session.session_id, bob_session.path_id), bob_binding);
+        // Restore the alternate for the path-mismatch assertion below.
+        store
+            .publish_endpoints(
+                derive_node_id(alice_key.public_key()),
+                network_id,
+                &[
+                    Endpoint::UdpIpv4 {
+                        priority: 0,
+                        port: 46001,
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::LOCALHOST,
+                    },
+                    Endpoint::UdpIpv4 {
+                        priority: 1,
+                        port: 46003,
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::LOCALHOST,
+                    },
+                ],
+                131,
+            )
+            .expect("restore alternate");
+        bob.reconcile(
+            state(&store, &controller, &bob_key, network_id),
+            &bob_key,
+            bob_mac,
+            Duration::ZERO,
+        )
+        .expect("add alternate without replacing session");
 
         let broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xa1);
         let packets = alice
