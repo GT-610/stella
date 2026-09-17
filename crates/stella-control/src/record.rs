@@ -10,9 +10,21 @@ use stella_proto::{
 use crate::{ControlError, OwnedControlMessage};
 
 /// Reads complete owned control records from an ordered asynchronous stream.
-#[derive(Debug)]
 pub struct RecordReader<R> {
     inner: R,
+    prefix: [u8; CONTROL_RECORD_PREFIX_LENGTH],
+    prefix_read: usize,
+    bytes: Vec<u8>,
+    record_read: usize,
+}
+
+impl<R> std::fmt::Debug for RecordReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordReader")
+            .field("prefix_read", &self.prefix_read)
+            .field("record_read", &self.record_read)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<R> RecordReader<R>
@@ -22,45 +34,56 @@ where
     /// Wraps an ordered asynchronous byte stream.
     #[must_use]
     pub const fn new(inner: R) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            prefix: [0; CONTROL_RECORD_PREFIX_LENGTH],
+            prefix_read: 0,
+            bytes: Vec::new(),
+            record_read: 0,
+        }
     }
 
     /// Reads and validates the next complete message.
     ///
     /// `Ok(None)` means EOF occurred exactly between records. EOF after any
-    /// prefix or body byte is reported as truncation.
+    /// prefix or body byte is reported as truncation. Cancelling this future
+    /// retains progress; resume using the same reader. Errors are terminal for
+    /// the carrier. Debug output never includes partially read credentials.
     ///
     /// # Errors
     ///
     /// Returns [`ControlError`] for I/O failure, truncated input, an invalid
     /// declared length, allocation failure, or an invalid control message.
     pub async fn read_message(&mut self) -> Result<Option<OwnedControlMessage>, ControlError> {
-        let mut prefix = [0_u8; CONTROL_RECORD_PREFIX_LENGTH];
-        let prefix_read = read_until_full(&mut self.inner, &mut prefix).await?;
-        if prefix_read == 0 {
+        read_until_full(&mut self.inner, &mut self.prefix, &mut self.prefix_read).await?;
+        if self.prefix_read == 0 {
             return Ok(None);
         }
-        if prefix_read != CONTROL_RECORD_PREFIX_LENGTH {
-            return Err(ControlError::TruncatedPrefix { read: prefix_read });
-        }
-
-        let record_length = decode_control_record_length(&prefix)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(record_length)
-            .map_err(|_| ControlError::AllocationFailed {
-                requested: record_length,
-            })?;
-        bytes.resize(record_length, 0);
-        let record_read = read_until_full(&mut self.inner, &mut bytes).await?;
-        if record_read != record_length {
-            return Err(ControlError::TruncatedRecord {
-                expected: record_length,
-                read: record_read,
+        if self.prefix_read != CONTROL_RECORD_PREFIX_LENGTH {
+            return Err(ControlError::TruncatedPrefix {
+                read: self.prefix_read,
             });
         }
-        ControlMessageView::decode(&bytes)?;
-        Ok(Some(OwnedControlMessage::from_validated_bytes(bytes)))
+        if self.bytes.is_empty() {
+            let length = decode_control_record_length(&self.prefix)?;
+            self.bytes
+                .try_reserve_exact(length)
+                .map_err(|_| ControlError::AllocationFailed { requested: length })?;
+            self.bytes.resize(length, 0);
+        }
+        read_until_full(&mut self.inner, &mut self.bytes, &mut self.record_read).await?;
+        if self.record_read != self.bytes.len() {
+            return Err(ControlError::TruncatedRecord {
+                expected: self.bytes.len(),
+                read: self.record_read,
+            });
+        }
+        ControlMessageView::decode(&self.bytes)?;
+        self.prefix_read = 0;
+        self.record_read = 0;
+        Ok(Some(OwnedControlMessage::from_validated_bytes(
+            std::mem::take(&mut self.bytes),
+        )))
     }
 
     /// Returns the wrapped stream.
@@ -130,23 +153,27 @@ where
     }
 }
 
-async fn read_until_full<R>(reader: &mut R, output: &mut [u8]) -> Result<usize, std::io::Error>
+async fn read_until_full<R>(
+    reader: &mut R,
+    output: &mut [u8],
+    read: &mut usize,
+) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
 {
-    let mut read = 0_usize;
-    while read < output.len() {
-        let count = reader.read(&mut output[read..]).await?;
+    while *read < output.len() {
+        let count = reader.read(&mut output[*read..]).await?;
         if count == 0 {
             break;
         }
-        read = read.saturating_add(count);
+        *read += count;
     }
-    Ok(read)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use tokio::io::{duplex, AsyncWriteExt};
 
     use stella_proto::{
@@ -168,6 +195,35 @@ mod tests {
             message = Some(sequence.build(builder).expect("valid join message"));
         }
         message.expect("message ID is non-zero")
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_every_byte_preserves_two_record_boundaries() {
+        let message = join_message(1);
+        let mut prefix = [0; 4];
+        encode_control_record_length(message.len(), &mut prefix).expect("length");
+        let wire = [prefix.as_slice(), message.as_bytes()].concat();
+        let (mut sender, receiver) = duplex(wire.len() * 2);
+        let mut reader = RecordReader::new(receiver);
+        for byte in &wire[..wire.len() - 1] {
+            sender.write_all(&[*byte]).await.expect("partial write");
+            let mut future = std::pin::pin!(reader.read_message());
+            std::future::poll_fn(|cx| {
+                assert!(future.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        sender
+            .write_all(&wire[wire.len() - 1..])
+            .await
+            .expect("last byte");
+        sender.write_all(&wire).await.expect("next record");
+        assert_eq!(
+            reader.read_message().await.expect("first"),
+            Some(message.clone())
+        );
+        assert_eq!(reader.read_message().await.expect("second"), Some(message));
     }
 
     #[tokio::test]

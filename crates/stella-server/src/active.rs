@@ -17,6 +17,7 @@ use stella_proto::{
 };
 use thiserror::Error;
 use tokio::{
+    io::WriteHalf,
     net::TcpStream,
     time::{sleep_until, timeout, Instant},
 };
@@ -79,6 +80,8 @@ pub async fn serve_authenticated_session(
     let connectivity_refresh = connectivity_expires_at
         .map(|expires_at| connectivity_refresh_deadline(expires_at, unix_time()?))
         .transpose()?;
+    let (read_half, stream) = tokio::io::split(stream);
+    let mut reader = RecordReader::new(read_half);
     let mut state = ActiveSessionState {
         stream,
         context,
@@ -100,7 +103,6 @@ pub async fn serve_authenticated_session(
     loop {
         let refresh_deadline = next_refresh_deadline(&state);
         let wake = {
-            let mut reader = RecordReader::new(&mut state.stream);
             if let Some(deadline) = refresh_deadline {
                 tokio::select! {
                     _ = shutdown.changed() => SessionWake::Shutdown,
@@ -147,7 +149,7 @@ enum SessionWake {
 }
 
 struct ActiveSessionState {
-    stream: TlsStream<TcpStream>,
+    stream: WriteHalf<TlsStream<TcpStream>>,
     context: SessionContext,
     node_id: NodeId,
     protocol_version: ProtocolVersion,
@@ -1306,7 +1308,9 @@ async fn write_message(
     Ok(())
 }
 
-async fn shutdown_writer(stream: &mut TlsStream<TcpStream>) -> Result<(), ActiveSessionError> {
+async fn shutdown_writer(
+    stream: &mut WriteHalf<TlsStream<TcpStream>>,
+) -> Result<(), ActiveSessionError> {
     RecordWriter::new(stream).shutdown().await?;
     Ok(())
 }
