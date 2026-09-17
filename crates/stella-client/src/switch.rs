@@ -404,7 +404,10 @@ fn validate_source(source: MacAddress) -> Result<(), SwitchError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
+    };
 
     use stella_common::{MacAddress, NetworkId, NodeId};
     use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
@@ -449,6 +452,48 @@ mod tests {
         [NodeId::from_bytes([2; 16]), NodeId::from_bytes([3; 16])]
             .into_iter()
             .collect()
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance measurement"]
+    fn benchmark_switch_forwarding() {
+        let primary = mac(1);
+        let target = NodeId::from_bytes([99; 16]);
+        let registry = (1..=100)
+            .map(|id| (NodeId::from_bytes([id; 16]), true))
+            .collect::<BTreeMap<_, _>>();
+        for destination in [mac(2), MacAddress::BROADCAST] {
+            for sample in 0..5 {
+                let mut policy = policy();
+                policy.flood_rate = 1_000_000;
+                policy.flood_burst = 1_000_000;
+                let mut switch = L2Switch::new(policy, primary, Duration::ZERO).expect("switch");
+                switch
+                    .accept_peer_frame(target, &frame(mac(2), primary), Duration::ZERO)
+                    .expect("learn");
+                let frame = frame(primary, destination);
+                let started = std::time::Instant::now();
+                for _ in 0..100_000 {
+                    let eligible = registry
+                        .iter()
+                        .filter_map(|(peer, active)| active.then_some(*peer))
+                        .collect();
+                    std::hint::black_box(
+                        switch
+                            .forward_tap_frame(
+                                std::hint::black_box(&frame),
+                                &eligible,
+                                Duration::ZERO,
+                            )
+                            .expect("forward"),
+                    );
+                }
+                eprintln!(
+                    "switch destination={destination} peers=100 sample={sample} us={}",
+                    started.elapsed().as_micros()
+                );
+            }
+        }
     }
 
     #[test]

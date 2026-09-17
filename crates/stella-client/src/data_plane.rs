@@ -870,6 +870,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release-mode performance measurement"]
+    fn benchmark_packet_round_trips() {
+        for (payload, mtu) in [(64, 1500), (1400, 1500), (1400, 220)] {
+            for sample in 0..5 {
+                let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, mtu);
+                let frame = frame(payload);
+                let started = std::time::Instant::now();
+                for _ in 0..10_000 {
+                    for packet in alice
+                        .protect_frame(std::hint::black_box(&frame))
+                        .expect("protect")
+                    {
+                        std::hint::black_box(
+                            bob.accept_datagram(&packet, Duration::ZERO)
+                                .expect("receive"),
+                        );
+                    }
+                }
+                eprintln!(
+                    "packet payload={payload} mtu={mtu} sample={sample} us={}",
+                    started.elapsed().as_micros()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn encrypted_fragments_reassemble_out_of_order() {
         let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 220);
         let frame = frame(900);
