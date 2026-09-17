@@ -396,42 +396,17 @@ pub struct ResponderHandshake {
 }
 
 impl ResponderHandshake {
-    /// Authenticates an initiation and creates a fresh signed response.
-    ///
-    /// Structurally invalid or unauthenticated input returns an error and must
-    /// be silently dropped by the caller rather than answered with a rejection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HandshakeError`] for stale or mismatched context, grant or
-    /// signature failure, randomness failure, or non-contributory agreement.
-    pub fn respond(
+    fn respond(
         config: PeerHandshakeConfig,
         local_signing_key: &IdentitySigningKey,
-        init_datagram: &[u8],
+        validated: ValidatedInitiation<'_>,
         now: u64,
     ) -> Result<Self, HandshakeError> {
         validate_local_signing_key(&config, local_signing_key)?;
-        let init = SessionInitView::decode(init_datagram)?;
-        validate_initiation_header(&config, init.header())?;
-        validate_timestamp(init.header().timestamp, now)?;
-        validate_grant_time(config.local_grant, now)?;
-        if presented_grant_rejection(&config, &init.initiator_grant(), now)?.is_some() {
-            return Err(HandshakeError::ContextMismatch {
-                field: "initiator membership grant",
-            });
-        }
-        if init.receiver_grant_serial() != config.local_grant.grant_serial {
-            return Err(HandshakeError::ContextMismatch {
-                field: "receiver grant serial",
-            });
-        }
-        config.peer_public_key.verify_segments(
-            SESSION_INIT_SIGNATURE_DOMAIN,
-            &[init.signed_header(), init.signed_payload()],
-            init.signature(),
-        )?;
-
+        let ValidatedInitiation {
+            datagram: init_datagram,
+            view: init,
+        } = validated;
         let ephemeral = EphemeralSecret::generate()?;
         let ephemeral_public = ephemeral.public_key().to_bytes();
         let nonce = random_nonzero_array::<HANDSHAKE_NONCE_LENGTH>()?;
@@ -997,20 +972,23 @@ impl PeerHandshakeManager {
                 .ok_or(HandshakeError::InvalidConfiguration {
                     reason: "initiation came from an unknown peer",
                 })?;
-        if let Some(reason) = classify_authenticated_initiation(&config, &init, wall_time)? {
-            let rejection = encode_signed_rejection(
-                &config,
-                init.header(),
-                datagram,
-                reason,
-                0,
-                signing_key,
-                wall_time,
-            )?;
-            return Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
-                peer, rejection,
-            )));
-        }
+        let validated = match authenticate_initiation(&config, datagram, wall_time)? {
+            Ok(validated) => validated,
+            Err(reason) => {
+                let rejection = encode_signed_rejection(
+                    &config,
+                    init.header(),
+                    datagram,
+                    reason,
+                    0,
+                    signing_key,
+                    wall_time,
+                )?;
+                return Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
+                    peer, rejection,
+                )));
+            }
+        };
         if self
             .active_session_ids
             .contains(&(peer, init.header().session_id))
@@ -1034,7 +1012,7 @@ impl PeerHandshakeManager {
             }
             self.outgoing.remove(&peer);
         }
-        let handshake = ResponderHandshake::respond(config, signing_key, datagram, wall_time)?;
+        let handshake = ResponderHandshake::respond(config, signing_key, validated, wall_time)?;
         let response = handshake.response_datagram().to_vec();
         self.make_responder_room(peer);
         self.responders.insert(
@@ -1297,11 +1275,17 @@ fn validate_grant_time(grant: MembershipGrant, now: u64) -> Result<(), Handshake
     Ok(())
 }
 
-fn classify_authenticated_initiation(
+struct ValidatedInitiation<'a> {
+    datagram: &'a [u8],
+    view: SessionInitView<'a>,
+}
+
+fn authenticate_initiation<'a>(
     config: &PeerHandshakeConfig,
-    init: &SessionInitView<'_>,
+    datagram: &'a [u8],
     now: u64,
-) -> Result<Option<SessionRejectReason>, HandshakeError> {
+) -> Result<Result<ValidatedInitiation<'a>, SessionRejectReason>, HandshakeError> {
+    let init = SessionInitView::decode(datagram)?;
     let header = init.header();
     if header.common.network_id != config.policy.network_id {
         return Err(HandshakeError::ContextMismatch {
@@ -1324,19 +1308,23 @@ fn classify_authenticated_initiation(
         &[init.signed_header(), init.signed_payload()],
         init.signature(),
     )?;
+    let grant_rejection = presented_grant_rejection(config, &init.initiator_grant(), now)?;
     if header.controller_epoch != config.controller_epoch {
-        return Ok(Some(SessionRejectReason::StaleEpoch));
+        return Ok(Err(SessionRejectReason::StaleEpoch));
     }
-    if let Some(reason) = presented_grant_rejection(config, &init.initiator_grant(), now)? {
-        return Ok(Some(reason));
+    if let Some(reason) = grant_rejection {
+        return Ok(Err(reason));
     }
     if init.receiver_grant_serial() != config.local_grant.grant_serial {
-        return Ok(Some(SessionRejectReason::PolicyMismatch));
+        return Ok(Err(SessionRejectReason::PolicyMismatch));
     }
     if validate_grant_time(config.local_grant, now).is_err() {
-        return Ok(Some(SessionRejectReason::GrantExpired));
+        return Ok(Err(SessionRejectReason::GrantExpired));
     }
-    Ok(None)
+    Ok(Ok(ValidatedInitiation {
+        datagram,
+        view: init,
+    }))
 }
 
 fn presented_grant_rejection(
@@ -1378,33 +1366,6 @@ fn same_grant_authority(left: MembershipGrant, right: MembershipGrant) -> bool {
 fn validate_timestamp(timestamp: u64, now: u64) -> Result<(), HandshakeError> {
     if timestamp.abs_diff(now) > TIMESTAMP_TOLERANCE_SECONDS {
         return Err(HandshakeError::StaleTimestamp);
-    }
-    Ok(())
-}
-
-fn validate_initiation_header(
-    config: &PeerHandshakeConfig,
-    header: HandshakeHeader,
-) -> Result<(), HandshakeError> {
-    if header.common.network_id != config.policy.network_id {
-        return Err(HandshakeError::ContextMismatch {
-            field: "network ID",
-        });
-    }
-    if header.sender_node_id != config.peer_node_id {
-        return Err(HandshakeError::ContextMismatch {
-            field: "sender node ID",
-        });
-    }
-    if header.receiver_node_id != config.local_node_id {
-        return Err(HandshakeError::ContextMismatch {
-            field: "receiver node ID",
-        });
-    }
-    if header.controller_epoch != config.controller_epoch {
-        return Err(HandshakeError::ContextMismatch {
-            field: "controller epoch",
-        });
     }
     Ok(())
 }
@@ -1791,6 +1752,20 @@ mod tests {
         frame
     }
 
+    fn respond(
+        config: PeerHandshakeConfig,
+        key: &IdentitySigningKey,
+        datagram: &[u8],
+        now: u64,
+    ) -> Result<ResponderHandshake, HandshakeError> {
+        let validated = super::authenticate_initiation(&config, datagram, now)?.map_err(|_| {
+            HandshakeError::ContextMismatch {
+                field: "initiation",
+            }
+        })?;
+        ResponderHandshake::respond(config, key, validated, now)
+    }
+
     #[test]
     fn four_message_handshake_establishes_bidirectional_data() {
         let alice_key = signing_key(11);
@@ -1806,9 +1781,8 @@ mod tests {
 
         let mut initiator =
             InitiatorHandshake::start(alice_config, &alice_key, NOW).expect("start initiation");
-        let mut responder =
-            ResponderHandshake::respond(bob_config, &bob_key, initiator.initiation_datagram(), NOW)
-                .expect("authenticate initiation");
+        let mut responder = respond(bob_config, &bob_key, initiator.initiation_datagram(), NOW)
+            .expect("authenticate initiation");
         let response = responder.response_datagram().to_vec();
         let initiator_confirm = initiator
             .accept_response(&response, NOW)
@@ -1862,7 +1836,7 @@ mod tests {
         let initiation =
             InitiatorHandshake::start(alice_config, &alice_key, NOW).expect("start initiation");
         assert!(matches!(
-            ResponderHandshake::respond(
+            respond(
                 bob_config.clone(),
                 &bob_key,
                 initiation.initiation_datagram(),
@@ -1874,7 +1848,7 @@ mod tests {
         let signature_index = mutated.len() - 1;
         mutated[signature_index] ^= 1;
         assert!(matches!(
-            ResponderHandshake::respond(bob_config, &bob_key, &mutated, NOW),
+            respond(bob_config, &bob_key, &mutated, NOW),
             Err(HandshakeError::Crypto(_))
         ));
     }

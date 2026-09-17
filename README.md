@@ -41,7 +41,8 @@ The runtime audit also removes unused Rust convenience APIs:
 `ClientDataRuntime::local_udp_addresses`, `IdentitySigningKey::export_seed`,
 `MacosTapProxyDevice::create_with_socket`, `MacAddress::is_locally_administered`,
 `Endpoint::as_turn_udp`, `verify_controller_identity_permissions`,
-`ResponderHandshake::into_established`, and `NetworkDataPlane::accept_udp_datagram`.
+`ResponderHandshake::into_established`, `ResponderHandshake::respond`, and
+`NetworkDataPlane::accept_udp_datagram`.
 Use the generic endpoint/session APIs and validated identity loading instead.
 Wire, CLI, configuration, and database formats are unchanged.
 
