@@ -14,16 +14,19 @@ flowchart TD
     Client --> Transport[stella-transport]
     Client --> Crypto[stella-crypto]
     Client --> Control[stella-control]
+    Client --> FileSecurity[stella-file-security]
     Server[stella-server] --> Common
     Server --> Proto
     Server --> Crypto
     Server --> Control
+    Server --> FileSecurity
     Control --> Common
     Control --> Proto
     Control --> Crypto
     Proto --> Common
     Transport --> Common
     Crypto --> Common
+    FileSecurity --> Crypto
 ```
 
 Lower-level crates must not depend on either binary. `stella-proto` remains
@@ -85,6 +88,13 @@ Owns configuration and CLI behavior, controller sessions, virtual-switch state,
 TAP lifecycle, transport sessions, forwarding, reconnect behavior, and graceful
 shutdown.
 
+### `stella-file-security`
+
+Owns protected identity creation/loading, bounded PKCS#8 reads, secret cleanup,
+and platform file validation shared by client and server. Windows ACLs and macOS
+permissions retain their platform semantics. This crate also encapsulates narrow
+unsafe macOS ACL calls; unsafe code is not exclusive to the TAP crate.
+
 ## Runtime boundaries
 
 The client uses one bounded path in each direction between TAP and the data
@@ -107,10 +117,3 @@ expires.
 5. Windows and macOS end-to-end tests use real TAP adapters or feth pairs and
    verify ARP, broadcast, multicast, LAN discovery, and bidirectional IP
    traffic.
-
-### `stella-file-security`
-
-Owns protected identity creation/loading, bounded PKCS#8 reads, secret cleanup,
-and platform file validation shared by client and server. Windows ACLs and macOS
-permissions retain their platform semantics. This crate also encapsulates narrow
-unsafe macOS ACL calls; unsafe code is not exclusive to the TAP crate.
