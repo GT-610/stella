@@ -39,6 +39,9 @@ source changes; this does not change network or persisted formats.
 | Server | `verify_controller_identity_permissions`; `AuthorityHandle::{max_queue_capacity,remaining_queue_capacity}`; `MembershipRecord::joined_at`; `EndpointLeaseRecord::updated_at`; `ConnectivityAuthorityRecord::encoded_generation` |
 | TAP | `MacosTapProxyDevice::create_with_socket`; `WindowsTapDevice::installed_adapters`; `WindowsTapRemoval::removed` |
 
+`NetworkDataPlane::established_peers` now returns a borrowed set instead of
+allocating an owned set; callers needing ownership must clone explicitly.
+
 Codec tests still exercise the internal offset encoders used by complete message
 encoding. Nonce validation remains in decoding even though unused view fields
 were removed. Device removal remains idempotent. Public constants and error
