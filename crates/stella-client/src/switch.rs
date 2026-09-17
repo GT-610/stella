@@ -14,7 +14,7 @@ const MAX_LOCAL_DYNAMIC_MACS: usize = 32;
 const MAX_REMOTE_MACS: usize = 4_096;
 const MAX_REMOTE_MACS_PER_PEER: usize = 256;
 const MAC_CONFLICT_DURATION: Duration = Duration::from_secs(30);
-const TOKEN_SCALE: u128 = 1_000_000_000;
+use crate::rate::TokenBucket;
 
 /// Invalid Ethernet input rejected before forwarding or learning.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -88,38 +88,6 @@ struct LocalEntry {
 struct RemoteEntry {
     peer: NodeId,
     last_seen: Duration,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TokenBucket {
-    rate: u32,
-    capacity: u32,
-    tokens_scaled: u128,
-    last_refill: Duration,
-}
-
-impl TokenBucket {
-    fn new(rate: u32, capacity: u32, now: Duration) -> Self {
-        Self {
-            rate,
-            capacity,
-            tokens_scaled: u128::from(capacity) * TOKEN_SCALE,
-            last_refill: now,
-        }
-    }
-
-    fn take(&mut self, now: Duration) -> bool {
-        let elapsed = now.saturating_sub(self.last_refill);
-        let refill = elapsed.as_nanos().saturating_mul(u128::from(self.rate));
-        let ceiling = u128::from(self.capacity) * TOKEN_SCALE;
-        self.tokens_scaled = self.tokens_scaled.saturating_add(refill).min(ceiling);
-        self.last_refill = now;
-        if self.tokens_scaled < TOKEN_SCALE {
-            return false;
-        }
-        self.tokens_scaled -= TOKEN_SCALE;
-        true
-    }
 }
 
 /// One isolated network's bounded local and remote forwarding state.

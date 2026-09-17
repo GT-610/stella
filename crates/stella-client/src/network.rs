@@ -1,7 +1,7 @@
 //! Per-network routing between TAP frames, peer sessions, and UDP datagrams.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -20,6 +20,8 @@ use crate::{
     PeerDataSession, PeerHandshakeConfig, PeerHandshakeManager, PeerIngress, SwitchError,
     TapForwarding,
 };
+
+use crate::rate::TokenBucket;
 
 const ROUTINE_REKEY_PACKET_LIMIT: u64 = u32::MAX as u64;
 const ROUTINE_REKEY_LEAD: u64 = 10;
@@ -182,6 +184,9 @@ pub struct NetworkDataPlane {
     paths: BTreeMap<PathId, PeerPath>,
     peer_paths: BTreeMap<NodeId, Vec<PathId>>,
     next_path_id: u64,
+    handshake_budget: TokenBucket,
+    node_budgets: BTreeMap<NodeId, TokenBucket>,
+    endpoint_budgets: HashMap<TransportEndpoint, TokenBucket>,
     sessions: BTreeMap<NodeId, InstalledSession>,
     retired_sessions: BTreeMap<(NodeId, u64), RetiredSession>,
 }
@@ -250,6 +255,9 @@ impl NetworkDataPlane {
             paths: BTreeMap::new(),
             peer_paths: BTreeMap::new(),
             next_path_id: 1,
+            handshake_budget: TokenBucket::new(256, 256, now),
+            node_budgets: BTreeMap::new(),
+            endpoint_budgets: HashMap::new(),
             sessions: BTreeMap::new(),
             retired_sessions: BTreeMap::new(),
         };
@@ -618,6 +626,9 @@ impl NetworkDataPlane {
             | PacketType::SessionReject => {
                 let header = HandshakeHeader::decode(datagram)?;
                 let path_id = self.resolve_peer_path(header.sender_node_id, source)?;
+                if !self.admit_handshake(header.sender_node_id, source, monotonic_now) {
+                    return Ok(NetworkOutput::default());
+                }
                 let event = self.handshakes.handle_datagram(
                     datagram,
                     signing_key,
@@ -707,6 +718,26 @@ impl NetworkDataPlane {
                 )?)?;
         }
         Ok(())
+    }
+
+    fn admit_handshake(&mut self, peer: NodeId, source: &TransportEndpoint, now: Duration) -> bool {
+        // Call only after resolving the authorized peer/path; attacker-controlled
+        // identities and addresses never allocate admission state.
+        self.node_budgets
+            .retain(|node, _| self.state.peers().contains_key(node));
+        self.endpoint_budgets
+            .retain(|endpoint, _| self.paths.values().any(|path| &path.endpoint == endpoint));
+        self.handshake_budget.take(now)
+            && self
+                .endpoint_budgets
+                .entry(source.clone())
+                .or_insert_with(|| TokenBucket::new(32, 64, now))
+                .take(now)
+            && self
+                .node_budgets
+                .entry(peer)
+                .or_insert_with(|| TokenBucket::new(8, 32, now))
+                .take(now)
     }
 
     fn accept_data(
@@ -2123,6 +2154,32 @@ mod tests {
             from_alice = !from_alice;
         }
         panic!("handshake did not converge within eight flights");
+    }
+
+    #[test]
+    fn handshake_admission_is_bounded_and_refills_monotonically() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let address = "127.0.0.1:46001".parse().expect("address");
+        let mut plane = NetworkDataPlane::new(
+            state(&store, &controller, &alice_key, network_id),
+            MacAddress::from_bytes([2, 0, 0, 0, 1, 1]),
+            address,
+            1200,
+            &alice_key,
+            Duration::ZERO,
+        )
+        .expect("plane");
+        let peer = derive_node_id(bob_key.public_key());
+        let source = TransportEndpoint::Udp("127.0.0.1:46002".parse().expect("peer"));
+        for _ in 0..32 {
+            assert!(plane.admit_handshake(peer, &source, Duration::ZERO));
+        }
+        assert!(!plane.admit_handshake(peer, &source, Duration::ZERO));
+        assert!(plane.admit_handshake(peer, &source, Duration::from_secs(1)));
+        assert_eq!(plane.node_budgets.len(), 1);
+        assert_eq!(plane.endpoint_budgets.len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[test]
