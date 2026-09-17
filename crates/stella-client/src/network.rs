@@ -277,8 +277,8 @@ impl NetworkDataPlane {
 
     /// Replaces the locally allocated relay carriers and rebuilds affected paths.
     ///
-    /// Existing sessions are withdrawn because changing local carrier
-    /// availability changes which exact `PathId` can send and receive packets.
+    /// Unchanged endpoints retain their path IDs and sessions. Only sessions
+    /// pinned to withdrawn carriers are removed.
     ///
     /// # Errors
     ///
@@ -304,8 +304,6 @@ impl NetworkDataPlane {
         self.available_relay_carriers = updated;
         let peers = self.state.peers().keys().copied().collect::<Vec<_>>();
         for peer in peers {
-            self.remove_session(peer);
-            self.remove_peer_paths(peer);
             self.install_peer_paths(peer)?;
         }
         Ok(())
@@ -998,51 +996,72 @@ impl NetworkDataPlane {
                 endpoint.port(),
             )
         });
-        let mut path_ids = Vec::with_capacity(
-            usize::from(nominated_direct.is_some())
-                .saturating_add(relay_endpoints.len())
-                .saturating_add(endpoints.len()),
+        let desired = nominated_direct.into_iter().chain(relay_endpoints).chain(
+            endpoints
+                .into_iter()
+                .map(|endpoint| TransportEndpoint::Udp(endpoint_socket_address(endpoint))),
         );
-        if let Some(endpoint) = nominated_direct {
-            let path_id = self.allocate_path_id()?;
-            self.paths.insert(
-                path_id,
-                PeerPath {
-                    peer_node_id: peer,
-                    endpoint,
-                },
-            );
-            path_ids.push(path_id);
-        }
-        for endpoint in relay_endpoints {
-            let path_id = self.allocate_path_id()?;
-            self.paths.insert(
-                path_id,
-                PeerPath {
-                    peer_node_id: peer,
-                    endpoint,
-                },
-            );
-            path_ids.push(path_id);
-        }
-        for endpoint in endpoints {
-            let endpoint = TransportEndpoint::Udp(endpoint_socket_address(endpoint));
-            if path_ids.iter().any(|path_id| {
-                self.paths
-                    .get(path_id)
-                    .is_some_and(|path| path.endpoint == endpoint)
-            }) {
-                continue;
+        let mut path_ids = Vec::new();
+        for endpoint in desired {
+            let existing = self.paths.iter().find_map(|(id, path)| {
+                (path.peer_node_id == peer && path.endpoint == endpoint).then_some(*id)
+            });
+            let path_id = if let Some(id) = existing {
+                id
+            } else {
+                let id = self.allocate_path_id()?;
+                self.paths.insert(
+                    id,
+                    PeerPath {
+                        peer_node_id: peer,
+                        endpoint,
+                    },
+                );
+                id
+            };
+            if !path_ids.contains(&path_id) {
+                path_ids.push(path_id);
             }
-            let path_id = self.allocate_path_id()?;
-            self.paths.insert(
-                path_id,
-                PeerPath {
-                    peer_node_id: peer,
-                    endpoint,
-                },
-            );
-            path_ids.push(path_id);
+        }
+        let removed = self
+            .peer_paths
+            .get(&peer)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|id| !path_ids.contains(id))
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            self.handshakes.cancel_exchanges(peer);
+            if self
+                .pending_path_upgrades
+                .get(&peer)
+                .is_some_and(|id| removed.contains(id))
+            {
+                self.pending_path_upgrades.remove(&peer);
+            }
+            if self
+                .sessions
+                .get(&peer)
+                .is_some_and(|session| removed.contains(&session.path_id))
+            {
+                if let Some(session) = self.sessions.remove(&peer) {
+                    self.handshakes.retire_session(peer, session.session_id);
+                }
+                self.switch.remove_peer(peer);
+            }
+            let retired = self
+                .retired_sessions
+                .iter()
+                .filter_map(|(key, session)| removed.contains(&session.path_id).then_some(*key))
+                .collect::<Vec<_>>();
+            for key @ (node, session_id) in retired {
+                self.retired_sessions.remove(&key);
+                self.handshakes.retire_session(node, session_id);
+            }
+            for id in removed {
+                self.paths.remove(&id);
+            }
         }
         self.peer_paths.insert(peer, path_ids);
         Ok(())
@@ -2218,6 +2237,34 @@ mod tests {
         );
         assert_eq!(alice.established_peers().len(), 1);
         assert_eq!(bob.established_peers().len(), 1);
+
+        let sessions_before = alice
+            .sessions
+            .iter()
+            .map(|(peer, session)| (*peer, session.session_id, session.path_id))
+            .collect::<Vec<_>>();
+        for carriers in [
+            vec![(
+                RelayId::from_bytes([0x71; 16]),
+                ConnectivityCarrier::TurnUdp,
+            )],
+            vec![],
+            vec![],
+        ] {
+            alice
+                .set_available_relay_carriers(&carriers)
+                .expect("relay availability change");
+            bob.set_available_relay_carriers(&carriers)
+                .expect("relay availability change");
+            assert_eq!(
+                alice
+                    .sessions
+                    .iter()
+                    .map(|(peer, session)| (*peer, session.session_id, session.path_id))
+                    .collect::<Vec<_>>(),
+                sessions_before
+            );
+        }
 
         let broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xa1);
         let packets = alice

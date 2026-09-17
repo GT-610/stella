@@ -3536,7 +3536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_standby_relay_survives_primary_failure() {
+    async fn standby_allocation_survives_primary_failure() {
         let first_id = RelayId::from_bytes([0x71; 16]);
         let second_id = RelayId::from_bytes([0x72; 16]);
         let issuer =

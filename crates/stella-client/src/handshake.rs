@@ -1211,6 +1211,11 @@ impl PeerHandshakeManager {
             .retain(|_, cached| now.saturating_sub(cached.created_at) < RESPONDER_CACHE_LIFETIME);
     }
 
+    pub(crate) fn cancel_exchanges(&mut self, peer: NodeId) {
+        self.outgoing.remove(&peer);
+        self.responders.retain(|key, _| key.peer_node_id != peer);
+    }
+
     fn clear_peer_exchange(&mut self, peer: NodeId) {
         self.outgoing.remove(&peer);
         self.responders.retain(|key, _| key.peer_node_id != peer);
