@@ -1067,6 +1067,12 @@ impl NetworkDataPlane {
             .copied()
             .filter(|id| !path_ids.contains(id))
             .collect::<Vec<_>>();
+        self.withdraw_peer_paths(peer, &removed);
+        self.peer_paths.insert(peer, path_ids);
+        Ok(())
+    }
+
+    fn withdraw_peer_paths(&mut self, peer: NodeId, removed: &[PathId]) {
         if !removed.is_empty() {
             self.handshakes.cancel_exchanges(peer);
             if self
@@ -1097,11 +1103,9 @@ impl NetworkDataPlane {
                 self.handshakes.retire_session(node, session_id);
             }
             for id in removed {
-                self.paths.remove(&id);
+                self.paths.remove(id);
             }
         }
-        self.peer_paths.insert(peer, path_ids);
-        Ok(())
     }
 
     fn relay_candidate_available(&self, candidate: &IceCandidate) -> bool {
