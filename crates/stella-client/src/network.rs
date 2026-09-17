@@ -730,16 +730,18 @@ impl NetworkDataPlane {
     fn admit_handshake(&mut self, peer: NodeId, source: &TransportEndpoint, now: Duration) -> bool {
         // Call only after resolving the authorized peer/path; attacker-controlled
         // identities and addresses never allocate admission state.
+        // Exhausted aggregate admission must also bound limiter housekeeping.
+        if !self.handshake_budget.take(now) {
+            return false;
+        }
         self.node_budgets
             .retain(|node, _| self.state.peers().contains_key(node));
         self.endpoint_budgets
             .retain(|endpoint, _| self.paths.values().any(|path| &path.endpoint == endpoint));
-        self.handshake_budget.take(now)
-            && self
-                .endpoint_budgets
-                .entry(source.clone())
-                .or_insert_with(|| TokenBucket::new(32, 64, now))
-                .take(now)
+        self.endpoint_budgets
+            .entry(source.clone())
+            .or_insert_with(|| TokenBucket::new(32, 64, now))
+            .take(now)
             && self
                 .node_budgets
                 .entry(peer)

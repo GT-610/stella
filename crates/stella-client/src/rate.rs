@@ -35,3 +35,22 @@ impl TokenBucket {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TokenBucket;
+    use std::time::Duration;
+
+    #[test]
+    fn fractional_refill_does_not_repeat_after_clock_regression() {
+        let mut bucket = TokenBucket::new(2, 1, Duration::ZERO);
+        assert!(bucket.take(Duration::ZERO));
+        assert!(!bucket.take(Duration::from_millis(250)));
+        assert!(!bucket.take(Duration::ZERO));
+        assert!(!bucket.take(Duration::from_millis(250)));
+        assert!(bucket.take(Duration::from_millis(500)));
+        assert!(!bucket.take(Duration::from_millis(500)));
+        assert!(bucket.take(Duration::MAX));
+        assert!(!bucket.take(Duration::MAX));
+    }
+}
