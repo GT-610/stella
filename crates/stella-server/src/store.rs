@@ -3312,6 +3312,55 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release-mode multi-network query measurement"]
+    fn benchmark_network_session_views() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("directory");
+        let store = AuthorityStore::initialize(
+            &directory.join("state.redb"),
+            ControllerId::from_bytes([1; 16]),
+        )
+        .expect("store");
+        let mut nodes = Vec::new();
+        for seed in 1..=32 {
+            let node =
+                NodeRecord::new(signing_key(seed).public_key(), "benchmark", 1000).expect("node");
+            store.create_node(&node).expect("create node");
+            nodes.push(node.node_id());
+        }
+        for id in 1..=8 {
+            let network = NetworkId::from_bytes([id; 16]);
+            store
+                .create_network(
+                    &NetworkRecord::new(policy(network), "benchmark", 1000).expect("network"),
+                )
+                .expect("create network");
+            for node in &nodes {
+                store.add_member(*node, network, 1000).expect("member");
+                store
+                    .publish_endpoints(*node, network, &[], 1000)
+                    .expect("online");
+            }
+        }
+        for sample in 0..5 {
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                let view = store
+                    .network_session_view(nodes[0], NetworkId::from_bytes([4; 16]))
+                    .expect("view");
+                assert_eq!(view.peers.len(), 31);
+                std::hint::black_box(view);
+            }
+            eprintln!(
+                "snapshot networks=8 nodes=32 iterations=1000 sample={sample} us={}",
+                started.elapsed().as_micros()
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn initialization_binds_controller_and_creates_all_tables() {
         let directory = temp_directory();
         std::fs::create_dir(&directory).expect("create test directory");
