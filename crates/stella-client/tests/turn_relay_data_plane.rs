@@ -35,7 +35,7 @@ use tokio::{sync::oneshot, time::timeout};
 const CONTROL_TIME: u64 = 130;
 const RELAY_PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 200);
 const RELATED_PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 201);
-fn connectivity_bytes(client: &TurnUdpClient) -> Vec<u8> {
+fn connectivity_bytes(client: &TurnUdpClient, rotation: u64) -> Vec<u8> {
     let candidate = IceCandidate {
         class: IceCandidateClass::Relay,
         carrier: ConnectivityCarrier::TurnUdp,
@@ -51,7 +51,7 @@ fn connectivity_bytes(client: &TurnUdpClient) -> Vec<u8> {
     };
     let candidates = [candidate];
     let generation = ConnectivityGenerationRef::new(
-        u64::from(client.relayed_address().port()),
+        u64::from(client.relayed_address().port()) + rotation,
         u64::from(client.relayed_address().port()) + 1,
         CONTROL_TIME,
         CONTROL_TIME + 470,
@@ -423,7 +423,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         .publish_connectivity(
             alice_id,
             network_id,
-            Some(&connectivity_bytes(&alice_turn)),
+            Some(&connectivity_bytes(&alice_turn, 0)),
             CONTROL_TIME,
         )
         .expect("publish Alice relay candidate");
@@ -431,7 +431,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         .publish_connectivity(
             bob_id,
             network_id,
-            Some(&connectivity_bytes(&bob_turn)),
+            Some(&connectivity_bytes(&bob_turn, 0)),
             CONTROL_TIME,
         )
         .expect("publish Bob relay candidate");
@@ -538,6 +538,51 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         .expect("route broadcast")
         .into_parts()
         .0;
+    // Preserve an established relay session across unrelated carrier recovery,
+    // duplicate notifications, and controller generation rotation. Deliver a
+    // packet protected before the refresh to catch silent session replacement.
+    for carriers in [
+        vec![
+            (relay_id, ConnectivityCarrier::TurnUdp),
+            (
+                RelayId::from_bytes([0x77; 16]),
+                ConnectivityCarrier::TurnTcp,
+            ),
+        ],
+        vec![(relay_id, ConnectivityCarrier::TurnUdp)],
+        vec![(relay_id, ConnectivityCarrier::TurnUdp)],
+    ] {
+        alice
+            .set_available_relay_carriers(&carriers)
+            .expect("update Alice carriers");
+        bob.set_available_relay_carriers(&carriers)
+            .expect("update Bob carriers");
+    }
+    for (id, client) in [(alice_id, &alice_turn), (bob_id, &bob_turn)] {
+        store
+            .publish_connectivity(
+                id,
+                network_id,
+                Some(&connectivity_bytes(client, 1)),
+                CONTROL_TIME,
+            )
+            .expect("rotate generation without changing relay path");
+    }
+    alice
+        .reconcile(
+            state(&store, &controller, &alice_key, network_id),
+            &alice_key,
+            alice_mac,
+            Duration::from_secs(1),
+        )
+        .expect("refresh Alice");
+    bob.reconcile(
+        state(&store, &controller, &bob_key, network_id),
+        &bob_key,
+        bob_mac,
+        Duration::from_secs(1),
+    )
+    .expect("refresh Bob");
     let (responses, delivered) = relay_flight(
         &alice,
         &alice_turn,
