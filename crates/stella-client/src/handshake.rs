@@ -559,15 +559,6 @@ impl ResponderHandshake {
             .map_or(&[], Vec::as_slice))
     }
 
-    /// Consumes the responder state after its confirmation has been produced.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HandshakeError`] if no valid initiator confirmation has been accepted.
-    pub fn into_established(mut self, now: u64) -> Result<EstablishedPeerSession, HandshakeError> {
-        self.take_established(now)
-    }
-
     /// Takes established key material while retaining cached handshake bytes.
     ///
     /// This is used by the replay cache so a lost responder confirmation can
@@ -1823,7 +1814,7 @@ mod tests {
             .expect("confirm initiator keys")
             .to_vec();
         let bob_established = responder
-            .into_established(NOW)
+            .take_established(NOW)
             .expect("establish responder");
         let alice_established = initiator
             .accept_responder_confirmation(&responder_confirm, NOW)

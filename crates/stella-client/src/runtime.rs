@@ -884,12 +884,6 @@ impl ClientDataRuntime {
         self.udp.local_address()
     }
 
-    /// Returns every direct UDP socket address owned by this runtime.
-    #[must_use]
-    pub fn local_udp_addresses(&self) -> Vec<SocketAddr> {
-        self.direct_udp_addresses()
-    }
-
     fn insert_network(
         &mut self,
         config: &ClientConfig,

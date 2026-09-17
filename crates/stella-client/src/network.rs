@@ -632,32 +632,6 @@ impl NetworkDataPlane {
         }
     }
 
-    /// Authenticates and routes one UDP datagram from an authorized endpoint.
-    ///
-    /// This compatibility entry point wraps the endpoint in the generic
-    /// transport-path representation used by [`Self::accept_datagram`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NetworkDataError`] for the same conditions as
-    /// [`Self::accept_datagram`].
-    pub fn accept_udp_datagram(
-        &mut self,
-        source: SocketAddr,
-        datagram: &[u8],
-        signing_key: &IdentitySigningKey,
-        wall_time: u64,
-        monotonic_now: Duration,
-    ) -> Result<NetworkOutput, NetworkDataError> {
-        self.accept_datagram(
-            &TransportEndpoint::Udp(source),
-            datagram,
-            signing_key,
-            wall_time,
-            monotonic_now,
-        )
-    }
-
     /// Replaces authoritative control state and invalidates affected sessions.
     ///
     /// Epoch, policy, local-grant, peer-grant, or endpoint changes immediately
@@ -2105,8 +2079,8 @@ mod tests {
             let mut next = Vec::new();
             for datagram in pending {
                 let output = if from_alice {
-                    bob.accept_udp_datagram(
-                        alice_address,
+                    bob.accept_datagram(
+                        &stella_transport::Endpoint::Udp(alice_address),
                         datagram.bytes(),
                         bob_key,
                         wall_time,
@@ -2115,8 +2089,8 @@ mod tests {
                     .expect("bob accepts handshake")
                 } else {
                     alice
-                        .accept_udp_datagram(
-                            bob_address,
+                        .accept_datagram(
+                            &stella_transport::Endpoint::Udp(bob_address),
                             datagram.bytes(),
                             alice_key,
                             wall_time,
@@ -2191,8 +2165,8 @@ mod tests {
             .datagrams()
             .is_empty());
         assert!(matches!(
-            bob.accept_udp_datagram(
-                alice_address,
+            bob.accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 late_packet.bytes(),
                 &bob_key,
                 expires_at,
@@ -2259,8 +2233,8 @@ mod tests {
             &TransportEndpoint::Udp(bob_address)
         );
         let received = bob
-            .accept_udp_datagram(
-                alice_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 packets[0].bytes(),
                 &bob_key,
                 WALL_TIME,
@@ -2277,8 +2251,8 @@ mod tests {
             .0;
         assert_eq!(packets.len(), 1);
         let received = alice
-            .accept_udp_datagram(
-                bob_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(bob_address),
                 packets[0].bytes(),
                 &alice_key,
                 WALL_TIME,
@@ -2297,19 +2271,19 @@ mod tests {
             .0
             .remove(0);
         assert!(matches!(
-            bob.accept_udp_datagram(
-                alternate_alice_address,
-                alternate_packet.bytes(),
-                &bob_key,
-                WALL_TIME,
-                Duration::from_secs(3),
-            ),
-            Err(NetworkDataError::SessionPathMismatch {
-                peer_node_id: _,
-                expected,
-                actual,
-            }) if expected != actual
-        ));
+                   bob.accept_datagram(
+        &stella_transport::Endpoint::Udp(alternate_alice_address),
+                       alternate_packet.bytes(),
+                       &bob_key,
+                       WALL_TIME,
+                       Duration::from_secs(3),
+                   ),
+                   Err(NetworkDataError::SessionPathMismatch {
+                       peer_node_id: _,
+                       expected,
+                       actual,
+                   }) if expected != actual
+               ));
 
         let keepalive = alice
             .maintain(&alice_key, WALL_TIME, Duration::from_secs(18))
@@ -2323,8 +2297,8 @@ mod tests {
                 .packet_type,
             PacketType::Keepalive
         );
-        bob.accept_udp_datagram(
-            alice_address,
+        bob.accept_datagram(
+            &stella_transport::Endpoint::Udp(alice_address),
             keepalive[0].bytes(),
             &bob_key,
             WALL_TIME,
@@ -2339,8 +2313,8 @@ mod tests {
             .0;
         assert_eq!(echo.len(), 1);
         alice
-            .accept_udp_datagram(
-                bob_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(bob_address),
                 echo[0].bytes(),
                 &alice_key,
                 WALL_TIME,
@@ -2448,8 +2422,8 @@ mod tests {
             let mut next = Vec::new();
             for datagram in pending {
                 let output = if from_alice {
-                    bob.accept_udp_datagram(
-                        alice_address,
+                    bob.accept_datagram(
+                        &stella_transport::Endpoint::Udp(alice_address),
                         datagram.bytes(),
                         &bob_key,
                         rekey_wall_time,
@@ -2458,8 +2432,8 @@ mod tests {
                     .expect("bob advances rekey")
                 } else {
                     alice
-                        .accept_udp_datagram(
-                            bob_address,
+                        .accept_datagram(
+                            &stella_transport::Endpoint::Udp(bob_address),
                             datagram.bytes(),
                             &alice_key,
                             rekey_wall_time,
@@ -2477,8 +2451,8 @@ mod tests {
         assert_eq!(bob.established_peers().len(), 1);
 
         let delayed = bob
-            .accept_udp_datagram(
-                alice_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 first_old_packet.bytes(),
                 &bob_key,
                 rekey_wall_time,
@@ -2490,8 +2464,8 @@ mod tests {
         bob.maintain(&bob_key, rekey_wall_time + 31, Duration::from_secs(41))
             .expect("expire old receive session");
         assert!(matches!(
-            bob.accept_udp_datagram(
-                alice_address,
+            bob.accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 second_old_packet.bytes(),
                 &bob_key,
                 rekey_wall_time + 31,

@@ -83,18 +83,6 @@ pub fn load_controller_identity(path: &Path) -> Result<IdentitySigningKey, Ident
     IdentitySigningKey::from_pkcs8_der(&document).map_err(IdentityFileError::from)
 }
 
-/// Verifies the native security policy of a controller identity file.
-///
-/// # Errors
-///
-/// Returns [`IdentityFileError`] when the path cannot be opened, is not a
-/// regular non-reparse file, or does not have the exact platform security
-/// policy required by Stella.
-pub fn verify_controller_identity_permissions(path: &Path) -> Result<(), IdentityFileError> {
-    let _file = platform::open_verified_file(path)?;
-    Ok(())
-}
-
 fn write_identity(file: &mut File, path: &Path, document: &[u8]) -> Result<(), IdentityFileError> {
     file.write_all(document)
         .map_err(|source| IdentityFileError::Write {
@@ -643,10 +631,7 @@ mod tests {
 
     use stella_crypto::MAX_IDENTITY_PKCS8_LENGTH;
 
-    use super::{
-        create_controller_identity, load_controller_identity,
-        verify_controller_identity_permissions, IdentityFileError,
-    };
+    use super::{create_controller_identity, load_controller_identity, IdentityFileError};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -665,7 +650,6 @@ mod tests {
         std::fs::create_dir(&directory).expect("create test directory");
         let path = directory.join("controller.pk8");
         let created = create_controller_identity(&path).expect("create identity");
-        verify_controller_identity_permissions(&path).expect("verify permissions");
         let loaded = load_controller_identity(&path).expect("load identity");
         assert_eq!(loaded.public_key(), created.public_key());
         assert!(matches!(
