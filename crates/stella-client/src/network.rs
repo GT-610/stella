@@ -2173,27 +2173,98 @@ mod tests {
     }
 
     #[test]
-    fn handshake_admission_is_bounded_and_refills_monotonically() {
+    fn cached_handshake_responses_obey_ingress_budgets() {
         let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
-        let address = "127.0.0.1:46001".parse().expect("address");
-        let mut plane = NetworkDataPlane::new(
-            state(&store, &controller, &alice_key, network_id),
+        let (initiator, responder, source, destination) =
+            if derive_node_id(alice_key.public_key()) < derive_node_id(bob_key.public_key()) {
+                (&alice_key, &bob_key, "127.0.0.1:46001", "127.0.0.1:46002")
+            } else {
+                (&bob_key, &alice_key, "127.0.0.1:46002", "127.0.0.1:46001")
+            };
+        let source = source.parse().expect("source");
+        let mut sender = NetworkDataPlane::new(
+            state(&store, &controller, initiator, network_id),
             MacAddress::from_bytes([2, 0, 0, 0, 1, 1]),
-            address,
+            source,
             1200,
-            &alice_key,
+            initiator,
             Duration::ZERO,
         )
-        .expect("plane");
-        let peer = derive_node_id(bob_key.public_key());
-        let source = TransportEndpoint::Udp("127.0.0.1:46002".parse().expect("peer"));
+        .expect("sender");
+        let mut receiver = NetworkDataPlane::new(
+            state(&store, &controller, responder, network_id),
+            MacAddress::from_bytes([2, 0, 0, 0, 1, 2]),
+            destination.parse().expect("destination"),
+            1200,
+            responder,
+            Duration::ZERO,
+        )
+        .expect("receiver");
+        let initiation = sender
+            .start_handshakes(initiator, WALL_TIME, Duration::ZERO)
+            .expect("initiate")
+            .into_parts()
+            .0
+            .remove(0);
+        let unknown = TransportEndpoint::Udp("127.0.0.1:49999".parse().expect("unknown"));
+        assert!(receiver
+            .accept_datagram(
+                &unknown,
+                initiation.bytes(),
+                responder,
+                WALL_TIME,
+                Duration::ZERO
+            )
+            .is_err());
+        assert!(receiver.node_budgets.is_empty());
+        assert!(receiver.endpoint_budgets.is_empty());
+        let endpoint = TransportEndpoint::Udp(source);
         for _ in 0..32 {
-            assert!(plane.admit_handshake(peer, &source, Duration::ZERO));
+            assert_eq!(
+                receiver
+                    .accept_datagram(
+                        &endpoint,
+                        initiation.bytes(),
+                        responder,
+                        WALL_TIME,
+                        Duration::ZERO
+                    )
+                    .expect("initial or cached response")
+                    .into_parts()
+                    .0
+                    .len(),
+                1
+            );
         }
-        assert!(!plane.admit_handshake(peer, &source, Duration::ZERO));
-        assert!(plane.admit_handshake(peer, &source, Duration::from_secs(1)));
-        assert_eq!(plane.node_budgets.len(), 1);
-        assert_eq!(plane.endpoint_budgets.len(), 1);
+        assert!(receiver
+            .accept_datagram(
+                &endpoint,
+                initiation.bytes(),
+                responder,
+                WALL_TIME,
+                Duration::ZERO
+            )
+            .expect("silent budget drop")
+            .into_parts()
+            .0
+            .is_empty());
+        assert_eq!(
+            receiver
+                .accept_datagram(
+                    &endpoint,
+                    initiation.bytes(),
+                    responder,
+                    WALL_TIME,
+                    Duration::from_secs(1)
+                )
+                .expect("refilled response budget")
+                .into_parts()
+                .0
+                .len(),
+            1
+        );
+        assert_eq!(receiver.node_budgets.len(), 1);
+        assert_eq!(receiver.endpoint_budgets.len(), 1);
         drop(store);
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
