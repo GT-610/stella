@@ -65,6 +65,10 @@ pub enum TurnStreamError {
 pub struct TurnStream<S> {
     stream: S,
     max_record_size: usize,
+    prefix: [u8; TURN_STREAM_PREFIX_LENGTH],
+    prefix_read: usize,
+    record: Vec<u8>,
+    record_read: usize,
 }
 
 impl<S> TurnStream<S> {
@@ -85,6 +89,10 @@ impl<S> TurnStream<S> {
         Ok(Self {
             stream,
             max_record_size,
+            prefix: [0; TURN_STREAM_PREFIX_LENGTH],
+            prefix_read: 0,
+            record: Vec::new(),
+            record_read: 0,
         })
     }
 
@@ -109,27 +117,26 @@ where
     ///
     /// The returned bytes retain standard `ChannelData` stream padding. A
     /// subsequent call starts at the next record even when the operating
-    /// system supplied several records in one read.
+    /// system supplied several records in one read. Cancellation retains partial
+    /// progress in this object; callers must close the carrier after any error.
     ///
     /// # Errors
     ///
     /// Returns [`TurnStreamError`] for malformed prefixes, oversized declared
     /// records, premature EOF, or underlying stream failures.
     pub async fn read_record(&mut self) -> Result<Vec<u8>, TurnStreamError> {
-        let mut prefix = [0_u8; TURN_STREAM_PREFIX_LENGTH];
-        self.stream
-            .read_exact(&mut prefix)
-            .await
-            .map_err(|source| TurnStreamError::Read { source })?;
-        let length = decode_turn_stream_record_length(&prefix)?;
-        self.validate_length(length)?;
-        let mut record = vec![0_u8; length];
-        record[..TURN_STREAM_PREFIX_LENGTH].copy_from_slice(&prefix);
-        self.stream
-            .read_exact(&mut record[TURN_STREAM_PREFIX_LENGTH..])
-            .await
-            .map_err(|source| TurnStreamError::Read { source })?;
-        Ok(record)
+        read_pending(&mut self.stream, &mut self.prefix, &mut self.prefix_read).await?;
+        if self.record.is_empty() {
+            let length = decode_turn_stream_record_length(&self.prefix)?;
+            self.validate_length(length)?;
+            self.record = vec![0; length];
+            self.record[..TURN_STREAM_PREFIX_LENGTH].copy_from_slice(&self.prefix);
+            self.record_read = TURN_STREAM_PREFIX_LENGTH;
+        }
+        read_pending(&mut self.stream, &mut self.record, &mut self.record_read).await?;
+        self.prefix_read = 0;
+        self.record_read = 0;
+        Ok(std::mem::take(&mut self.record))
     }
 }
 
@@ -181,8 +188,29 @@ impl<S> TurnStream<S> {
     }
 }
 
+async fn read_pending<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buffer: &mut [u8],
+    read: &mut usize,
+) -> Result<(), TurnStreamError> {
+    while *read < buffer.len() {
+        let count = stream
+            .read(&mut buffer[*read..])
+            .await
+            .map_err(|source| TurnStreamError::Read { source })?;
+        if count == 0 {
+            return Err(TurnStreamError::Read {
+                source: std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            });
+        }
+        *read += count;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use stella_proto::{
         encode_stun_message, encode_turn_channel_data_stream, StunClass, StunMessageRef,
         StunMessageType, StunMethod, StunTransactionId, TurnChannelNumber,
@@ -213,6 +241,33 @@ mod tests {
         .expect("encode stream ChannelData");
         encoded.truncate(length);
         encoded
+    }
+
+    #[tokio::test]
+    async fn cancelled_reads_preserve_stun_and_channel_boundaries() {
+        for record in [binding_request(), channel_data()] {
+            let (mut writer, reader) = duplex(128);
+            let mut framed = TurnStream::new(reader, 128).expect("framing");
+            for byte in &record[..record.len() - 1] {
+                writer.write_all(&[*byte]).await.expect("partial byte");
+                let mut future = std::pin::pin!(framed.read_record());
+                std::future::poll_fn(|cx| {
+                    assert!(future.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            }
+            writer
+                .write_all(&record[record.len() - 1..])
+                .await
+                .expect("last byte");
+            writer.write_all(&record).await.expect("following record");
+            assert_eq!(framed.read_record().await.expect("resumed record"), record);
+            assert_eq!(
+                framed.read_record().await.expect("following record"),
+                record
+            );
+        }
     }
 
     #[tokio::test]
