@@ -131,12 +131,10 @@ fn provisioning_creates_reuses_opens_and_removes_adapter() {
     device.destroy().expect("close provisioned adapter");
 
     let removed = WindowsTapDevice::remove_adapter(&name).expect("remove provisioned adapter");
-    assert!(removed.removed());
     assert!(!removed.reboot_required());
-    assert!(WindowsTapDevice::installed_adapters()
-        .expect("enumerate after removal")
-        .iter()
-        .all(|adapter| !adapter.friendly_name.eq_ignore_ascii_case(&name)));
+    assert!(!WindowsTapDevice::remove_adapter(&name)
+        .expect("repeated removal is idempotent")
+        .reboot_required());
 }
 
 fn test_frame(source: [u8; 6]) -> [u8; 60] {

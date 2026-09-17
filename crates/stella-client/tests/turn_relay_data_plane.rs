@@ -232,7 +232,7 @@ fn converge_ice(
     for transmission in alice
         .poll(Duration::ZERO)
         .expect("poll Alice ICE")
-        .into_parts()
+        .into_all_parts()
         .0
     {
         queue.push_back((true, transmission));
@@ -240,7 +240,7 @@ fn converge_ice(
     for transmission in bob
         .poll(Duration::ZERO)
         .expect("poll Bob ICE")
-        .into_parts()
+        .into_all_parts()
         .0
     {
         queue.push_back((false, transmission));
@@ -262,7 +262,7 @@ fn converge_ice(
                 .expect("Alice accepts ICE datagram")
                 .expect("Alice ICE component")
         };
-        let (responses, nominations) = output.into_parts();
+        let (responses, nominations, _) = output.into_all_parts();
         for nomination in nominations {
             if from_alice {
                 bob_nomination = Some(nomination);
@@ -273,10 +273,15 @@ fn converge_ice(
         for response in responses {
             queue.push_back((!from_alice, response));
         }
-        for transmission in alice.poll(now).expect("repoll Alice ICE").into_parts().0 {
+        for transmission in alice
+            .poll(now)
+            .expect("repoll Alice ICE")
+            .into_all_parts()
+            .0
+        {
             queue.push_back((true, transmission));
         }
-        for transmission in bob.poll(now).expect("repoll Bob ICE").into_parts().0 {
+        for transmission in bob.poll(now).expect("repoll Bob ICE").into_all_parts().0 {
             queue.push_back((false, transmission));
         }
         if alice_nomination.is_some() && bob_nomination.is_some() {
@@ -708,7 +713,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
     let maintenance = bob
         .maintain(&bob_key, CONTROL_TIME + 41, Duration::from_secs(41))
         .expect("expire Bob retired relay session");
-    assert!(maintenance.tap_frame().is_none());
+    assert!(maintenance.into_parts().1.is_none());
     assert_eq!(delayed_old_second_datagrams.len(), 1);
     let delayed_old_second_datagram = delayed_old_second_datagrams.remove(0);
     assert_eq!(

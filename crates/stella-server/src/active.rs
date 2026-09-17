@@ -1687,7 +1687,7 @@ mod tests {
                 .await
                 .expect("read connectivity")
                 .expect("connectivity exists")
-                .encoded_generation(),
+                .encoded_record()[stella_proto::CONNECTIVITY_RECORD_FIXED_LENGTH..],
             connectivity
         );
         assert!(matches!(

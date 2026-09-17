@@ -127,18 +127,6 @@ pub struct NetworkOutput {
 }
 
 impl NetworkOutput {
-    /// Borrows all complete datagrams selected for transmission.
-    #[must_use]
-    pub fn datagrams(&self) -> &[RoutedDatagram] {
-        &self.datagrams
-    }
-
-    /// Borrows one authenticated frame selected for local TAP delivery.
-    #[must_use]
-    pub fn tap_frame(&self) -> Option<&[u8]> {
-        self.tap_frame.as_deref()
-    }
-
     /// Consumes the output into owned datagrams and optional TAP frame.
     #[must_use]
     pub fn into_parts(self) -> (Vec<RoutedDatagram>, Option<Vec<u8>>) {
@@ -457,9 +445,8 @@ impl NetworkDataPlane {
                     .peers()
                     .get(peer)
                     .is_some_and(|state| grant_is_valid(state.grant(), wall_time))
-                    && self.sessions.get(peer).is_none_or(|session| {
-                        session.rekeying || self.pending_path_upgrades.contains_key(peer)
-                    })
+                    && (!self.established_peers().contains(peer)
+                        || self.pending_path_upgrades.contains_key(peer))
                     && !self.handshakes.has_outgoing(*peer)
                     && self.handshakes.can_initiate(*peer, monotonic_now)
                     && self.select_peer_path(*peer).is_some()
@@ -1584,12 +1571,12 @@ mod tests {
         assert!(plane
             .start_handshakes(local_key, WALL_TIME, Duration::ZERO)
             .expect("skip endpointless peer")
-            .datagrams()
+            .datagrams
             .is_empty());
         assert!(plane
             .maintain(local_key, WALL_TIME, Duration::from_secs(1))
             .expect("continue waiting for peer endpoint")
-            .datagrams()
+            .datagrams
             .is_empty());
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
@@ -1904,7 +1891,7 @@ mod tests {
         let output = local
             .start_handshakes(local_key, WALL_TIME, Duration::from_secs(1))
             .expect("start relay fallback handshake");
-        let datagram = output.datagrams().first().expect("relay handshake");
+        let datagram = output.datagrams.first().expect("relay handshake");
         assert_eq!(datagram.peer_node_id(), remote_id);
         assert_eq!(
             local
@@ -2249,7 +2236,7 @@ mod tests {
         assert!(alice
             .accept_tap_frame(&frame, Duration::from_secs(2))
             .expect("drop local frame after expiry")
-            .datagrams()
+            .datagrams
             .is_empty());
         assert!(matches!(
             bob.accept_datagram(
@@ -2356,7 +2343,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .expect("receive broadcast");
-        assert_eq!(received.tap_frame(), Some(broadcast.as_slice()));
+        assert_eq!(received.tap_frame.as_deref(), Some(broadcast.as_slice()));
 
         let reverse = ethernet_frame(bob_mac, alice_mac, 0xb2);
         let packets = bob
@@ -2374,7 +2361,7 @@ mod tests {
                 Duration::from_secs(2),
             )
             .expect("receive reverse frame");
-        assert_eq!(received.tap_frame(), Some(reverse.as_slice()));
+        assert_eq!(received.tap_frame.as_deref(), Some(reverse.as_slice()));
 
         let alternate_alice_address: SocketAddr =
             "127.0.0.1:46003".parse().expect("alternate alice address");
@@ -2574,7 +2561,10 @@ mod tests {
                 Duration::from_secs(11),
             )
             .expect("accept reordered old-session packet");
-        assert_eq!(delayed.tap_frame(), Some(first_old_frame.as_slice()));
+        assert_eq!(
+            delayed.tap_frame.as_deref(),
+            Some(first_old_frame.as_slice())
+        );
 
         bob.maintain(&bob_key, rekey_wall_time + 31, Duration::from_secs(41))
             .expect("expire old receive session");

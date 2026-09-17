@@ -1895,12 +1895,6 @@ impl MembershipRecord {
         self.permissions
     }
 
-    /// Returns the membership creation time as Unix seconds.
-    #[must_use]
-    pub const fn joined_at(&self) -> u64 {
-        self.joined_at
-    }
-
     /// Returns the authorized virtual network.
     #[must_use]
     pub const fn network_id(&self) -> NetworkId {
@@ -2034,12 +2028,6 @@ impl EndpointLeaseRecord {
     #[must_use]
     pub const fn node_id(&self) -> NodeId {
         self.node_id
-    }
-
-    /// Returns the last controller-observed activity time as Unix seconds.
-    #[must_use]
-    pub const fn updated_at(&self) -> u64 {
-        self.updated_at
     }
 
     /// Returns the complete canonical endpoint set.
@@ -2201,12 +2189,6 @@ impl ConnectivityAuthorityRecord {
     #[must_use]
     pub fn encoded_record(&self) -> &[u8] {
         &self.encoded_record
-    }
-
-    /// Borrows the canonical generation nested inside the record.
-    #[must_use]
-    pub fn encoded_generation(&self) -> &[u8] {
-        &self.encoded_record[CONNECTIVITY_RECORD_FIXED_LENGTH..]
     }
 
     fn encode(&self) -> Result<Vec<u8>, StoreError> {
@@ -3967,14 +3949,17 @@ mod tests {
             .get_endpoints(first_id, network_id)
             .expect("read generated lease")
             .expect("online lease exists");
-        assert_eq!(lease.updated_at(), 120);
+        assert_eq!(lease.updated_at, 120);
         assert!(lease.endpoints().is_empty());
         let stored = store
             .get_connectivity(first_id, network_id)
             .expect("read connectivity")
             .expect("connectivity exists");
         assert_eq!(stored.generation_id(), 7);
-        assert_eq!(stored.encoded_generation(), first_generation);
+        assert_eq!(
+            &stored.encoded_record()[stella_proto::CONNECTIVITY_RECORD_FIXED_LENGTH..],
+            first_generation
+        );
         let diagnostic = format!("{stored:?}");
         assert!(!diagnostic.contains("Abcd1234"));
         assert!(!diagnostic.contains("Abcdefghijklmnopqrstuv"));
@@ -3990,7 +3975,7 @@ mod tests {
                 .get_endpoints(first_id, network_id)
                 .expect("read refreshed lease")
                 .expect("online lease exists")
-                .updated_at(),
+                .updated_at,
             125
         );
         assert!(matches!(
@@ -4042,7 +4027,7 @@ mod tests {
                 .get_connectivity(first_id, network_id)
                 .expect("read backed-up connectivity")
                 .expect("backed-up connectivity exists")
-                .encoded_generation(),
+                .encoded_record()[stella_proto::CONNECTIVITY_RECORD_FIXED_LENGTH..],
             generation
         );
         drop(backup);
@@ -4126,7 +4111,7 @@ mod tests {
                 .get_endpoints(first_id, network_id)
                 .expect("read retained online lease")
                 .expect("online lease remains")
-                .updated_at(),
+                .updated_at,
             690
         );
 
@@ -4178,7 +4163,7 @@ mod tests {
             .get_endpoints(first_id, network_id)
             .expect("get endpoints")
             .expect("online record exists");
-        assert_eq!(record.updated_at(), 125);
+        assert_eq!(record.updated_at, 125);
         assert_eq!(record.endpoints(), &[endpoint(1, 4242)]);
         store
             .publish_endpoints(first_id, network_id, &[endpoint(1, 4242)], 124)
@@ -4188,7 +4173,7 @@ mod tests {
                 .get_endpoints(first_id, network_id)
                 .expect("get endpoints")
                 .expect("online record exists")
-                .updated_at(),
+                .updated_at,
             125
         );
 

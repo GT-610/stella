@@ -96,12 +96,6 @@ impl<S> TurnStream<S> {
         })
     }
 
-    /// Returns the configured complete-record ceiling.
-    #[must_use]
-    pub const fn max_record_size(&self) -> usize {
-        self.max_record_size
-    }
-
     /// Consumes the framing layer and returns the underlying byte stream.
     #[must_use]
     pub fn into_inner(self) -> S {

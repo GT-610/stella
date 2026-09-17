@@ -141,7 +141,6 @@ impl WindowsTapProvision {
 /// Result of removing one named TAP-Windows adapter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowsTapRemoval {
-    removed: bool,
     reboot_required: bool,
 }
 
@@ -172,12 +171,6 @@ impl fmt::Debug for WindowsTapManagementTransaction {
 }
 
 impl WindowsTapRemoval {
-    /// Returns whether a matching adapter existed and was removed.
-    #[must_use]
-    pub const fn removed(self) -> bool {
-        self.removed
-    }
-
     /// Returns whether Windows requires a reboot to finish the removal.
     #[must_use]
     pub const fn reboot_required(self) -> bool {
@@ -250,19 +243,6 @@ impl WindowsTapDevice {
         lock_device_management()
     }
 
-    /// Enumerates installed adapters whose driver description identifies
-    /// TAP-Windows.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed operating-system or adapter-metadata error.
-    pub fn installed_adapters() -> Result<Vec<WindowsTapAdapter>> {
-        Ok(enumerate_candidates()?
-            .into_iter()
-            .map(|candidate| candidate.metadata)
-            .collect())
-    }
-
     /// Ensures that a persistent TAP-Windows adapter with `name` exists.
     ///
     /// The TAP-Windows driver package must already be installed in the Windows
@@ -284,7 +264,7 @@ impl WindowsTapDevice {
     /// Removes the TAP-Windows adapter matching `selector` when it exists.
     ///
     /// The selector may be the friendly name or interface GUID returned by
-    /// [`Self::installed_adapters`]. Removal requires administrator privileges.
+    /// the installed adapter inventory. Removal requires administrator privileges.
     ///
     /// # Errors
     ///
@@ -297,7 +277,6 @@ impl WindowsTapDevice {
             Ok(candidate) => candidate,
             Err(TapError::AdapterNotFound { .. }) => {
                 return Ok(WindowsTapRemoval {
-                    removed: false,
                     reboot_required: false,
                 });
             }
@@ -935,7 +914,6 @@ fn remove_interface_device(adapter: &WindowsTapAdapter) -> Result<WindowsTapRemo
             Ok(()) => {}
             Err(error) if is_win32_error(&error, ERROR_NO_MORE_ITEMS) => {
                 return Ok(WindowsTapRemoval {
-                    removed: false,
                     reboot_required: false,
                 });
             }
@@ -960,10 +938,7 @@ fn remove_interface_device(adapter: &WindowsTapAdapter) -> Result<WindowsTapRemo
             if !reboot_required {
                 wait_for_interface_removal(&adapter.interface_id)?;
             }
-            return Ok(WindowsTapRemoval {
-                removed: true,
-                reboot_required,
-            });
+            return Ok(WindowsTapRemoval { reboot_required });
         }
     }
 }

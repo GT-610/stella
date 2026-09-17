@@ -35,12 +35,6 @@ impl<'a> ExtensionRef<'a> {
         })
     }
 
-    /// Returns the complete 16-bit extension type.
-    #[must_use]
-    pub const fn extension_type(self) -> u16 {
-        self.extension_type
-    }
-
     /// Returns whether the critical bit is set.
     #[must_use]
     pub const fn is_critical(self) -> bool {
@@ -158,22 +152,6 @@ pub fn extensions_encoded_len(extensions: &[ExtensionRef<'_>]) -> Result<usize, 
     })
 }
 
-/// Encodes an aligned extension sequence into `output`.
-///
-/// Padding bytes are always written as zero. The returned value is the number
-/// of bytes written; extra output capacity is left unchanged.
-///
-/// # Errors
-///
-/// Returns [`CodecError`] when an extension is invalid, length arithmetic
-/// overflows, or `output` is too small.
-pub fn encode_extensions(
-    extensions: &[ExtensionRef<'_>],
-    output: &mut [u8],
-) -> Result<usize, CodecError> {
-    encode_extension_block_at(extensions, output, 0)
-}
-
 pub(crate) fn encode_extension_block_at(
     extensions: &[ExtensionRef<'_>],
     output: &mut [u8],
@@ -246,7 +224,7 @@ fn padded_extension_length(value_length: usize) -> Result<usize, CodecError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_extensions, validate_extension_block, ExtensionIter, ExtensionRef};
+    use super::{encode_extension_block_at, validate_extension_block, ExtensionIter, ExtensionRef};
     use crate::CodecError;
 
     #[test]
@@ -257,7 +235,10 @@ mod tests {
         ];
         let mut encoded = [0xff; 16];
 
-        assert_eq!(encode_extensions(&extensions, &mut encoded), Ok(16));
+        assert_eq!(
+            encode_extension_block_at(&extensions, &mut encoded, 0),
+            Ok(16)
+        );
         assert_eq!(
             encoded,
             [0, 1, 0, 1, 0xaa, 0, 0, 0, 0, 2, 0, 4, 0xbb, 0xcc, 0xdd, 0xee]

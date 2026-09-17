@@ -114,7 +114,6 @@ pub struct PeerState {
     node_id: NodeId,
     public_key: IdentityPublicKey,
     grant: MembershipGrant,
-    grant_bytes: [u8; MEMBERSHIP_GRANT_LENGTH],
     endpoints: Vec<Endpoint>,
     connectivity: Option<PeerConnectivityState>,
 }
@@ -136,12 +135,6 @@ impl PeerState {
     #[must_use]
     pub const fn grant(&self) -> MembershipGrant {
         self.grant
-    }
-
-    /// Returns the exact encoded controller-signed membership grant.
-    #[must_use]
-    pub const fn grant_bytes(&self) -> &[u8; MEMBERSHIP_GRANT_LENGTH] {
-        &self.grant_bytes
     }
 
     /// Returns the canonical advertised endpoint sequence.
@@ -569,7 +562,6 @@ fn validate_peer(
         node_id: peer.node_id(),
         public_key,
         grant,
-        grant_bytes,
         endpoints: peer.endpoints().collect(),
         connectivity: None,
     })
