@@ -1227,7 +1227,9 @@ impl AuthorityStore {
         let endpoint_table = read.open_table(ENDPOINTS)?;
         let connectivity_table = read.open_table(CONNECTIVITY)?;
         let mut peers = Vec::new();
-        for entry in endpoint_table.iter()? {
+        let lower = membership_key(network_id, NodeId::from_bytes([0; 16]));
+        let upper = membership_key(network_id, NodeId::from_bytes([u8::MAX; 16]));
+        for entry in endpoint_table.range(lower.as_slice()..=upper.as_slice())? {
             let (key, value) = entry?;
             let key = decode_identifier::<32>(key.value(), "endpoints", "endpoint key")?;
             let endpoint_lease = EndpointLeaseRecord::decode(value.value())?;
