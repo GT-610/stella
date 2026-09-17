@@ -8,3 +8,10 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use macos::extended_acl_grants_non_owner_access;
+
+mod identity;
+
+pub use identity::{
+    create_identity, create_protected_secret_file, load_identity, open_protected_secret_file,
+    IdentityFileError,
+};
