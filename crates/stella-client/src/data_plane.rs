@@ -313,6 +313,10 @@ impl PeerDataSession {
             plaintext.copy_from_slice(packet.fragment());
         }
         self.replay.commit(header.sequence_number)?;
+        if header.fragment_offset == 0 && header.fragment_length == header.frame_length {
+            header.validate_authenticated_frame(&plaintext)?;
+            return Ok(Some(plaintext));
+        }
 
         let extension_bytes = packet
             .authenticated_header()
@@ -353,15 +357,14 @@ impl PeerDataSession {
             echo_probe_id,
         };
         let encoded_length = KEEPALIVE_FIXED_HEADER_LENGTH + AUTHENTICATION_TAG_LENGTH;
-        let mut draft = vec![0_u8; encoded_length];
-        encode_keepalive_packet(header, &[], &[0; AUTHENTICATION_TAG_LENGTH], &mut draft)?;
-        let view = KeepalivePacketView::decode(&draft)?;
+        let mut encoded = vec![0; encoded_length];
+        encode_keepalive_packet(header, &[], &[0; AUTHENTICATION_TAG_LENGTH], &mut encoded)?;
+        let (authenticated_header, trailer) = encoded.split_at_mut(KEEPALIVE_FIXED_HEADER_LENGTH);
         let tag = self
             .protectors
             .send()
-            .authenticate_header(sequence_number, view.authenticated_header())?;
-        let mut encoded = vec![0_u8; encoded_length];
-        encode_keepalive_packet(header, &[], &tag, &mut encoded)?;
+            .authenticate_header(sequence_number, authenticated_header)?;
+        trailer.copy_from_slice(&tag);
         self.next_sequence = sequence_number.checked_add(1);
         Ok(encoded)
     }
@@ -458,33 +461,31 @@ impl PeerDataSession {
     ) -> Result<Vec<u8>, DataPlaneError> {
         let encoded_length =
             usize::from(header.common.header_length) + fragment.len() + AUTHENTICATION_TAG_LENGTH;
-        let mut draft = vec![0_u8; encoded_length];
+        let mut encoded = vec![0; encoded_length];
         encode_data_packet(
             header,
             &[],
             fragment,
             &[0; AUTHENTICATION_TAG_LENGTH],
-            &mut draft,
+            &mut encoded,
         )?;
-        let view = DataPacketView::decode(&draft)?;
-        let mut protected_fragment = vec![0_u8; fragment.len()];
+        let (authenticated_header, body) = encoded.split_at_mut(DATA_FIXED_HEADER_LENGTH);
+        let (protected_fragment, trailer) = body.split_at_mut(fragment.len());
         let tag = if header.is_encrypted() {
             self.protectors.send().seal_encrypted(
                 header.sequence_number,
-                view.authenticated_header(),
+                authenticated_header,
                 fragment,
-                &mut protected_fragment,
+                protected_fragment,
             )?
         } else {
-            protected_fragment.copy_from_slice(fragment);
             self.protectors.send().authenticate_only(
                 header.sequence_number,
-                view.authenticated_header(),
+                authenticated_header,
                 fragment,
             )?
         };
-        let mut encoded = vec![0_u8; encoded_length];
-        encode_data_packet(header, &[], &protected_fragment, &tag, &mut encoded)?;
+        trailer.copy_from_slice(&tag);
         Ok(encoded)
     }
 
@@ -553,11 +554,6 @@ impl PeerDataSession {
         fragment: &[u8],
         now: Duration,
     ) -> Result<Option<Vec<u8>>, DataPlaneError> {
-        if header.fragment_offset == 0 && header.fragment_length == header.frame_length {
-            header.validate_authenticated_frame(fragment)?;
-            return Ok(Some(fragment.to_vec()));
-        }
-
         let metadata = FrameMetadata::new(header, extension_bytes);
         if let Some(existing) = self.incomplete.get(&header.frame_id) {
             if existing.metadata != metadata {
