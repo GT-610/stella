@@ -67,19 +67,6 @@ pub struct MacosTapProxyDevice {
 }
 
 impl MacosTapProxyDevice {
-    /// Connects to an explicitly selected helper socket.
-    ///
-    /// This is primarily useful to integration tests and non-default service
-    /// layouts. Production callers normally use [`TapDevice::create`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the socket is unavailable, its peer is not root, or
-    /// the helper rejects the TAP configuration.
-    pub fn create_with_socket(config: &TapConfig, socket: &Path) -> Result<Self> {
-        Self::connect(config, socket, 0)
-    }
-
     fn connect(config: &TapConfig, socket: &Path, expected_uid: u32) -> Result<Self> {
         config.validate()?;
         let reader = UnixStream::connect(socket)

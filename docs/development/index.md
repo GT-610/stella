@@ -37,3 +37,6 @@ authentication, atomic peer state, heartbeats, reconnect, and fail-closed
 forwarding behavior. [Client data plane](./client-data-plane.md) covers
 TAP worker ownership, authenticated peer routing, keepalives, endpoint pinning,
 and rekey behavior.
+
+The [runtime audit report](./runtime-audit.md) records compatibility, removed
+Rust APIs, regression coverage and reproducible performance measurements.

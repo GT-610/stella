@@ -14,6 +14,7 @@ mod http_proxy;
 mod ice;
 mod identity;
 mod network;
+mod rate;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod runtime;
 mod state;

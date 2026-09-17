@@ -151,30 +151,6 @@ pub struct IceOutput {
 }
 
 impl IceOutput {
-    /// Borrows complete STUN datagrams ready to send.
-    #[must_use]
-    pub fn transmissions(&self) -> &[IceTransmission] {
-        &self.transmissions
-    }
-
-    /// Borrows newly nominated direct paths.
-    #[must_use]
-    pub fn nominations(&self) -> &[IceNomination] {
-        &self.nominations
-    }
-
-    /// Borrows direct paths that failed consent freshness.
-    #[must_use]
-    pub fn failures(&self) -> &[IcePathFailure] {
-        &self.failures
-    }
-
-    /// Consumes output into transmissions and nominations.
-    #[must_use]
-    pub fn into_parts(self) -> (Vec<IceTransmission>, Vec<IceNomination>) {
-        (self.transmissions, self.nominations)
-    }
-
     /// Consumes output into transmissions, nominations, and failed paths.
     #[must_use]
     pub fn into_all_parts(
@@ -1158,31 +1134,31 @@ mod tests {
             .expect("configure peer candidates");
 
         let first = agent.poll(Duration::ZERO).expect("first check");
-        assert_eq!(first.transmissions().len(), 1);
+        assert_eq!(first.transmissions.len(), 1);
         assert_eq!(
-            first.transmissions()[0].target(),
+            first.transmissions[0].target(),
             remote_candidates[0].address
         );
         assert!(agent
             .poll(Duration::from_millis(49))
             .expect("respect pacing")
-            .transmissions()
+            .transmissions
             .is_empty());
 
         let second = agent
             .poll(Duration::from_millis(50))
             .expect("second overlapping check");
-        assert_eq!(second.transmissions().len(), 1);
+        assert_eq!(second.transmissions.len(), 1);
         assert_eq!(
-            second.transmissions()[0].target(),
+            second.transmissions[0].target(),
             remote_candidates[1].address
         );
         let third = agent
             .poll(Duration::from_millis(100))
             .expect("third overlapping check");
-        assert_eq!(third.transmissions().len(), 1);
+        assert_eq!(third.transmissions.len(), 1);
         assert_eq!(
-            third.transmissions()[0].target(),
+            third.transmissions[0].target(),
             remote_candidates[2].address
         );
         assert_eq!(agent.transactions.len(), 3);
@@ -1318,15 +1294,9 @@ mod tests {
             .expect("configure dual-stack peer");
 
         let ipv6 = agent.poll(Duration::ZERO).expect("IPv6 check");
-        assert_eq!(
-            ipv6.transmissions()[0].target(),
-            remote_candidates[0].address
-        );
+        assert_eq!(ipv6.transmissions[0].target(), remote_candidates[0].address);
         let ipv4 = agent.poll(Duration::from_millis(50)).expect("IPv4 check");
-        assert_eq!(
-            ipv4.transmissions()[0].target(),
-            remote_candidates[1].address
-        );
+        assert_eq!(ipv4.transmissions[0].target(), remote_candidates[1].address);
     }
 
     #[test]
@@ -1356,7 +1326,7 @@ mod tests {
         let request = alice
             .poll(Duration::ZERO)
             .expect("initial check")
-            .into_parts()
+            .into_all_parts()
             .0
             .remove(0);
 
@@ -1399,7 +1369,7 @@ mod tests {
         let retry = alice
             .poll(Duration::from_millis(250))
             .expect("retry after invalid response")
-            .into_parts()
+            .into_all_parts()
             .0;
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].bytes(), request.bytes());
@@ -1451,7 +1421,7 @@ mod tests {
         let first = alice
             .poll(Duration::ZERO)
             .expect("initial Alice check")
-            .into_parts()
+            .into_all_parts()
             .0
             .remove(0);
         let mut mutated = first.bytes().to_vec();
@@ -1466,7 +1436,7 @@ mod tests {
         for transmission in bob
             .poll(Duration::ZERO)
             .expect("initial Bob check")
-            .into_parts()
+            .into_all_parts()
             .0
         {
             queue.push_back((false, transmission));
@@ -1488,7 +1458,7 @@ mod tests {
                     .expect("Alice accepts check")
                     .expect("ICE datagram")
             };
-            let (responses, nominations) = output.into_parts();
+            let (responses, nominations, _) = output.into_all_parts();
             for nomination in nominations {
                 if from_alice {
                     bob_nomination = Some(nomination);
@@ -1499,10 +1469,10 @@ mod tests {
             for response in responses {
                 queue.push_back((!from_alice, response));
             }
-            for transmission in alice.poll(now).expect("poll Alice").into_parts().0 {
+            for transmission in alice.poll(now).expect("poll Alice").into_all_parts().0 {
                 queue.push_back((true, transmission));
             }
-            for transmission in bob.poll(now).expect("poll Bob").into_parts().0 {
+            for transmission in bob.poll(now).expect("poll Bob").into_all_parts().0 {
                 queue.push_back((false, transmission));
             }
             if alice_nomination.is_some() && bob_nomination.is_some() {
@@ -1540,13 +1510,13 @@ mod tests {
         assert!(alice
             .poll(Duration::from_secs(50))
             .expect("respect direct retry backoff")
-            .transmissions()
+            .transmissions
             .is_empty());
         assert_eq!(
             alice
                 .poll(Duration::from_secs(51))
                 .expect("retry direct connectivity")
-                .transmissions()
+                .transmissions
                 .len(),
             1
         );

@@ -1227,7 +1227,9 @@ impl AuthorityStore {
         let endpoint_table = read.open_table(ENDPOINTS)?;
         let connectivity_table = read.open_table(CONNECTIVITY)?;
         let mut peers = Vec::new();
-        for entry in endpoint_table.iter()? {
+        let lower = membership_key(network_id, NodeId::from_bytes([0; 16]));
+        let upper = membership_key(network_id, NodeId::from_bytes([u8::MAX; 16]));
+        for entry in endpoint_table.range(lower.as_slice()..=upper.as_slice())? {
             let (key, value) = entry?;
             let key = decode_identifier::<32>(key.value(), "endpoints", "endpoint key")?;
             let endpoint_lease = EndpointLeaseRecord::decode(value.value())?;
@@ -1893,12 +1895,6 @@ impl MembershipRecord {
         self.permissions
     }
 
-    /// Returns the membership creation time as Unix seconds.
-    #[must_use]
-    pub const fn joined_at(&self) -> u64 {
-        self.joined_at
-    }
-
     /// Returns the authorized virtual network.
     #[must_use]
     pub const fn network_id(&self) -> NetworkId {
@@ -2032,12 +2028,6 @@ impl EndpointLeaseRecord {
     #[must_use]
     pub const fn node_id(&self) -> NodeId {
         self.node_id
-    }
-
-    /// Returns the last controller-observed activity time as Unix seconds.
-    #[must_use]
-    pub const fn updated_at(&self) -> u64 {
-        self.updated_at
     }
 
     /// Returns the complete canonical endpoint set.
@@ -2199,12 +2189,6 @@ impl ConnectivityAuthorityRecord {
     #[must_use]
     pub fn encoded_record(&self) -> &[u8] {
         &self.encoded_record
-    }
-
-    /// Borrows the canonical generation nested inside the record.
-    #[must_use]
-    pub fn encoded_generation(&self) -> &[u8] {
-        &self.encoded_record[CONNECTIVITY_RECORD_FIXED_LENGTH..]
     }
 
     fn encode(&self) -> Result<Vec<u8>, StoreError> {
@@ -3312,6 +3296,55 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release-mode multi-network query measurement"]
+    fn benchmark_network_session_views() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("directory");
+        let store = AuthorityStore::initialize(
+            &directory.join("state.redb"),
+            ControllerId::from_bytes([1; 16]),
+        )
+        .expect("store");
+        let mut nodes = Vec::new();
+        for seed in 1..=32 {
+            let node =
+                NodeRecord::new(signing_key(seed).public_key(), "benchmark", 1000).expect("node");
+            store.create_node(&node).expect("create node");
+            nodes.push(node.node_id());
+        }
+        for id in 1..=8 {
+            let network = NetworkId::from_bytes([id; 16]);
+            store
+                .create_network(
+                    &NetworkRecord::new(policy(network), "benchmark", 1000).expect("network"),
+                )
+                .expect("create network");
+            for node in &nodes {
+                store.add_member(*node, network, 1000).expect("member");
+                store
+                    .publish_endpoints(*node, network, &[], 1000)
+                    .expect("online");
+            }
+        }
+        for sample in 0..5 {
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                let view = store
+                    .network_session_view(nodes[0], NetworkId::from_bytes([4; 16]))
+                    .expect("view");
+                assert_eq!(view.peers.len(), 31);
+                std::hint::black_box(view);
+            }
+            eprintln!(
+                "snapshot networks=8 nodes=32 iterations=1000 sample={sample} us={}",
+                started.elapsed().as_micros()
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn initialization_binds_controller_and_creates_all_tables() {
         let directory = temp_directory();
         std::fs::create_dir(&directory).expect("create test directory");
@@ -3831,6 +3864,49 @@ mod tests {
     }
 
     #[test]
+    fn network_session_views_isolate_adjacent_network_prefixes() {
+        let (directory, store, local, peer, _) = endpoint_test_store();
+        let networks = [
+            NetworkId::from_bytes(1_u128.to_be_bytes()),
+            NetworkId::from_bytes(2_u128.to_be_bytes()),
+            NetworkId::from_bytes([255; 16]),
+        ];
+        for (index, network) in networks.into_iter().enumerate() {
+            store
+                .create_network(
+                    &NetworkRecord::new(policy(network), "range", 100).expect("network"),
+                )
+                .expect("create network");
+            for node in [local, peer] {
+                store.add_member(node, network, 110).expect("member");
+                store
+                    .publish_endpoints(
+                        node,
+                        network,
+                        &[endpoint(1, 4000 + u16::try_from(index).expect("index"))],
+                        120,
+                    )
+                    .expect("online");
+            }
+        }
+        for (index, network) in networks.into_iter().enumerate() {
+            let view = store
+                .network_session_view(local, network)
+                .expect("scoped view");
+            assert_eq!(view.peers().len(), 1);
+            assert_eq!(view.peers()[0].node().node_id(), peer);
+            assert_eq!(
+                view.peers()[0].endpoint_lease().endpoints(),
+                &[endpoint(1, 4000 + u16::try_from(index).expect("index"))]
+            );
+            assert_eq!(view.network().network_id(), network);
+        }
+        store.verify().expect("full database verification");
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn network_session_view_keeps_online_peers_and_authority_state_coherent() {
         let (directory, store, first_id, second_id, network_id) = endpoint_test_store();
         store
@@ -3916,14 +3992,17 @@ mod tests {
             .get_endpoints(first_id, network_id)
             .expect("read generated lease")
             .expect("online lease exists");
-        assert_eq!(lease.updated_at(), 120);
+        assert_eq!(lease.updated_at, 120);
         assert!(lease.endpoints().is_empty());
         let stored = store
             .get_connectivity(first_id, network_id)
             .expect("read connectivity")
             .expect("connectivity exists");
         assert_eq!(stored.generation_id(), 7);
-        assert_eq!(stored.encoded_generation(), first_generation);
+        assert_eq!(
+            &stored.encoded_record()[stella_proto::CONNECTIVITY_RECORD_FIXED_LENGTH..],
+            first_generation
+        );
         let diagnostic = format!("{stored:?}");
         assert!(!diagnostic.contains("Abcd1234"));
         assert!(!diagnostic.contains("Abcdefghijklmnopqrstuv"));
@@ -3939,7 +4018,7 @@ mod tests {
                 .get_endpoints(first_id, network_id)
                 .expect("read refreshed lease")
                 .expect("online lease exists")
-                .updated_at(),
+                .updated_at,
             125
         );
         assert!(matches!(
@@ -3991,7 +4070,7 @@ mod tests {
                 .get_connectivity(first_id, network_id)
                 .expect("read backed-up connectivity")
                 .expect("backed-up connectivity exists")
-                .encoded_generation(),
+                .encoded_record()[stella_proto::CONNECTIVITY_RECORD_FIXED_LENGTH..],
             generation
         );
         drop(backup);
@@ -4075,7 +4154,7 @@ mod tests {
                 .get_endpoints(first_id, network_id)
                 .expect("read retained online lease")
                 .expect("online lease remains")
-                .updated_at(),
+                .updated_at,
             690
         );
 
@@ -4127,7 +4206,7 @@ mod tests {
             .get_endpoints(first_id, network_id)
             .expect("get endpoints")
             .expect("online record exists");
-        assert_eq!(record.updated_at(), 125);
+        assert_eq!(record.updated_at, 125);
         assert_eq!(record.endpoints(), &[endpoint(1, 4242)]);
         store
             .publish_endpoints(first_id, network_id, &[endpoint(1, 4242)], 124)
@@ -4137,7 +4216,7 @@ mod tests {
                 .get_endpoints(first_id, network_id)
                 .expect("get endpoints")
                 .expect("online record exists")
-                .updated_at(),
+                .updated_at,
             125
         );
 

@@ -283,3 +283,12 @@ specification documents:
 - canonical network policy and signed grants bind limits and authorization.
 
 Changes to these choices require a new ADR and compatibility analysis.
+
+## Version scope of implementation notes
+
+The base 0.1 profile uses explicitly published static UDP endpoints. ICE/STUN,
+connectivity generations and managed relay fallback belong to the 0.2 profile
+specified in chapters 11 and 12. Implementations select an exact advertised
+version; support for 0.2 does not reinterpret a 0.1 endpoint lease as ICE state.
+The runtime admission and resource policies documented here do not change
+packet layouts, signature domains, key derivation or version selection.

@@ -88,6 +88,15 @@ proptest! {
         let _turn_channel_datagram = TurnChannelDataView::decode_datagram(&input);
         let _turn_channel_stream = TurnChannelDataView::decode_stream(&input);
         let _turn_stream_length = decode_turn_stream_record_length(&input);
+        if let Ok(fields) = ControlFieldIter::decode(&input) { for field in fields { let _ = field; } }
+        if let Ok(view) = ControlMessageView::decode(&input) { for field in view.fields() { let _ = field; } }
+        if let Ok(view) = StunMessageView::decode(&input) { for attribute in view.attributes() { let _ = attribute; } }
+        if let Ok(view) = PeerListView::decode(&input) { for peer in view.peers() { let _ = peer; } }
+        if let Ok(view) = EndpointSetView::decode(&input) { for endpoint in view.endpoints() { let _ = endpoint; } }
+        if let Ok(view) = ConnectivityGenerationView::decode(&input) { for candidate in view.candidates() { let _ = candidate; } }
+        if let Ok(view) = ConnectivityListView::decode(&input) { for record in view.records() { let _ = record; } }
+        if let Ok(view) = RelayServiceListView::decode(&input) { for service in view.services() { let _ = service; } }
+        if let Ok(view) = StunServerListView::decode(&input) { for server in view.servers() { let _ = server; } }
     }
 
     #[test]
@@ -144,6 +153,15 @@ proptest! {
         prop_assert_eq!(decoded.role(), role);
         prop_assert_eq!(decoded.confirmation_tag(), &tag);
         prop_assert_eq!(decoded.datagram(), encoded);
+        // Valid seeds exercise deep checks that arbitrary magic bytes rarely reach.
+        for length in 0..encoded.len() {
+            prop_assert!(SessionConfirmView::decode(&encoded[..length]).is_err());
+        }
+        for offset in [2, 3, 7, 8, 9, 10, 11, 129, 130, 131, 132, 133, 134, 135] {
+            let mut invalid = encoded;
+            invalid[offset] ^= 0x80;
+            prop_assert!(SessionConfirmView::decode(&invalid).is_err());
+        }
     }
 
     #[test]

@@ -117,18 +117,6 @@ impl Endpoint {
         }
     }
 
-    /// Returns the relay identity and peer address for a TURN UDP endpoint.
-    #[must_use]
-    pub const fn as_turn_udp(&self) -> Option<(RelayId, SocketAddr)> {
-        match self {
-            Self::Udp(_)
-            | Self::TurnTcp { .. }
-            | Self::TurnTls { .. }
-            | Self::SecureWebSocket { .. } => None,
-            Self::TurnUdp { relay_id, address } => Some((*relay_id, *address)),
-        }
-    }
-
     /// Returns the carrier, relay identity, and peer address for any relayed endpoint.
     #[must_use]
     pub const fn as_relay(&self) -> Option<(RelayCarrier, RelayId, SocketAddr)> {
@@ -254,13 +242,6 @@ mod tests {
             "turn+udp://11111111111111111111111111111111@192.0.2.30:50000"
         );
         assert_eq!(
-            endpoint.as_turn_udp(),
-            Some((
-                relay_id,
-                "192.0.2.30:50000".parse().expect("TURN UDP endpoint")
-            ))
-        );
-        assert_eq!(
             endpoint.as_relay(),
             Some((
                 RelayCarrier::TurnUdp,
@@ -301,7 +282,6 @@ mod tests {
                 endpoint.as_relay(),
                 Some((carrier, relay_id, endpoint_address(&endpoint)))
             );
-            assert_eq!(endpoint.as_turn_udp(), None);
         }
     }
 

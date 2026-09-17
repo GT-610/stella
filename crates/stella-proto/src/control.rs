@@ -452,12 +452,6 @@ impl<'a> ControlFieldRef<'a> {
         })
     }
 
-    /// Returns the raw 16-bit type, including its critical bit.
-    #[must_use]
-    pub const fn raw_type(self) -> u16 {
-        self.raw_type
-    }
-
     /// Returns the registered type, or `None` for an unknown non-critical field.
     #[must_use]
     pub fn field_type(self) -> Option<ControlFieldType> {
@@ -562,21 +556,6 @@ pub fn control_fields_encoded_len(fields: &[ControlFieldRef<'_>]) -> Result<usiz
     })
 }
 
-/// Encodes ordered control body fields and zeroes every padding byte.
-///
-/// The returned value is the number of bytes written.
-///
-/// # Errors
-///
-/// Returns [`CodecError`] for an invalid field, order, length, arithmetic
-/// overflow, or insufficient output capacity.
-pub fn encode_control_fields(
-    fields: &[ControlFieldRef<'_>],
-    output: &mut [u8],
-) -> Result<usize, CodecError> {
-    encode_control_fields_at(fields, output, 0)
-}
-
 /// Borrowed, structurally validated control message without its outer prefix.
 #[derive(Clone)]
 pub struct ControlMessageView<'a> {
@@ -648,12 +627,6 @@ impl<'a> ControlMessageView<'a> {
     #[must_use]
     pub const fn extensions(&self) -> ExtensionIter<'a> {
         ExtensionIter::new(self.extension_bytes)
-    }
-
-    /// Borrows the exact aligned body bytes.
-    #[must_use]
-    pub const fn body(&self) -> &'a [u8] {
-        self.body
     }
 
     /// Iterates over validated body fields.
@@ -1466,7 +1439,7 @@ mod tests {
     use stella_common::{NodeId, RelayId};
 
     use super::{
-        control_fields_encoded_len, decode_control_record_length, encode_control_fields,
+        control_fields_encoded_len, decode_control_record_length, encode_control_fields_at,
         encode_control_message, encode_control_record_length, field_allowed, field_required,
         ControlFieldIter, ControlFieldRef, ControlFieldType, ControlHeader, ControlMessageType,
         ControlMessageView, CONTROL_HEADER_LENGTH,
@@ -1624,7 +1597,7 @@ mod tests {
         let decoded = ControlMessageView::decode(&encoded).expect("valid control message");
         assert_eq!(decoded.header(), join_header());
         assert_eq!(decoded.extensions().next(), None);
-        assert_eq!(decoded.body(), &encoded[32..]);
+        assert_eq!(decoded.body, &encoded[32..]);
         assert_eq!(decoded.fields().collect::<Vec<_>>(), join_fields());
         assert_eq!(decoded.encoded_len(), encoded.len());
     }
@@ -1774,7 +1747,10 @@ mod tests {
         );
 
         let mut body = [0; 56];
-        assert_eq!(encode_control_fields(&join_fields(), &mut body), Ok(56));
+        assert_eq!(
+            encode_control_fields_at(&join_fields(), &mut body, 0),
+            Ok(56)
+        );
     }
 
     #[test]

@@ -39,12 +39,6 @@ impl SpkiPin {
         Self(digest)
     }
 
-    /// Returns the exact SHA-256 digest bytes.
-    #[must_use]
-    pub const fn digest(self) -> [u8; SPKI_SHA256_LENGTH] {
-        self.0
-    }
-
     fn matches(self, digest: &[u8; SPKI_SHA256_LENGTH]) -> bool {
         bool::from(self.0.ct_eq(digest))
     }
@@ -249,7 +243,6 @@ mod tests {
         assert!(text.starts_with("sha256/"));
         assert_eq!(SpkiPin::from_str(&text), Ok(pin));
         assert_eq!(format!("{pin:?}"), format!("SpkiPin({text})"));
-        assert_eq!(pin.digest(), [0x5a; 32]);
     }
 
     #[test]

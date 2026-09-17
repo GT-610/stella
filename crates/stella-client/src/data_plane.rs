@@ -313,6 +313,10 @@ impl PeerDataSession {
             plaintext.copy_from_slice(packet.fragment());
         }
         self.replay.commit(header.sequence_number)?;
+        if header.fragment_offset == 0 && header.fragment_length == header.frame_length {
+            header.validate_authenticated_frame(&plaintext)?;
+            return Ok(Some(plaintext));
+        }
 
         let extension_bytes = packet
             .authenticated_header()
@@ -353,15 +357,14 @@ impl PeerDataSession {
             echo_probe_id,
         };
         let encoded_length = KEEPALIVE_FIXED_HEADER_LENGTH + AUTHENTICATION_TAG_LENGTH;
-        let mut draft = vec![0_u8; encoded_length];
-        encode_keepalive_packet(header, &[], &[0; AUTHENTICATION_TAG_LENGTH], &mut draft)?;
-        let view = KeepalivePacketView::decode(&draft)?;
+        let mut encoded = vec![0; encoded_length];
+        encode_keepalive_packet(header, &[], &[0; AUTHENTICATION_TAG_LENGTH], &mut encoded)?;
+        let (authenticated_header, trailer) = encoded.split_at_mut(KEEPALIVE_FIXED_HEADER_LENGTH);
         let tag = self
             .protectors
             .send()
-            .authenticate_header(sequence_number, view.authenticated_header())?;
-        let mut encoded = vec![0_u8; encoded_length];
-        encode_keepalive_packet(header, &[], &tag, &mut encoded)?;
+            .authenticate_header(sequence_number, authenticated_header)?;
+        trailer.copy_from_slice(&tag);
         self.next_sequence = sequence_number.checked_add(1);
         Ok(encoded)
     }
@@ -458,33 +461,31 @@ impl PeerDataSession {
     ) -> Result<Vec<u8>, DataPlaneError> {
         let encoded_length =
             usize::from(header.common.header_length) + fragment.len() + AUTHENTICATION_TAG_LENGTH;
-        let mut draft = vec![0_u8; encoded_length];
+        let mut encoded = vec![0; encoded_length];
         encode_data_packet(
             header,
             &[],
             fragment,
             &[0; AUTHENTICATION_TAG_LENGTH],
-            &mut draft,
+            &mut encoded,
         )?;
-        let view = DataPacketView::decode(&draft)?;
-        let mut protected_fragment = vec![0_u8; fragment.len()];
+        let (authenticated_header, body) = encoded.split_at_mut(DATA_FIXED_HEADER_LENGTH);
+        let (protected_fragment, trailer) = body.split_at_mut(fragment.len());
         let tag = if header.is_encrypted() {
             self.protectors.send().seal_encrypted(
                 header.sequence_number,
-                view.authenticated_header(),
+                authenticated_header,
                 fragment,
-                &mut protected_fragment,
+                protected_fragment,
             )?
         } else {
-            protected_fragment.copy_from_slice(fragment);
             self.protectors.send().authenticate_only(
                 header.sequence_number,
-                view.authenticated_header(),
+                authenticated_header,
                 fragment,
             )?
         };
-        let mut encoded = vec![0_u8; encoded_length];
-        encode_data_packet(header, &[], &protected_fragment, &tag, &mut encoded)?;
+        trailer.copy_from_slice(&tag);
         Ok(encoded)
     }
 
@@ -553,11 +554,6 @@ impl PeerDataSession {
         fragment: &[u8],
         now: Duration,
     ) -> Result<Option<Vec<u8>>, DataPlaneError> {
-        if header.fragment_offset == 0 && header.fragment_length == header.frame_length {
-            header.validate_authenticated_frame(fragment)?;
-            return Ok(Some(fragment.to_vec()));
-        }
-
         let metadata = FrameMetadata::new(header, extension_bytes);
         if let Some(existing) = self.incomplete.get(&header.frame_id) {
             if existing.metadata != metadata {
@@ -870,6 +866,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release-mode performance measurement"]
+    fn benchmark_packet_round_trips() {
+        for (payload, mtu) in [(64, 1500), (1400, 1500), (1400, 220)] {
+            for sample in 0..5 {
+                let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, mtu);
+                let frame = frame(payload);
+                let started = std::time::Instant::now();
+                for _ in 0..10_000 {
+                    for packet in alice
+                        .protect_frame(std::hint::black_box(&frame))
+                        .expect("protect")
+                    {
+                        std::hint::black_box(
+                            bob.accept_datagram(&packet, Duration::ZERO)
+                                .expect("receive"),
+                        );
+                    }
+                }
+                eprintln!(
+                    "packet payload={payload} mtu={mtu} sample={sample} us={}",
+                    started.elapsed().as_micros()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn encrypted_fragments_reassemble_out_of_order() {
         let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 220);
         let frame = frame(900);
@@ -994,6 +1017,60 @@ mod tests {
             None
         );
         assert_eq!(bob.incomplete_frame_count(), 0);
+    }
+
+    #[test]
+    fn incomplete_frame_and_fragment_limits_release_accounted_storage() {
+        let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 220);
+        let frame = frame(400);
+        for _ in 0..65 {
+            let packet = alice
+                .protect_frame(&frame)
+                .expect("fragmented frame")
+                .remove(0);
+            assert!(bob
+                .accept_datagram(&packet, Duration::ZERO)
+                .expect("first fragment")
+                .is_none());
+        }
+        assert_eq!(bob.incomplete.len(), super::MAX_INCOMPLETE_FRAMES);
+        assert!(!bob.incomplete.contains_key(&1));
+        assert_eq!(
+            bob.reassembly_bytes,
+            frame.len() * super::MAX_INCOMPLETE_FRAMES
+        );
+        let (alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 220);
+        for offset in 0_u16..129 {
+            let header = alice.data_header(
+                super::FrameHeaderFields {
+                    frame_id: 1,
+                    frame_length: 414,
+                    source_mac: stella_common::MacAddress::from_bytes([2, 0, 0, 0, 0, 1]),
+                    destination_mac: stella_common::MacAddress::BROADCAST,
+                    outer_ether_type: 0x0800,
+                },
+                super::FragmentHeaderFields {
+                    sequence_number: u64::from(offset) + 1,
+                    offset,
+                    length: 1,
+                },
+            );
+            let packet = alice
+                .protect_fragment(header, &frame[usize::from(offset)..=usize::from(offset)])
+                .expect("protected fragment");
+            assert!(bob
+                .accept_datagram(&packet, Duration::ZERO)
+                .expect("bounded reassembly")
+                .is_none());
+            if offset == 127 {
+                assert_eq!(
+                    bob.incomplete.get(&1).expect("frame at limit").ranges.len(),
+                    128
+                );
+            }
+        }
+        assert!(bob.incomplete.is_empty());
+        assert_eq!(bob.reassembly_bytes, 0);
     }
 
     #[test]

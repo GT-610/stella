@@ -1,0 +1,747 @@
+//! Protected persistent identity files.
+
+use std::{
+    fs::File,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+};
+
+use stella_crypto::{CryptoError, IdentitySigningKey, MAX_IDENTITY_PKCS8_LENGTH};
+use thiserror::Error;
+use zeroize::Zeroizing;
+
+/// Creates a new protected Ed25519 identity file.
+///
+/// The target is never overwritten. Windows applies a protected exact DACL;
+/// macOS requires a non-linked regular file with mode `0600`. The native
+/// policy is verified before secret bytes are written.
+///
+/// # Errors
+///
+/// Returns [`IdentityFileError`] for unsupported platforms, key creation,
+/// an existing path, insecure permissions, write/sync, or cleanup failure.
+pub fn create_identity(path: &Path) -> Result<IdentitySigningKey, IdentityFileError> {
+    let signing_key = IdentitySigningKey::generate()?;
+    let document = signing_key.to_pkcs8_der()?;
+    let mut file = create_protected_secret_file(path)?;
+    if let Err(error) = write_identity(&mut file, path, document.expose_secret()) {
+        drop(file);
+        return Err(cleanup_created_file(path, error));
+    }
+    Ok(signing_key)
+}
+
+/// Loads a protected bounded PKCS#8 identity.
+///
+/// Native permissions and file kind are verified before any secret bytes are
+/// read. The bounded input buffer is zeroized on drop.
+///
+/// # Errors
+///
+/// Returns [`IdentityFileError`] for native security, metadata, size,
+/// read, or PKCS#8 decoding failure.
+pub fn load_identity(path: &Path) -> Result<IdentitySigningKey, IdentityFileError> {
+    let mut file = open_protected_secret_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| IdentityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let maximum = u64::try_from(MAX_IDENTITY_PKCS8_LENGTH)
+        .map_err(|_| IdentityFileError::LengthConversion)?;
+    if metadata.len() > maximum {
+        return Err(IdentityFileError::TooLarge {
+            path: path.to_path_buf(),
+            actual: metadata.len(),
+            maximum: MAX_IDENTITY_PKCS8_LENGTH,
+        });
+    }
+    let mut document = Zeroizing::new(Vec::with_capacity(MAX_IDENTITY_PKCS8_LENGTH));
+    (&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut document)
+        .map_err(|source| IdentityFileError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if document.len() > MAX_IDENTITY_PKCS8_LENGTH {
+        return Err(IdentityFileError::TooLarge {
+            path: path.to_path_buf(),
+            actual: u64::try_from(document.len())
+                .map_err(|_| IdentityFileError::LengthConversion)?,
+            maximum: MAX_IDENTITY_PKCS8_LENGTH,
+        });
+    }
+    IdentitySigningKey::from_pkcs8_der(&document).map_err(IdentityFileError::from)
+}
+
+/// Creates a new secret file with verified native permissions before writing.
+///
+/// # Errors
+/// Returns an error for an existing path or an insecure native file policy.
+pub fn create_protected_secret_file(path: &Path) -> Result<File, IdentityFileError> {
+    platform::create_secure_file(path)
+}
+
+/// Opens a secret file only after verifying native permissions and file kind.
+///
+/// # Errors
+/// Returns an error for missing, linked, non-regular, or insecure files.
+pub fn open_protected_secret_file(path: &Path) -> Result<File, IdentityFileError> {
+    platform::open_verified_file(path)
+}
+
+fn write_identity(file: &mut File, path: &Path, document: &[u8]) -> Result<(), IdentityFileError> {
+    file.write_all(document)
+        .map_err(|source| IdentityFileError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.sync_all().map_err(|source| IdentityFileError::Sync {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn cleanup_created_file(path: &Path, cause: IdentityFileError) -> IdentityFileError {
+    match std::fs::remove_file(path) {
+        Ok(()) => cause,
+        Err(source) => IdentityFileError::CleanupFailed {
+            path: path.to_path_buf(),
+            cause: Box::new(cause),
+            source,
+        },
+    }
+}
+
+/// Identity persistence or native-permission failure.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum IdentityFileError {
+    /// This build has no secure native file backend.
+    #[error("secure identity files are unsupported on this platform")]
+    UnsupportedPlatform,
+    /// A create-new identity file could not be opened.
+    #[error("unable to create new identity file {path}")]
+    Create {
+        /// Requested path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// An existing identity file could not be opened.
+    #[error("unable to open identity file {path}")]
+    Open {
+        /// Requested path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// File metadata could not be inspected.
+    #[error("unable to inspect identity file {path}")]
+    Metadata {
+        /// Inspected path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// The identity path is not a regular file.
+    #[error("identity path {path} is not a regular file")]
+    NotRegularFile {
+        /// Rejected path.
+        path: PathBuf,
+    },
+    /// The identity path is a Windows reparse point.
+    #[error("identity path {path} is a reparse point")]
+    ReparsePoint {
+        /// Rejected path.
+        path: PathBuf,
+    },
+    /// The current Windows account SID could not be resolved.
+    #[error("unable to resolve the current Windows account SID")]
+    CurrentAccountUnavailable,
+    /// A native ACL operation failed.
+    #[error("Windows ACL operation {operation} failed with status {code}")]
+    WindowsAcl {
+        /// Failed operation.
+        operation: &'static str,
+        /// Win32 status code.
+        code: u32,
+    },
+    /// An ACL wrapper reported success without applying the change.
+    #[error("Windows ACL operation {operation} did not apply the requested change")]
+    WindowsAclIncomplete {
+        /// Incomplete operation.
+        operation: &'static str,
+    },
+    /// The identity file has access beyond the exact Stella policy.
+    #[error("identity file {path} has insecure permissions: {reason}")]
+    InsecurePermissions {
+        /// Rejected path.
+        path: PathBuf,
+        /// Stable non-secret reason.
+        reason: &'static str,
+    },
+    /// The bounded PKCS#8 input size was exceeded.
+    #[error("identity file {path} has {actual} bytes, exceeding maximum {maximum}")]
+    TooLarge {
+        /// Rejected path.
+        path: PathBuf,
+        /// Observed bytes.
+        actual: u64,
+        /// Maximum accepted bytes.
+        maximum: usize,
+    },
+    /// A file length could not be represented safely.
+    #[error("identity length cannot be represented safely")]
+    LengthConversion,
+    /// Secret bytes could not be read.
+    #[error("unable to read identity file {path}")]
+    Read {
+        /// Identity path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Secret bytes could not be written.
+    #[error("unable to write identity file {path}")]
+    Write {
+        /// Identity path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// The new identity could not be durably synchronized.
+    #[error("unable to sync identity file {path}")]
+    Sync {
+        /// Identity path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// A partial newly created file could not be removed.
+    #[error("unable to remove partial identity file {path} after {cause}")]
+    CleanupFailed {
+        /// Partial path.
+        path: PathBuf,
+        /// Original failure.
+        cause: Box<IdentityFileError>,
+        /// Cleanup failure.
+        #[source]
+        source: io::Error,
+    },
+    /// Key generation or PKCS#8 processing failed.
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
+}
+
+#[cfg(windows)]
+mod platform {
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs::{File, OpenOptions},
+        os::windows::{
+            fs::{MetadataExt, OpenOptionsExt},
+            io::AsRawHandle,
+        },
+        path::Path,
+    };
+
+    use windows_acl::{
+        acl::{AceType, ACL},
+        helper::{current_user, name_to_sid, sid_to_string, string_to_sid},
+    };
+
+    use super::{cleanup_created_file, IdentityFileError};
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+    pub(super) fn create_secure_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|source| IdentityFileError::Create {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if let Err(error) = validate_file_kind(&file, path)
+            .and_then(|()| harden_permissions(&file, path))
+            .and_then(|()| verify_permissions(&file, path))
+        {
+            drop(file);
+            return Err(cleanup_created_file(path, error));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_verified_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file_kind(&file, path)?;
+        verify_permissions(&file, path)?;
+        Ok(file)
+    }
+
+    fn validate_file_kind(file: &File, path: &Path) -> Result<(), IdentityFileError> {
+        let metadata = file
+            .metadata()
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !metadata.is_file() {
+            return Err(IdentityFileError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(IdentityFileError::ReparsePoint {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
+    }
+
+    fn harden_permissions(file: &File, path: &Path) -> Result<(), IdentityFileError> {
+        let mut acl = open_acl(file)?;
+        let entries = acl.all().map_err(|code| IdentityFileError::WindowsAcl {
+            operation: "enumerate",
+            code,
+        })?;
+        let mut existing_sids = BTreeSet::new();
+        for entry in entries {
+            if entry.string_sid.is_empty() {
+                return Err(insecure(path, "an ACL entry has no valid SID"));
+            }
+            existing_sids.insert(entry.string_sid);
+        }
+        for sid_string in existing_sids {
+            let sid = string_to_sid(&sid_string).map_err(|code| IdentityFileError::WindowsAcl {
+                operation: "decode existing SID",
+                code,
+            })?;
+            let removed = acl
+                .remove(sid.as_ptr().cast_mut().cast(), None, None)
+                .map_err(|code| IdentityFileError::WindowsAcl {
+                    operation: "remove existing entry",
+                    code,
+                })?;
+            if removed == 0 {
+                return Err(IdentityFileError::WindowsAclIncomplete {
+                    operation: "remove existing entry",
+                });
+            }
+        }
+        for sid in required_principals()?.into_values() {
+            let applied = acl
+                .allow(sid.as_ptr().cast_mut().cast(), false, FILE_ALL_ACCESS)
+                .map_err(|code| IdentityFileError::WindowsAcl {
+                    operation: "grant required principal",
+                    code,
+                })?;
+            if !applied {
+                return Err(IdentityFileError::WindowsAclIncomplete {
+                    operation: "grant required principal",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_permissions(file: &File, path: &Path) -> Result<(), IdentityFileError> {
+        let acl = open_acl(file)?;
+        let entries = acl.all().map_err(|code| IdentityFileError::WindowsAcl {
+            operation: "enumerate",
+            code,
+        })?;
+        let required = required_principals()?;
+        let expected = required.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        let mut observed = BTreeSet::new();
+        for entry in entries {
+            if entry.entry_type != AceType::AccessAllow {
+                return Err(insecure(path, "an entry is not an access-allow ACE"));
+            }
+            if entry.flags != 0 {
+                return Err(insecure(
+                    path,
+                    "an entry is inherited or has unexpected flags",
+                ));
+            }
+            if entry.mask != FILE_ALL_ACCESS {
+                return Err(insecure(path, "an entry has an unexpected access mask"));
+            }
+            if !expected.contains(entry.string_sid.as_str()) {
+                return Err(insecure(path, "an unexpected principal has access"));
+            }
+            if !observed.insert(entry.string_sid) {
+                return Err(insecure(path, "a required principal has duplicate entries"));
+            }
+        }
+        if observed.len() != expected.len()
+            || !observed.iter().all(|sid| expected.contains(sid.as_str()))
+        {
+            return Err(insecure(path, "a required principal is missing"));
+        }
+        Ok(())
+    }
+
+    fn open_acl(file: &File) -> Result<ACL, IdentityFileError> {
+        ACL::from_file_handle(file.as_raw_handle().cast(), false).map_err(|code| {
+            IdentityFileError::WindowsAcl {
+                operation: "open security descriptor",
+                code,
+            }
+        })
+    }
+
+    fn required_principals() -> Result<BTreeMap<String, Vec<u8>>, IdentityFileError> {
+        let account = current_user().ok_or(IdentityFileError::CurrentAccountUnavailable)?;
+        let user_sid =
+            name_to_sid(&account, None).map_err(|code| IdentityFileError::WindowsAcl {
+                operation: "resolve current account",
+                code,
+            })?;
+        let user_string = sid_to_string(user_sid.as_ptr().cast_mut().cast()).map_err(|code| {
+            IdentityFileError::WindowsAcl {
+                operation: "format current account SID",
+                code,
+            }
+        })?;
+        let system_sid =
+            string_to_sid(LOCAL_SYSTEM_SID).map_err(|code| IdentityFileError::WindowsAcl {
+                operation: "decode LocalSystem SID",
+                code,
+            })?;
+        let system_string =
+            sid_to_string(system_sid.as_ptr().cast_mut().cast()).map_err(|code| {
+                IdentityFileError::WindowsAcl {
+                    operation: "format LocalSystem SID",
+                    code,
+                }
+            })?;
+        let mut principals = BTreeMap::new();
+        principals.insert(user_string, user_sid);
+        principals.insert(system_string, system_sid);
+        Ok(principals)
+    }
+
+    fn insecure(path: &Path, reason: &'static str) -> IdentityFileError {
+        IdentityFileError::InsecurePermissions {
+            path: path.to_path_buf(),
+            reason,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_everyone_for_test(path: &Path) -> Result<(), IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut acl = open_acl(&file)?;
+        let sid = string_to_sid("S-1-1-0").map_err(|code| IdentityFileError::WindowsAcl {
+            operation: "decode Everyone SID",
+            code,
+        })?;
+        acl.allow(sid.as_ptr().cast_mut().cast(), false, FILE_ALL_ACCESS)
+            .map_err(|code| IdentityFileError::WindowsAcl {
+                operation: "grant Everyone for test",
+                code,
+            })?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    #[cfg(test)]
+    use std::process::Command;
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        path::Path,
+    };
+
+    use super::{cleanup_created_file, IdentityFileError};
+
+    const SECRET_FILE_MODE: u32 = 0o600;
+
+    pub(super) fn create_secure_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Create {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if let Err(error) = validate_file(&file, path) {
+            drop(file);
+            return Err(cleanup_created_file(path, error));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_verified_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file(&file, path)?;
+        Ok(file)
+    }
+
+    fn validate_file(file: &File, path: &Path) -> Result<(), IdentityFileError> {
+        let metadata = file
+            .metadata()
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(IdentityFileError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        if metadata.mode() & 0o777 != SECRET_FILE_MODE {
+            return Err(IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "mode must be exactly 0600",
+            });
+        }
+        validate_extended_acl(file, path, metadata.uid())?;
+        Ok(())
+    }
+
+    fn validate_extended_acl(
+        file: &File,
+        path: &Path,
+        owner_uid: u32,
+    ) -> Result<(), IdentityFileError> {
+        let grants_non_owner_access = crate::extended_acl_grants_non_owner_access(file, owner_uid)
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if grants_non_owner_access {
+            return Err(IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "an extended ACL grants access to a non-owner principal",
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_test_acl(path: &Path, acl: &str) -> Result<(), IdentityFileError> {
+        let status = Command::new("/bin/chmod")
+            .args(["+a", acl])
+            .arg(path)
+            .status()
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("chmod could not install the test ACL"),
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_everyone_for_test(path: &Path) -> Result<(), IdentityFileError> {
+        let mut permissions = std::fs::metadata(path)
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        std::fs::set_permissions(path, permissions).map_err(|source| IdentityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_inherited_everyone_for_test(path: &Path) -> Result<(), IdentityFileError> {
+        install_test_acl(path, "everyone allow read,file_inherit")
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod platform {
+    use std::{fs::File, path::Path};
+
+    use super::IdentityFileError;
+
+    pub(super) fn create_secure_file(_path: &Path) -> Result<File, IdentityFileError> {
+        Err(IdentityFileError::UnsupportedPlatform)
+    }
+
+    pub(super) fn open_verified_file(_path: &Path) -> Result<File, IdentityFileError> {
+        Err(IdentityFileError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    #[cfg(any(windows, target_os = "macos"))]
+    use std::{fs::OpenOptions, io::Write};
+
+    #[cfg(any(windows, target_os = "macos"))]
+    use stella_crypto::MAX_IDENTITY_PKCS8_LENGTH;
+
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::load_identity;
+    use super::{create_identity, IdentityFileError};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_directory() -> PathBuf {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "stella-node-identity-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn create_load_verify_and_refuse_overwrite() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("node.pk8");
+        let created = create_identity(&path).expect("create identity");
+        let loaded = load_identity(&path).expect("load identity");
+        assert_eq!(loaded.public_key(), created.public_key());
+        assert!(matches!(
+            create_identity(&path),
+            Err(IdentityFileError::Create { .. })
+        ));
+        drop(loaded);
+        drop(created);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn malformed_oversized_and_permission_tampered_files_are_rejected() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("node.pk8");
+        let identity = create_identity(&path).expect("create identity");
+        drop(identity);
+
+        overwrite(&path, &[0x30, 0x01, 0]);
+        assert!(matches!(
+            load_identity(&path),
+            Err(IdentityFileError::Crypto(_))
+        ));
+        overwrite(&path, &vec![0; MAX_IDENTITY_PKCS8_LENGTH + 1]);
+        assert!(matches!(
+            load_identity(&path),
+            Err(IdentityFileError::TooLarge { .. })
+        ));
+
+        let replacement_path = directory.join("replacement.pk8");
+        let replacement = create_identity(&replacement_path).expect("create replacement");
+        let document = replacement.to_pkcs8_der().expect("encode replacement");
+        overwrite(&path, document.expose_secret());
+        super::platform::grant_everyone_for_test(&path).expect("tamper permissions");
+        assert!(matches!(
+            load_identity(&path),
+            Err(IdentityFileError::InsecurePermissions { .. })
+        ));
+        drop(document);
+        drop(replacement);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_extended_acl_is_rejected() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        super::platform::grant_inherited_everyone_for_test(&directory)
+            .expect("grant inheritable test ACL");
+        let path = directory.join("node.pk8");
+        assert!(matches!(
+            create_identity(&path),
+            Err(IdentityFileError::InsecurePermissions { .. })
+        ));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn overwrite(path: &std::path::Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open identity for overwrite");
+        file.write_all(bytes).expect("overwrite identity");
+        file.sync_all().expect("sync identity");
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn unsupported_platform_creates_nothing() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("node.pk8");
+        assert!(matches!(
+            create_identity(&path),
+            Err(IdentityFileError::UnsupportedPlatform)
+        ));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+}

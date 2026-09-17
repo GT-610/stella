@@ -149,79 +149,79 @@ async fn main() -> Result<()> {
             ready_reported = true;
         }
         tokio::select! {
-            command = commands.recv() => {
-                match command.context("verifier command reader stopped")?? {
-                    Command::Inject(frame) => {
-                        let output = plane
-                            .accept_tap_frame(&frame, started_at.elapsed())
-                            .context("headless frame injection failed")?;
-                        send_output(&udp, &plane, output, Some(&mut writer)).await?;
-                        write_line(&mut writer, "OK").await?;
-                    }
-                    Command::Quit => break,
-                }
-            }
-            received = udp.recv_from(&mut udp_buffer) => {
-                let (length, source) = received.context("headless UDP receive failed")?;
-                let packet_type = CommonHeader::decode(&udp_buffer[..length]).map_or_else(
-                    |_| "malformed".to_owned(),
-                    |header| format!("{:?}", header.packet_type),
-                );
-                eprintln!("received {length} {packet_type} bytes from {source}");
-                if let Ok(rejection) = SessionRejectView::decode(&udp_buffer[..length]) {
-                    eprintln!("received session rejection reason: {:?}", rejection.reason());
-                }
-                match plane.accept_udp_datagram(
-                    source,
-                    &udp_buffer[..length],
-                    &identity,
-                    unix_time()?,
-                    started_at.elapsed(),
-                ) {
-                    Ok(output) => send_output(&udp, &plane, output, Some(&mut writer)).await?,
-                    Err(error) => eprintln!("dropped invalid peer datagram: {error}"),
-                }
-            }
-            update = active.receive_update() => {
-                let update = update.context("controller update failed")?;
-                eprintln!("received controller update: {update:?}");
-                match update {
-                    ControlUpdate::ServerShutdown { deadline } => {
-                        anyhow::bail!("controller requested shutdown with deadline {deadline}");
-                    }
-                    ControlUpdate::ControllerError { status, retry_after_ms } => {
-                        anyhow::bail!("controller sent status {status} with retry delay {retry_after_ms:?}");
-                    }
-                    _ => {}
-                }
-                let state = active
-                    .network(network_id)
-                    .cloned()
-                    .context("network was withdrawn during verification")?;
-                plane
-                    .reconcile(state, &identity, mac, started_at.elapsed())
-                    .context("could not reconcile headless data plane")?;
-            }
-            () = &mut heartbeat => {
-                active.heartbeat().await.context("headless heartbeat failed")?;
-                let state = active
-                    .network(network_id)
-                    .cloned()
-                    .context("network was withdrawn after heartbeat")?;
-                plane
-                    .reconcile(state, &identity, mac, started_at.elapsed())
-                    .context("could not reconcile headless heartbeat state")?;
-                heartbeat.as_mut().reset(
-                    tokio::time::Instant::now() + Duration::from_secs(heartbeat_seconds)
-                );
-            }
-            _ = maintenance.tick() => {
-                let output = plane
-                    .maintain(&identity, unix_time()?, started_at.elapsed())
-                    .context("headless data-plane maintenance failed")?;
-                send_output(&udp, &plane, output, Some(&mut writer)).await?;
-            }
-        }
+                   command = commands.recv() => {
+                       match command.context("verifier command reader stopped")?? {
+                           Command::Inject(frame) => {
+                               let output = plane
+                                   .accept_tap_frame(&frame, started_at.elapsed())
+                                   .context("headless frame injection failed")?;
+                               send_output(&udp, &plane, output, Some(&mut writer)).await?;
+                               write_line(&mut writer, "OK").await?;
+                           }
+                           Command::Quit => break,
+                       }
+                   }
+                   received = udp.recv_from(&mut udp_buffer) => {
+                       let (length, source) = received.context("headless UDP receive failed")?;
+                       let packet_type = CommonHeader::decode(&udp_buffer[..length]).map_or_else(
+                           |_| "malformed".to_owned(),
+                           |header| format!("{:?}", header.packet_type),
+                       );
+                       eprintln!("received {length} {packet_type} bytes from {source}");
+                       if let Ok(rejection) = SessionRejectView::decode(&udp_buffer[..length]) {
+                           eprintln!("received session rejection reason: {:?}", rejection.reason());
+                       }
+                       match plane.accept_datagram(
+        &stella_transport::Endpoint::Udp(source),
+                           &udp_buffer[..length],
+                           &identity,
+                           unix_time()?,
+                           started_at.elapsed(),
+                       ) {
+                           Ok(output) => send_output(&udp, &plane, output, Some(&mut writer)).await?,
+                           Err(error) => eprintln!("dropped invalid peer datagram: {error}"),
+                       }
+                   }
+                   update = active.receive_update() => {
+                       let update = update.context("controller update failed")?;
+                       eprintln!("received controller update: {update:?}");
+                       match update {
+                           ControlUpdate::ServerShutdown { deadline } => {
+                               anyhow::bail!("controller requested shutdown with deadline {deadline}");
+                           }
+                           ControlUpdate::ControllerError { status, retry_after_ms } => {
+                               anyhow::bail!("controller sent status {status} with retry delay {retry_after_ms:?}");
+                           }
+                           _ => {}
+                       }
+                       let state = active
+                           .network(network_id)
+                           .cloned()
+                           .context("network was withdrawn during verification")?;
+                       plane
+                           .reconcile(state, &identity, mac, started_at.elapsed())
+                           .context("could not reconcile headless data plane")?;
+                   }
+                   () = &mut heartbeat => {
+                       active.heartbeat().await.context("headless heartbeat failed")?;
+                       let state = active
+                           .network(network_id)
+                           .cloned()
+                           .context("network was withdrawn after heartbeat")?;
+                       plane
+                           .reconcile(state, &identity, mac, started_at.elapsed())
+                           .context("could not reconcile headless heartbeat state")?;
+                       heartbeat.as_mut().reset(
+                           tokio::time::Instant::now() + Duration::from_secs(heartbeat_seconds)
+                       );
+                   }
+                   _ = maintenance.tick() => {
+                       let output = plane
+                           .maintain(&identity, unix_time()?, started_at.elapsed())
+                           .context("headless data-plane maintenance failed")?;
+                       send_output(&udp, &plane, output, Some(&mut writer)).await?;
+                   }
+               }
     }
     command_reader
         .await

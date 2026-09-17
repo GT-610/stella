@@ -396,42 +396,17 @@ pub struct ResponderHandshake {
 }
 
 impl ResponderHandshake {
-    /// Authenticates an initiation and creates a fresh signed response.
-    ///
-    /// Structurally invalid or unauthenticated input returns an error and must
-    /// be silently dropped by the caller rather than answered with a rejection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HandshakeError`] for stale or mismatched context, grant or
-    /// signature failure, randomness failure, or non-contributory agreement.
-    pub fn respond(
+    fn respond(
         config: PeerHandshakeConfig,
         local_signing_key: &IdentitySigningKey,
-        init_datagram: &[u8],
+        validated: ValidatedInitiation<'_>,
         now: u64,
     ) -> Result<Self, HandshakeError> {
         validate_local_signing_key(&config, local_signing_key)?;
-        let init = SessionInitView::decode(init_datagram)?;
-        validate_initiation_header(&config, init.header())?;
-        validate_timestamp(init.header().timestamp, now)?;
-        validate_grant_time(config.local_grant, now)?;
-        if presented_grant_rejection(&config, &init.initiator_grant(), now)?.is_some() {
-            return Err(HandshakeError::ContextMismatch {
-                field: "initiator membership grant",
-            });
-        }
-        if init.receiver_grant_serial() != config.local_grant.grant_serial {
-            return Err(HandshakeError::ContextMismatch {
-                field: "receiver grant serial",
-            });
-        }
-        config.peer_public_key.verify_segments(
-            SESSION_INIT_SIGNATURE_DOMAIN,
-            &[init.signed_header(), init.signed_payload()],
-            init.signature(),
-        )?;
-
+        let ValidatedInitiation {
+            datagram: init_datagram,
+            view: init,
+        } = validated;
         let ephemeral = EphemeralSecret::generate()?;
         let ephemeral_public = ephemeral.public_key().to_bytes();
         let nonce = random_nonzero_array::<HANDSHAKE_NONCE_LENGTH>()?;
@@ -557,15 +532,6 @@ impl ResponderHandshake {
             .responder_confirmation
             .as_ref()
             .map_or(&[], Vec::as_slice))
-    }
-
-    /// Consumes the responder state after its confirmation has been produced.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HandshakeError`] if no valid initiator confirmation has been accepted.
-    pub fn into_established(mut self, now: u64) -> Result<EstablishedPeerSession, HandshakeError> {
-        self.take_established(now)
     }
 
     /// Takes established key material while retaining cached handshake bytes.
@@ -1006,20 +972,23 @@ impl PeerHandshakeManager {
                 .ok_or(HandshakeError::InvalidConfiguration {
                     reason: "initiation came from an unknown peer",
                 })?;
-        if let Some(reason) = classify_authenticated_initiation(&config, &init, wall_time)? {
-            let rejection = encode_signed_rejection(
-                &config,
-                init.header(),
-                datagram,
-                reason,
-                0,
-                signing_key,
-                wall_time,
-            )?;
-            return Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
-                peer, rejection,
-            )));
-        }
+        let validated = match authenticate_initiation(&config, datagram, wall_time)? {
+            Ok(validated) => validated,
+            Err(reason) => {
+                let rejection = encode_signed_rejection(
+                    &config,
+                    init.header(),
+                    datagram,
+                    reason,
+                    0,
+                    signing_key,
+                    wall_time,
+                )?;
+                return Ok(HandshakeEvent::Transmit(HandshakeTransmission::new(
+                    peer, rejection,
+                )));
+            }
+        };
         if self
             .active_session_ids
             .contains(&(peer, init.header().session_id))
@@ -1043,7 +1012,7 @@ impl PeerHandshakeManager {
             }
             self.outgoing.remove(&peer);
         }
-        let handshake = ResponderHandshake::respond(config, signing_key, datagram, wall_time)?;
+        let handshake = ResponderHandshake::respond(config, signing_key, validated, wall_time)?;
         let response = handshake.response_datagram().to_vec();
         self.make_responder_room(peer);
         self.responders.insert(
@@ -1220,6 +1189,11 @@ impl PeerHandshakeManager {
             .retain(|_, cached| now.saturating_sub(cached.created_at) < RESPONDER_CACHE_LIFETIME);
     }
 
+    pub(crate) fn cancel_exchanges(&mut self, peer: NodeId) {
+        self.outgoing.remove(&peer);
+        self.responders.retain(|key, _| key.peer_node_id != peer);
+    }
+
     fn clear_peer_exchange(&mut self, peer: NodeId) {
         self.outgoing.remove(&peer);
         self.responders.retain(|key, _| key.peer_node_id != peer);
@@ -1301,11 +1275,17 @@ fn validate_grant_time(grant: MembershipGrant, now: u64) -> Result<(), Handshake
     Ok(())
 }
 
-fn classify_authenticated_initiation(
+struct ValidatedInitiation<'a> {
+    datagram: &'a [u8],
+    view: SessionInitView<'a>,
+}
+
+fn authenticate_initiation<'a>(
     config: &PeerHandshakeConfig,
-    init: &SessionInitView<'_>,
+    datagram: &'a [u8],
     now: u64,
-) -> Result<Option<SessionRejectReason>, HandshakeError> {
+) -> Result<Result<ValidatedInitiation<'a>, SessionRejectReason>, HandshakeError> {
+    let init = SessionInitView::decode(datagram)?;
     let header = init.header();
     if header.common.network_id != config.policy.network_id {
         return Err(HandshakeError::ContextMismatch {
@@ -1328,19 +1308,23 @@ fn classify_authenticated_initiation(
         &[init.signed_header(), init.signed_payload()],
         init.signature(),
     )?;
+    let grant_rejection = presented_grant_rejection(config, &init.initiator_grant(), now)?;
     if header.controller_epoch != config.controller_epoch {
-        return Ok(Some(SessionRejectReason::StaleEpoch));
+        return Ok(Err(SessionRejectReason::StaleEpoch));
     }
-    if let Some(reason) = presented_grant_rejection(config, &init.initiator_grant(), now)? {
-        return Ok(Some(reason));
+    if let Some(reason) = grant_rejection {
+        return Ok(Err(reason));
     }
     if init.receiver_grant_serial() != config.local_grant.grant_serial {
-        return Ok(Some(SessionRejectReason::PolicyMismatch));
+        return Ok(Err(SessionRejectReason::PolicyMismatch));
     }
     if validate_grant_time(config.local_grant, now).is_err() {
-        return Ok(Some(SessionRejectReason::GrantExpired));
+        return Ok(Err(SessionRejectReason::GrantExpired));
     }
-    Ok(None)
+    Ok(Ok(ValidatedInitiation {
+        datagram,
+        view: init,
+    }))
 }
 
 fn presented_grant_rejection(
@@ -1382,33 +1366,6 @@ fn same_grant_authority(left: MembershipGrant, right: MembershipGrant) -> bool {
 fn validate_timestamp(timestamp: u64, now: u64) -> Result<(), HandshakeError> {
     if timestamp.abs_diff(now) > TIMESTAMP_TOLERANCE_SECONDS {
         return Err(HandshakeError::StaleTimestamp);
-    }
-    Ok(())
-}
-
-fn validate_initiation_header(
-    config: &PeerHandshakeConfig,
-    header: HandshakeHeader,
-) -> Result<(), HandshakeError> {
-    if header.common.network_id != config.policy.network_id {
-        return Err(HandshakeError::ContextMismatch {
-            field: "network ID",
-        });
-    }
-    if header.sender_node_id != config.peer_node_id {
-        return Err(HandshakeError::ContextMismatch {
-            field: "sender node ID",
-        });
-    }
-    if header.receiver_node_id != config.local_node_id {
-        return Err(HandshakeError::ContextMismatch {
-            field: "receiver node ID",
-        });
-    }
-    if header.controller_epoch != config.controller_epoch {
-        return Err(HandshakeError::ContextMismatch {
-            field: "controller epoch",
-        });
     }
     Ok(())
 }
@@ -1795,6 +1752,209 @@ mod tests {
         frame
     }
 
+    fn respond(
+        config: PeerHandshakeConfig,
+        key: &IdentitySigningKey,
+        datagram: &[u8],
+        now: u64,
+    ) -> Result<ResponderHandshake, HandshakeError> {
+        let validated = super::authenticate_initiation(&config, datagram, now)?.map_err(|_| {
+            HandshakeError::ContextMismatch {
+                field: "initiation",
+            }
+        })?;
+        ResponderHandshake::respond(config, key, validated, now)
+    }
+
+    fn reject_each_mutated_byte(bytes: &[u8], mut rejects: impl FnMut(&[u8]) -> bool) {
+        for index in 0..bytes.len() {
+            let mut invalid = bytes.to_vec();
+            invalid[index] ^= 1;
+            assert!(rejects(&invalid), "mutated byte {index}");
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixed complete interoperation transcript"
+    )]
+    fn complete_interoperation_vector() {
+        use std::fmt::Write;
+        use stella_crypto::{
+            derive_session_secrets, session_transcript_hash, sha256_segments, EphemeralSecret,
+            SessionRole,
+        };
+        let alice_key = signing_key(11);
+        let bob_key = signing_key(12);
+        let mut alice_config = config(&alice_key, &bob_key, 21, 22);
+        let mut bob_config = config(&bob_key, &alice_key, 22, 21);
+        let mut policy_bytes = [0; stella_proto::NETWORK_POLICY_LENGTH];
+        policy().encode(&mut policy_bytes).expect("policy");
+        for config in [&mut alice_config, &mut bob_config] {
+            config.local_grant.policy_digest = sha256_segments(&[&policy_bytes]);
+            config.peer_grant.policy_digest = config.local_grant.policy_digest;
+            config.local_grant_bytes = grant_bytes(config.local_grant);
+        }
+        let alice_secret = EphemeralSecret::from_bytes([7; 32]);
+        let bob_secret = EphemeralSecret::from_bytes([9; 32]);
+        let alice_public = alice_secret.public_key();
+        let bob_public = bob_secret.public_key();
+        let header = super::handshake_header(
+            stella_proto::PacketType::SessionInit,
+            0,
+            super::INIT_PAYLOAD_LENGTH,
+            &alice_config,
+            NOW,
+            41,
+            42,
+        );
+        let initiation = encode_signed_init(
+            header,
+            &alice_config.local_grant_bytes,
+            alice_config.peer_grant.grant_serial,
+            alice_public.as_bytes(),
+            &[13; 32],
+            1200,
+            &alice_key,
+        )
+        .expect("initiation");
+        assert!(
+            super::authenticate_initiation(&bob_config, &initiation, NOW)
+                .expect("signature")
+                .is_ok()
+        );
+        reject_each_mutated_byte(&initiation, |invalid| {
+            super::authenticate_initiation(&bob_config, invalid, NOW).is_err()
+        });
+        let response_header = super::handshake_header(
+            stella_proto::PacketType::SessionResponse,
+            0,
+            super::RESPONSE_PAYLOAD_LENGTH,
+            &bob_config,
+            NOW,
+            41,
+            42,
+        );
+        let response = super::encode_signed_response(
+            response_header,
+            &bob_config.local_grant_bytes,
+            &sha256_segments(&[&initiation]),
+            bob_public.as_bytes(),
+            &[14; 32],
+            1200,
+            &bob_key,
+        )
+        .expect("response");
+        let transcript_hash = session_transcript_hash(&initiation, &response);
+        let response_hash = sha256_segments(&[&response]);
+        let protectors = derive_session_secrets(
+            bob_secret.agree(alice_public).expect("agreement"),
+            &transcript_hash,
+            SessionRole::Responder,
+        )
+        .expect("derive")
+        .into_protectors();
+        let mut responder = ResponderHandshake {
+            config: bob_config,
+            init_header: header,
+            response_datagram: response.clone(),
+            response_hash,
+            transcript_hash,
+            protectors: Some(protectors),
+            negotiated_datagram_size: 1200,
+            initiator_confirmation: None,
+            responder_confirmation: None,
+        };
+        let mut initiator = InitiatorHandshake {
+            config: alice_config,
+            header,
+            init_datagram: initiation.clone(),
+            ephemeral: Some(alice_secret),
+            confirmation: None,
+        };
+        reject_each_mutated_byte(&response, |invalid| {
+            initiator.accept_response(invalid, NOW).is_err()
+        });
+        let confirm_i = initiator
+            .accept_response(&response, NOW)
+            .expect("response authentication")
+            .to_vec();
+        reject_each_mutated_byte(&confirm_i, |invalid| {
+            responder
+                .accept_initiator_confirmation(invalid, NOW)
+                .is_err()
+        });
+        let confirm_r = responder
+            .accept_initiator_confirmation(&confirm_i, NOW)
+            .expect("initiator confirmation")
+            .to_vec();
+        reject_each_mutated_byte(&confirm_r, |invalid| {
+            initiator
+                .accept_responder_confirmation(invalid, NOW)
+                .is_err()
+        });
+        let mut alice = initiator
+            .accept_responder_confirmation(&confirm_r, NOW)
+            .expect("responder confirmation")
+            .into_data_session()
+            .expect("data session");
+        let mut bob = responder
+            .take_established(NOW)
+            .expect("established")
+            .into_data_session()
+            .expect("data session");
+        let frame = frame(1);
+        let packet = alice.protect_frame(&frame).expect("protect").remove(0);
+        for index in 0..packet.len() {
+            let mut invalid = packet.clone();
+            invalid[index] ^= 1;
+            assert!(
+                bob.accept_datagram(&invalid, std::time::Duration::ZERO)
+                    .is_err(),
+                "DATA byte {index}"
+            );
+        }
+        assert_eq!(
+            bob.accept_datagram(&packet, std::time::Duration::ZERO)
+                .expect("data"),
+            Some(frame.clone())
+        );
+        let keepalive = alice.protect_keepalive(0).expect("keepalive");
+        for index in 0..keepalive.len() {
+            let mut invalid = keepalive.clone();
+            invalid[index] ^= 1;
+            assert!(
+                bob.accept_keepalive(&invalid).is_err(),
+                "KEEPALIVE byte {index}"
+            );
+        }
+        bob.accept_keepalive(&keepalive)
+            .expect("authenticate keepalive");
+        let mut vector = String::new();
+        for (name, bytes) in [
+            ("policy", policy_bytes.as_slice()),
+            ("init", initiation.as_slice()),
+            ("response", response.as_slice()),
+            ("confirm_i", confirm_i.as_slice()),
+            ("confirm_r", confirm_r.as_slice()),
+            ("transcript_hash", transcript_hash.as_slice()),
+            ("frame", frame.as_slice()),
+            ("data", packet.as_slice()),
+            ("keepalive", keepalive.as_slice()),
+        ] {
+            write!(vector, "{name}=").expect("string");
+            for byte in bytes {
+                write!(vector, "{byte:02x}").expect("hex");
+            }
+            vector.push('\n');
+        }
+        assert_eq!(
+            vector,
+            include_str!("../../../protocol/vectors/session-v1.txt")
+        );
+    }
+
     #[test]
     fn four_message_handshake_establishes_bidirectional_data() {
         let alice_key = signing_key(11);
@@ -1810,9 +1970,8 @@ mod tests {
 
         let mut initiator =
             InitiatorHandshake::start(alice_config, &alice_key, NOW).expect("start initiation");
-        let mut responder =
-            ResponderHandshake::respond(bob_config, &bob_key, initiator.initiation_datagram(), NOW)
-                .expect("authenticate initiation");
+        let mut responder = respond(bob_config, &bob_key, initiator.initiation_datagram(), NOW)
+            .expect("authenticate initiation");
         let response = responder.response_datagram().to_vec();
         let initiator_confirm = initiator
             .accept_response(&response, NOW)
@@ -1823,7 +1982,7 @@ mod tests {
             .expect("confirm initiator keys")
             .to_vec();
         let bob_established = responder
-            .into_established(NOW)
+            .take_established(NOW)
             .expect("establish responder");
         let alice_established = initiator
             .accept_responder_confirmation(&responder_confirm, NOW)
@@ -1866,7 +2025,7 @@ mod tests {
         let initiation =
             InitiatorHandshake::start(alice_config, &alice_key, NOW).expect("start initiation");
         assert!(matches!(
-            ResponderHandshake::respond(
+            respond(
                 bob_config.clone(),
                 &bob_key,
                 initiation.initiation_datagram(),
@@ -1878,7 +2037,7 @@ mod tests {
         let signature_index = mutated.len() - 1;
         mutated[signature_index] ^= 1;
         assert!(matches!(
-            ResponderHandshake::respond(bob_config, &bob_key, &mutated, NOW),
+            respond(bob_config, &bob_key, &mutated, NOW),
             Err(HandshakeError::Crypto(_))
         ));
     }
@@ -2018,7 +2177,9 @@ mod tests {
             &preferred_config.local_grant_bytes,
             preferred_config.peer_grant.grant_serial,
             original_init.initiator_ephemeral(),
-            original_init.initiator_nonce(),
+            original_init.signed_payload()[288..320]
+                .try_into()
+                .expect("nonce"),
             original_init.max_datagram_size(),
             preferred_key,
         )
@@ -2145,7 +2306,7 @@ mod tests {
             &stale_grant_bytes,
             bob_config.local_grant.grant_serial,
             init.initiator_ephemeral(),
-            init.initiator_nonce(),
+            init.signed_payload()[288..320].try_into().expect("nonce"),
             init.max_datagram_size(),
             &alice_key,
         )
@@ -2166,7 +2327,7 @@ mod tests {
             &alice_config.local_grant_bytes,
             GrantSerial::from_bytes([0xee; 16]),
             init.initiator_ephemeral(),
-            init.initiator_nonce(),
+            init.signed_payload()[288..320].try_into().expect("nonce"),
             init.max_datagram_size(),
             &alice_key,
         )

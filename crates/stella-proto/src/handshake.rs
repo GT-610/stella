@@ -231,7 +231,6 @@ pub struct SessionInitView<'a> {
     initiator_grant: MembershipGrantView<'a>,
     receiver_grant_serial: GrantSerial,
     initiator_ephemeral: &'a [u8; X25519_PUBLIC_KEY_LENGTH],
-    initiator_nonce: &'a [u8; HANDSHAKE_NONCE_LENGTH],
     max_datagram_size: u32,
     signature: &'a [u8; ED25519_SIGNATURE_LENGTH],
 }
@@ -258,7 +257,7 @@ impl<'a> SessionInitView<'a> {
             "initiator ephemeral key",
             parts.signed_header.len() + cursor.position() - X25519_PUBLIC_KEY_LENGTH,
         )?;
-        let initiator_nonce = array_ref(
+        let initiator_nonce = array_ref::<HANDSHAKE_NONCE_LENGTH>(
             cursor.read_slice(HANDSHAKE_NONCE_LENGTH, "initiator nonce")?,
             "initiator nonce",
             parts.signed_header.len() + cursor.position() - HANDSHAKE_NONCE_LENGTH,
@@ -297,7 +296,6 @@ impl<'a> SessionInitView<'a> {
             initiator_grant,
             receiver_grant_serial,
             initiator_ephemeral,
-            initiator_nonce,
             max_datagram_size,
             signature,
         })
@@ -349,12 +347,6 @@ impl<'a> SessionInitView<'a> {
     #[must_use]
     pub const fn initiator_ephemeral(&self) -> &'a [u8; X25519_PUBLIC_KEY_LENGTH] {
         self.initiator_ephemeral
-    }
-
-    /// Borrows the initiator nonce.
-    #[must_use]
-    pub const fn initiator_nonce(&self) -> &'a [u8; HANDSHAKE_NONCE_LENGTH] {
-        self.initiator_nonce
     }
 
     /// Returns the initiator receive datagram limit.
@@ -444,7 +436,6 @@ pub struct SessionResponseView<'a> {
     responder_grant: MembershipGrantView<'a>,
     init_hash: &'a [u8; SHA256_DIGEST_LENGTH],
     responder_ephemeral: &'a [u8; X25519_PUBLIC_KEY_LENGTH],
-    responder_nonce: &'a [u8; HANDSHAKE_NONCE_LENGTH],
     max_datagram_size: u32,
     signature: &'a [u8; ED25519_SIGNATURE_LENGTH],
 }
@@ -473,7 +464,7 @@ impl<'a> SessionResponseView<'a> {
             "responder ephemeral key",
             parts.signed_header.len() + cursor.position() - X25519_PUBLIC_KEY_LENGTH,
         )?;
-        let responder_nonce = array_ref(
+        let responder_nonce = array_ref::<HANDSHAKE_NONCE_LENGTH>(
             cursor.read_slice(HANDSHAKE_NONCE_LENGTH, "responder nonce")?,
             "responder nonce",
             parts.signed_header.len() + cursor.position() - HANDSHAKE_NONCE_LENGTH,
@@ -512,7 +503,6 @@ impl<'a> SessionResponseView<'a> {
             responder_grant,
             init_hash,
             responder_ephemeral,
-            responder_nonce,
             max_datagram_size,
             signature,
         })
@@ -564,12 +554,6 @@ impl<'a> SessionResponseView<'a> {
     #[must_use]
     pub const fn responder_ephemeral(&self) -> &'a [u8; X25519_PUBLIC_KEY_LENGTH] {
         self.responder_ephemeral
-    }
-
-    /// Borrows the responder nonce.
-    #[must_use]
-    pub const fn responder_nonce(&self) -> &'a [u8; HANDSHAKE_NONCE_LENGTH] {
-        self.responder_nonce
     }
 
     /// Returns the responder receive datagram limit.
@@ -1454,7 +1438,7 @@ mod tests {
         );
         assert_eq!(decoded.receiver_grant_serial(), serial);
         assert_eq!(decoded.initiator_ephemeral(), &EPHEMERAL);
-        assert_eq!(decoded.initiator_nonce(), &NONCE);
+        assert_eq!(&decoded.signed_payload()[288..320], &NONCE);
         assert_eq!(decoded.max_datagram_size(), 1_400);
         assert_eq!(decoded.signature(), &SESSION_SIGNATURE);
         assert_eq!(decoded.encoded_len(), encoded.len());
@@ -1493,7 +1477,7 @@ mod tests {
         assert_eq!(decoded.responder_grant().grant(), grant(RESPONDER_ID));
         assert_eq!(decoded.init_hash(), &INIT_HASH);
         assert_eq!(decoded.responder_ephemeral(), &EPHEMERAL);
-        assert_eq!(decoded.responder_nonce(), &NONCE);
+        assert_eq!(&decoded.signed_payload()[304..336], &NONCE);
         assert_eq!(decoded.max_datagram_size(), 65_507);
         assert_eq!(decoded.signature(), &SESSION_SIGNATURE);
     }

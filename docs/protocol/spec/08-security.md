@@ -487,3 +487,25 @@ An implementation test suite includes:
 The Stella repository publishes deterministic protocol vectors alongside the
 codec implementation. A vector includes every input byte, intermediate digest,
 derived key, nonce prefix, output packet, and expected validation result.
+
+## Reference handshake admission policy
+
+Before signature verification or key agreement, the reference client admits only
+controller-authorized peer endpoints and applies monotonic token buckets per
+network: 8 attempts/second with burst 32 per node, 32/second with burst 64 per
+endpoint, and 256/second with burst 256 in aggregate. These are local deployment
+defaults, not wire fields or negotiated protocol constants. Every handshake
+packet, including one requesting a cached response, consumes admission budget.
+Over-budget packets are silently dropped. Unknown identities or endpoints do
+not allocate limiter entries; entries are bounded by authorized peers and paths
+and pruned as those sets change.
+
+An INIT that reaches authentication is validated once. Its private validated
+result is consumed by responder construction; there is no public entry point
+that skips grant or INIT authentication. Signed stale-epoch rejections still
+require a valid controller signature on the presented grant.
+
+The complete deterministic session fixture is published in the repository at
+`protocol/vectors/session-v1.txt`, with key-schedule results in
+`protocol/vectors/session-v1-keys.txt` and an independent Python verifier.
+These public test keys MUST NOT be used for deployment identities.

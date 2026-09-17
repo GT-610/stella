@@ -457,3 +457,23 @@ Relay tests cover:
 - direct-to-relay failover and relay-to-direct upgrade;
 - relay restart and replacement allocation; and
 - 32-node normal and 100-node bounded stress scenarios.
+
+## Reference runtime path and stream lifecycle
+
+TURN TCP/TLS readers retain framing progress across cancelled reads, including
+partial prefixes and bodies. Timer or command selection MUST NOT discard bytes
+already consumed from a stream. Framing errors terminate the carrier.
+
+Relay availability updates are incremental. An unchanged endpoint retains its
+path identity and healthy sessions; an added relay only adds candidate paths.
+Withdrawal removes active and receive-only retired sessions bound to that path,
+its pending exchanges, and affected forwarding state. It does not revoke healthy
+direct sessions or sessions on other relay paths. Duplicate availability
+notifications are idempotent. Carrier events remain scoped to their allocation.
+
+Rotating connectivity credentials or generation IDs does not itself revoke a
+data session. Candidate withdrawal removes the affected advertised paths;
+peer-reflexive direct paths remain subject to consent. Authorization, epoch,
+policy and grant changes retain their existing invalidation rules. Moving a
+session to another path still requires a fresh handshake and the existing
+receive-only old-session grace period.

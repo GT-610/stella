@@ -37,17 +37,17 @@ pub use connectivity::{
     MIN_ICE_PASSWORD_LENGTH, MIN_ICE_USERNAME_FRAGMENT_LENGTH, STUN_SERVER_RECORD_LENGTH,
 };
 pub use control::{
-    control_fields_encoded_len, decode_control_record_length, encode_control_fields,
-    encode_control_message, encode_control_record_length, ControlFieldIter, ControlFieldRef,
-    ControlFieldType, ControlHeader, ControlMessageType, ControlMessageView, CONTROL_HEADER_LENGTH,
-    CONTROL_MAGIC, CONTROL_RECORD_PREFIX_LENGTH, MAX_CONTROL_RECORD_LENGTH,
+    control_fields_encoded_len, decode_control_record_length, encode_control_message,
+    encode_control_record_length, ControlFieldIter, ControlFieldRef, ControlFieldType,
+    ControlHeader, ControlMessageType, ControlMessageView, CONTROL_HEADER_LENGTH, CONTROL_MAGIC,
+    CONTROL_RECORD_PREFIX_LENGTH, MAX_CONTROL_RECORD_LENGTH,
 };
 pub use data::{
     encode_data_packet, DataHeader, DataPacketView, AUTHENTICATION_TAG_LENGTH, DATA_ENCRYPTED_FLAG,
     DATA_FIXED_HEADER_LENGTH, MAX_ETHERNET_FRAME_LENGTH, MIN_ETHERNET_FRAME_LENGTH,
 };
 pub use error::CodecError;
-pub use extension::{encode_extensions, extensions_encoded_len, ExtensionIter, ExtensionRef};
+pub use extension::{extensions_encoded_len, ExtensionIter, ExtensionRef};
 pub use grant::{
     encode_membership_grant, MembershipGrant, MembershipGrantView, MembershipPermissions,
     ED25519_SIGNATURE_LENGTH, MAX_MEMBERSHIP_GRANT_LIFETIME_SECONDS,

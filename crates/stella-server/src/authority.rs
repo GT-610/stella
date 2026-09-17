@@ -23,18 +23,6 @@ pub struct AuthorityHandle {
 }
 
 impl AuthorityHandle {
-    /// Returns the fixed maximum number of queued authority commands.
-    #[must_use]
-    pub fn max_queue_capacity(&self) -> usize {
-        self.sender.max_capacity()
-    }
-
-    /// Returns the number of commands that can currently enter without waiting.
-    #[must_use]
-    pub fn remaining_queue_capacity(&self) -> usize {
-        self.sender.capacity()
-    }
-
     /// Verifies every persisted authority invariant.
     ///
     /// # Errors
@@ -1082,7 +1070,6 @@ mod tests {
         )
         .expect("spawn authority thread");
         let authority = worker.handle();
-        assert_eq!(authority.max_queue_capacity(), 2);
 
         let node =
             NodeRecord::new(signing_key(32).public_key(), "Async node", 100).expect("valid node");
@@ -1211,7 +1198,6 @@ mod tests {
             .await
             .expect("get endpoints")
             .expect("online record exists");
-        assert_eq!(stored.updated_at(), 140);
         assert_eq!(stored.endpoints(), &[endpoint]);
         let view = authority
             .network_session_view(node_id, network_id)
@@ -1291,7 +1277,10 @@ mod tests {
             .expect("get connectivity")
             .expect("connectivity exists");
         assert_eq!(stored.generation_id(), 42);
-        assert_eq!(stored.encoded_generation(), generation);
+        assert_eq!(
+            &stored.encoded_record()[stella_proto::CONNECTIVITY_RECORD_FIXED_LENGTH..],
+            generation
+        );
         assert_eq!(
             authority
                 .list_connectivity(network_id)

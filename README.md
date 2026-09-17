@@ -37,6 +37,15 @@ Version 0.2.0 removes the public `stella_control::CorrelationTracker` type and
 workspace and are no longer supported; downstream consumers must maintain any
 request-correlation limits themselves.
 
+The runtime audit also removes unused Rust convenience APIs:
+`ClientDataRuntime::local_udp_addresses`, `IdentitySigningKey::export_seed`,
+`MacosTapProxyDevice::create_with_socket`, `MacAddress::is_locally_administered`,
+`Endpoint::as_turn_udp`, `verify_controller_identity_permissions`,
+`ResponderHandshake::into_established`, `ResponderHandshake::respond`, and
+`NetworkDataPlane::accept_udp_datagram`.
+Use the generic endpoint/session APIs and validated identity loading instead.
+Wire, CLI, configuration, and database formats are unchanged.
+
 ## Workspace checks
 
 ```sh
@@ -51,3 +60,6 @@ each development or production build. Controller setup and operation are
 documented in [`docs/guide/server-deployment.md`](docs/guide/server-deployment.md).
 macOS feth setup and privileged verification are documented in
 [`docs/guide/macos-development.md`](docs/guide/macos-development.md).
+
+The [runtime audit report](docs/development/runtime-audit.md) contains the full
+removed Rust API list, performance samples and current verification scope.

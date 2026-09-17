@@ -227,12 +227,6 @@ impl MacAddress {
         !self.is_group() && !self.is_zero()
     }
 
-    /// Returns whether the locally administered bit is set.
-    #[must_use]
-    pub const fn is_locally_administered(&self) -> bool {
-        self.0[0] & 2 == 2
-    }
-
     /// Classifies this address as a destination.
     #[must_use]
     pub const fn destination_class(&self) -> EthernetDestination {
@@ -433,7 +427,6 @@ mod tests {
         let zero = MacAddress::from_bytes([0; MacAddress::LENGTH]);
 
         assert!(unicast.is_valid_unicast());
-        assert!(unicast.is_locally_administered());
         assert_eq!(unicast.destination_class(), EthernetDestination::Unicast);
         assert!(multicast.is_group());
         assert!(multicast.is_multicast());

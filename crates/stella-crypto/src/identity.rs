@@ -211,12 +211,6 @@ impl IdentitySigningKey {
         IdentityPublicKey(self.0.verifying_key().to_bytes())
     }
 
-    /// Copies the private seed into a new zeroizing wrapper for persistence.
-    #[must_use]
-    pub fn export_seed(&self) -> IdentitySeed {
-        IdentitySeed::from_bytes(self.0.to_bytes())
-    }
-
     /// Encodes this identity as an unencrypted PKCS#8 DER document.
     ///
     /// # Errors

@@ -1,7 +1,7 @@
 //! Per-network routing between TAP frames, peer sessions, and UDP datagrams.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -20,6 +20,8 @@ use crate::{
     PeerDataSession, PeerHandshakeConfig, PeerHandshakeManager, PeerIngress, SwitchError,
     TapForwarding,
 };
+
+use crate::rate::TokenBucket;
 
 const ROUTINE_REKEY_PACKET_LIMIT: u64 = u32::MAX as u64;
 const ROUTINE_REKEY_LEAD: u64 = 10;
@@ -125,18 +127,6 @@ pub struct NetworkOutput {
 }
 
 impl NetworkOutput {
-    /// Borrows all complete datagrams selected for transmission.
-    #[must_use]
-    pub fn datagrams(&self) -> &[RoutedDatagram] {
-        &self.datagrams
-    }
-
-    /// Borrows one authenticated frame selected for local TAP delivery.
-    #[must_use]
-    pub fn tap_frame(&self) -> Option<&[u8]> {
-        self.tap_frame.as_deref()
-    }
-
     /// Consumes the output into owned datagrams and optional TAP frame.
     #[must_use]
     pub fn into_parts(self) -> (Vec<RoutedDatagram>, Option<Vec<u8>>) {
@@ -182,7 +172,11 @@ pub struct NetworkDataPlane {
     paths: BTreeMap<PathId, PeerPath>,
     peer_paths: BTreeMap<NodeId, Vec<PathId>>,
     next_path_id: u64,
+    handshake_budget: TokenBucket,
+    node_budgets: BTreeMap<NodeId, TokenBucket>,
+    endpoint_budgets: HashMap<TransportEndpoint, TokenBucket>,
     sessions: BTreeMap<NodeId, InstalledSession>,
+    forwarding_peers: BTreeSet<NodeId>,
     retired_sessions: BTreeMap<(NodeId, u64), RetiredSession>,
 }
 
@@ -250,7 +244,11 @@ impl NetworkDataPlane {
             paths: BTreeMap::new(),
             peer_paths: BTreeMap::new(),
             next_path_id: 1,
+            handshake_budget: TokenBucket::new(256, 256, now),
+            node_budgets: BTreeMap::new(),
+            endpoint_budgets: HashMap::new(),
             sessions: BTreeMap::new(),
+            forwarding_peers: BTreeSet::new(),
             retired_sessions: BTreeMap::new(),
         };
         let peers: Vec<NodeId> = plane.state.peers().keys().copied().collect();
@@ -268,17 +266,14 @@ impl NetworkDataPlane {
 
     /// Returns the established peers currently eligible for forwarding.
     #[must_use]
-    pub fn established_peers(&self) -> BTreeSet<NodeId> {
-        self.sessions
-            .iter()
-            .filter_map(|(peer, session)| (!session.rekeying).then_some(*peer))
-            .collect()
+    pub const fn established_peers(&self) -> &BTreeSet<NodeId> {
+        &self.forwarding_peers
     }
 
     /// Replaces the locally allocated relay carriers and rebuilds affected paths.
     ///
-    /// Existing sessions are withdrawn because changing local carrier
-    /// availability changes which exact `PathId` can send and receive packets.
+    /// Unchanged endpoints retain their path IDs and sessions. Only sessions
+    /// pinned to withdrawn carriers are removed.
     ///
     /// # Errors
     ///
@@ -304,8 +299,6 @@ impl NetworkDataPlane {
         self.available_relay_carriers = updated;
         let peers = self.state.peers().keys().copied().collect::<Vec<_>>();
         for peer in peers {
-            self.remove_session(peer);
-            self.remove_peer_paths(peer);
             self.install_peer_paths(peer)?;
         }
         Ok(())
@@ -452,9 +445,8 @@ impl NetworkDataPlane {
                     .peers()
                     .get(peer)
                     .is_some_and(|state| grant_is_valid(state.grant(), wall_time))
-                    && self.sessions.get(peer).is_none_or(|session| {
-                        session.rekeying || self.pending_path_upgrades.contains_key(peer)
-                    })
+                    && (!self.established_peers().contains(peer)
+                        || self.pending_path_upgrades.contains_key(peer))
                     && !self.handshakes.has_outgoing(*peer)
                     && self.handshakes.can_initiate(*peer, monotonic_now)
                     && self.select_peer_path(*peer).is_some()
@@ -509,6 +501,7 @@ impl NetworkDataPlane {
         for peer in rekey {
             if let Some(session) = self.sessions.get_mut(&peer) {
                 session.rekeying = true;
+                self.forwarding_peers.remove(&peer);
             }
         }
         let mut output = NetworkOutput::default();
@@ -564,8 +557,9 @@ impl NetworkDataPlane {
         frame: &[u8],
         now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
-        let eligible = self.established_peers();
-        let forwarding = self.switch.forward_tap_frame(frame, &eligible, now)?;
+        let forwarding = self
+            .switch
+            .forward_tap_frame(frame, &self.forwarding_peers, now)?;
         let peers = match forwarding {
             TapForwarding::Local | TapForwarding::RateLimited { .. } => Vec::new(),
             TapForwarding::Unicast(peer) => vec![peer],
@@ -620,6 +614,9 @@ impl NetworkDataPlane {
             | PacketType::SessionReject => {
                 let header = HandshakeHeader::decode(datagram)?;
                 let path_id = self.resolve_peer_path(header.sender_node_id, source)?;
+                if !self.admit_handshake(header.sender_node_id, source, monotonic_now) {
+                    return Ok(NetworkOutput::default());
+                }
                 let event = self.handshakes.handle_datagram(
                     datagram,
                     signing_key,
@@ -632,36 +629,10 @@ impl NetworkDataPlane {
         }
     }
 
-    /// Authenticates and routes one UDP datagram from an authorized endpoint.
-    ///
-    /// This compatibility entry point wraps the endpoint in the generic
-    /// transport-path representation used by [`Self::accept_datagram`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NetworkDataError`] for the same conditions as
-    /// [`Self::accept_datagram`].
-    pub fn accept_udp_datagram(
-        &mut self,
-        source: SocketAddr,
-        datagram: &[u8],
-        signing_key: &IdentitySigningKey,
-        wall_time: u64,
-        monotonic_now: Duration,
-    ) -> Result<NetworkOutput, NetworkDataError> {
-        self.accept_datagram(
-            &TransportEndpoint::Udp(source),
-            datagram,
-            signing_key,
-            wall_time,
-            monotonic_now,
-        )
-    }
-
     /// Replaces authoritative control state and invalidates affected sessions.
     ///
-    /// Epoch, policy, local-grant, peer-grant, or endpoint changes immediately
-    /// remove the corresponding data keys, replay state, and learned MACs.
+    /// Authority changes invalidate affected sessions immediately. Connectivity
+    /// refreshes retain unchanged paths and only withdraw unavailable endpoints.
     ///
     /// # Errors
     ///
@@ -683,6 +654,7 @@ impl NetworkDataPlane {
         let old_peers = self.state.peers().clone();
         if reset_all {
             self.sessions.clear();
+            self.forwarding_peers.clear();
             self.retired_sessions.clear();
             self.paths.clear();
             self.peer_paths.clear();
@@ -707,23 +679,41 @@ impl NetworkDataPlane {
                 || old_peers.get(&peer).is_none_or(|old| {
                     self.state.peers().get(&peer).is_none_or(|current| {
                         old.endpoints() != current.endpoints()
-                            || old.connectivity() != current.connectivity()
+                            || old
+                                .connectivity()
+                                .map(crate::PeerConnectivityState::candidates)
+                                != current
+                                    .connectivity()
+                                    .map(crate::PeerConnectivityState::candidates)
                     })
                 });
             let changed = old_peers.get(&peer).is_none_or(|old| {
-                self.state.peers().get(&peer).is_none_or(|current| {
-                    old.grant().grant_serial != current.grant().grant_serial
-                        || old.endpoints() != current.endpoints()
-                        || old.connectivity() != current.connectivity()
-                })
+                self.state
+                    .peers()
+                    .get(&peer)
+                    .is_none_or(|current| old.grant().grant_serial != current.grant().grant_serial)
             });
             if changed {
                 self.remove_session(peer);
             }
             if endpoints_changed {
-                self.nominated_direct_paths.remove(&peer);
-                self.pending_path_upgrades.remove(&peer);
-                self.remove_peer_paths(peer);
+                // A nominated peer-reflexive path is governed by consent. An
+                // explicitly removed advertised candidate cannot remain pinned.
+                if let Some(address) = self.nominated_direct_paths.get(&peer).copied() {
+                    let advertised = |state: &crate::PeerState| {
+                        state.connectivity().is_some_and(|connectivity| {
+                            connectivity.candidates().iter().any(|candidate| {
+                                candidate.carrier == ConnectivityCarrier::DirectUdp
+                                    && candidate.address == address
+                            })
+                        })
+                    };
+                    if old_peers.get(&peer).is_some_and(advertised)
+                        && !self.state.peers().get(&peer).is_some_and(advertised)
+                    {
+                        self.nominated_direct_paths.remove(&peer);
+                    }
+                }
                 self.install_peer_paths(peer)?;
             }
             self.handshakes
@@ -735,6 +725,28 @@ impl NetworkDataPlane {
                 )?)?;
         }
         Ok(())
+    }
+
+    fn admit_handshake(&mut self, peer: NodeId, source: &TransportEndpoint, now: Duration) -> bool {
+        // Call only after resolving the authorized peer/path; attacker-controlled
+        // identities and addresses never allocate admission state.
+        // Exhausted aggregate admission must also bound limiter housekeeping.
+        if !self.handshake_budget.take(now) {
+            return false;
+        }
+        self.node_budgets
+            .retain(|node, _| self.state.peers().contains_key(node));
+        self.endpoint_budgets
+            .retain(|endpoint, _| self.paths.values().any(|path| &path.endpoint == endpoint));
+        self.endpoint_budgets
+            .entry(source.clone())
+            .or_insert_with(|| TokenBucket::new(32, 64, now))
+            .take(now)
+            && self
+                .node_budgets
+                .entry(peer)
+                .or_insert_with(|| TokenBucket::new(8, 32, now))
+                .take(now)
     }
 
     fn accept_data(
@@ -766,7 +778,9 @@ impl NetworkDataPlane {
                 datagrams: Vec::new(),
                 tap_frame: Some(frame),
             }),
-            PeerIngress::DropLocalMacConflict => Ok(NetworkOutput::default()),
+            PeerIngress::DropLocalMacConflict | PeerIngress::DropFloodLimit => {
+                Ok(NetworkOutput::default())
+            }
         }
     }
 
@@ -818,6 +832,7 @@ impl NetworkDataPlane {
                 if self.pending_path_upgrades.get(&peer_node_id) == Some(&path_id) {
                     self.pending_path_upgrades.remove(&peer_node_id);
                 }
+                self.forwarding_peers.insert(peer_node_id);
                 if let Some(previous) = self.sessions.insert(
                     peer_node_id,
                     InstalledSession {
@@ -1024,54 +1039,80 @@ impl NetworkDataPlane {
                 endpoint.port(),
             )
         });
-        let mut path_ids = Vec::with_capacity(
-            usize::from(nominated_direct.is_some())
-                .saturating_add(relay_endpoints.len())
-                .saturating_add(endpoints.len()),
+        let desired = nominated_direct.into_iter().chain(relay_endpoints).chain(
+            endpoints
+                .into_iter()
+                .map(|endpoint| TransportEndpoint::Udp(endpoint_socket_address(endpoint))),
         );
-        if let Some(endpoint) = nominated_direct {
-            let path_id = self.allocate_path_id()?;
-            self.paths.insert(
-                path_id,
-                PeerPath {
-                    peer_node_id: peer,
-                    endpoint,
-                },
-            );
-            path_ids.push(path_id);
-        }
-        for endpoint in relay_endpoints {
-            let path_id = self.allocate_path_id()?;
-            self.paths.insert(
-                path_id,
-                PeerPath {
-                    peer_node_id: peer,
-                    endpoint,
-                },
-            );
-            path_ids.push(path_id);
-        }
-        for endpoint in endpoints {
-            let endpoint = TransportEndpoint::Udp(endpoint_socket_address(endpoint));
-            if path_ids.iter().any(|path_id| {
-                self.paths
-                    .get(path_id)
-                    .is_some_and(|path| path.endpoint == endpoint)
-            }) {
-                continue;
+        let mut path_ids = Vec::new();
+        for endpoint in desired {
+            let existing = self.paths.iter().find_map(|(id, path)| {
+                (path.peer_node_id == peer && path.endpoint == endpoint).then_some(*id)
+            });
+            let path_id = if let Some(id) = existing {
+                id
+            } else {
+                let id = self.allocate_path_id()?;
+                self.paths.insert(
+                    id,
+                    PeerPath {
+                        peer_node_id: peer,
+                        endpoint,
+                    },
+                );
+                id
+            };
+            if !path_ids.contains(&path_id) {
+                path_ids.push(path_id);
             }
-            let path_id = self.allocate_path_id()?;
-            self.paths.insert(
-                path_id,
-                PeerPath {
-                    peer_node_id: peer,
-                    endpoint,
-                },
-            );
-            path_ids.push(path_id);
         }
+        let removed = self
+            .peer_paths
+            .get(&peer)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|id| !path_ids.contains(id))
+            .collect::<Vec<_>>();
+        self.withdraw_peer_paths(peer, &removed);
         self.peer_paths.insert(peer, path_ids);
         Ok(())
+    }
+
+    fn withdraw_peer_paths(&mut self, peer: NodeId, removed: &[PathId]) {
+        if !removed.is_empty() {
+            self.handshakes.cancel_exchanges(peer);
+            if self
+                .pending_path_upgrades
+                .get(&peer)
+                .is_some_and(|id| removed.contains(id))
+            {
+                self.pending_path_upgrades.remove(&peer);
+            }
+            if self
+                .sessions
+                .get(&peer)
+                .is_some_and(|session| removed.contains(&session.path_id))
+            {
+                self.forwarding_peers.remove(&peer);
+                if let Some(session) = self.sessions.remove(&peer) {
+                    self.handshakes.retire_session(peer, session.session_id);
+                }
+                self.switch.remove_peer(peer);
+            }
+            let retired = self
+                .retired_sessions
+                .iter()
+                .filter_map(|(key, session)| removed.contains(&session.path_id).then_some(*key))
+                .collect::<Vec<_>>();
+            for key @ (node, session_id) in retired {
+                self.retired_sessions.remove(&key);
+                self.handshakes.retire_session(node, session_id);
+            }
+            for id in removed {
+                self.paths.remove(id);
+            }
+        }
     }
 
     fn relay_candidate_available(&self, candidate: &IceCandidate) -> bool {
@@ -1129,6 +1170,7 @@ impl NetworkDataPlane {
     }
 
     fn remove_session(&mut self, peer: NodeId) {
+        self.forwarding_peers.remove(&peer);
         if let Some(previous) = self.sessions.remove(&peer) {
             self.handshakes.retire_session(peer, previous.session_id);
         }
@@ -1549,12 +1591,12 @@ mod tests {
         assert!(plane
             .start_handshakes(local_key, WALL_TIME, Duration::ZERO)
             .expect("skip endpointless peer")
-            .datagrams()
+            .datagrams
             .is_empty());
         assert!(plane
             .maintain(local_key, WALL_TIME, Duration::from_secs(1))
             .expect("continue waiting for peer endpoint")
-            .datagrams()
+            .datagrams
             .is_empty());
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
@@ -1869,7 +1911,7 @@ mod tests {
         let output = local
             .start_handshakes(local_key, WALL_TIME, Duration::from_secs(1))
             .expect("start relay fallback handshake");
-        let datagram = output.datagrams().first().expect("relay handshake");
+        let datagram = output.datagrams.first().expect("relay handshake");
         assert_eq!(datagram.peer_node_id(), remote_id);
         assert_eq!(
             local
@@ -2105,8 +2147,8 @@ mod tests {
             let mut next = Vec::new();
             for datagram in pending {
                 let output = if from_alice {
-                    bob.accept_udp_datagram(
-                        alice_address,
+                    bob.accept_datagram(
+                        &stella_transport::Endpoint::Udp(alice_address),
                         datagram.bytes(),
                         bob_key,
                         wall_time,
@@ -2115,8 +2157,8 @@ mod tests {
                     .expect("bob accepts handshake")
                 } else {
                     alice
-                        .accept_udp_datagram(
-                            bob_address,
+                        .accept_datagram(
+                            &stella_transport::Endpoint::Udp(bob_address),
                             datagram.bytes(),
                             alice_key,
                             wall_time,
@@ -2130,6 +2172,103 @@ mod tests {
             from_alice = !from_alice;
         }
         panic!("handshake did not converge within eight flights");
+    }
+
+    #[test]
+    fn cached_handshake_responses_obey_ingress_budgets() {
+        let (directory, store, controller, alice_key, bob_key, network_id) = fixture();
+        let (initiator, responder, source, destination) =
+            if derive_node_id(alice_key.public_key()) < derive_node_id(bob_key.public_key()) {
+                (&alice_key, &bob_key, "127.0.0.1:46001", "127.0.0.1:46002")
+            } else {
+                (&bob_key, &alice_key, "127.0.0.1:46002", "127.0.0.1:46001")
+            };
+        let source = source.parse().expect("source");
+        let mut sender = NetworkDataPlane::new(
+            state(&store, &controller, initiator, network_id),
+            MacAddress::from_bytes([2, 0, 0, 0, 1, 1]),
+            source,
+            1200,
+            initiator,
+            Duration::ZERO,
+        )
+        .expect("sender");
+        let mut receiver = NetworkDataPlane::new(
+            state(&store, &controller, responder, network_id),
+            MacAddress::from_bytes([2, 0, 0, 0, 1, 2]),
+            destination.parse().expect("destination"),
+            1200,
+            responder,
+            Duration::ZERO,
+        )
+        .expect("receiver");
+        let initiation = sender
+            .start_handshakes(initiator, WALL_TIME, Duration::ZERO)
+            .expect("initiate")
+            .into_parts()
+            .0
+            .remove(0);
+        let unknown = TransportEndpoint::Udp("127.0.0.1:49999".parse().expect("unknown"));
+        assert!(receiver
+            .accept_datagram(
+                &unknown,
+                initiation.bytes(),
+                responder,
+                WALL_TIME,
+                Duration::ZERO
+            )
+            .is_err());
+        assert!(receiver.node_budgets.is_empty());
+        assert!(receiver.endpoint_budgets.is_empty());
+        let endpoint = TransportEndpoint::Udp(source);
+        for _ in 0..32 {
+            assert_eq!(
+                receiver
+                    .accept_datagram(
+                        &endpoint,
+                        initiation.bytes(),
+                        responder,
+                        WALL_TIME,
+                        Duration::ZERO
+                    )
+                    .expect("initial or cached response")
+                    .into_parts()
+                    .0
+                    .len(),
+                1
+            );
+        }
+        assert!(receiver
+            .accept_datagram(
+                &endpoint,
+                initiation.bytes(),
+                responder,
+                WALL_TIME,
+                Duration::ZERO
+            )
+            .expect("silent budget drop")
+            .into_parts()
+            .0
+            .is_empty());
+        assert_eq!(
+            receiver
+                .accept_datagram(
+                    &endpoint,
+                    initiation.bytes(),
+                    responder,
+                    WALL_TIME,
+                    Duration::from_secs(1)
+                )
+                .expect("refilled response budget")
+                .into_parts()
+                .0
+                .len(),
+            1
+        );
+        assert_eq!(receiver.node_budgets.len(), 1);
+        assert_eq!(receiver.endpoint_budgets.len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[test]
@@ -2188,11 +2327,11 @@ mod tests {
         assert!(alice
             .accept_tap_frame(&frame, Duration::from_secs(2))
             .expect("drop local frame after expiry")
-            .datagrams()
+            .datagrams
             .is_empty());
         assert!(matches!(
-            bob.accept_udp_datagram(
-                alice_address,
+            bob.accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 late_packet.bytes(),
                 &bob_key,
                 expires_at,
@@ -2245,6 +2384,89 @@ mod tests {
         assert_eq!(alice.established_peers().len(), 1);
         assert_eq!(bob.established_peers().len(), 1);
 
+        let sessions_before = alice
+            .sessions
+            .iter()
+            .map(|(peer, session)| (*peer, session.session_id, session.path_id))
+            .collect::<Vec<_>>();
+        for carriers in [
+            vec![(
+                RelayId::from_bytes([0x71; 16]),
+                ConnectivityCarrier::TurnUdp,
+            )],
+            vec![],
+            vec![],
+        ] {
+            alice
+                .set_available_relay_carriers(&carriers)
+                .expect("relay availability change");
+            bob.set_available_relay_carriers(&carriers)
+                .expect("relay availability change");
+            assert_eq!(
+                alice
+                    .sessions
+                    .iter()
+                    .map(|(peer, session)| (*peer, session.session_id, session.path_id))
+                    .collect::<Vec<_>>(),
+                sessions_before
+            );
+        }
+
+        // Removing an unused advertised endpoint must preserve the active path.
+        store
+            .publish_endpoints(
+                derive_node_id(alice_key.public_key()),
+                network_id,
+                &[Endpoint::UdpIpv4 {
+                    priority: 0,
+                    port: alice_address.port(),
+                    max_datagram_size: 1_200,
+                    address: Ipv4Addr::LOCALHOST,
+                }],
+                130,
+            )
+            .expect("withdraw unused alternate endpoint");
+        let bob_session = bob.sessions.values().next().expect("Bob session");
+        let bob_binding = (bob_session.session_id, bob_session.path_id);
+        bob.reconcile(
+            state(&store, &controller, &bob_key, network_id),
+            &bob_key,
+            bob_mac,
+            Duration::ZERO,
+        )
+        .expect("reconcile partial endpoint withdrawal");
+        let bob_session = bob.sessions.values().next().expect("preserved Bob session");
+        assert_eq!((bob_session.session_id, bob_session.path_id), bob_binding);
+        // Restore the alternate for the path-mismatch assertion below.
+        store
+            .publish_endpoints(
+                derive_node_id(alice_key.public_key()),
+                network_id,
+                &[
+                    Endpoint::UdpIpv4 {
+                        priority: 0,
+                        port: 46001,
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::LOCALHOST,
+                    },
+                    Endpoint::UdpIpv4 {
+                        priority: 1,
+                        port: 46003,
+                        max_datagram_size: 1_200,
+                        address: Ipv4Addr::LOCALHOST,
+                    },
+                ],
+                131,
+            )
+            .expect("restore alternate");
+        bob.reconcile(
+            state(&store, &controller, &bob_key, network_id),
+            &bob_key,
+            bob_mac,
+            Duration::ZERO,
+        )
+        .expect("add alternate without replacing session");
+
         let broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xa1);
         let packets = alice
             .accept_tap_frame(&broadcast, Duration::from_secs(1))
@@ -2259,15 +2481,15 @@ mod tests {
             &TransportEndpoint::Udp(bob_address)
         );
         let received = bob
-            .accept_udp_datagram(
-                alice_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 packets[0].bytes(),
                 &bob_key,
                 WALL_TIME,
                 Duration::from_secs(1),
             )
             .expect("receive broadcast");
-        assert_eq!(received.tap_frame(), Some(broadcast.as_slice()));
+        assert_eq!(received.tap_frame.as_deref(), Some(broadcast.as_slice()));
 
         let reverse = ethernet_frame(bob_mac, alice_mac, 0xb2);
         let packets = bob
@@ -2277,15 +2499,15 @@ mod tests {
             .0;
         assert_eq!(packets.len(), 1);
         let received = alice
-            .accept_udp_datagram(
-                bob_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(bob_address),
                 packets[0].bytes(),
                 &alice_key,
                 WALL_TIME,
                 Duration::from_secs(2),
             )
             .expect("receive reverse frame");
-        assert_eq!(received.tap_frame(), Some(reverse.as_slice()));
+        assert_eq!(received.tap_frame.as_deref(), Some(reverse.as_slice()));
 
         let alternate_alice_address: SocketAddr =
             "127.0.0.1:46003".parse().expect("alternate alice address");
@@ -2297,19 +2519,19 @@ mod tests {
             .0
             .remove(0);
         assert!(matches!(
-            bob.accept_udp_datagram(
-                alternate_alice_address,
-                alternate_packet.bytes(),
-                &bob_key,
-                WALL_TIME,
-                Duration::from_secs(3),
-            ),
-            Err(NetworkDataError::SessionPathMismatch {
-                peer_node_id: _,
-                expected,
-                actual,
-            }) if expected != actual
-        ));
+                   bob.accept_datagram(
+        &stella_transport::Endpoint::Udp(alternate_alice_address),
+                       alternate_packet.bytes(),
+                       &bob_key,
+                       WALL_TIME,
+                       Duration::from_secs(3),
+                   ),
+                   Err(NetworkDataError::SessionPathMismatch {
+                       peer_node_id: _,
+                       expected,
+                       actual,
+                   }) if expected != actual
+               ));
 
         let keepalive = alice
             .maintain(&alice_key, WALL_TIME, Duration::from_secs(18))
@@ -2323,8 +2545,8 @@ mod tests {
                 .packet_type,
             PacketType::Keepalive
         );
-        bob.accept_udp_datagram(
-            alice_address,
+        bob.accept_datagram(
+            &stella_transport::Endpoint::Udp(alice_address),
             keepalive[0].bytes(),
             &bob_key,
             WALL_TIME,
@@ -2339,8 +2561,8 @@ mod tests {
             .0;
         assert_eq!(echo.len(), 1);
         alice
-            .accept_udp_datagram(
-                bob_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(bob_address),
                 echo[0].bytes(),
                 &alice_key,
                 WALL_TIME,
@@ -2448,8 +2670,8 @@ mod tests {
             let mut next = Vec::new();
             for datagram in pending {
                 let output = if from_alice {
-                    bob.accept_udp_datagram(
-                        alice_address,
+                    bob.accept_datagram(
+                        &stella_transport::Endpoint::Udp(alice_address),
                         datagram.bytes(),
                         &bob_key,
                         rekey_wall_time,
@@ -2458,8 +2680,8 @@ mod tests {
                     .expect("bob advances rekey")
                 } else {
                     alice
-                        .accept_udp_datagram(
-                            bob_address,
+                        .accept_datagram(
+                            &stella_transport::Endpoint::Udp(bob_address),
                             datagram.bytes(),
                             &alice_key,
                             rekey_wall_time,
@@ -2477,21 +2699,24 @@ mod tests {
         assert_eq!(bob.established_peers().len(), 1);
 
         let delayed = bob
-            .accept_udp_datagram(
-                alice_address,
+            .accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 first_old_packet.bytes(),
                 &bob_key,
                 rekey_wall_time,
                 Duration::from_secs(11),
             )
             .expect("accept reordered old-session packet");
-        assert_eq!(delayed.tap_frame(), Some(first_old_frame.as_slice()));
+        assert_eq!(
+            delayed.tap_frame.as_deref(),
+            Some(first_old_frame.as_slice())
+        );
 
         bob.maintain(&bob_key, rekey_wall_time + 31, Duration::from_secs(41))
             .expect("expire old receive session");
         assert!(matches!(
-            bob.accept_udp_datagram(
-                alice_address,
+            bob.accept_datagram(
+                &stella_transport::Endpoint::Udp(alice_address),
                 second_old_packet.bytes(),
                 &bob_key,
                 rekey_wall_time + 31,

@@ -1192,7 +1192,6 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "if-addrs",
- "libc",
  "serde",
  "sha2",
  "stella-common",
@@ -1212,7 +1211,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
- "windows-acl",
  "x509-parser",
  "zeroize",
 ]
@@ -1260,6 +1258,10 @@ name = "stella-file-security"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "stella-crypto",
+ "thiserror",
+ "windows-acl",
+ "zeroize",
 ]
 
 [[package]]
@@ -1281,7 +1283,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hmac",
- "libc",
  "rcgen",
  "redb",
  "rustls-pemfile",
@@ -1302,7 +1303,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "windows-acl",
  "x509-parser",
  "zeroize",
 ]

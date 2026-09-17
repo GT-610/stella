@@ -14,7 +14,7 @@ const MAX_LOCAL_DYNAMIC_MACS: usize = 32;
 const MAX_REMOTE_MACS: usize = 4_096;
 const MAX_REMOTE_MACS_PER_PEER: usize = 256;
 const MAC_CONFLICT_DURATION: Duration = Duration::from_secs(30);
-const TOKEN_SCALE: u128 = 1_000_000_000;
+use crate::rate::TokenBucket;
 
 /// Invalid Ethernet input rejected before forwarding or learning.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -76,6 +76,8 @@ pub enum PeerIngress {
     DeliverToTap,
     /// Drop a remote claim for a currently local source address.
     DropLocalMacConflict,
+    /// Drop authenticated flood traffic exceeding the per-peer safety budget.
+    DropFloodLimit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,38 +92,6 @@ struct RemoteEntry {
     last_seen: Duration,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct TokenBucket {
-    rate: u32,
-    capacity: u32,
-    tokens_scaled: u128,
-    last_refill: Duration,
-}
-
-impl TokenBucket {
-    fn new(rate: u32, capacity: u32, now: Duration) -> Self {
-        Self {
-            rate,
-            capacity,
-            tokens_scaled: u128::from(capacity) * TOKEN_SCALE,
-            last_refill: now,
-        }
-    }
-
-    fn take(&mut self, now: Duration) -> bool {
-        let elapsed = now.saturating_sub(self.last_refill);
-        let refill = elapsed.as_nanos().saturating_mul(u128::from(self.rate));
-        let ceiling = u128::from(self.capacity) * TOKEN_SCALE;
-        self.tokens_scaled = self.tokens_scaled.saturating_add(refill).min(ceiling);
-        self.last_refill = now;
-        if self.tokens_scaled < TOKEN_SCALE {
-            return false;
-        }
-        self.tokens_scaled -= TOKEN_SCALE;
-        true
-    }
-}
-
 /// One isolated network's bounded local and remote forwarding state.
 pub struct L2Switch {
     policy: NetworkPolicy,
@@ -131,6 +101,7 @@ pub struct L2Switch {
     broadcast: TokenBucket,
     multicast: TokenBucket,
     unknown_unicast: TokenBucket,
+    ingress_flood: BTreeMap<NodeId, [TokenBucket; 3]>,
 }
 
 impl L2Switch {
@@ -162,6 +133,7 @@ impl L2Switch {
             broadcast: TokenBucket::new(policy.flood_rate, policy.flood_burst, now),
             multicast: TokenBucket::new(policy.flood_rate, policy.flood_burst, now),
             unknown_unicast: TokenBucket::new(policy.flood_rate, policy.flood_burst, now),
+            ingress_flood: BTreeMap::new(),
         })
     }
 
@@ -223,6 +195,31 @@ impl L2Switch {
         if self.local.contains_key(&ethernet.source) {
             return Ok(PeerIngress::DropLocalMacConflict);
         }
+        let class = match ethernet.destination.destination_class() {
+            EthernetDestination::Broadcast => Some(0),
+            EthernetDestination::Multicast => Some(1),
+            EthernetDestination::Unicast => {
+                (!self.local.contains_key(&ethernet.destination)).then_some(2)
+            }
+        };
+        if let Some(class) = class {
+            if !self.ingress_flood.contains_key(&peer)
+                && self.ingress_flood.len()
+                    >= usize::from(self.policy.max_flood_peers.saturating_sub(1))
+            {
+                return Ok(PeerIngress::DropFloodLimit);
+            }
+            let buckets = self.ingress_flood.entry(peer).or_insert_with(|| {
+                [TokenBucket::new(
+                    self.policy.flood_rate.saturating_mul(2),
+                    self.policy.flood_burst.saturating_mul(2),
+                    now,
+                ); 3]
+            });
+            if !buckets[class].take(now) {
+                return Ok(PeerIngress::DropFloodLimit);
+            }
+        }
         if self.contested.contains_key(&ethernet.source) {
             return Ok(PeerIngress::DeliverToTap);
         }
@@ -248,6 +245,7 @@ impl L2Switch {
 
     /// Immediately removes every forwarding entry learned from one peer.
     pub fn remove_peer(&mut self, peer: NodeId) {
+        self.ingress_flood.remove(&peer);
         self.remote.retain(|_, entry| entry.peer != peer);
     }
 
@@ -406,7 +404,10 @@ fn validate_source(source: MacAddress) -> Result<(), SwitchError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
+    };
 
     use stella_common::{MacAddress, NetworkId, NodeId};
     use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
@@ -454,6 +455,48 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release-mode performance measurement"]
+    fn benchmark_switch_forwarding() {
+        let primary = mac(1);
+        let target = NodeId::from_bytes([99; 16]);
+        let registry = (1..=100)
+            .map(|id| (NodeId::from_bytes([id; 16]), true))
+            .collect::<BTreeMap<_, _>>();
+        for destination in [mac(2), MacAddress::BROADCAST] {
+            for sample in 0..5 {
+                let mut policy = policy();
+                policy.flood_rate = 1_000_000;
+                policy.flood_burst = 1_000_000;
+                let mut switch = L2Switch::new(policy, primary, Duration::ZERO).expect("switch");
+                switch
+                    .accept_peer_frame(target, &frame(mac(2), primary), Duration::ZERO)
+                    .expect("learn");
+                let frame = frame(primary, destination);
+                let eligible = registry
+                    .iter()
+                    .filter_map(|(peer, active)| active.then_some(*peer))
+                    .collect();
+                let started = std::time::Instant::now();
+                for _ in 0..100_000 {
+                    std::hint::black_box(
+                        switch
+                            .forward_tap_frame(
+                                std::hint::black_box(&frame),
+                                &eligible,
+                                Duration::ZERO,
+                            )
+                            .expect("forward"),
+                    );
+                }
+                eprintln!(
+                    "switch destination={destination} peers=100 sample={sample} us={}",
+                    started.elapsed().as_micros()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unknown_then_learned_unicast_uses_complete_peer_snapshot() {
         let primary = mac(1);
         let remote = mac(2);
@@ -480,6 +523,59 @@ mod tests {
                 .expect("known unicast"),
             TapForwarding::Unicast(peer)
         );
+    }
+
+    #[test]
+    fn ingress_flood_budgets_are_peer_and_class_scoped_before_learning() {
+        let primary = mac(1);
+        let peer = NodeId::from_bytes([2; 16]);
+        let other = NodeId::from_bytes([3; 16]);
+        let mut switch = L2Switch::new(policy(), primary, Duration::ZERO).expect("switch");
+        for destination in [
+            MacAddress::BROADCAST,
+            MacAddress::from_bytes([1, 0, 0, 0, 0, 1]),
+            mac(99),
+        ] {
+            for _ in 0..4 {
+                assert_eq!(
+                    switch
+                        .accept_peer_frame(peer, &frame(mac(2), destination), Duration::ZERO)
+                        .expect("ingress"),
+                    PeerIngress::DeliverToTap
+                );
+            }
+            assert_eq!(
+                switch
+                    .accept_peer_frame(peer, &frame(mac(4), destination), Duration::ZERO)
+                    .expect("limit"),
+                PeerIngress::DropFloodLimit
+            );
+            assert_eq!(switch.remote_peer(mac(4)), None);
+            assert_eq!(
+                switch
+                    .accept_peer_frame(other, &frame(mac(3), destination), Duration::ZERO)
+                    .expect("other peer"),
+                PeerIngress::DeliverToTap
+            );
+        }
+        assert_eq!(
+            switch
+                .accept_peer_frame(peer, &frame(mac(2), primary), Duration::ZERO)
+                .expect("known local unicast"),
+            PeerIngress::DeliverToTap
+        );
+        assert_eq!(
+            switch
+                .accept_peer_frame(
+                    peer,
+                    &frame(mac(2), MacAddress::BROADCAST),
+                    Duration::from_secs(1)
+                )
+                .expect("refill"),
+            PeerIngress::DeliverToTap
+        );
+        switch.remove_peer(peer);
+        assert!(!switch.ingress_flood.contains_key(&peer));
     }
 
     #[test]
