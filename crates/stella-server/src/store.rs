@@ -3864,6 +3864,49 @@ mod tests {
     }
 
     #[test]
+    fn network_session_views_isolate_adjacent_network_prefixes() {
+        let (directory, store, local, peer, _) = endpoint_test_store();
+        let networks = [
+            NetworkId::from_bytes(1_u128.to_be_bytes()),
+            NetworkId::from_bytes(2_u128.to_be_bytes()),
+            NetworkId::from_bytes([255; 16]),
+        ];
+        for (index, network) in networks.into_iter().enumerate() {
+            store
+                .create_network(
+                    &NetworkRecord::new(policy(network), "range", 100).expect("network"),
+                )
+                .expect("create network");
+            for node in [local, peer] {
+                store.add_member(node, network, 110).expect("member");
+                store
+                    .publish_endpoints(
+                        node,
+                        network,
+                        &[endpoint(1, 4000 + u16::try_from(index).expect("index"))],
+                        120,
+                    )
+                    .expect("online");
+            }
+        }
+        for (index, network) in networks.into_iter().enumerate() {
+            let view = store
+                .network_session_view(local, network)
+                .expect("scoped view");
+            assert_eq!(view.peers().len(), 1);
+            assert_eq!(view.peers()[0].node().node_id(), peer);
+            assert_eq!(
+                view.peers()[0].endpoint_lease().endpoints(),
+                &[endpoint(1, 4000 + u16::try_from(index).expect("index"))]
+            );
+            assert_eq!(view.network().network_id(), network);
+        }
+        store.verify().expect("full database verification");
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn network_session_view_keeps_online_peers_and_authority_state_coherent() {
         let (directory, store, first_id, second_id, network_id) = endpoint_test_store();
         store
