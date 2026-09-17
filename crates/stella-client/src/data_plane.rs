@@ -1020,6 +1020,60 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_frame_and_fragment_limits_release_accounted_storage() {
+        let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 220);
+        let frame = frame(400);
+        for _ in 0..65 {
+            let packet = alice
+                .protect_frame(&frame)
+                .expect("fragmented frame")
+                .remove(0);
+            assert!(bob
+                .accept_datagram(&packet, Duration::ZERO)
+                .expect("first fragment")
+                .is_none());
+        }
+        assert_eq!(bob.incomplete.len(), super::MAX_INCOMPLETE_FRAMES);
+        assert!(!bob.incomplete.contains_key(&1));
+        assert_eq!(
+            bob.reassembly_bytes,
+            frame.len() * super::MAX_INCOMPLETE_FRAMES
+        );
+        let (alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 220);
+        for offset in 0_u16..129 {
+            let header = alice.data_header(
+                super::FrameHeaderFields {
+                    frame_id: 1,
+                    frame_length: 414,
+                    source_mac: stella_common::MacAddress::from_bytes([2, 0, 0, 0, 0, 1]),
+                    destination_mac: stella_common::MacAddress::BROADCAST,
+                    outer_ether_type: 0x0800,
+                },
+                super::FragmentHeaderFields {
+                    sequence_number: u64::from(offset) + 1,
+                    offset,
+                    length: 1,
+                },
+            );
+            let packet = alice
+                .protect_fragment(header, &frame[usize::from(offset)..=usize::from(offset)])
+                .expect("protected fragment");
+            assert!(bob
+                .accept_datagram(&packet, Duration::ZERO)
+                .expect("bounded reassembly")
+                .is_none());
+            if offset == 127 {
+                assert_eq!(
+                    bob.incomplete.get(&1).expect("frame at limit").ranges.len(),
+                    128
+                );
+            }
+        }
+        assert!(bob.incomplete.is_empty());
+        assert_eq!(bob.reassembly_bytes, 0);
+    }
+
+    #[test]
     fn timeout_discards_incomplete_frame() {
         let (mut alice, mut bob) = sessions(ConfidentialityPolicy::Encrypt, 220);
         let datagrams = alice.protect_frame(&frame(400)).expect("protect frame");
