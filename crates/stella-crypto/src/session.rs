@@ -338,6 +338,44 @@ mod tests {
     ];
 
     #[test]
+    fn published_complete_session_derives_independently_verified_keys() {
+        fn values(text: &str) -> std::collections::BTreeMap<&str, Vec<u8>> {
+            text.lines()
+                .map(|line| {
+                    let (name, hex) = line.split_once('=').expect("vector field");
+                    let bytes = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+                        .collect();
+                    (name, bytes)
+                })
+                .collect()
+        }
+        let vector = values(include_str!("../../../protocol/vectors/session-v1.txt"));
+        let expected = values(include_str!(
+            "../../../protocol/vectors/session-v1-keys.txt"
+        ));
+        let transcript = super::session_transcript_hash(&vector["init"], &vector["response"]);
+        assert_eq!(transcript.as_slice(), vector["transcript_hash"]);
+        let shared = EphemeralSecret::from_bytes([7; 32])
+            .agree(EphemeralSecret::from_bytes([9; 32]).public_key())
+            .expect("agreement");
+        assert_eq!(shared.0.as_slice(), expected["shared_secret"]);
+        let secrets = super::derive_session_secrets(shared, &transcript, SessionRole::Initiator)
+            .expect("keys");
+        for (name, actual) in [
+            ("i2r_key", secrets.send.key.as_slice()),
+            ("r2i_key", secrets.receive.key.as_slice()),
+            ("i2r_nonce", secrets.send.nonce_prefix.as_slice()),
+            ("r2i_nonce", secrets.receive.nonce_prefix.as_slice()),
+            ("confirm_i_key", secrets.local_confirmation.as_slice()),
+            ("confirm_r_key", secrets.remote_confirmation.as_slice()),
+        ] {
+            assert_eq!(actual, expected[name], "{name}");
+        }
+    }
+
+    #[test]
     fn x25519_matches_rfc7748_vector_in_both_directions() {
         let alice = EphemeralSecret::from_bytes(ALICE_SECRET);
         assert_eq!(alice.public_key().to_bytes(), ALICE_PUBLIC);

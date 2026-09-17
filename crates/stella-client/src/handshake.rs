@@ -1766,6 +1766,195 @@ mod tests {
         ResponderHandshake::respond(config, key, validated, now)
     }
 
+    fn reject_each_mutated_byte(bytes: &[u8], mut rejects: impl FnMut(&[u8]) -> bool) {
+        for index in 0..bytes.len() {
+            let mut invalid = bytes.to_vec();
+            invalid[index] ^= 1;
+            assert!(rejects(&invalid), "mutated byte {index}");
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixed complete interoperation transcript"
+    )]
+    fn complete_interoperation_vector() {
+        use std::fmt::Write;
+        use stella_crypto::{
+            derive_session_secrets, session_transcript_hash, sha256_segments, EphemeralSecret,
+            SessionRole,
+        };
+        let alice_key = signing_key(11);
+        let bob_key = signing_key(12);
+        let mut alice_config = config(&alice_key, &bob_key, 21, 22);
+        let mut bob_config = config(&bob_key, &alice_key, 22, 21);
+        let mut policy_bytes = [0; stella_proto::NETWORK_POLICY_LENGTH];
+        policy().encode(&mut policy_bytes).expect("policy");
+        for config in [&mut alice_config, &mut bob_config] {
+            config.local_grant.policy_digest = sha256_segments(&[&policy_bytes]);
+            config.peer_grant.policy_digest = config.local_grant.policy_digest;
+            config.local_grant_bytes = grant_bytes(config.local_grant);
+        }
+        let alice_secret = EphemeralSecret::from_bytes([7; 32]);
+        let bob_secret = EphemeralSecret::from_bytes([9; 32]);
+        let alice_public = alice_secret.public_key();
+        let bob_public = bob_secret.public_key();
+        let header = super::handshake_header(
+            stella_proto::PacketType::SessionInit,
+            0,
+            super::INIT_PAYLOAD_LENGTH,
+            &alice_config,
+            NOW,
+            41,
+            42,
+        );
+        let initiation = encode_signed_init(
+            header,
+            &alice_config.local_grant_bytes,
+            alice_config.peer_grant.grant_serial,
+            alice_public.as_bytes(),
+            &[13; 32],
+            1200,
+            &alice_key,
+        )
+        .expect("initiation");
+        assert!(
+            super::authenticate_initiation(&bob_config, &initiation, NOW)
+                .expect("signature")
+                .is_ok()
+        );
+        reject_each_mutated_byte(&initiation, |invalid| {
+            super::authenticate_initiation(&bob_config, invalid, NOW).is_err()
+        });
+        let response_header = super::handshake_header(
+            stella_proto::PacketType::SessionResponse,
+            0,
+            super::RESPONSE_PAYLOAD_LENGTH,
+            &bob_config,
+            NOW,
+            41,
+            42,
+        );
+        let response = super::encode_signed_response(
+            response_header,
+            &bob_config.local_grant_bytes,
+            &sha256_segments(&[&initiation]),
+            bob_public.as_bytes(),
+            &[14; 32],
+            1200,
+            &bob_key,
+        )
+        .expect("response");
+        let transcript_hash = session_transcript_hash(&initiation, &response);
+        let response_hash = sha256_segments(&[&response]);
+        let protectors = derive_session_secrets(
+            bob_secret.agree(alice_public).expect("agreement"),
+            &transcript_hash,
+            SessionRole::Responder,
+        )
+        .expect("derive")
+        .into_protectors();
+        let mut responder = ResponderHandshake {
+            config: bob_config,
+            init_header: header,
+            response_datagram: response.clone(),
+            response_hash,
+            transcript_hash,
+            protectors: Some(protectors),
+            negotiated_datagram_size: 1200,
+            initiator_confirmation: None,
+            responder_confirmation: None,
+        };
+        let mut initiator = InitiatorHandshake {
+            config: alice_config,
+            header,
+            init_datagram: initiation.clone(),
+            ephemeral: Some(alice_secret),
+            confirmation: None,
+        };
+        reject_each_mutated_byte(&response, |invalid| {
+            initiator.accept_response(invalid, NOW).is_err()
+        });
+        let confirm_i = initiator
+            .accept_response(&response, NOW)
+            .expect("response authentication")
+            .to_vec();
+        reject_each_mutated_byte(&confirm_i, |invalid| {
+            responder
+                .accept_initiator_confirmation(invalid, NOW)
+                .is_err()
+        });
+        let confirm_r = responder
+            .accept_initiator_confirmation(&confirm_i, NOW)
+            .expect("initiator confirmation")
+            .to_vec();
+        reject_each_mutated_byte(&confirm_r, |invalid| {
+            initiator
+                .accept_responder_confirmation(invalid, NOW)
+                .is_err()
+        });
+        let mut alice = initiator
+            .accept_responder_confirmation(&confirm_r, NOW)
+            .expect("responder confirmation")
+            .into_data_session()
+            .expect("data session");
+        let mut bob = responder
+            .take_established(NOW)
+            .expect("established")
+            .into_data_session()
+            .expect("data session");
+        let frame = frame(1);
+        let packet = alice.protect_frame(&frame).expect("protect").remove(0);
+        for index in 0..packet.len() {
+            let mut invalid = packet.clone();
+            invalid[index] ^= 1;
+            assert!(
+                bob.accept_datagram(&invalid, std::time::Duration::ZERO)
+                    .is_err(),
+                "DATA byte {index}"
+            );
+        }
+        assert_eq!(
+            bob.accept_datagram(&packet, std::time::Duration::ZERO)
+                .expect("data"),
+            Some(frame.clone())
+        );
+        let keepalive = alice.protect_keepalive(0).expect("keepalive");
+        for index in 0..keepalive.len() {
+            let mut invalid = keepalive.clone();
+            invalid[index] ^= 1;
+            assert!(
+                bob.accept_keepalive(&invalid).is_err(),
+                "KEEPALIVE byte {index}"
+            );
+        }
+        bob.accept_keepalive(&keepalive)
+            .expect("authenticate keepalive");
+        let mut vector = String::new();
+        for (name, bytes) in [
+            ("policy", policy_bytes.as_slice()),
+            ("init", initiation.as_slice()),
+            ("response", response.as_slice()),
+            ("confirm_i", confirm_i.as_slice()),
+            ("confirm_r", confirm_r.as_slice()),
+            ("transcript_hash", transcript_hash.as_slice()),
+            ("frame", frame.as_slice()),
+            ("data", packet.as_slice()),
+            ("keepalive", keepalive.as_slice()),
+        ] {
+            write!(vector, "{name}=").expect("string");
+            for byte in bytes {
+                write!(vector, "{byte:02x}").expect("hex");
+            }
+            vector.push('\n');
+        }
+        assert_eq!(
+            vector,
+            include_str!("../../../protocol/vectors/session-v1.txt")
+        );
+    }
+
     #[test]
     fn four_message_handshake_establishes_bidirectional_data() {
         let alice_key = signing_key(11);
@@ -1988,7 +2177,9 @@ mod tests {
             &preferred_config.local_grant_bytes,
             preferred_config.peer_grant.grant_serial,
             original_init.initiator_ephemeral(),
-            original_init.initiator_nonce(),
+            original_init.signed_payload()[288..320]
+                .try_into()
+                .expect("nonce"),
             original_init.max_datagram_size(),
             preferred_key,
         )
@@ -2115,7 +2306,7 @@ mod tests {
             &stale_grant_bytes,
             bob_config.local_grant.grant_serial,
             init.initiator_ephemeral(),
-            init.initiator_nonce(),
+            init.signed_payload()[288..320].try_into().expect("nonce"),
             init.max_datagram_size(),
             &alice_key,
         )
@@ -2136,7 +2327,7 @@ mod tests {
             &alice_config.local_grant_bytes,
             GrantSerial::from_bytes([0xee; 16]),
             init.initiator_ephemeral(),
-            init.initiator_nonce(),
+            init.signed_payload()[288..320].try_into().expect("nonce"),
             init.max_datagram_size(),
             &alice_key,
         )
