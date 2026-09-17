@@ -472,12 +472,12 @@ mod tests {
                     .accept_peer_frame(target, &frame(mac(2), primary), Duration::ZERO)
                     .expect("learn");
                 let frame = frame(primary, destination);
+                let eligible = registry
+                    .iter()
+                    .filter_map(|(peer, active)| active.then_some(*peer))
+                    .collect();
                 let started = std::time::Instant::now();
                 for _ in 0..100_000 {
-                    let eligible = registry
-                        .iter()
-                        .filter_map(|(peer, active)| active.then_some(*peer))
-                        .collect();
                     std::hint::black_box(
                         switch
                             .forward_tap_frame(

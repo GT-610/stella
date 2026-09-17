@@ -188,6 +188,7 @@ pub struct NetworkDataPlane {
     node_budgets: BTreeMap<NodeId, TokenBucket>,
     endpoint_budgets: HashMap<TransportEndpoint, TokenBucket>,
     sessions: BTreeMap<NodeId, InstalledSession>,
+    forwarding_peers: BTreeSet<NodeId>,
     retired_sessions: BTreeMap<(NodeId, u64), RetiredSession>,
 }
 
@@ -259,6 +260,7 @@ impl NetworkDataPlane {
             node_budgets: BTreeMap::new(),
             endpoint_budgets: HashMap::new(),
             sessions: BTreeMap::new(),
+            forwarding_peers: BTreeSet::new(),
             retired_sessions: BTreeMap::new(),
         };
         let peers: Vec<NodeId> = plane.state.peers().keys().copied().collect();
@@ -276,11 +278,8 @@ impl NetworkDataPlane {
 
     /// Returns the established peers currently eligible for forwarding.
     #[must_use]
-    pub fn established_peers(&self) -> BTreeSet<NodeId> {
-        self.sessions
-            .iter()
-            .filter_map(|(peer, session)| (!session.rekeying).then_some(*peer))
-            .collect()
+    pub const fn established_peers(&self) -> &BTreeSet<NodeId> {
+        &self.forwarding_peers
     }
 
     /// Replaces the locally allocated relay carriers and rebuilds affected paths.
@@ -515,6 +514,7 @@ impl NetworkDataPlane {
         for peer in rekey {
             if let Some(session) = self.sessions.get_mut(&peer) {
                 session.rekeying = true;
+                self.forwarding_peers.remove(&peer);
             }
         }
         let mut output = NetworkOutput::default();
@@ -570,8 +570,9 @@ impl NetworkDataPlane {
         frame: &[u8],
         now: Duration,
     ) -> Result<NetworkOutput, NetworkDataError> {
-        let eligible = self.established_peers();
-        let forwarding = self.switch.forward_tap_frame(frame, &eligible, now)?;
+        let forwarding = self
+            .switch
+            .forward_tap_frame(frame, &self.forwarding_peers, now)?;
         let peers = match forwarding {
             TapForwarding::Local | TapForwarding::RateLimited { .. } => Vec::new(),
             TapForwarding::Unicast(peer) => vec![peer],
@@ -666,6 +667,7 @@ impl NetworkDataPlane {
         let old_peers = self.state.peers().clone();
         if reset_all {
             self.sessions.clear();
+            self.forwarding_peers.clear();
             self.retired_sessions.clear();
             self.paths.clear();
             self.peer_paths.clear();
@@ -823,6 +825,7 @@ impl NetworkDataPlane {
                 if self.pending_path_upgrades.get(&peer_node_id) == Some(&path_id) {
                     self.pending_path_upgrades.remove(&peer_node_id);
                 }
+                self.forwarding_peers.insert(peer_node_id);
                 if let Some(previous) = self.sessions.insert(
                     peer_node_id,
                     InstalledSession {
@@ -1078,6 +1081,7 @@ impl NetworkDataPlane {
                 .get(&peer)
                 .is_some_and(|session| removed.contains(&session.path_id))
             {
+                self.forwarding_peers.remove(&peer);
                 if let Some(session) = self.sessions.remove(&peer) {
                     self.handshakes.retire_session(peer, session.session_id);
                 }
@@ -1155,6 +1159,7 @@ impl NetworkDataPlane {
     }
 
     fn remove_session(&mut self, peer: NodeId) {
+        self.forwarding_peers.remove(&peer);
         if let Some(previous) = self.sessions.remove(&peer) {
             self.handshakes.retire_session(peer, previous.session_id);
         }
