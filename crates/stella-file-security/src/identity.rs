@@ -14,7 +14,9 @@ use zeroize::Zeroizing;
 ///
 /// The target is never overwritten. Windows applies a protected exact DACL;
 /// macOS requires a non-linked regular file with mode `0600`. The native
-/// policy is verified before secret bytes are written.
+/// policy is verified before secret bytes are written, and the document is
+/// placed with an atomic write so a crash never leaves a partial secret at
+/// the final path.
 ///
 /// # Errors
 ///
@@ -23,12 +25,91 @@ use zeroize::Zeroizing;
 pub fn create_identity(path: &Path) -> Result<IdentitySigningKey, IdentityFileError> {
     let signing_key = IdentitySigningKey::generate()?;
     let document = signing_key.to_pkcs8_der()?;
-    let mut file = create_protected_secret_file(path)?;
-    if let Err(error) = write_identity(&mut file, path, document.expose_secret()) {
-        drop(file);
-        return Err(cleanup_created_file(path, error));
-    }
+    write_protected_secret(path, document.expose_secret())?;
     Ok(signing_key)
+}
+
+/// Writes one complete secret file atomically under the native policy.
+///
+/// The destination name is first reserved with a zero-length protected
+/// placeholder, the full secret is written to a private temporary sibling,
+/// and the temporary file is renamed over the placeholder. A crash therefore
+/// never leaves a partially written secret at the final path, and the native
+/// permissions of the destination are verified both before and after the
+/// swap. A failure removes only files created by this call.
+///
+/// # Errors
+///
+/// Returns [`IdentityFileError`] when the destination exists, the parent
+/// directory is not writable through the native policy, or writing, syncing,
+/// renaming, or final verification fails.
+pub fn write_protected_secret(path: &Path, bytes: &[u8]) -> Result<(), IdentityFileError> {
+    let file_name = path.file_name().ok_or_else(|| IdentityFileError::Write {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "secret destination must name a file",
+        ),
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Reserve the final name so a concurrent writer cannot claim it between
+    // the checks and the rename.
+    let placeholder = create_protected_secret_file(path)?;
+    let temporary = parent.join(format!(
+        ".{}.stella-{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+    ));
+    let result = write_and_swap(&temporary, path, bytes);
+    match result {
+        Ok(()) => {
+            drop(placeholder);
+            Ok(())
+        }
+        Err(error) => Err(cleanup_created_file(&placeholder, path, error)),
+    }
+}
+
+fn write_and_swap(temporary: &Path, path: &Path, bytes: &[u8]) -> Result<(), IdentityFileError> {
+    let write_result = (|| {
+        let mut file = create_protected_secret_file(temporary)?;
+        if let Err(error) = file.write_all(bytes) {
+            return Err(IdentityFileError::Write {
+                path: temporary.to_path_buf(),
+                source: error,
+            });
+        }
+        if let Err(error) = file.sync_all() {
+            return Err(IdentityFileError::Sync {
+                path: temporary.to_path_buf(),
+                source: error,
+            });
+        }
+        drop(file);
+        std::fs::rename(temporary, path).map_err(|source| IdentityFileError::Rename {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        #[cfg(unix)]
+        if let Ok(directory) = std::fs::File::open(
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        ) {
+            // Best-effort directory sync so the rename survives a power loss.
+            let _ = directory.sync_all();
+        }
+        // The swapped-in destination must still satisfy the native policy.
+        drop(open_protected_secret_file(path)?);
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    write_result
 }
 
 /// Loads a protected bounded PKCS#8 identity.
@@ -92,19 +173,15 @@ pub fn open_protected_secret_file(path: &Path) -> Result<File, IdentityFileError
     platform::open_verified_file(path)
 }
 
-fn write_identity(file: &mut File, path: &Path, document: &[u8]) -> Result<(), IdentityFileError> {
-    file.write_all(document)
-        .map_err(|source| IdentityFileError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.sync_all().map_err(|source| IdentityFileError::Sync {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn cleanup_created_file(path: &Path, cause: IdentityFileError) -> IdentityFileError {
+/// Removes a file this process created, but only if the path still names it.
+///
+/// The cleanup is bound to the creating file's identity (device and inode on
+/// Unix) so a concurrent replacement of the path cannot make the cleanup
+/// delete another principal's file.
+fn cleanup_created_file(file: &File, path: &Path, cause: IdentityFileError) -> IdentityFileError {
+    if created_file_was_replaced(file, path) {
+        return cause;
+    }
     match std::fs::remove_file(path) {
         Ok(()) => cause,
         Err(source) => IdentityFileError::CleanupFailed {
@@ -113,6 +190,22 @@ fn cleanup_created_file(path: &Path, cause: IdentityFileError) -> IdentityFileEr
             source,
         },
     }
+}
+
+#[cfg(unix)]
+fn created_file_was_replaced(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(file_metadata), Ok(path_metadata)) => {
+            file_metadata.dev() != path_metadata.dev() || file_metadata.ino() != path_metadata.ino()
+        }
+        _ => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn created_file_was_replaced(_file: &File, _path: &Path) -> bool {
+    false
 }
 
 /// Identity persistence or native-permission failure.
@@ -226,6 +319,15 @@ pub enum IdentityFileError {
         #[source]
         source: io::Error,
     },
+    /// The complete secret could not be swapped into place atomically.
+    #[error("unable to move the completed secret into {path}")]
+    Rename {
+        /// Identity path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
     /// A partial newly created file could not be removed.
     #[error("unable to remove partial identity file {path} after {cause}")]
     CleanupFailed {
@@ -286,8 +388,7 @@ mod platform {
             .and_then(|()| harden_permissions(&file, path))
             .and_then(|()| verify_permissions(&file, path))
         {
-            drop(file);
-            return Err(cleanup_created_file(path, error));
+            return Err(cleanup_created_file(&file, path, error));
         }
         Ok(file)
     }
@@ -509,8 +610,7 @@ mod platform {
                 source,
             })?;
         if let Err(error) = validate_file(&file, path) {
-            drop(file);
-            return Err(cleanup_created_file(path, error));
+            return Err(cleanup_created_file(&file, path, error));
         }
         Ok(file)
     }

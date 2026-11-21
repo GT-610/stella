@@ -23,9 +23,7 @@ use tokio_rustls::rustls::{
 use x509_parser::parse_x509_certificate;
 use zeroize::Zeroizing;
 
-use crate::identity::{
-    create_protected_secret_file, open_protected_secret_file, IdentityFileError,
-};
+use crate::identity::{open_protected_secret_file, write_protected_secret, IdentityFileError};
 
 /// Default lifetime of a generated self-signed TLS certificate.
 pub const DEFAULT_TLS_VALIDITY_DAYS: u16 = 825;
@@ -238,11 +236,8 @@ fn ensure_target_absent(path: &Path) -> Result<(), TlsIdentityError> {
 }
 
 fn write_protected(path: &Path, bytes: &[u8]) -> Result<(), TlsIdentityError> {
-    let mut file = create_protected_secret_file(path)?;
-    write_and_sync(&mut file, path, bytes).map_err(|error| {
-        drop(file);
-        cleanup_partial(path, error)
-    })
+    // The private key never appears partially written at its final path.
+    write_protected_secret(path, bytes).map_err(TlsIdentityError::from)
 }
 
 fn write_public(path: &Path, bytes: &[u8]) -> Result<(), TlsIdentityError> {

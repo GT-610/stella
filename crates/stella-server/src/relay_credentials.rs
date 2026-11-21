@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -19,9 +19,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::identity::{
-    create_protected_secret_file, open_protected_secret_file, IdentityFileError,
-};
+use crate::identity::{open_protected_secret_file, write_protected_secret, IdentityFileError};
 
 const CREDENTIAL_DOMAIN: &[u8] = b"stella relay credential v1\0";
 const TURN_NONCE_DOMAIN: &[u8] = b"stella turn nonce v1\0";
@@ -55,33 +53,14 @@ pub fn create_relay_credential_key(path: &Path) -> Result<(), RelayCredentialKey
             break;
         }
     }
-    let mut file = create_protected_secret_file(path).map_err(|source| {
+    // The atomic writer verifies the native policy before and after the swap,
+    // and a crash never leaves a partial key at the final path.
+    write_protected_secret(path, key.as_ref()).map_err(|source| {
         RelayCredentialKeyFileError::Create {
             path: path.to_path_buf(),
             source,
         }
-    })?;
-    if let Err(source) = file.write_all(key.as_ref()) {
-        drop(file);
-        return Err(cleanup_partial_key(
-            path,
-            RelayCredentialKeyFileError::Write {
-                path: path.to_path_buf(),
-                source,
-            },
-        ));
-    }
-    if let Err(source) = file.sync_all() {
-        drop(file);
-        return Err(cleanup_partial_key(
-            path,
-            RelayCredentialKeyFileError::Sync {
-                path: path.to_path_buf(),
-                source,
-            },
-        ));
-    }
-    Ok(())
+    })
 }
 
 /// Loads a protected deployment key into a relay credential authority.
@@ -116,20 +95,6 @@ pub fn load_relay_credential_authority(
         })?;
     RelayCredentialAuthority::new(*key, lifetime_seconds)
         .map_err(RelayCredentialAuthorityFileError::Credential)
-}
-
-fn cleanup_partial_key(
-    path: &Path,
-    cause: RelayCredentialKeyFileError,
-) -> RelayCredentialKeyFileError {
-    match std::fs::remove_file(path) {
-        Ok(()) => cause,
-        Err(source) => RelayCredentialKeyFileError::CleanupFailed {
-            path: path.to_path_buf(),
-            cause: Box::new(cause),
-            source,
-        },
-    }
 }
 
 /// Stateless deployment authority for node-scoped short-lived relay credentials.
