@@ -109,6 +109,13 @@ impl ServerCertVerifier for PinnedServerVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        if self.pins.is_empty() && self.web_pki.is_none() {
+            // Fail closed: a verifier without a trust anchor would otherwise
+            // promote the presented certificate to its own root below.
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
+        }
         if !self.pins.is_empty() {
             let (remaining, certificate) = parse_x509_certificate(end_entity.as_ref())
                 .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
@@ -134,6 +141,10 @@ impl ServerCertVerifier for PinnedServerVerifier {
                 now,
             );
         }
+        // Pin-only verification. The SPKI pin above already authenticated the
+        // certificate key; the certificate is evaluated against itself purely
+        // to enforce name and validity fields without introducing any
+        // additional trust anchor.
         let mut roots = RootCertStore::empty();
         roots.add(end_entity.clone())?;
         let verifier = WebPkiServerVerifier::builder_with_provider(

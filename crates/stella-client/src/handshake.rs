@@ -2214,24 +2214,33 @@ mod tests {
         let first = manager
             .initiate(bob_id, &alice_key, NOW, std::time::Duration::ZERO)
             .expect("initiate");
-        assert!(manager
-            .poll_retransmissions(std::time::Duration::from_millis(249))
-            .is_empty());
+        assert_eq!(
+            manager
+                .poll_retransmissions(std::time::Duration::from_millis(249))
+                .len(),
+            0
+        );
         let retry = manager.poll_retransmissions(std::time::Duration::from_millis(250));
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].datagram(), first.datagram());
-        assert!(manager
-            .poll_retransmissions(std::time::Duration::from_millis(749))
-            .is_empty());
+        assert_eq!(
+            manager
+                .poll_retransmissions(std::time::Duration::from_millis(749))
+                .len(),
+            0
+        );
         assert_eq!(
             manager
                 .poll_retransmissions(std::time::Duration::from_millis(750))
                 .len(),
             1
         );
-        assert!(manager
-            .poll_retransmissions(std::time::Duration::from_secs(10))
-            .is_empty());
+        assert_eq!(
+            manager
+                .poll_retransmissions(std::time::Duration::from_secs(10))
+                .len(),
+            0
+        );
         let replacement = manager
             .initiate(
                 bob_id,

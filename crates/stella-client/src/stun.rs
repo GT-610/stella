@@ -719,9 +719,9 @@ mod tests {
             discovery.mappings[0].base_address,
             transport.local_address()
         );
-        assert!(discovery.deferred.is_empty());
+        assert_eq!(discovery.deferred.len(), 0);
         assert_eq!(discovery.dropped_datagrams, 0);
-        assert!(server_reflexive_candidates(&discovery, 1_200).is_empty());
+        assert_eq!(server_reflexive_candidates(&discovery, 1_200).len(), 0);
 
         transport.shutdown().await.expect("shutdown transport");
         let _result = shutdown_sender.send(());
@@ -754,7 +754,7 @@ mod tests {
         .await
         .expect("bounded STUN discovery");
 
-        assert!(discovery.mappings.is_empty());
+        assert_eq!(discovery.mappings.len(), 0);
         assert!(started_at.elapsed() < Duration::from_millis(500));
         transport.shutdown().await.expect("shutdown transport");
     }

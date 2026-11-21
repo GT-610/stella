@@ -3359,7 +3359,7 @@ mod tests {
         assert_eq!(selections[6].settings.spki_pins, vec![[1; 32]]);
         assert_eq!(selections[6].settings.proxy_address, None);
         assert_eq!(selections[0].settings.trust, RelayTrustRequirements::NONE);
-        assert!(selections[0].settings.spki_pins.is_empty());
+        assert_eq!(selections[0].settings.spki_pins, Vec::<[u8; 32]>::new());
         let preferred = preferred_relay_settings(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             None,

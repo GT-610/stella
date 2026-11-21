@@ -1209,7 +1209,7 @@ mod tests {
             view.network().snapshot_revision(),
             published.snapshot_revision
         );
-        assert!(view.peers().is_empty());
+        assert_eq!(view.peers(), []);
         assert_eq!(
             authority
                 .list_endpoints(network_id)
@@ -1217,19 +1217,20 @@ mod tests {
                 .expect("list endpoints"),
             vec![stored]
         );
-        assert!(authority
-            .expire_endpoints(169)
-            .await
-            .expect("retain lease")
-            .is_empty());
+        assert_eq!(
+            authority.expire_endpoints(169).await.expect("retain lease"),
+            []
+        );
         let expired = authority.expire_endpoints(170).await.expect("expire lease");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].snapshot_revision, 4);
-        assert!(authority
-            .list_endpoints(network_id)
-            .await
-            .expect("list expired endpoints")
-            .is_empty());
+        assert_eq!(
+            authority
+                .list_endpoints(network_id)
+                .await
+                .expect("list expired endpoints"),
+            []
+        );
         worker.shutdown().await.expect("shutdown worker");
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
@@ -1306,11 +1307,13 @@ mod tests {
             .await
             .expect("get withdrawn connectivity")
             .is_none());
-        assert!(authority
-            .list_connectivity(network_id)
-            .await
-            .expect("list withdrawn connectivity")
-            .is_empty());
+        assert_eq!(
+            authority
+                .list_connectivity(network_id)
+                .await
+                .expect("list withdrawn connectivity"),
+            []
+        );
 
         worker.shutdown().await.expect("shutdown authority worker");
         std::fs::remove_dir_all(&directory).expect("remove test directory");

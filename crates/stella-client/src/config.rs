@@ -581,7 +581,7 @@ tap_peer = "feth101"
             .join("\n");
         let config = ClientConfig::parse(&without_network, Path::new("C:/stella"))
             .expect("pre-join configuration is valid");
-        assert!(config.networks.is_empty());
+        assert_eq!(config.networks, []);
     }
 
     #[test]
