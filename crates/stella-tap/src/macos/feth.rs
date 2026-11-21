@@ -19,6 +19,21 @@ const LOCK_DIRECTORY: &str = "/var/run/stella";
 const LOCK_DIRECTORY_MODE: u32 = 0o700;
 const LOCK_FILE_MODE: u32 = 0o600;
 const METADATA_PREFIX: &str = "stella-feth-v1";
+const OWNERSHIP_PREFIX: &str = "stella-feth-v2";
+const METADATA_LINE_LIMIT: u64 = 512;
+
+/// Sets the single user authorized to own new feth pair lock records.
+///
+/// The root helper calls this once with its `--allow-uid` value so that a
+/// second helper instance started for a different user cannot take over an
+/// idle pair owned by the first user. When unset, records stay unbound and
+/// validation does not require a UID match, which keeps direct privileged
+/// development paths working.
+pub(crate) fn set_authorized_uid(uid: u32) {
+    let _ = AUTHORIZED_UID.set(uid);
+}
+
+static AUTHORIZED_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct InterfaceState {
@@ -355,12 +370,11 @@ fn validate_ownership(
     peer: &str,
     interface_exists: bool,
 ) -> Result<()> {
-    let expected = ownership_record(visible, peer);
     let length = lock
         .metadata()
         .map_err(|source| TapError::io(TapOperation::VerifyDeviceOwnership, source))?
         .len();
-    if length > 512 {
+    if length > METADATA_LINE_LIMIT {
         return Err(TapError::DeviceOwnershipConflict {
             name: visible.to_owned(),
             peer_name: peer.to_owned(),
@@ -371,7 +385,9 @@ fn validate_ownership(
     let mut actual = String::new();
     lock.read_to_string(&mut actual)
         .map_err(|source| TapError::io(TapOperation::VerifyDeviceOwnership, source))?;
-    if actual == expected || (!interface_exists && actual.is_empty()) {
+    let matching = actual.is_empty() && !interface_exists
+        || record_matches_authorized_user(&actual, visible, peer);
+    if matching {
         Ok(())
     } else {
         Err(TapError::DeviceOwnershipConflict {
@@ -381,8 +397,53 @@ fn validate_ownership(
     }
 }
 
+/// Compares one lock record against the requested pair and authorized user.
+///
+/// Legacy version-1 records carry no owner UID and are accepted unchanged so
+/// existing deployments upgrade to a bound record on the next commit. Every
+/// version-2 record must name the exact pair, and when a helper context is
+/// active the record's UID must equal the caller's authorized UID. This stops
+/// a helper instance started for one local user from taking over an idle pair
+/// opened through a helper for another user.
+fn record_matches_authorized_user(record: &str, visible: &str, peer: &str) -> bool {
+    match parse_ownership_record(record) {
+        Some((record_uid, record_visible, record_peer)) => {
+            record_visible == visible
+                && record_peer == peer
+                && match (AUTHORIZED_UID.get().copied(), record_uid) {
+                    // Direct privileged path without a helper context accepts
+                    // both bound and unbound records.
+                    (None, _) | (Some(_), None) => true,
+                    // The lock is bound to the authorized local user.
+                    (Some(authorized), Some(record_uid)) => authorized == record_uid,
+                }
+        }
+        None => record == ownership_record(visible, peer, None),
+    }
+}
+
+/// Parses one `stella-feth-v2` record into its UID, visible, and peer names.
+fn parse_ownership_record(record: &str) -> Option<(Option<u32>, &str, &str)> {
+    let mut lines = record.lines();
+    if lines.next()? != OWNERSHIP_PREFIX {
+        return None;
+    }
+    let visible = lines.next()?.strip_prefix("visible=")?;
+    let peer = lines.next()?.strip_prefix("peer=")?;
+    let uid = lines
+        .next()?
+        .strip_prefix("uid=")?
+        .parse::<u32>()
+        .ok()
+        .map(Some)?;
+    if lines.next().is_some() {
+        return None;
+    }
+    Some((uid, visible, peer))
+}
+
 fn write_ownership(lock: &mut File, visible: &str, peer: &str) -> Result<()> {
-    let record = ownership_record(visible, peer);
+    let record = ownership_record(visible, peer, AUTHORIZED_UID.get().copied());
     lock.set_len(0)
         .map_err(|source| TapError::io(TapOperation::RecordDeviceOwnership, source))?;
     lock.seek(SeekFrom::Start(0))
@@ -392,25 +453,74 @@ fn write_ownership(lock: &mut File, visible: &str, peer: &str) -> Result<()> {
         .map_err(|source| TapError::io(TapOperation::RecordDeviceOwnership, source))
 }
 
-fn ownership_record(visible: &str, peer: &str) -> String {
-    format!("{METADATA_PREFIX}\nvisible={visible}\npeer={peer}\n")
+fn ownership_record(visible: &str, peer: &str, authorized_uid: Option<u32>) -> String {
+    match authorized_uid {
+        Some(uid) => format!("{OWNERSHIP_PREFIX}\nvisible={visible}\npeer={peer}\nuid={uid}\n"),
+        None => format!("{METADATA_PREFIX}\nvisible={visible}\npeer={peer}\n"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{feth_mtu_limit_update, normalize_local_unicast_mac, ownership_record};
+    use super::{
+        feth_mtu_limit_update, normalize_local_unicast_mac, ownership_record,
+        parse_ownership_record, record_matches_authorized_user,
+    };
     use crate::MAX_TAP_MTU;
 
     #[test]
     fn ownership_record_preserves_interface_roles() {
         assert_eq!(
-            ownership_record("feth100", "feth101"),
+            ownership_record("feth100", "feth101", None),
             "stella-feth-v1\nvisible=feth100\npeer=feth101\n"
         );
         assert_ne!(
-            ownership_record("feth100", "feth101"),
-            ownership_record("feth101", "feth100")
+            ownership_record("feth100", "feth101", None),
+            ownership_record("feth101", "feth100", None)
         );
+        assert_eq!(
+            ownership_record("feth100", "feth101", Some(501)),
+            "stella-feth-v2\nvisible=feth100\npeer=feth101\nuid=501\n"
+        );
+    }
+
+    #[test]
+    fn ownership_matching_binds_the_authorized_user() {
+        let bound = ownership_record("feth100", "feth101", Some(501));
+        let legacy = ownership_record("feth100", "feth101", None);
+        // Records only match the exact pair names.
+        assert!(!record_matches_authorized_user(
+            &bound, "feth101", "feth100"
+        ));
+        assert!(!record_matches_authorized_user(
+            &legacy, "feth101", "feth100"
+        ));
+
+        // Parsing tolerates neither extra lines nor malformed UIDs.
+        assert_eq!(
+            parse_ownership_record("stella-feth-v2\nvisible=feth100\npeer=feth101\nuid=x\n"),
+            None
+        );
+        assert_eq!(
+            parse_ownership_record("stella-feth-v2\nvisible=feth100\npeer=feth101\nuid=1\njunk\n"),
+            None
+        );
+        assert_eq!(
+            parse_ownership_record("stella-feth-v1\nvisible=feth100\npeer=feth101\n"),
+            None
+        );
+        assert_eq!(
+            parse_ownership_record("stella-feth-v2\nvisible=feth100\npeer=feth101\nuid=501\n"),
+            Some((Some(501), "feth100", "feth101"))
+        );
+
+        // Without a helper context (direct privileged development path) both
+        // legacy and bound records match the exact pair names; the
+        // UID-binding branch itself runs under the root-only macos_tap test.
+        assert!(record_matches_authorized_user(
+            &legacy, "feth100", "feth101"
+        ));
+        assert!(record_matches_authorized_user(&bound, "feth100", "feth101"));
     }
 
     #[test]

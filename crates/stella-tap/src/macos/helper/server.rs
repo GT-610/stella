@@ -75,6 +75,9 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
             ),
         ));
     }
+    // Bind every new feth-pair lock record to this helper's authorized user
+    // before any session can open a device.
+    crate::macos::feth::set_authorized_uid(config.allowed_uid);
     validate_socket_path(&config.socket_path)?;
     let (listener, _socket_guard) = prepare_listener(&config.socket_path, config.allowed_uid)?;
     let active_sessions = Arc::new(AtomicUsize::new(0));
@@ -120,7 +123,7 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
                         cancellation,
                     }))
                 });
-                let _ = serve_connection(stream, Some(allowed_uid), factory);
+                let _ = serve_connection(stream, allowed_uid, factory);
             })
         {
             active_sessions.fetch_sub(1, Ordering::AcqRel);
@@ -275,17 +278,15 @@ impl SessionOperation {
 
 fn serve_connection(
     mut stream: UnixStream,
-    expected_uid: Option<u32>,
+    expected_uid: u32,
     factory: DeviceFactory,
 ) -> io::Result<()> {
-    if let Some(expected_uid) = expected_uid {
-        let (actual_uid, _) = sys::peer_credentials(&stream)?;
-        if actual_uid != expected_uid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "TAP helper rejected an unauthorized local user",
-            ));
-        }
+    let (actual_uid, _) = sys::peer_credentials(&stream)?;
+    if actual_uid != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "TAP helper rejected an unauthorized local user",
+        ));
     }
     let ClientMessage::Open(config) = protocol::read_client(&mut stream)? else {
         return Err(invalid_protocol(
@@ -489,6 +490,35 @@ fn validate_socket_path(path: &Path) -> Result<()> {
             reason: "must name a Unix socket",
         });
     }
+    let Some(parent) = path.parent() else {
+        return Err(TapError::InvalidConfig {
+            field: "helper socket path",
+            reason: "must live inside a directory",
+        });
+    };
+    let parent_metadata = fs::metadata(parent).map_err(|source| {
+        TapError::io(
+            TapOperation::ConnectHelper,
+            io::Error::new(
+                source.kind(),
+                format!(
+                    "helper socket directory {} is not accessible",
+                    parent.display()
+                ),
+            ),
+        )
+    })?;
+    // The parent directory must be root-owned with no group or world write
+    // access, so other local users cannot replace the freshly bound socket.
+    if !parent_metadata.is_dir()
+        || parent_metadata.uid() != 0
+        || parent_metadata.mode() & 0o022 != 0
+    {
+        return Err(TapError::InvalidConfig {
+            field: "helper socket path",
+            reason: "parent directory must be root-owned and not group or world writable",
+        });
+    }
     Ok(())
 }
 
@@ -508,14 +538,27 @@ fn prepare_listener(path: &Path, allowed_uid: u32) -> Result<(UnixListener, Sock
         fs::remove_file(path)
             .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     }
-    let listener = UnixListener::bind(path)
-        .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
+    // Bind with a tightened process mask so the socket is owner-only from the
+    // instant it exists, independent of the launching environment's umask.
+    let previous_umask = sys::replace_umask(0o177);
+    let listener = UnixListener::bind(path);
+    sys::replace_umask(previous_umask);
+    let listener = listener.map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     sys::chown_path(path, allowed_uid)
         .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
+    if metadata.mode() & 0o777 != 0o600 {
+        return Err(TapError::io(
+            TapOperation::ConnectHelper,
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper socket must be owner-only",
+            ),
+        ));
+    }
     Ok((
         listener,
         SocketGuard {
@@ -561,7 +604,7 @@ mod tests {
     };
 
     use super::{
-        accept_error_action, next_accept_backoff, serve_connection, AcceptErrorAction,
+        accept_error_action, next_accept_backoff, serve_connection, sys, AcceptErrorAction,
         DeviceFactory, HelperDevice, INITIAL_ACCEPT_BACKOFF, MAX_ACCEPT_BACKOFF,
     };
     use crate::{
@@ -668,7 +711,8 @@ mod tests {
                 destroyed: factory_destroyed,
             }))
         });
-        let worker = thread::spawn(move || serve_connection(server, None, factory));
+        let current_uid = sys::effective_uid();
+        let worker = thread::spawn(move || serve_connection(server, current_uid, factory));
         protocol::write_client(&mut client, &ClientMessage::Open(TapConfig::default()))
             .expect("open fake TAP");
         assert!(matches!(
@@ -717,7 +761,8 @@ mod tests {
                 destroyed: factory_destroyed,
             }))
         });
-        let worker = thread::spawn(move || serve_connection(server, None, factory));
+        let current_uid = sys::effective_uid();
+        let worker = thread::spawn(move || serve_connection(server, current_uid, factory));
         protocol::write_client(&mut client, &ClientMessage::Open(TapConfig::default()))
             .expect("open fake TAP");
         let _ = protocol::read_server(&mut client).expect("read opened");
@@ -743,7 +788,7 @@ mod tests {
         let actual_uid = super::sys::effective_uid();
         let unexpected_uid = actual_uid.wrapping_add(1);
         let factory: DeviceFactory = Box::new(|_| panic!("unauthorized factory must not run"));
-        let error = serve_connection(server, Some(unexpected_uid), factory)
+        let error = serve_connection(server, unexpected_uid, factory)
             .expect_err("wrong peer must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
