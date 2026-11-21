@@ -29,6 +29,8 @@ pub const MAX_CONFIG_BYTES: u64 = 1_048_576;
 const MAX_LOG_FILTER_BYTES: usize = 256;
 const MAX_AUTHORITY_QUEUE: usize = 4_096;
 const MAX_CONNECTIONS: usize = 65_535;
+const MAX_CONNECTIONS_PER_IP: usize = 65_535;
+const MAX_PENDING_HANDSHAKES: usize = 65_535;
 const MAX_OUTBOUND_MESSAGES: usize = 1_024;
 const MAX_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 60;
 const MAX_AUTHENTICATION_TIMEOUT_SECONDS: u64 = 10;
@@ -510,6 +512,16 @@ pub struct LimitsConfig {
     pub authority_queue: usize,
     /// Maximum simultaneous TLS control connections.
     pub max_connections: usize,
+    /// Maximum simultaneous connections accepted from one source IP.
+    ///
+    /// This bounds single-source connection floods before authentication can
+    /// consume the global `max_connections` budget.
+    pub max_connections_per_ip: usize,
+    /// Maximum simultaneous TLS handshakes not yet handed to a session.
+    ///
+    /// This is a separate quota from `max_connections`, so unauthenticated
+    /// connection floods cannot crowd out established authenticated sessions.
+    pub max_pending_handshakes: usize,
     /// Maximum queued outbound messages per connection.
     pub outbound_messages: usize,
     /// Deadline for completing one TLS handshake.
@@ -535,6 +547,18 @@ impl LimitsConfig {
             &1,
             &MAX_CONNECTIONS,
             "limits.max_connections",
+        )?;
+        validate_range(
+            &self.max_connections_per_ip,
+            &1,
+            &MAX_CONNECTIONS_PER_IP,
+            "limits.max_connections_per_ip",
+        )?;
+        validate_range(
+            &self.max_pending_handshakes,
+            &1,
+            &MAX_PENDING_HANDSHAKES,
+            "limits.max_pending_handshakes",
         )?;
         validate_range(
             &self.outbound_messages,
@@ -574,6 +598,8 @@ impl Default for LimitsConfig {
         Self {
             authority_queue: 256,
             max_connections: 1_024,
+            max_connections_per_ip: 64,
+            max_pending_handshakes: 128,
             outbound_messages: 64,
             tls_handshake_timeout_seconds: 10,
             authentication_timeout_seconds: 10,
