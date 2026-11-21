@@ -2328,7 +2328,10 @@ async fn resolve_relay_address_set(
 const fn usable_relay_dns_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
-            !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
+            !address.is_unspecified()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+                && !address.is_link_local()
         }
         IpAddr::V6(address) => {
             !address.is_unspecified()
