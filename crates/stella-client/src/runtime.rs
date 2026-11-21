@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{sync_channel, Receiver as SyncReceiver, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
@@ -200,10 +200,31 @@ pub struct ClientDataRuntime {
     networks: BTreeMap<NetworkId, ActiveNetwork>,
     tap_events: mpsc::Receiver<TapEvent>,
     tap_event_sender: mpsc::Sender<TapEvent>,
+    trusted_controller_time: AtomicU64,
     started_at: std::time::Instant,
 }
 
 impl ClientDataRuntime {
+    /// Records the most recently authenticated controller wall-clock time.
+    ///
+    /// Grant and session validity are evaluated against
+    /// [`Self::trusted_unix_time`], the maximum of the local clock and this
+    /// recorded controller time. Winding the local clock backwards can
+    /// therefore no longer extend a revoked member's grants or sessions.
+    pub fn observe_controller_time(&self, server_time: u64) {
+        self.trusted_controller_time
+            .fetch_max(server_time, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns the trust clock used for grant and session validity.
+    fn trusted_unix_time(&self) -> Result<u64, RuntimeError> {
+        let local = unix_time()?;
+        Ok(self
+            .trusted_controller_time
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(local))
+    }
+
     /// Binds direct UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
     ///
     /// # Errors
@@ -259,6 +280,7 @@ impl ClientDataRuntime {
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
+            trusted_controller_time: AtomicU64::new(0),
             started_at,
         };
         for state in states.values().cloned() {
@@ -266,7 +288,7 @@ impl ClientDataRuntime {
         }
         runtime.replace_local_connectivity_generations(states)?;
         runtime.prepare_relay_paths().await?;
-        let wall_time = unix_time()?;
+        let wall_time = runtime.trusted_unix_time()?;
         runtime.reconcile_ice_agents(states, wall_time)?;
         let monotonic_now = runtime.monotonic_now();
         let network_ids: Vec<NetworkId> = runtime.networks.keys().copied().collect();
@@ -410,7 +432,7 @@ impl ClientDataRuntime {
         }
         let common = CommonHeader::decode(datagram)?;
         let network_id = common.network_id;
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let monotonic_now = self.monotonic_now();
         let output = self
             .networks
@@ -471,7 +493,7 @@ impl ClientDataRuntime {
             .to_vec();
         let common = CommonHeader::decode(&datagram)?;
         let network_id = common.network_id;
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let monotonic_now = self.monotonic_now();
         let output = self
             .networks
@@ -494,7 +516,7 @@ impl ClientDataRuntime {
     ///
     /// Returns [`RuntimeError`] for clock, handshake, endpoint, UDP, or TAP failure.
     pub async fn maintain(&mut self, signing_key: &IdentitySigningKey) -> Result<(), RuntimeError> {
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let now = self.monotonic_now();
         self.refresh_host_candidates(wall_time, now).await?;
         let ice_network_ids = self.ice_agents.keys().copied().collect::<Vec<_>>();
@@ -670,7 +692,7 @@ impl ClientDataRuntime {
             }
         }
         self.reconcile_local_connectivity_generations(states)?;
-        self.reconcile_ice_agents(states, unix_time()?)?;
+        self.reconcile_ice_agents(states, self.trusted_unix_time()?)?;
         self.prepare_relay_paths().await?;
         Ok(())
     }
@@ -715,7 +737,7 @@ impl ClientDataRuntime {
         if self.connectivity_generations.is_empty() {
             return Ok(!before.is_empty());
         }
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let refresh_deadline = wall_time.saturating_add(ICE_GENERATION_REFRESH_LEAD);
         let prospective_expiry = LocalConnectivityGeneration::expiry_at(wall_time, &self.relays)?;
         let due = self
@@ -989,7 +1011,7 @@ impl ClientDataRuntime {
         if !path_changed {
             return Ok(());
         }
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let monotonic_now = self.monotonic_now();
         let handshakes = self
             .networks
@@ -1116,7 +1138,7 @@ impl ClientDataRuntime {
         }
         self.relay_buffers = relay_buffers(&self.relays);
         self.replace_local_connectivity_generations(states)?;
-        self.reconcile_ice_agents(states, unix_time()?)
+        self.reconcile_ice_agents(states, self.trusted_unix_time()?)
     }
 
     fn current_network_states(&self) -> BTreeMap<NetworkId, NetworkState> {
@@ -2785,7 +2807,10 @@ mod tests {
         collections::{BTreeMap, BTreeSet, VecDeque},
         future::pending,
         net::{IpAddr, SocketAddr},
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::AtomicU64,
+            {Arc, Mutex},
+        },
         time::{Duration, SystemTime},
     };
 
@@ -2857,6 +2882,21 @@ mod tests {
         assert!(excluded.contains("feth101"));
     }
 
+    #[tokio::test]
+    async fn controller_time_raises_the_trusted_clock_monotonically() {
+        let mut runtime = runtime_with_pending_relay_recovery().await;
+        runtime.observe_controller_time(1_000_000_000_000);
+        assert!(
+            runtime.trusted_unix_time().expect("trusted time") >= 1_000_000_000_000,
+            "observed controller time must never be lower than the trust clock"
+        );
+        runtime.observe_controller_time(50);
+        assert!(
+            runtime.trusted_unix_time().expect("trusted time") >= 1_000_000_000_000,
+            "a stale controller time must not move the trust clock backwards"
+        );
+    }
+
     async fn runtime_with_pending_relay_recovery() -> ClientDataRuntime {
         let udp = UdpTransport::bind(UdpConfig {
             bind_address: "127.0.0.1:0".parse().expect("loopback bind"),
@@ -2889,6 +2929,7 @@ mod tests {
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
+            trusted_controller_time: AtomicU64::new(0),
             started_at: std::time::Instant::now(),
         }
     }
@@ -2929,6 +2970,7 @@ mod tests {
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
+            trusted_controller_time: AtomicU64::new(0),
             started_at: std::time::Instant::now(),
         }
     }

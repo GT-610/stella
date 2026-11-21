@@ -563,6 +563,7 @@ async fn run_active_control(
             "{DATA_PLANE_PLATFORM} data runtime is unavailable"
         ))
     })?;
+    data.observe_controller_time(active.connection().server_time());
     publish_configured_endpoints(config, &mut active)
         .await
         .map_err(ActiveRuntimeFailure::control)?;
@@ -663,6 +664,7 @@ async fn run_active_io(
                     updated_networks = report.updated_networks().len(),
                     "controller heartbeat acknowledged"
                 );
+                data.observe_controller_time(report.server_time());
                 synchronize_and_publish_connectivity(active, data, false).await?;
                 data.reconcile(config, active.networks(), identity)
                     .await
