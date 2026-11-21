@@ -33,6 +33,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zeroize::Zeroizing;
 
 const DEFAULT_TOKEN_TTL_SECONDS: u64 = 3_600;
+/// Upper bound for CLI-issued bearer tokens.
+///
+/// Bearer tokens cannot be revoked before expiry, so a typo in a huge
+/// `--ttl-seconds` value must not produce a de-facto permanent credential.
+const MAX_TOKEN_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -927,6 +932,12 @@ fn generate_network_id() -> Result<NetworkId> {
 fn token_lifetime(ttl_seconds: u64) -> Result<(u64, u64)> {
     if ttl_seconds == 0 {
         return Err(anyhow!("token lifetime must be non-zero"));
+    }
+    if ttl_seconds > MAX_TOKEN_TTL_SECONDS {
+        return Err(anyhow!(
+            "token lifetime must not exceed {MAX_TOKEN_TTL_SECONDS} seconds (30 days); \
+             bearer tokens cannot be revoked early"
+        ));
     }
     let created_at = unix_time()?;
     let expires_at = created_at
