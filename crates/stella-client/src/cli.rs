@@ -23,8 +23,8 @@ use stella_client::{
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use stella_client::{ClientDataRuntime, RuntimeError};
-use stella_common::{ControllerId, JoinInvitation, NetworkId};
-use stella_crypto::derive_node_id;
+use stella_common::{ControllerId, JoinInvitation, NetworkId, INVITATION_SIGNATURE_DOMAIN};
+use stella_crypto::{derive_node_id, validate_controller_id, IdentityPublicKey};
 #[cfg(target_os = "windows")]
 use stella_tap::WindowsTapDevice;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -1191,6 +1191,32 @@ fn read_join_invitation(input: &mut dyn Read, source: &str) -> Result<JoinInvita
     }
     text.parse::<JoinInvitation>()
         .with_context(|| format!("invalid invitation from {source}"))
+        .and_then(|invitation| {
+            verify_invitation_controller_signature(&invitation)
+                .with_context(|| format!("untrusted invitation from {source}"))?;
+            Ok(invitation)
+        })
+}
+
+/// Verifies the embedded controller Ed25519 signature and identity binding.
+///
+/// Every invitation carries the complete controller trust anchor, so the
+/// signature is the only barrier between a substituted invitation and full
+/// trust transfer to an attacker controller; it is verified before any
+/// trust configuration is persisted.
+fn verify_invitation_controller_signature(invitation: &JoinInvitation) -> Result<()> {
+    let public_key = IdentityPublicKey::from_bytes(*invitation.controller_public_key())
+        .context("invitation carries an invalid controller public key")?;
+    validate_controller_id(invitation.controller_id(), public_key)
+        .context("invitation controller ID does not match its public key")?;
+    let unsigned = invitation.unsigned_bytes();
+    public_key
+        .verify_segments(
+            INVITATION_SIGNATURE_DOMAIN,
+            &[&unsigned],
+            invitation.signature(),
+        )
+        .context("invitation controller signature verification failed")
 }
 
 /// Largest credential file accepted by `--token-file` and friends.
@@ -1802,9 +1828,8 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     use stella_client::{load_node_identity, ClientDataRuntime};
     use stella_client::{ClientConfig, SpkiPin};
-    use stella_common::{ControllerId, JoinInvitation, NetworkId};
-    #[cfg(any(windows, target_os = "macos"))]
-    use stella_crypto::{IdentitySeed, IdentitySigningKey};
+    use stella_common::{ControllerId, JoinInvitation, NetworkId, INVITATION_SIGNATURE_DOMAIN};
+    use stella_crypto::{derive_controller_id, IdentitySeed, IdentitySigningKey};
 
     #[cfg(any(windows, target_os = "macos"))]
     use super::prepare_invitation_configuration;
@@ -1894,6 +1919,33 @@ mod tests {
         }
     }
 
+    /// Builds a controller-signed invitation from the fixed test signing key.
+    fn signed_test_invitation(
+        controller_address: SocketAddr,
+        spki_sha256: [u8; 32],
+        network_id: NetworkId,
+        expires_at: u64,
+    ) -> JoinInvitation {
+        let key = IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x96; 32]));
+        let controller_id = derive_controller_id(key.public_key());
+        let invitation = JoinInvitation::new(
+            controller_address,
+            "localhost".to_owned(),
+            controller_id,
+            spki_sha256,
+            network_id,
+            expires_at,
+            [0x74; 32],
+            [0x75; 32],
+        )
+        .expect("construct invitation");
+        let unsigned = invitation.unsigned_bytes();
+        let signature = key
+            .sign_segments(INVITATION_SIGNATURE_DOMAIN, &[&unsigned])
+            .expect("sign test invitation");
+        invitation.with_controller_signature(key.public_key().to_bytes(), signature)
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     async fn data_runtime_without_tap() -> (ClientDataRuntime, IdentitySigningKey) {
         let mut args = init_args();
@@ -1975,22 +2027,47 @@ mod tests {
 
     #[test]
     fn invitation_file_input_is_bounded_parsed_and_redacted() {
-        let invitation = JoinInvitation::new(
+        let invitation = signed_test_invitation(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 44_900)),
+            [0x72; 32],
+            NetworkId::from_bytes([0x73; 16]),
+            u64::MAX,
+        );
+        let encoded = invitation.encode();
+        let mut with_newline = std::io::Cursor::new(format!("{}\r\n", encoded.as_str()));
+        let parsed = read_join_invitation(&mut with_newline, "test input")
+            .expect("parse newline-terminated invitation");
+        assert_eq!(parsed.network_id(), invitation.network_id());
+
+        let unsigned = JoinInvitation::new(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 44_900)),
             "localhost".to_owned(),
-            ControllerId::from_bytes([0x71; 16]),
+            derive_controller_id(
+                IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x96; 32])).public_key(),
+            ),
             [0x72; 32],
             NetworkId::from_bytes([0x73; 16]),
             u64::MAX,
             [0x74; 32],
             [0x75; 32],
         )
-        .expect("construct invitation");
-        let encoded = invitation.encode();
-        let mut with_newline = std::io::Cursor::new(format!("{}\r\n", encoded.as_str()));
-        let parsed = read_join_invitation(&mut with_newline, "test input")
-            .expect("parse newline-terminated invitation");
-        assert_eq!(parsed.network_id(), invitation.network_id());
+        .expect("construct unsigned invitation");
+        let mut unsigned_input = std::io::Cursor::new(unsigned.encode().as_bytes().to_vec());
+        assert!(read_join_invitation(&mut unsigned_input, "unsigned input").is_err());
+
+        let mut tampered = invitation.encode().as_str().to_owned();
+        let last = tampered
+            .pop()
+            .and_then(|character| {
+                character
+                    .to_digit(36)
+                    .map(|digit| std::char::from_digit((digit + 1) % 36, 36))
+            })
+            .flatten()
+            .expect("tamper the final signature character");
+        tampered.push(last);
+        let mut tampered_input = std::io::Cursor::new(tampered);
+        assert!(read_join_invitation(&mut tampered_input, "tampered input").is_err());
 
         assert!(
             read_join_invitation(&mut std::io::Cursor::new(Vec::new()), "empty input").is_err()
@@ -2032,17 +2109,12 @@ mod tests {
         assert_eq!(args.invite_file.as_deref(), Some(std::path::Path::new("-")));
         assert!(args.network.is_none());
 
-        let invitation = JoinInvitation::new(
+        let invitation = signed_test_invitation(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 44_900)),
-            "localhost".to_owned(),
-            ControllerId::from_bytes([0x81; 16]),
             [0x82; 32],
             NetworkId::from_bytes([0x83; 16]),
             u64::MAX,
-            [0x84; 32],
-            [0x85; 32],
-        )
-        .expect("construct stdin invitation");
+        );
         let encoded = invitation.encode();
         let loaded = load_join_invitation_with_stdin(
             &args,
@@ -2320,17 +2392,12 @@ mod tests {
     fn invitation_creates_matching_configuration_and_rejects_trust_changes() {
         let directory = directory();
         let config_path = directory.join("client.toml");
-        let invitation = JoinInvitation::new(
+        let invitation = signed_test_invitation(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 44_900)),
-            "localhost".to_owned(),
-            ControllerId::from_bytes([0x61; 16]),
             [0x62; 32],
             NetworkId::from_bytes([0x63; 16]),
             u64::MAX,
-            [0x64; 32],
-            [0x65; 32],
-        )
-        .expect("construct invitation");
+        );
         let args = invitation_join_args(&directory, &invitation);
         let mut output = Vec::new();
         prepare_invitation_configuration(&config_path, &args, Some(&invitation), &mut output)
@@ -2339,24 +2406,21 @@ mod tests {
         assert_eq!(config.controller.address().to_string(), "127.0.0.1:44900");
         assert_eq!(
             config.controller.controller_id(),
-            ControllerId::from_bytes([0x61; 16])
+            derive_controller_id(
+                IdentitySigningKey::from_seed(&IdentitySeed::from_bytes([0x96; 32])).public_key()
+            )
         );
         assert!(config
             .controller
             .spki_pins()
             .contains(&SpkiPin::from_digest([0x62; 32])));
 
-        let conflicting = JoinInvitation::new(
+        let conflicting = signed_test_invitation(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 44_901)),
-            "localhost".to_owned(),
-            ControllerId::from_bytes([0x61; 16]),
             [0x62; 32],
             NetworkId::from_bytes([0x63; 16]),
             u64::MAX,
-            [0x64; 32],
-            [0x65; 32],
-        )
-        .expect("construct conflicting invitation");
+        );
         let conflicting_args = invitation_join_args(&directory, &conflicting);
         assert!(prepare_invitation_configuration(
             &config_path,

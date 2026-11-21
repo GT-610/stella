@@ -11,7 +11,7 @@ token material that users must transfer without weakening those checks.
 Obtain these items from the administrator:
 
 - `stella-client`, plus `stella-tap-helper` on macOS;
-- one single-use invitation beginning with `stella1:`;
+- one single-use invitation beginning with `stella2:`;
 - the TAP-Windows Adapter V9 driver package on Windows, or two unused macOS
   feth names;
 - the IP address and subnet mask assigned for this Layer-2 network.

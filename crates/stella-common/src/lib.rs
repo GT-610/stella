@@ -8,7 +8,7 @@ use std::{fmt, str::FromStr};
 
 use thiserror::Error;
 
-pub use invitation::{InvitationError, JoinInvitation};
+pub use invitation::{InvitationError, JoinInvitation, INVITATION_SIGNATURE_DOMAIN};
 
 const IDENTIFIER_LENGTH: usize = 16;
 

@@ -11,7 +11,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use stella_common::{JoinInvitation, NetworkId, NodeId, RelayId};
+use stella_common::{JoinInvitation, NetworkId, NodeId, RelayId, INVITATION_SIGNATURE_DOMAIN};
 use stella_crypto::derive_controller_id;
 use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 use stella_server::{
@@ -745,7 +745,6 @@ async fn execute_invite(
             )
         })?;
     let controller_id = derive_controller_id(identity.public_key());
-    drop(identity);
     let spki_sha256 = load_tls_spki_sha256(&config.tls_certificate_path).with_context(|| {
         format!(
             "could not load controller certificate {}",
@@ -775,6 +774,12 @@ async fn execute_invite(
         *join_token.expose_secret(),
     )
     .context("could not construct invitation")?;
+    let unsigned = invitation.unsigned_bytes();
+    let signature = identity
+        .sign_segments(INVITATION_SIGNATURE_DOMAIN, &[&unsigned])
+        .context("could not sign invitation")?;
+    let invitation =
+        invitation.with_controller_signature(identity.public_key().to_bytes(), signature);
     let encoded = invitation.encode();
     writeln!(output, "{}", encoded.as_str()).context("could not write invitation")
 }

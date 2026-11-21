@@ -169,12 +169,14 @@ $NetworkId
 
 Replace `--controller` with the numeric address clients can actually reach;
 `--tls-name` must be present in the certificate generated during initialization.
-The `stella1:` invitation contains controller trust, the network ID, and both
-single-use tokens. It expires after one hour by default and is printed exactly
-once. Deliver it through a trusted private channel, generate a separate
-invitation for every node, and do not place it in logs, tickets, or source
-control. The client can follow the [quick start](./quick-start) to configure and
-join with one command.
+The `stella2:` invitation contains controller trust, the network ID, and both
+single-use tokens, and is signed with the controller's Ed25519 identity;
+clients verify that signature before persisting the trust anchor, so
+substituted or edited invitations are rejected. It expires after one hour by
+default and is printed exactly once. Deliver it through a trusted private
+channel, generate a separate invitation for every node, and do not place it in
+logs, tickets, or source control. The client can follow the
+[quick start](./quick-start) to configure and join with one command.
 
 The lower-level `enrollment-token create` and `join-token create` commands
 remain available when tokens must be managed separately; see the
