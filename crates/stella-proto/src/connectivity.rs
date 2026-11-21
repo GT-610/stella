@@ -1291,7 +1291,12 @@ impl<'a> StunServerListView<'a> {
         let records = cursor.read_slice(records_length, "STUN server records")?;
         let mut previous = None;
         for index in 0..usize::from(count) {
-            let server = decode_stun_server_at(records, index * STUN_SERVER_RECORD_LENGTH, 4)?;
+            let offset = index.checked_mul(STUN_SERVER_RECORD_LENGTH).ok_or(
+                CodecError::IntegerOverflow {
+                    field: "STUN server record offset",
+                },
+            )?;
+            let server = decode_stun_server_at(records, offset, 4)?;
             if previous.is_some_and(|prior: StunServer| prior.sort_cmp(server) != Ordering::Less) {
                 return Err(CodecError::NestedRecordsOutOfOrder {
                     context: "STUN server list",
@@ -1411,8 +1416,21 @@ pub fn encode_stun_server_list(
         cursor.write_bytes(&[0; 3], "STUN server list reserved")?;
     }
     for (index, server) in servers.iter().copied().enumerate() {
-        let start = 4 + index * STUN_SERVER_RECORD_LENGTH;
-        let end = start + STUN_SERVER_RECORD_LENGTH;
+        let start = 4_usize
+            .checked_add(index.checked_mul(STUN_SERVER_RECORD_LENGTH).ok_or(
+                CodecError::IntegerOverflow {
+                    field: "STUN server record offset",
+                },
+            )?)
+            .ok_or(CodecError::IntegerOverflow {
+                field: "STUN server record start",
+            })?;
+        let end =
+            start
+                .checked_add(STUN_SERVER_RECORD_LENGTH)
+                .ok_or(CodecError::IntegerOverflow {
+                    field: "STUN server record end",
+                })?;
         let remaining = output.len().saturating_sub(start);
         let record = output
             .get_mut(start..end)

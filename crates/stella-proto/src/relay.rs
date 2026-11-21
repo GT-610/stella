@@ -365,7 +365,7 @@ impl<'a> RelayServiceView<'a> {
         let tls_server_name = decode_text(tls_name_bytes, "relay TLS server name")?;
         let region = decode_text(region_bytes, "relay region label")?;
         let string_length = relay_header_strings_length(header)?;
-        let padding_length = align_to_four(string_length)? - string_length;
+        let padding_length = aligned_string_padding(string_length)?;
         let padding_offset = base_offset.saturating_add(cursor.position());
         if cursor
             .read_slice(padding_length, "relay service string padding")?
@@ -844,7 +844,7 @@ fn encode_relay_header_and_strings(
     cursor.write_bytes(service.credential_secret, "relay credential secret")?;
     cursor.write_bytes(service.region.as_bytes(), "relay region label")?;
     let string_length = service_strings_length(service)?;
-    let padding_length = align_to_four(string_length)? - string_length;
+    let padding_length = aligned_string_padding(string_length)?;
     cursor.write_bytes(&[0; 3][..padding_length], "relay service string padding")?;
     Ok(cursor.position())
 }
@@ -1132,7 +1132,13 @@ fn validate_service_credentials(service: RelayServiceRef<'_>) -> Result<(), Code
             not_after: service.credential_expires_at,
         });
     }
-    let lifetime = service.credential_expires_at - service.credential_issued_at;
+    let lifetime = service
+        .credential_expires_at
+        .checked_sub(service.credential_issued_at)
+        .ok_or(CodecError::InvalidTimeRange {
+            not_before: service.credential_issued_at,
+            not_after: service.credential_expires_at,
+        })?;
     if lifetime > MAX_RELAY_CREDENTIAL_LIFETIME_SECONDS {
         return Err(CodecError::LifetimeTooLong {
             actual: lifetime,
@@ -1541,6 +1547,18 @@ fn align_to_four(length: usize) -> Result<usize, CodecError> {
         .map(|value| value & !3)
         .ok_or(CodecError::IntegerOverflow {
             field: "four-byte aligned length",
+        })
+}
+
+/// Padding needed to bring one string block up to a four-byte boundary.
+///
+/// The subtraction is checked even though alignment guarantees it cannot
+/// underflow, keeping the arithmetic discipline uniform.
+fn aligned_string_padding(length: usize) -> Result<usize, CodecError> {
+    align_to_four(length)?
+        .checked_sub(length)
+        .ok_or(CodecError::IntegerOverflow {
+            field: "four-byte aligned padding",
         })
 }
 

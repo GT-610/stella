@@ -820,14 +820,15 @@ impl<'a> Iterator for StunAttributeIter<'a> {
         if self.position == self.body.len() {
             return None;
         }
-        if self.position > self.body.len() {
+        let Some(remaining) = self.body.get(self.position..) else {
+            // Unreachable while position only advances within the body, but a
+            // direct slice index here would panic if that invariant regressed.
             return Some(Err(CodecError::TrailingBytes {
                 expected: self.body.len(),
                 actual: self.position,
             }));
-        }
+        };
         let base = STUN_HEADER_LENGTH.saturating_add(self.position);
-        let remaining = &self.body[self.position..];
         let mut cursor = ReadCursor::new(remaining, base);
         let raw_attribute_type = match cursor.read_u16("STUN attribute type") {
             Ok(value) => value,
