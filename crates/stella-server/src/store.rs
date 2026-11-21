@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::OpenOptions,
     path::{Path, PathBuf},
     str,
 };
@@ -10,6 +9,7 @@ use std::{
 use redb::{Database, ReadableTable, TableDefinition};
 use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
 use stella_crypto::{derive_node_id, sha256_segments, CryptoError, IdentityPublicKey};
+use stella_file_security::{create_protected_secret_file, open_protected_secret_file};
 use stella_proto::{
     encode_endpoint_set, CodecError, ConnectivityGenerationView, ConnectivityRecordView, Endpoint,
     EndpointSetView, MembershipPermissions, NetworkPolicy, CONNECTIVITY_RECORD_FIXED_LENGTH,
@@ -70,26 +70,21 @@ pub struct AuthorityStore {
 impl AuthorityStore {
     /// Creates a new redb file and initializes every version 1 authority table.
     ///
-    /// The target is opened with create-new semantics and is never silently
+    /// The target is created with the native protected-secret file policy
+    /// (mode `0600` or an exact DACL) so member topology and relay credentials
+    /// are never readable by other local principals, and is never silently
     /// replaced or reused.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the path already exists, the file cannot be
-    /// created, redb initialization fails, or metadata cannot be committed.
+    /// created securely, redb initialization fails, or metadata cannot be
+    /// committed.
     pub fn initialize(path: &Path, controller_id: ControllerId) -> Result<Self, StoreError> {
         if controller_id.is_zero() {
             return Err(StoreError::InvalidControllerId);
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|source| StoreError::Create {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let file = create_protected_secret_file(path).map_err(StoreError::from)?;
         let database = redb::Builder::new().create_file(file)?;
         let write = database.begin_write()?;
         {
@@ -109,16 +104,23 @@ impl AuthorityStore {
 
     /// Opens existing authority state and verifies schema and controller binding.
     ///
+    /// The file must satisfy the native protected-secret policy (mode `0600`
+    /// or an exact DACL, no links) before and after the database is opened.
+    /// Databases with looser historical permissions are rejected so local
+    /// principals cannot read member topology or relay credentials.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] for redb failure, missing or malformed metadata,
-    /// an unsupported schema, a controller identity mismatch, or corrupt
-    /// versioned records.
+    /// Returns [`StoreError`] for an insecure state file, redb failure,
+    /// missing or malformed metadata, an unsupported schema, a controller
+    /// identity mismatch, or corrupt versioned records.
     pub fn open(path: &Path, expected_controller_id: ControllerId) -> Result<Self, StoreError> {
         if expected_controller_id.is_zero() {
             return Err(StoreError::InvalidControllerId);
         }
+        verify_state_file_permissions(path)?;
         let database = Database::open(path)?;
+        verify_state_file_permissions(path)?;
         let (schema_version, controller_id) = read_metadata_unchecked(&database)?;
         if controller_id != expected_controller_id {
             return Err(StoreError::ControllerMismatch {
@@ -1421,15 +1423,7 @@ impl AuthorityStore {
 
     pub(crate) fn backup(&self, destination: &Path) -> Result<u64, StoreError> {
         self.verify()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|source| StoreError::BackupCreate {
-                path: destination.to_path_buf(),
-                source,
-            })?;
+        let file = create_protected_secret_file(destination)?;
         match self.populate_backup(file, destination) {
             Ok(copied) => Ok(copied),
             Err(error) => Err(cleanup_backup(destination, error)),
@@ -1456,14 +1450,7 @@ impl AuthorityStore {
         drop(source_read);
         drop(backup);
 
-        let backup_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(destination)
-            .map_err(|source| StoreError::BackupSync {
-                path: destination.to_path_buf(),
-                source,
-            })?;
+        let backup_file = open_protected_secret_file(destination)?;
         backup_file
             .sync_all()
             .map_err(|source| StoreError::BackupSync {
@@ -2460,14 +2447,15 @@ impl JoinTokenRecord {
 /// Authority database initialization, validation, or transaction failure.
 #[derive(Debug, Error)]
 pub enum StoreError {
-    /// The new database file could not be created exclusively.
-    #[error("could not create authority database {path}: {source}")]
-    Create {
-        /// Requested database path.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        source: std::io::Error,
-    },
+    /// The state file failed a native protected-secret security check.
+    ///
+    /// This covers creation and verification failures: an existing path, a
+    /// link, a non-regular file, or permissions broader than the exact
+    /// owner-only policy. Existing deployments created with a permissive
+    /// umask must tighten the file (for example `chmod 600 controller.redb`)
+    /// before the authority store will open it.
+    #[error("authority state file failed a native security check: {0}")]
+    InsecureStateFile(#[from] stella_file_security::IdentityFileError),
     /// A boxed redb database, transaction, table, storage, or commit failure.
     #[error("authority database operation failed: {0}")]
     Redb(#[source] Box<redb::Error>),
@@ -2611,15 +2599,6 @@ pub enum StoreError {
         /// Network whose counter cannot advance.
         network_id: NetworkId,
     },
-    /// A create-new backup destination could not be opened.
-    #[error("unable to create authority backup {path}")]
-    BackupCreate {
-        /// Requested backup path.
-        path: PathBuf,
-        /// Underlying filesystem failure.
-        #[source]
-        source: std::io::Error,
-    },
     /// Backup bytes could not be durably synchronized.
     #[error("unable to sync authority backup {path}")]
     BackupSync {
@@ -2682,6 +2661,16 @@ fn enrollment_token_digest(token: &BearerToken) -> [u8; 32] {
 
 fn join_token_digest(token: &BearerToken) -> [u8; 32] {
     sha256_segments(&[JOIN_TOKEN_DOMAIN, token.expose_secret()])
+}
+
+/// Verifies the native protected-secret policy for an authority state file.
+///
+/// The file handle is opened with link and file-kind checks and immediately
+/// dropped; callers that subsequently open by path must re-verify to narrow
+/// the replacement window.
+fn verify_state_file_permissions(path: &Path) -> Result<(), StoreError> {
+    drop(open_protected_secret_file(path)?);
+    Ok(())
 }
 
 fn cleanup_backup(path: &Path, cause: StoreError) -> StoreError {
@@ -3365,7 +3354,28 @@ mod tests {
         ));
         assert!(matches!(
             AuthorityStore::initialize(&path, controller_id),
-            Err(StoreError::Create { .. })
+            Err(StoreError::InsecureStateFile(_))
+        ));
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn open_rejects_permissive_database_permissions() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let controller_id = ControllerId::from_bytes([91; 16]);
+        let store = AuthorityStore::initialize(&path, controller_id).expect("initialize store");
+        drop(store);
+
+        let mut permissions = std::fs::metadata(&path)
+            .expect("read database metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        std::fs::set_permissions(&path, permissions).expect("loosen permissions");
+        assert!(matches!(
+            AuthorityStore::open(&path, controller_id),
+            Err(StoreError::InsecureStateFile(_))
         ));
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
@@ -3382,6 +3392,12 @@ mod tests {
             .create_new(true)
             .open(&path)
             .expect("create legacy database");
+        let mut permissions = file
+            .metadata()
+            .expect("read legacy database metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+        std::fs::set_permissions(&path, permissions).expect("secure legacy database");
         let database = redb::Builder::new()
             .create_file(file)
             .expect("initialize legacy database");
@@ -3408,10 +3424,12 @@ mod tests {
         drop(database);
 
         let store = AuthorityStore::open(&path, controller_id).expect("migrate legacy database");
-        assert!(store
-            .list_connectivity(NetworkId::from_bytes([56; 16]))
-            .expect("read migrated connectivity table")
-            .is_empty());
+        assert_eq!(
+            store
+                .list_connectivity(NetworkId::from_bytes([56; 16]))
+                .expect("read migrated connectivity table"),
+            []
+        );
         let read = store.database.begin_read().expect("read migrated metadata");
         let metadata = read.open_table(METADATA).expect("open migrated metadata");
         let schema = metadata
@@ -3583,7 +3601,7 @@ mod tests {
         assert!(store.backup(&backup_path).expect("create backup") > 0);
         assert!(matches!(
             store.backup(&backup_path),
-            Err(StoreError::BackupCreate { .. })
+            Err(StoreError::InsecureStateFile(_))
         ));
         store
             .set_node_enabled(node_id, false)
@@ -3922,7 +3940,7 @@ mod tests {
         assert_eq!(offline.local_node().node_id(), first_id);
         assert_eq!(offline.local_membership().node_id(), first_id);
         assert_eq!(offline.network().network_id(), network_id);
-        assert!(offline.peers().is_empty());
+        assert_eq!(offline.peers(), []);
 
         store
             .publish_endpoints(second_id, network_id, &[], 120)
@@ -3938,7 +3956,7 @@ mod tests {
         assert_eq!(peer.node().node_id(), second_id);
         assert_eq!(peer.membership().node_id(), second_id);
         assert_eq!(peer.endpoint_lease().node_id(), second_id);
-        assert!(peer.endpoint_lease().endpoints().is_empty());
+        assert_eq!(peer.endpoint_lease().endpoints(), []);
         assert_eq!(
             online.network().snapshot_revision(),
             store
@@ -3951,11 +3969,13 @@ mod tests {
         store
             .set_membership_status(second_id, network_id, MembershipStatus::Suspended)
             .expect("suspend peer");
-        assert!(store
-            .network_session_view(first_id, network_id)
-            .expect("read suspended peer view")
-            .peers()
-            .is_empty());
+        assert_eq!(
+            store
+                .network_session_view(first_id, network_id)
+                .expect("read suspended peer view")
+                .peers(),
+            []
+        );
         assert!(matches!(
             store.network_session_view(second_id, network_id),
             Err(StoreError::MembershipSuspended { .. })
@@ -3993,7 +4013,7 @@ mod tests {
             .expect("read generated lease")
             .expect("online lease exists");
         assert_eq!(lease.updated_at, 120);
-        assert!(lease.endpoints().is_empty());
+        assert_eq!(lease.endpoints(), []);
         let stored = store
             .get_connectivity(first_id, network_id)
             .expect("read connectivity")
@@ -4098,10 +4118,12 @@ mod tests {
             .publish_connectivity(first_id, network_id, Some(&generation), 145)
             .expect("republish before expiry");
         assert_eq!(republished.snapshot_revision, 6);
-        assert!(store
-            .expire_endpoints(174)
-            .expect("retain live connectivity")
-            .is_empty());
+        assert_eq!(
+            store
+                .expire_endpoints(174)
+                .expect("retain live connectivity"),
+            []
+        );
         let expired = store
             .expire_endpoints(175)
             .expect("expire connectivity lease");
@@ -4137,10 +4159,10 @@ mod tests {
                 .expect("refresh online lease"),
             published
         );
-        assert!(store
-            .expire_endpoints(699)
-            .expect("retain live generation")
-            .is_empty());
+        assert_eq!(
+            store.expire_endpoints(699).expect("retain live generation"),
+            []
+        );
 
         let generation_expired = store.expire_endpoints(700).expect("expire generation only");
         assert_eq!(generation_expired.len(), 1);
@@ -4158,10 +4180,12 @@ mod tests {
             690
         );
 
-        assert!(store
-            .expire_endpoints(719)
-            .expect("retain fresh online lease")
-            .is_empty());
+        assert_eq!(
+            store
+                .expire_endpoints(719)
+                .expect("retain fresh online lease"),
+            []
+        );
         let lease_expired = store.expire_endpoints(720).expect("expire online lease");
         assert_eq!(lease_expired.len(), 1);
         assert_eq!(lease_expired[0].snapshot_revision, 5);
@@ -4224,12 +4248,14 @@ mod tests {
             .publish_endpoints(second_id, network_id, &[], 125)
             .expect("publish empty endpoint set");
         assert_eq!(second_online.snapshot_revision, 5);
-        assert!(store
-            .get_endpoints(second_id, network_id)
-            .expect("get empty endpoints")
-            .expect("empty online record exists")
-            .endpoints()
-            .is_empty());
+        assert_eq!(
+            store
+                .get_endpoints(second_id, network_id)
+                .expect("get empty endpoints")
+                .expect("empty online record exists")
+                .endpoints(),
+            []
+        );
         let withdrawn = store
             .publish_endpoints(first_id, network_id, &[], 130)
             .expect("withdraw direct endpoint");
@@ -4250,19 +4276,21 @@ mod tests {
             .expect("refresh second lease");
         assert_eq!(first_refresh, withdrawn);
         assert_eq!(second_refresh, withdrawn);
-        assert!(store
-            .expire_endpoints(169)
-            .expect("retain live endpoints")
-            .is_empty());
+        assert_eq!(
+            store.expire_endpoints(169).expect("retain live endpoints"),
+            []
+        );
         let expired = store.expire_endpoints(170).expect("expire both endpoints");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].network_id, network_id);
         assert_eq!(expired[0].controller_epoch, 3);
         assert_eq!(expired[0].snapshot_revision, 7);
-        assert!(store
-            .list_endpoints(network_id)
-            .expect("list expired endpoints")
-            .is_empty());
+        assert_eq!(
+            store
+                .list_endpoints(network_id)
+                .expect("list expired endpoints"),
+            []
+        );
         store.verify().expect("endpoint lease state is valid");
         drop(store);
         std::fs::remove_dir_all(&directory).expect("remove test directory");

@@ -213,7 +213,13 @@ fn ensure_directory(path: &Path, created: &mut Vec<PathBuf>) -> Result<(), Boots
     if let Some(parent) = path.parent() {
         ensure_directory(parent, created)?;
     }
-    match std::fs::create_dir(path) {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
         Ok(()) => created.push(path.to_path_buf()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = std::fs::metadata(path).map_err(|source| BootstrapError::Inspect {
