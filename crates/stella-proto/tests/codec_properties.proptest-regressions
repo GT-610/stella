@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c9485f383cf6827f9a668254c40d42e2c8f5966bcceded76531f1e80e08b1dfb # shrinks to servers = []
+cc faac8fc5415896d6a2be010e9a55b030ce5f8700153d8c0484447e1f652ea4d0 # shrinks to endpoints = [(false, 0, 0, 0, [224, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])]
+cc c986c234e866de81e81bc0489c4c5d89cab8937f0459d10172942ffd15f018b3 # shrinks to servers = [(false, 0, 0, [127, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])]
