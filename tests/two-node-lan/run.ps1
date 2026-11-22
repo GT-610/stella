@@ -166,7 +166,7 @@ try {
         @{ Path = Join-Path $Artifacts 'right-join-token'; Value = $rightJoin },
         @{ Path = Join-Path $Artifacts 'right-enrollment-token'; Value = $rightEnrollment }
     )) {
-        Set-Content -Path $credential.Path -Value $credential.Value -NoNewline
+        Set-Content -LiteralPath $credential.Path -Value $credential.Value -NoNewline
         $credentialFiles += $credential.Path
     }
     & $client --config $leftConfig join --network $networkId --token-file $credentialFiles[0] --enrollment-token-file $credentialFiles[1] --tap-adapter $LeftAdapter
@@ -174,7 +174,7 @@ try {
     & $client --config $rightConfig join --network $networkId --token-file $credentialFiles[2] --enrollment-token-file $credentialFiles[3] --tap-adapter $RightAdapter
     Require-Success 'right client join'
     foreach ($credentialFile in $credentialFiles) {
-        Remove-Item -Path $credentialFile -ErrorAction Stop
+        Remove-Item -LiteralPath $credentialFile -ErrorAction Stop
     }
     $credentialFiles = @()
     $leftEnrollment = $null
