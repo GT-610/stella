@@ -319,10 +319,10 @@ fn native_file_identity(file: &File) -> (Option<u32>, Option<u64>) {
     // binding expects winapi::ctypes::c_void. Both are one-byte-aligned void
     // pointer representations of the same kernel handle value, so the cast
     // only adjusts the pointer type.
-    let handle = file.as_raw_handle() as *mut c_void;
+    let handle = file.as_raw_handle().cast::<c_void>();
     // SAFETY: `GetFileInformationByHandle` reads the handle and writes the
     // structure; both arguments are valid for the duration of the call.
-    let succeeded = unsafe { GetFileInformationByHandle(handle, &mut information) };
+    let succeeded = unsafe { GetFileInformationByHandle(handle, &raw mut information) };
     if succeeded == 0 {
         return (None, None);
     }
