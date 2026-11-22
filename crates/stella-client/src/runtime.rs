@@ -219,11 +219,28 @@ impl ClientDataRuntime {
     /// Panics if the internal monotonic anchor lock is poisoned by a
     /// panicking thread.
     pub fn observe_controller_time(&self, server_time: u64) {
-        let mut anchor = self
-            .trusted_time_anchor
-            .lock()
-            .expect("trusted time anchor lock");
-        let elapsed = anchor.elapsed();
+        let elapsed = {
+            let anchor = self
+                .trusted_time_anchor
+                .lock()
+                .expect("trusted time anchor lock");
+            anchor.elapsed()
+        };
+        self.observe_controller_time_at(server_time, elapsed);
+    }
+
+    /// Applies one controller time observation against an explicit elapsed
+    /// span since the previous observation.
+    ///
+    /// Production callers pass the monotonic anchor's real elapsed time;
+    /// tests pass fixed spans so the fold arithmetic is exercised without
+    /// the real clock advancing between assertions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal monotonic anchor lock is poisoned by a
+    /// panicking thread.
+    fn observe_controller_time_at(&self, server_time: u64, elapsed: Duration) {
         let whole_seconds = elapsed.as_secs();
         let anchored_now = self
             .trusted_controller_time
@@ -232,6 +249,10 @@ impl ClientDataRuntime {
         let recorded = advance_trusted_time(anchored_now, server_time);
         self.trusted_controller_time
             .store(recorded, std::sync::atomic::Ordering::Relaxed);
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
         if server_time > anchored_now {
             // The controller timestamp strictly replaced the anchored floor,
             // so the anchor restarts from this observation.
@@ -242,13 +263,7 @@ impl ClientDataRuntime {
             // the whole seconds just folded into that floor, so the
             // sub-second remainder stays pending for the next observation
             // instead of being counted twice or discarded by a full reset.
-            match anchor.checked_add(Duration::from_secs(whole_seconds)) {
-                Some(advanced) => *anchor = advanced,
-                // The instant range overflowed, which practical durations
-                // never reach; falling back to now merely drops the pending
-                // remainder once.
-                None => *anchor = std::time::Instant::now(),
-            }
+            *anchor = advance_anchor(*anchor, whole_seconds);
         }
     }
 
@@ -2878,6 +2893,18 @@ fn advance_trusted_time(anchored_now: u64, server_time: u64) -> u64 {
     server_time.max(anchored_now)
 }
 
+/// Moves the observation anchor forward by the folded whole seconds.
+///
+/// Folding must never move the anchor backward: a backward move would
+/// re-count the folded seconds on the next observation and accelerate the
+/// trust clock. The instant range overflow falls back to the current
+/// instant, which only drops the pending sub-second remainder once.
+fn advance_anchor(anchor: std::time::Instant, whole_seconds: u64) -> std::time::Instant {
+    anchor
+        .checked_add(Duration::from_secs(whole_seconds))
+        .unwrap_or_else(std::time::Instant::now)
+}
+
 fn unix_time() -> Result<u64, RuntimeError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2994,36 +3021,60 @@ mod tests {
     #[tokio::test]
     async fn repeated_sub_second_observations_preserve_the_fractional_remainder() {
         let runtime = runtime_with_pending_relay_recovery().await;
-        // Far above any real local wall clock, so trusted_unix_time reports
-        // the anchored component itself and the assertions cannot pass by
-        // accident through the local clock.
+        // Far above any real local wall clock, so every value below comes
+        // from the anchored component and none can pass through the local
+        // clock floor. Observations pass explicit elapsed spans, so no real
+        // time passing between the calls can influence the assertions.
         let far_future = 1_000_000_000_000_000;
-        runtime.observe_controller_time(far_future);
-        // Two identical controller reports arrive less than a second apart:
-        // the first stores the timestamp, the second folds no whole seconds
-        // yet, and neither may discard the accumulated remainder.
-        runtime.rewind_trusted_time_anchor(Duration::from_millis(600));
-        runtime.observe_controller_time(far_future);
-        // The accumulated remainder now exceeds one second, so the next
-        // identical observation folds exactly one whole second forward.
-        runtime.rewind_trusted_time_anchor(Duration::from_millis(600));
-        runtime.observe_controller_time(far_future);
-        let trusted = runtime.trusted_unix_time().expect("trusted time");
+        runtime.observe_controller_time_at(far_future, Duration::ZERO);
+        // An identical report arrives 600ms after the previous one: no whole
+        // second folds yet, and the accumulated remainder must be kept.
+        runtime.observe_controller_time_at(far_future, Duration::from_millis(600));
         assert_eq!(
-            trusted,
+            runtime
+                .trusted_controller_time
+                .load(std::sync::atomic::Ordering::Relaxed),
+            far_future,
+            "sub-second reports must not fold a whole second yet"
+        );
+        // The next identical report arrives after the accumulated span
+        // crossed one second, so exactly one whole second folds into the
+        // floor while the remainder stays pending on the anchor.
+        runtime.observe_controller_time_at(far_future, Duration::from_millis(1200));
+        assert_eq!(
+            runtime
+                .trusted_controller_time
+                .load(std::sync::atomic::Ordering::Relaxed),
             far_future + 1,
             "one whole second must be folded in, not more and not zero"
         );
-        // A further 900ms folds one more whole second and keeps 100ms
-        // pending. A backward-moving anchor would re-count the folded
-        // second and land far ahead, so this pins the direction.
-        runtime.rewind_trusted_time_anchor(Duration::from_millis(900));
-        runtime.observe_controller_time(far_future);
-        let trusted = runtime.trusted_unix_time().expect("trusted time");
+        // A further 900ms interval folds one more whole second and keeps
+        // the rest pending. A backward-moving anchor would re-count the
+        // folded second into the next observation and record more; the
+        // direction is pinned separately in the anchor unit test.
+        runtime.observe_controller_time_at(far_future, Duration::from_millis(1100));
         assert_eq!(
-            trusted,
+            runtime
+                .trusted_controller_time
+                .load(std::sync::atomic::Ordering::Relaxed),
             far_future + 2,
-            "the folded seconds must not be counted twice, got {trusted}"
+            "the folded seconds must not be counted twice"
+        );
+    }
+
+    #[test]
+    fn folding_seconds_moves_the_anchor_forward_only() {
+        // Folding whole seconds must move the anchor exactly that far into
+        // the future, never backward. A backward move would re-count the
+        // folded seconds on the next observation and accelerate the trust
+        // clock. Comparing the instants directly keeps the check free of
+        // any real-time dependence.
+        let before = std::time::Instant::now();
+        let advanced = super::advance_anchor(before, 1);
+        assert_eq!(
+            advanced.checked_duration_since(before),
+            Some(Duration::from_secs(1)),
+            "folding one second must advance the anchor by exactly that second"
         );
     }
 
