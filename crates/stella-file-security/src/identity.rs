@@ -253,10 +253,13 @@ impl CreatedFileIdentity {
 ///
 /// The identity is captured from the creating handle and compared against a
 /// fresh no-reparse-point open of the path, so cleanup never deletes a path
-/// that was concurrently replaced by another writer. Windows does not
-/// guarantee unique file indexes on every file system, but the comparison
-/// only ever authorizes removal of a file this process just created, and
-/// every failure mode fails closed.
+/// that was concurrently replaced by another writer. Both values come from
+/// the stable `GetFileInformationByHandle` binding: the std metadata
+/// accessors for these fields still require the unstable
+/// `windows_by_handle` feature. Windows does not guarantee unique file
+/// indexes on every file system, but the comparison only ever authorizes
+/// removal of a file this process just created, and every failure mode
+/// fails closed.
 #[cfg(windows)]
 struct CreatedFileIdentity {
     volume_serial: Option<u32>,
@@ -266,26 +269,20 @@ struct CreatedFileIdentity {
 #[cfg(windows)]
 impl CreatedFileIdentity {
     fn of(file: &File) -> Self {
-        use std::os::windows::fs::MetadataExt;
-        let metadata = file.metadata();
+        let (volume_serial, file_index) = native_file_identity(file);
         Self {
-            volume_serial: metadata
-                .as_ref()
-                .ok()
-                .and_then(|metadata| metadata.volume_serial_number()),
-            file_index: metadata
-                .as_ref()
-                .ok()
-                .and_then(|metadata| metadata.file_index()),
+            volume_serial,
+            file_index,
         }
     }
 
     fn path_matches(&self, path: &Path) -> bool {
         use std::fs::OpenOptions;
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::fs::OpenOptionsExt;
         // Fail closed: an unidentifiable creation must never authorize
         // removing the path.
-        let (Some(volume_serial), Some(file_index)) = (self.volume_serial, self.file_index) else {
+        let (Some(created_volume), Some(created_index)) = (self.volume_serial, self.file_index)
+        else {
             return false;
         };
         // The reparse-point open does not follow links, so a replacement
@@ -298,14 +295,34 @@ impl CreatedFileIdentity {
         let Ok(file) = file else {
             return false;
         };
-        match file.metadata() {
-            Ok(metadata) => {
-                metadata.volume_serial_number() == Some(volume_serial)
-                    && metadata.file_index() == Some(file_index)
-            }
-            Err(_) => false,
+        match native_file_identity(&file) {
+            (Some(volume), Some(index)) => volume == created_volume && index == created_index,
+            _ => false,
         }
     }
+}
+
+/// Reads the native volume and file-index identity of an open handle.
+///
+/// Returns `None` components when the native query fails, which keeps every
+/// comparison fail closed.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn native_file_identity(file: &File) -> (Option<u32>, Option<u64>) {
+    use std::os::windows::io::AsRawHandle;
+    use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    // SAFETY: the handle belongs to a live `File` and the pointer names a
+    // `BY_HANDLE_FILE_INFORMATION` value of exactly the type the API fills.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `GetFileInformationByHandle` reads the handle and writes the
+    // structure; both arguments are valid for the duration of the call.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return (None, None);
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    (Some(information.dwVolumeSerialNumber), Some(file_index))
 }
 
 /// Placeholder identity for platforms with no secure file backend.
