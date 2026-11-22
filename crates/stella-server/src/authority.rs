@@ -1060,7 +1060,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn typed_commands_preserve_transaction_order() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([31; 16]))
             .expect("initialize store");
@@ -1115,7 +1115,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn token_commands_own_zeroizing_secret_copies() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([34; 16]))
             .expect("initialize store");
@@ -1149,7 +1149,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn endpoint_commands_preserve_publish_refresh_and_expiry_order() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([36; 16]))
             .expect("initialize store");
@@ -1238,7 +1238,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn connectivity_commands_publish_list_and_withdraw_secret_generations() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([39; 16]))
             .expect("initialize store");
@@ -1322,7 +1322,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn backup_and_network_delete_commands_are_serialized() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let backup_path = directory.join("controller.backup.redb");
         let controller_id = ControllerId::from_bytes([36; 16]);

@@ -1544,7 +1544,7 @@ mod tests {
             "stella-active-session-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let controller = signing_key(101);
         let controller_id: ControllerId = derive_controller_id(controller.public_key());
         let store = AuthorityStore::initialize(&directory.join("controller.redb"), controller_id)

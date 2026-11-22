@@ -215,9 +215,7 @@ pub fn open_protected_secret_file_for_update(path: &Path) -> Result<File, Identi
 /// Identity of a file created by this process, used to bind failure cleanup.
 ///
 /// On Unix the identity is the device and inode pair, so cleanup never
-/// deletes a path that was concurrently replaced by another writer. Other
-/// platforms keep the create-new semantics: a path that the call opened
-/// exclusively names a file created for this call.
+/// deletes a path that was concurrently replaced by another writer.
 #[cfg(unix)]
 struct CreatedFileIdentity {
     device: u64,
@@ -251,16 +249,83 @@ impl CreatedFileIdentity {
     }
 }
 
-#[cfg(not(unix))]
-struct CreatedFileIdentity;
+/// Windows file identity: the volume serial number and file index pair.
+///
+/// The identity is captured from the creating handle and compared against a
+/// fresh no-reparse-point open of the path, so cleanup never deletes a path
+/// that was concurrently replaced by another writer. Windows does not
+/// guarantee unique file indexes on every file system, but the comparison
+/// only ever authorizes removal of a file this process just created, and
+/// every failure mode fails closed.
+#[cfg(windows)]
+struct CreatedFileIdentity {
+    volume_serial: Option<u32>,
+    file_index: Option<u64>,
+}
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+impl CreatedFileIdentity {
+    fn of(file: &File) -> Self {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = file.metadata();
+        Self {
+            volume_serial: metadata
+                .as_ref()
+                .ok()
+                .and_then(|metadata| metadata.volume_serial_number()),
+            file_index: metadata
+                .as_ref()
+                .ok()
+                .and_then(|metadata| metadata.file_index()),
+        }
+    }
+
+    fn path_matches(&self, path: &Path) -> bool {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        // Fail closed: an unidentifiable creation must never authorize
+        // removing the path.
+        let (Some(volume_serial), Some(file_index)) = (self.volume_serial, self.file_index) else {
+            return false;
+        };
+        // The reparse-point open does not follow links, so a replacement
+        // junction or symlink is compared against its own identity and
+        // never matches the created file.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(platform::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path);
+        let Ok(file) = file else {
+            return false;
+        };
+        match file.metadata() {
+            Ok(metadata) => {
+                metadata.volume_serial_number() == Some(volume_serial)
+                    && metadata.file_index() == Some(file_index)
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Placeholder identity for platforms with no secure file backend.
+///
+/// Every creation and open path returns [`IdentityFileError::UnsupportedPlatform`]
+/// there, so identity checks are unreachable; the type keeps the cleanup
+/// helpers uniform across platform configurations.
+#[cfg(not(any(windows, unix)))]
+struct CreatedFileIdentity(());
+
+#[cfg(not(any(windows, unix)))]
 impl CreatedFileIdentity {
     fn of(_file: &File) -> Self {
-        Self
+        Self(())
     }
 
     fn path_matches(&self, _path: &Path) -> bool {
+        // Unreachable on unsupported platforms; the field keeps this stub
+        // shaped like the real backends.
+        self.0;
         true
     }
 }
@@ -457,7 +522,7 @@ mod platform {
     const WRITE_DAC: u32 = 0x0004_0000;
     const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
     pub(super) fn create_secure_file(path: &Path) -> Result<File, IdentityFileError> {
@@ -721,7 +786,9 @@ mod platform {
     pub(super) fn open_verified_file(path: &Path) -> Result<File, IdentityFileError> {
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // O_NOFOLLOW rejects links; O_NONBLOCK keeps a FIFO at the path
+            // from blocking the open before the regular-file check runs.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|source| IdentityFileError::Open {
                 path: path.to_path_buf(),
@@ -735,7 +802,7 @@ mod platform {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|source| IdentityFileError::Open {
                 path: path.to_path_buf(),
@@ -860,7 +927,9 @@ mod platform {
     pub(super) fn open_verified_file(path: &Path) -> Result<File, IdentityFileError> {
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // O_NOFOLLOW rejects links; O_NONBLOCK keeps a FIFO at the path
+            // from blocking the open before the regular-file check runs.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|source| IdentityFileError::Open {
                 path: path.to_path_buf(),
@@ -874,7 +943,7 @@ mod platform {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|source| IdentityFileError::Open {
                 path: path.to_path_buf(),

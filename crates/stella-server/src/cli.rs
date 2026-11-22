@@ -1046,6 +1046,25 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    /// Creates fixture directories with owner-only permissions.
+    ///
+    /// The authority store rejects state paths whose ancestors are group or
+    /// world writable, so fixtures must not depend on the ambient umask
+    /// (`umask 0002` would turn a plain `create_dir` into `0775`).
+    #[cfg(any(windows, target_os = "macos"))]
+    fn create_owner_only_directory(directory: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(directory)
+                .expect("create test directory");
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(directory).expect("create test directory");
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     struct Fixture {
         directory: PathBuf,
@@ -1061,9 +1080,9 @@ mod tests {
                 "stella-server-cli-{}-{sequence}",
                 std::process::id()
             ));
-            std::fs::create_dir(&directory).expect("create fixture directory");
-            std::fs::create_dir(directory.join("state")).expect("create state directory");
-            std::fs::create_dir(directory.join("secrets")).expect("create secrets directory");
+            create_owner_only_directory(&directory);
+            create_owner_only_directory(&directory.join("state"));
+            create_owner_only_directory(&directory.join("secrets"));
             let identity_path = directory.join("secrets/controller.pk8");
             let identity = create_controller_identity(&identity_path).expect("create identity");
             let controller_id = derive_controller_id(identity.public_key());
@@ -1206,7 +1225,7 @@ mod tests {
             "stella-server-cli-relay-key-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::create_dir(&directory).expect("create relay key test directory");
+        create_owner_only_directory(&directory);
         let path = directory.join("relay-credential.key");
         let argv = [
             OsString::from("stella-server"),

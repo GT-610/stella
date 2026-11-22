@@ -526,7 +526,7 @@ mod tests {
         ));
         assert!(!directory.exists());
 
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         std::fs::write(&config_path, "owned by operator").expect("create existing target");
         assert!(matches!(
             initialize_controller(&config_path, &BootstrapOptions::default()),
