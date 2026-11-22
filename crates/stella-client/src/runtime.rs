@@ -238,12 +238,15 @@ impl ClientDataRuntime {
             *anchor = std::time::Instant::now();
         } else {
             // The anchored floor stands (a stale or identical controller
-            // timestamp cannot move it). The anchor advances only by the
-            // whole seconds just folded into that floor, so the sub-second
-            // remainder is preserved for the next observation instead of
-            // being discarded by a full reset.
-            match anchor.checked_sub(Duration::from_secs(whole_seconds)) {
+            // timestamp cannot move it). The anchor moves forward by exactly
+            // the whole seconds just folded into that floor, so the
+            // sub-second remainder stays pending for the next observation
+            // instead of being counted twice or discarded by a full reset.
+            match anchor.checked_add(Duration::from_secs(whole_seconds)) {
                 Some(advanced) => *anchor = advanced,
+                // The instant range overflowed, which practical durations
+                // never reach; falling back to now merely drops the pending
+                // remainder once.
                 None => *anchor = std::time::Instant::now(),
             }
         }
@@ -2991,18 +2994,36 @@ mod tests {
     #[tokio::test]
     async fn repeated_sub_second_observations_preserve_the_fractional_remainder() {
         let runtime = runtime_with_pending_relay_recovery().await;
-        runtime.observe_controller_time(500);
-        // Two controller reports of the same timestamp arrive less than a
-        // second apart. The first observation stores it; the second must not
-        // discard the sub-second remainder via a full anchor reset, so the
-        // accumulated elapsed time keeps advancing the trust clock.
-        runtime.rewind_trusted_time_anchor(Duration::from_millis(500));
-        runtime.observe_controller_time(500);
+        // Far above any real local wall clock, so trusted_unix_time reports
+        // the anchored component itself and the assertions cannot pass by
+        // accident through the local clock.
+        let far_future = 1_000_000_000_000_000;
+        runtime.observe_controller_time(far_future);
+        // Two identical controller reports arrive less than a second apart:
+        // the first stores the timestamp, the second folds no whole seconds
+        // yet, and neither may discard the accumulated remainder.
         runtime.rewind_trusted_time_anchor(Duration::from_millis(600));
+        runtime.observe_controller_time(far_future);
+        // The accumulated remainder now exceeds one second, so the next
+        // identical observation folds exactly one whole second forward.
+        runtime.rewind_trusted_time_anchor(Duration::from_millis(600));
+        runtime.observe_controller_time(far_future);
         let trusted = runtime.trusted_unix_time().expect("trusted time");
-        assert!(
-            trusted >= 501,
-            "the sub-second remainder between identical observations must count, got {trusted}"
+        assert_eq!(
+            trusted,
+            far_future + 1,
+            "one whole second must be folded in, not more and not zero"
+        );
+        // A further 900ms folds one more whole second and keeps 100ms
+        // pending. A backward-moving anchor would re-count the folded
+        // second and land far ahead, so this pins the direction.
+        runtime.rewind_trusted_time_anchor(Duration::from_millis(900));
+        runtime.observe_controller_time(far_future);
+        let trusted = runtime.trusted_unix_time().expect("trusted time");
+        assert_eq!(
+            trusted,
+            far_future + 2,
+            "the folded seconds must not be counted twice, got {trusted}"
         );
     }
 
