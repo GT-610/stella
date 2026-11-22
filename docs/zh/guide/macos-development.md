@@ -41,11 +41,14 @@ bun run docs:build
 ```sh
 target/debug/stella-client --config /path/to/client.toml join \
   --network <id> \
-  --token <unpadded-base64url-token> \
-  --enrollment-token <unpadded-base64url-token> \
+  --token-file /path/to/join-token.txt \
+  --enrollment-token-file /path/to/enrollment-token.txt \
   --tap-adapter feth100 \
   --tap-peer feth101
 ```
+
+令牌通过文件而不是命令行参数传入，避免其他本地用户从进程列表读取令牌。请以仅属主
+可读的权限创建每个令牌文件，并在加入完成后删除。
 
 构建客户端与 helper，再为客户端用户的数值 UID 启动 helper。保持此前台进程运行；其
 socket 为 mode `0600` 且归所选用户所有：

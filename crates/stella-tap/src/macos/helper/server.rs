@@ -75,11 +75,12 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
             ),
         ));
     }
-    // Bind every new feth-pair lock record to this helper's authorized user
-    // before any session can open a device.
-    crate::macos::feth::set_authorized_uid(config.allowed_uid);
     validate_socket_path(&config.socket_path)?;
     let (listener, _socket_guard) = prepare_listener(&config.socket_path, config.allowed_uid)?;
+    // Bind every new feth-pair lock record to this helper's authorized user
+    // only after the socket work succeeds. A conflicting UID stored earlier
+    // in the process fails closed before any session can open a device.
+    crate::macos::feth::set_authorized_uid(config.allowed_uid)?;
     let active_sessions = Arc::new(AtomicUsize::new(0));
     let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
     loop {
@@ -101,7 +102,7 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
             },
         };
         if active_sessions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_HELPER_SESSIONS).then_some(active + 1)
             })
             .is_err()
@@ -496,7 +497,11 @@ fn validate_socket_path(path: &Path) -> Result<()> {
             reason: "must live inside a directory",
         });
     };
-    let parent_metadata = fs::metadata(parent).map_err(|source| {
+    // Resolve symlinks first so the ancestor walk covers the directories the
+    // socket actually lives in. Every ancestor must then be a root-owned
+    // directory without group or world write access, so a non-root principal
+    // cannot rewrite any path component the helper binds through.
+    let canonical_parent = fs::canonicalize(parent).map_err(|source| {
         TapError::io(
             TapOperation::ConnectHelper,
             io::Error::new(
@@ -508,16 +513,26 @@ fn validate_socket_path(path: &Path) -> Result<()> {
             ),
         )
     })?;
-    // The parent directory must be root-owned with no group or world write
-    // access, so other local users cannot replace the freshly bound socket.
-    if !parent_metadata.is_dir()
-        || parent_metadata.uid() != 0
-        || parent_metadata.mode() & 0o022 != 0
-    {
-        return Err(TapError::InvalidConfig {
-            field: "helper socket path",
-            reason: "parent directory must be root-owned and not group or world writable",
-        });
+    let mut current: &Path = canonical_parent.as_path();
+    loop {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(current)
+            .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(TapError::InvalidConfig {
+                field: "helper socket path",
+                reason: "every path ancestor must be a root-owned directory \
+                         without group or world write access",
+            });
+        }
+        match current.parent() {
+            Some(ancestor) => current = ancestor,
+            None => break,
+        }
     }
     Ok(())
 }

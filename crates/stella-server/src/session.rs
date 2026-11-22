@@ -838,10 +838,10 @@ mod tests {
     use crate::{
         bootstrap::{initialize_controller, BootstrapOptions},
         config::ServerConfig,
-        identity::create_protected_secret_file,
         runtime::{run_controller, SessionError, SessionHandler},
         store::{AuthorityStore, BearerToken},
     };
+    use stella_file_security::create_protected_secret_file;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 

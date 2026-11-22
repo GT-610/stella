@@ -9,7 +9,10 @@ use std::{
 use redb::{Database, ReadableTable, TableDefinition};
 use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
 use stella_crypto::{derive_node_id, sha256_segments, CryptoError, IdentityPublicKey};
-use stella_file_security::{create_protected_secret_file, open_protected_secret_file};
+use stella_file_security::{
+    create_protected_secret_file, open_protected_secret_file,
+    open_protected_secret_file_for_update, IdentityFileError,
+};
 use stella_proto::{
     encode_endpoint_set, CodecError, ConnectivityGenerationView, ConnectivityRecordView, Endpoint,
     EndpointSetView, MembershipPermissions, NetworkPolicy, CONNECTIVITY_RECORD_FIXED_LENGTH,
@@ -107,17 +110,21 @@ impl AuthorityStore {
     /// The file must satisfy the native protected-secret policy (mode `0600`
     /// or an exact DACL, no links) before and after the database is opened.
     /// Databases with looser historical permissions are rejected so local
-    /// principals cannot read member topology or relay credentials.
+    /// principals cannot read member topology or relay credentials. On Unix
+    /// the state directory itself must not be group or world writable,
+    /// closing the path-swap window between the policy checks.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] for an insecure state file, redb failure,
-    /// missing or malformed metadata, an unsupported schema, a controller
-    /// identity mismatch, or corrupt versioned records.
+    /// Returns [`StoreError`] for an insecure state file or directory, redb
+    /// failure, missing or malformed metadata, an unsupported schema, a
+    /// controller identity mismatch, or corrupt versioned records.
     pub fn open(path: &Path, expected_controller_id: ControllerId) -> Result<Self, StoreError> {
         if expected_controller_id.is_zero() {
             return Err(StoreError::InvalidControllerId);
         }
+        #[cfg(unix)]
+        verify_state_directory(path)?;
         verify_state_file_permissions(path)?;
         let database = Database::open(path)?;
         verify_state_file_permissions(path)?;
@@ -1450,7 +1457,10 @@ impl AuthorityStore {
         drop(source_read);
         drop(backup);
 
-        let backup_file = open_protected_secret_file(destination)?;
+        // The update-capable handle keeps the native permission verification:
+        // on Windows `sync_all` needs write access on the handle, so the
+        // read-only policy opener cannot be reused here.
+        let backup_file = open_protected_secret_file_for_update(destination)?;
         backup_file
             .sync_all()
             .map_err(|source| StoreError::BackupSync {
@@ -2673,6 +2683,36 @@ fn verify_state_file_permissions(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Verifies that the Unix state directory cannot be rewritten by group or
+/// world principals.
+///
+/// `Database::open` retains the path, so a directory writable by other local
+/// principals would allow the state file to be swapped between the policy
+/// checks. The directory check must therefore pass before the database opens.
+#[cfg(unix)]
+fn verify_state_directory(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = std::fs::symlink_metadata(parent).map_err(|source| {
+        StoreError::InsecureStateFile(IdentityFileError::Metadata {
+            path: parent.to_path_buf(),
+            source,
+        })
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.mode() & 0o022 != 0 {
+        return Err(StoreError::InsecureStateFile(
+            IdentityFileError::InsecurePermissions {
+                path: parent.to_path_buf(),
+                reason: "state directory must not be a link or be group or world writable",
+            },
+        ));
+    }
+    Ok(())
+}
+
 fn cleanup_backup(path: &Path, cause: StoreError) -> StoreError {
     match std::fs::remove_file(path) {
         Ok(()) => cause,
@@ -3160,7 +3200,6 @@ const fn malformed(table: &'static str, reason: &'static str) -> StoreError {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::OpenOptions,
         net::Ipv4Addr,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
@@ -3168,6 +3207,7 @@ mod tests {
 
     use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
+    use stella_file_security::create_protected_secret_file;
     use stella_proto::{
         encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
         ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
@@ -3360,6 +3400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn open_rejects_permissive_database_permissions() {
         let directory = temp_directory();
         std::fs::create_dir(&directory).expect("create test directory");
@@ -3381,23 +3422,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn open_rejects_a_group_writable_state_directory() {
+        let directory = temp_directory();
+        std::fs::create_dir(&directory).expect("create test directory");
+        let path = directory.join("controller.redb");
+        let controller_id = ControllerId::from_bytes([92; 16]);
+        let store = AuthorityStore::initialize(&path, controller_id).expect("initialize store");
+        drop(store);
+
+        let mut permissions = std::fs::metadata(&directory)
+            .expect("read directory metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o770);
+        std::fs::set_permissions(&directory, permissions).expect("loosen directory");
+        assert!(matches!(
+            AuthorityStore::open(&path, controller_id),
+            Err(StoreError::InsecureStateFile(_))
+        ));
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
     fn schema_one_is_atomically_migrated_before_verification() {
         let directory = temp_directory();
         std::fs::create_dir(&directory).expect("create test directory");
         let path = directory.join("controller.redb");
         let controller_id = ControllerId::from_bytes([55; 16]);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .expect("create legacy database");
-        let mut permissions = file
-            .metadata()
-            .expect("read legacy database metadata")
-            .permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
-        std::fs::set_permissions(&path, permissions).expect("secure legacy database");
+        // The legacy fixture goes through the protected-file API so it
+        // carries the exact native policy (mode 0600 or the Windows DACL)
+        // instead of Unix-only permission calls.
+        let file = create_protected_secret_file(&path).expect("create legacy database");
         let database = redb::Builder::new()
             .create_file(file)
             .expect("initialize legacy database");

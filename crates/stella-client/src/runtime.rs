@@ -201,28 +201,69 @@ pub struct ClientDataRuntime {
     tap_events: mpsc::Receiver<TapEvent>,
     tap_event_sender: mpsc::Sender<TapEvent>,
     trusted_controller_time: AtomicU64,
+    trusted_time_anchor: std::sync::Mutex<std::time::Instant>,
     started_at: std::time::Instant,
 }
 
 impl ClientDataRuntime {
     /// Records the most recently authenticated controller wall-clock time.
     ///
-    /// Grant and session validity are evaluated against
-    /// [`Self::trusted_unix_time`], the maximum of the local clock and this
-    /// recorded controller time. Winding the local clock backwards can
-    /// therefore no longer extend a revoked member's grants or sessions.
+    /// The observation anchors the recorded value to a monotonic instant so
+    /// [`Self::trusted_unix_time`] keeps advancing between observations even
+    /// when the local clock runs behind. A stale controller timestamp can
+    /// therefore not freeze the trust clock and extend a session beyond its
+    /// lifetime while controller updates pause.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal monotonic anchor lock is poisoned by a
+    /// panicking thread.
     pub fn observe_controller_time(&self, server_time: u64) {
-        self.trusted_controller_time
-            .fetch_max(server_time, std::sync::atomic::Ordering::Relaxed);
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        let anchored_now = self
+            .trusted_controller_time
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(anchor.elapsed().as_secs());
+        self.trusted_controller_time.store(
+            advance_trusted_time(anchored_now, server_time),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        *anchor = std::time::Instant::now();
     }
 
     /// Returns the trust clock used for grant and session validity.
+    ///
+    /// The value is the maximum of the local clock and the anchored controller
+    /// time, so winding the local clock backwards can no longer extend a
+    /// revoked member's grants or sessions, and elapsed monotonic time keeps
+    /// the anchor advancing between controller observations.
     fn trusted_unix_time(&self) -> Result<u64, RuntimeError> {
         let local = unix_time()?;
-        Ok(self
+        let anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        let anchored = self
             .trusted_controller_time
             .load(std::sync::atomic::Ordering::Relaxed)
-            .max(local))
+            .saturating_add(anchor.elapsed().as_secs());
+        Ok(anchored.max(local))
+    }
+
+    /// Rewinds the monotonic anchor for regression tests, simulating elapsed
+    /// time since the last controller observation.
+    #[cfg(test)]
+    fn rewind_trusted_time_anchor(&self, elapsed: std::time::Duration) {
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        if let Some(rewound) = anchor.checked_sub(elapsed) {
+            *anchor = rewound;
+        }
     }
 
     /// Binds direct UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
@@ -281,14 +322,15 @@ impl ClientDataRuntime {
             tap_events,
             tap_event_sender,
             trusted_controller_time: AtomicU64::new(0),
+            trusted_time_anchor: std::sync::Mutex::new(std::time::Instant::now()),
             started_at,
         };
         for state in states.values().cloned() {
             runtime.insert_network(config, state, signing_key)?;
         }
-        runtime.replace_local_connectivity_generations(states)?;
-        runtime.prepare_relay_paths().await?;
         let wall_time = runtime.trusted_unix_time()?;
+        runtime.replace_local_connectivity_generations(states, wall_time)?;
+        runtime.prepare_relay_paths().await?;
         runtime.reconcile_ice_agents(states, wall_time)?;
         let monotonic_now = runtime.monotonic_now();
         let network_ids: Vec<NetworkId> = runtime.networks.keys().copied().collect();
@@ -577,7 +619,7 @@ impl ClientDataRuntime {
         self.refresh_server_reflexive_candidates(candidate_datagram_size)
             .await;
         let states = self.current_network_states();
-        self.replace_local_connectivity_generations(&states)?;
+        self.replace_local_connectivity_generations(&states, wall_time)?;
         self.reconcile_ice_agents(&states, wall_time)?;
         self.connectivity_changed = true;
         let current_count = self
@@ -691,8 +733,9 @@ impl ClientDataRuntime {
                 active.state = state.clone();
             }
         }
-        self.reconcile_local_connectivity_generations(states)?;
-        self.reconcile_ice_agents(states, self.trusted_unix_time()?)?;
+        let wall_time = self.trusted_unix_time()?;
+        self.reconcile_local_connectivity_generations(states, wall_time)?;
+        self.reconcile_ice_agents(states, wall_time)?;
         self.prepare_relay_paths().await?;
         Ok(())
     }
@@ -733,11 +776,11 @@ impl ClientDataRuntime {
             .iter()
             .map(|(network_id, generation)| (*network_id, generation.generation_id))
             .collect::<BTreeMap<_, _>>();
-        self.reconcile_local_connectivity_generations(states)?;
+        let wall_time = self.trusted_unix_time()?;
+        self.reconcile_local_connectivity_generations(states, wall_time)?;
         if self.connectivity_generations.is_empty() {
             return Ok(!before.is_empty());
         }
-        let wall_time = self.trusted_unix_time()?;
         let refresh_deadline = wall_time.saturating_add(ICE_GENERATION_REFRESH_LEAD);
         let prospective_expiry = LocalConnectivityGeneration::expiry_at(wall_time, &self.relays)?;
         let due = self
@@ -1137,8 +1180,9 @@ impl ClientDataRuntime {
             network.plane.set_available_relay_carriers(&available)?;
         }
         self.relay_buffers = relay_buffers(&self.relays);
-        self.replace_local_connectivity_generations(states)?;
-        self.reconcile_ice_agents(states, self.trusted_unix_time()?)
+        let wall_time = self.trusted_unix_time()?;
+        self.replace_local_connectivity_generations(states, wall_time)?;
+        self.reconcile_ice_agents(states, wall_time)
     }
 
     fn current_network_states(&self) -> BTreeMap<NetworkId, NetworkState> {
@@ -1259,6 +1303,7 @@ impl ClientDataRuntime {
     fn replace_local_connectivity_generations(
         &mut self,
         states: &BTreeMap<NetworkId, NetworkState>,
+        wall_time: u64,
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations.clear();
         if self.relays.is_empty() && self.direct_candidates.is_empty() {
@@ -1267,7 +1312,11 @@ impl ClientDataRuntime {
         for network_id in states.keys().copied() {
             self.connectivity_generations.insert(
                 network_id,
-                LocalConnectivityGeneration::new(&self.relays, &self.direct_candidates)?,
+                LocalConnectivityGeneration::new_at(
+                    wall_time,
+                    &self.relays,
+                    &self.direct_candidates,
+                )?,
             );
         }
         Ok(())
@@ -1276,6 +1325,7 @@ impl ClientDataRuntime {
     fn reconcile_local_connectivity_generations(
         &mut self,
         states: &BTreeMap<NetworkId, NetworkState>,
+        wall_time: u64,
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations
             .retain(|network_id, _| states.contains_key(network_id));
@@ -1287,7 +1337,8 @@ impl ClientDataRuntime {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 self.connectivity_generations.entry(network_id)
             {
-                entry.insert(LocalConnectivityGeneration::new(
+                entry.insert(LocalConnectivityGeneration::new_at(
+                    wall_time,
                     &self.relays,
                     &self.direct_candidates,
                 )?);
@@ -1677,6 +1728,12 @@ struct LocalConnectivityGeneration {
 }
 
 impl LocalConnectivityGeneration {
+    /// Creates a generation stamped with the current local clock.
+    ///
+    /// Production code always passes the runtime's trusted clock through
+    /// [`Self::new_at`]; this test-facing helper keeps the legacy direct
+    /// stamping for fixtures that do not model a controller observation.
+    #[cfg(test)]
     fn new(relays: &[WarmRelay], direct_candidates: &[IceCandidate]) -> Result<Self, RuntimeError> {
         let created_at = unix_time()?;
         Self::new_at(created_at, relays, direct_candidates)
@@ -2794,6 +2851,15 @@ fn effective_tap_mtu(policy_mtu: u16, installed_mtu: u32) -> Result<u16, TapErro
     })
 }
 
+/// Chooses the next recorded controller time for one authenticated observation.
+///
+/// The recorded value never moves backwards: a controller timestamp that
+/// lags behind the anchored trust clock keeps the already-anchored value,
+/// while a newer timestamp is adopted immediately.
+fn advance_trusted_time(anchored_now: u64, server_time: u64) -> u64 {
+    server_time.max(anchored_now)
+}
+
 fn unix_time() -> Result<u64, RuntimeError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2884,7 +2950,7 @@ mod tests {
 
     #[tokio::test]
     async fn controller_time_raises_the_trusted_clock_monotonically() {
-        let mut runtime = runtime_with_pending_relay_recovery().await;
+        let runtime = runtime_with_pending_relay_recovery().await;
         runtime.observe_controller_time(1_000_000_000_000);
         assert!(
             runtime.trusted_unix_time().expect("trusted time") >= 1_000_000_000_000,
@@ -2895,6 +2961,26 @@ mod tests {
             runtime.trusted_unix_time().expect("trusted time") >= 1_000_000_000_000,
             "a stale controller time must not move the trust clock backwards"
         );
+        // Elapsed monotonic time keeps the anchored clock advancing between
+        // observations even when the local wall clock runs behind and the
+        // controller stops sending timestamps.
+        let before = runtime.trusted_unix_time().expect("trusted time");
+        runtime.rewind_trusted_time_anchor(Duration::from_secs(600));
+        let after = runtime.trusted_unix_time().expect("trusted time");
+        assert!(
+            after >= before + 590,
+            "trusted time must advance with elapsed monotonic time, {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn trusted_time_observations_never_move_the_recorded_value_backwards() {
+        // A fresh anchor contributes no elapsed seconds, so the recorded value
+        // equals the newer of the two inputs.
+        assert_eq!(super::advance_trusted_time(0, 500), 500);
+        // A controller timestamp that lags the anchored clock keeps the floor.
+        assert_eq!(super::advance_trusted_time(10_000, 50), 10_000);
+        assert_eq!(super::advance_trusted_time(10_000, 10_001), 10_001);
     }
 
     async fn runtime_with_pending_relay_recovery() -> ClientDataRuntime {
@@ -2930,6 +3016,7 @@ mod tests {
             tap_events,
             tap_event_sender,
             trusted_controller_time: AtomicU64::new(0),
+            trusted_time_anchor: std::sync::Mutex::new(std::time::Instant::now()),
             started_at: std::time::Instant::now(),
         }
     }
@@ -2971,6 +3058,7 @@ mod tests {
             tap_events,
             tap_event_sender,
             trusted_controller_time: AtomicU64::new(0),
+            trusted_time_anchor: std::sync::Mutex::new(std::time::Instant::now()),
             started_at: std::time::Instant::now(),
         }
     }

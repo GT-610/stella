@@ -1020,7 +1020,6 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
     let network_id = join_network_id(args, invitation.as_ref())?;
     let tap = join_tap_selection(network_id, args)?;
     validate_intent_compatibility(&config, network_id, &tap)?;
-    let provision = JoinTapProvision::prepare(&tap)?;
     let invitation_join_token = invitation
         .as_ref()
         .map(|value| BearerCredential::from_bytes(*value.join_token()));
@@ -1035,6 +1034,9 @@ async fn join_network(config_path: &Path, args: &JoinArgs, output: &mut dyn Writ
         Some(path) => Some(read_credential_file(path)?),
         None => None,
     };
+    // Provisioning starts only after both credential reads succeed so a
+    // failing read cannot leak a freshly created TAP adapter on the host.
+    let provision = JoinTapProvision::prepare(&tap)?;
     let join_token = invitation_join_token
         .as_ref()
         .or(token_file_credential.as_ref());
@@ -1202,10 +1204,13 @@ fn read_join_invitation(input: &mut dyn Read, source: &str) -> Result<JoinInvita
 
 /// Verifies the embedded controller Ed25519 signature and identity binding.
 ///
-/// Every invitation carries the complete controller trust anchor, so the
-/// signature is the only barrier between a substituted invitation and full
-/// trust transfer to an attacker controller; it is verified before any
-/// trust configuration is persisted.
+/// The signature proves the invitation is intact under the key it carries and
+/// rejects in-transit edits of a legitimate invitation. It does not, by
+/// itself, bind the invitation to the intended controller: a fully
+/// substituted invitation can be self-consistent under an attacker's key.
+/// Delivery through an authenticated private channel therefore remains the
+/// required trust boundary, and verification must still run before any trust
+/// configuration is persisted.
 fn verify_invitation_controller_signature(invitation: &JoinInvitation) -> Result<()> {
     let public_key = IdentityPublicKey::from_bytes(*invitation.controller_public_key())
         .context("invitation carries an invalid controller public key")?;
@@ -1817,10 +1822,12 @@ fn write_create_new(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[cfg(any(windows, target_os = "macos"))]
+    use std::path::Path;
+    #[cfg(any(windows, target_os = "macos"))]
     use std::{collections::BTreeMap, time::Duration};
     use std::{
         net::{Ipv4Addr, SocketAddr},
-        path::{Path, PathBuf},
+        path::PathBuf,
         str::FromStr,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -1839,6 +1846,8 @@ mod tests {
     use super::validate_intent_compatibility;
     #[cfg(target_os = "macos")]
     use super::validate_join_tap;
+    #[cfg(any(windows, target_os = "macos"))]
+    use super::JoinArgs;
     #[cfg(target_os = "windows")]
     use super::JoinTapSelection;
     use super::{
@@ -1846,14 +1855,12 @@ mod tests {
         full_jitter, load_join_invitation_with_stdin, pending_network_removals_path,
         persist_network_intent, read_credential_file, read_join_invitation, reconnect_cap,
         record_pending_network_removal, remove_network_intent, report_control_shutdown, Cli,
-        CliCredential, Command, InitArgs, MAXIMUM_RECONNECT_DELAY,
+        CliCredential, Command, InitArgs, MAXIMUM_RECONNECT_DELAY, MAX_CREDENTIAL_FILE_BYTES,
     };
     #[cfg(any(windows, target_os = "macos"))]
     use super::{drive_data_until, finish_client_shutdown, reconnect_delay_from, DataDriveOutcome};
     #[cfg(any(windows, target_os = "macos"))]
     use super::{initialize, status};
-    #[cfg(any(windows, target_os = "macos"))]
-    use super::{JoinArgs, MAX_CREDENTIAL_FILE_BYTES};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 

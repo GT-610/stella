@@ -63,7 +63,7 @@ impl ConnectivityConfigIssuer {
     ) -> Result<EncodedConnectivityConfig, ConnectivityConfigError> {
         let revision = self
             .next_revision
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |revision| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |revision| {
                 revision.checked_add(1)
             })
             .map_err(|_| ConnectivityConfigError::RevisionExhausted)?;
@@ -213,9 +213,9 @@ mod tests {
     use super::ConnectivityConfigIssuer;
     use crate::{
         config::{ConnectivityServicesConfig, RelayServiceConfig},
-        identity::create_protected_secret_file,
         relay_credentials::RelayCredentialAuthority,
     };
+    use stella_file_security::create_protected_secret_file;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 

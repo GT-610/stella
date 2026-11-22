@@ -163,10 +163,25 @@ try {
     $serverProcess = Start-Process -FilePath $server -ArgumentList @('--config', $serverConfig, 'run') -RedirectStandardOutput $serverStdout -RedirectStandardError $serverStderr -WindowStyle Hidden -PassThru
     Wait-TcpPort $ControllerPort $serverProcess
 
-    & $client --config $leftConfig join --network $networkId --token $leftJoin --enrollment-token $leftEnrollment --tap-adapter $Adapter
+    # Tokens are passed through local files: process arguments can be read
+    # by other local users, so the credentials never appear on a command line.
+    $credentialFiles = @(
+        @{ Path = Join-Path $Artifacts 'left-join-token'; Value = $leftJoin },
+        @{ Path = Join-Path $Artifacts 'left-enrollment-token'; Value = $leftEnrollment },
+        @{ Path = Join-Path $Artifacts 'right-join-token'; Value = $rightJoin },
+        @{ Path = Join-Path $Artifacts 'right-enrollment-token'; Value = $rightEnrollment }
+    )
+    foreach ($credentialFile in $credentialFiles) {
+        Set-Content -Path $credentialFile.Path -Value $credentialFile.Value -NoNewline
+    }
+    & $client --config $leftConfig join --network $networkId --token-file $credentialFiles[0].Path --enrollment-token-file $credentialFiles[1].Path --tap-adapter $Adapter
     Require-Success 'left client join'
-    & $client --config $rightConfig join --network $networkId --token $rightJoin --enrollment-token $rightEnrollment --tap-adapter 'Headless verification peer'
+    & $client --config $rightConfig join --network $networkId --token-file $credentialFiles[2].Path --enrollment-token-file $credentialFiles[3].Path --tap-adapter 'Headless verification peer'
     Require-Success 'right peer join'
+    foreach ($credentialFile in $credentialFiles) {
+        Remove-Item -Path $credentialFile.Path -ErrorAction SilentlyContinue
+    }
+    $credentialFiles = $null
     $leftEnrollment = $null
     $rightEnrollment = $null
     $leftJoin = $null

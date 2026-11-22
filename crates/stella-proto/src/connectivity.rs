@@ -1617,6 +1617,7 @@ fn validate_connectivity_address(
             address.is_unspecified()
                 || address.is_loopback()
                 || address.is_multicast()
+                || address.is_link_local()
                 || address == Ipv4Addr::BROADCAST
         }
         IpAddr::V6(address) => {
@@ -2059,6 +2060,34 @@ mod tests {
             Err(CodecError::NestedRecordsOutOfOrder {
                 context: "STUN server list",
                 index: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn connectivity_addresses_reject_link_local_and_other_probe_classes() {
+        // IPv4 link-local addresses, including the cloud metadata range, must
+        // be refused for every connectivity address class: STUN servers, ICE
+        // candidates, and advertised endpoints share this validator.
+        let server = StunServer {
+            priority: 0,
+            address: "169.254.169.254:80".parse().expect("metadata endpoint"),
+        };
+        let mut encoded = vec![0; 4 + super::STUN_SERVER_RECORD_LENGTH];
+        assert!(matches!(
+            encode_stun_server_list(&[server], &mut encoded),
+            Err(CodecError::InvalidEndpointAddress {
+                family: "STUN server"
+            })
+        ));
+        let ipv6_server = StunServer {
+            priority: 0,
+            address: "[fe80::1]:3478".parse().expect("link-local server"),
+        };
+        assert!(matches!(
+            encode_stun_server_list(&[ipv6_server], &mut encoded),
+            Err(CodecError::InvalidEndpointAddress {
+                family: "STUN server"
             })
         ));
     }

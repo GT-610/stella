@@ -13,5 +13,5 @@ mod identity;
 
 pub use identity::{
     create_identity, create_protected_secret_file, load_identity, open_protected_secret_file,
-    write_protected_secret, IdentityFileError,
+    open_protected_secret_file_for_update, write_protected_secret, IdentityFileError,
 };

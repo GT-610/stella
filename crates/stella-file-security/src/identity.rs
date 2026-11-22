@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 /// Creates a new protected Ed25519 identity file.
 ///
 /// The target is never overwritten. Windows applies a protected exact DACL;
-/// macOS requires a non-linked regular file with mode `0600`. The native
+/// Unix requires a non-linked regular file with mode `0600`. The native
 /// policy is verified before secret bytes are written, and the document is
 /// placed with an atomic write so a crash never leaves a partial secret at
 /// the final path.
@@ -74,8 +74,12 @@ pub fn write_protected_secret(path: &Path, bytes: &[u8]) -> Result<(), IdentityF
 }
 
 fn write_and_swap(temporary: &Path, path: &Path, bytes: &[u8]) -> Result<(), IdentityFileError> {
-    let write_result = (|| {
-        let mut file = create_protected_secret_file(temporary)?;
+    // A create-new failure never names a file created by this call, so the
+    // error returns directly: removing the path here could delete another
+    // writer's pre-existing file.
+    let mut file = create_protected_secret_file(temporary)?;
+    let identity = CreatedFileIdentity::of(&file);
+    let result = (|| {
         if let Err(error) = file.write_all(bytes) {
             return Err(IdentityFileError::Write {
                 path: temporary.to_path_buf(),
@@ -106,10 +110,32 @@ fn write_and_swap(temporary: &Path, path: &Path, bytes: &[u8]) -> Result<(), Ide
         drop(open_protected_secret_file(path)?);
         Ok(())
     })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(temporary);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(cleanup_swap_failure(&identity, temporary, path, error)),
     }
-    write_result
+}
+
+/// Cleans up a failed swap while only removing files this call created.
+///
+/// Before the rename the temporary names the freshly created file; after the
+/// rename that identity belongs to the destination. Removing the temporary
+/// first and then, when the rename already happened, the destination keeps
+/// every removal bound to the created identity, so a concurrently replaced
+/// path is never deleted.
+fn cleanup_swap_failure(
+    identity: &CreatedFileIdentity,
+    temporary: &Path,
+    path: &Path,
+    cause: IdentityFileError,
+) -> IdentityFileError {
+    if identity.path_matches(temporary) {
+        return cleanup_created_identity(identity, temporary, cause);
+    }
+    if identity.path_matches(path) {
+        return cleanup_created_identity(identity, path, cause);
+    }
+    cause
 }
 
 /// Loads a protected bounded PKCS#8 identity.
@@ -173,39 +199,101 @@ pub fn open_protected_secret_file(path: &Path) -> Result<File, IdentityFileError
     platform::open_verified_file(path)
 }
 
+/// Opens a secret file for reading and writing after verifying the native
+/// permissions and file kind.
+///
+/// Update-capable handles exist for callers that must flush recent writes;
+/// on Windows `sync_all` needs write access on the handle. The policy
+/// verification is identical to [`open_protected_secret_file`].
+///
+/// # Errors
+/// Returns an error for missing, linked, non-regular, or insecure files.
+pub fn open_protected_secret_file_for_update(path: &Path) -> Result<File, IdentityFileError> {
+    platform::open_verified_file_for_update(path)
+}
+
+/// Identity of a file created by this process, used to bind failure cleanup.
+///
+/// On Unix the identity is the device and inode pair, so cleanup never
+/// deletes a path that was concurrently replaced by another writer. Other
+/// platforms keep the create-new semantics: a path that the call opened
+/// exclusively names a file created for this call.
+#[cfg(unix)]
+struct CreatedFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl CreatedFileIdentity {
+    fn of(file: &File) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        match file.metadata() {
+            Ok(metadata) => Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            // An unidentifiable file is never matched again, so cleanup
+            // fails closed and keeps the path in place.
+            Err(_) => Self {
+                device: u64::MAX,
+                inode: u64::MAX,
+            },
+        }
+    }
+
+    fn path_matches(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata.dev() == self.device && metadata.ino() == self.inode,
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct CreatedFileIdentity;
+
+#[cfg(not(unix))]
+impl CreatedFileIdentity {
+    fn of(_file: &File) -> Self {
+        Self
+    }
+
+    fn path_matches(&self, _path: &Path) -> bool {
+        true
+    }
+}
+
 /// Removes a file this process created, but only if the path still names it.
 ///
 /// The cleanup is bound to the creating file's identity (device and inode on
 /// Unix) so a concurrent replacement of the path cannot make the cleanup
 /// delete another principal's file.
 fn cleanup_created_file(file: &File, path: &Path, cause: IdentityFileError) -> IdentityFileError {
-    if created_file_was_replaced(file, path) {
+    cleanup_created_identity(&CreatedFileIdentity::of(file), path, cause)
+}
+
+/// Removes a path only while it still names the given created file.
+fn cleanup_created_identity(
+    identity: &CreatedFileIdentity,
+    path: &Path,
+    cause: IdentityFileError,
+) -> IdentityFileError {
+    if !identity.path_matches(path) {
         return cause;
     }
     match std::fs::remove_file(path) {
+        // A concurrently removed path is already clean; the original cause is
+        // what the caller needs to see.
         Ok(()) => cause,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => cause,
         Err(source) => IdentityFileError::CleanupFailed {
             path: path.to_path_buf(),
             cause: Box::new(cause),
             source,
         },
     }
-}
-
-#[cfg(unix)]
-fn created_file_was_replaced(file: &File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (file.metadata(), std::fs::symlink_metadata(path)) {
-        (Ok(file_metadata), Ok(path_metadata)) => {
-            file_metadata.dev() != path_metadata.dev() || file_metadata.ino() != path_metadata.ino()
-        }
-        _ => true,
-    }
-}
-
-#[cfg(not(unix))]
-fn created_file_was_replaced(_file: &File, _path: &Path) -> bool {
-    false
 }
 
 /// Identity persistence or native-permission failure.
@@ -396,6 +484,21 @@ mod platform {
     pub(super) fn open_verified_file(path: &Path) -> Result<File, IdentityFileError> {
         let file = OpenOptions::new()
             .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file_kind(&file, path)?;
+        verify_permissions(&file, path)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_verified_file_for_update(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .map_err(|source| IdentityFileError::Open {
@@ -628,6 +731,20 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn open_verified_file_for_update(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file(&file, path)?;
+        Ok(file)
+    }
+
     fn validate_file(file: &File, path: &Path) -> Result<(), IdentityFileError> {
         let metadata = file
             .metadata()
@@ -710,7 +827,104 @@ mod platform {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos")))]
+mod platform {
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        path::Path,
+    };
+
+    use super::{cleanup_created_file, IdentityFileError};
+
+    const SECRET_FILE_MODE: u32 = 0o600;
+
+    pub(super) fn create_secure_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Create {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if let Err(error) = validate_file(&file, path) {
+            return Err(cleanup_created_file(&file, path, error));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn open_verified_file(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file(&file, path)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_verified_file_for_update(path: &Path) -> Result<File, IdentityFileError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|source| IdentityFileError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_file(&file, path)?;
+        Ok(file)
+    }
+
+    fn validate_file(file: &File, path: &Path) -> Result<(), IdentityFileError> {
+        let metadata = file
+            .metadata()
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        // Linux has no portable extended-ACL probe without extra crate
+        // dependencies; exact owner-only mode bits and hard-link rejection
+        // form the native policy.
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(IdentityFileError::NotRegularFile {
+                path: path.to_path_buf(),
+            });
+        }
+        if metadata.mode() & 0o777 != SECRET_FILE_MODE {
+            return Err(IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "mode must be exactly 0600",
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn grant_everyone_for_test(path: &Path) -> Result<(), IdentityFileError> {
+        let mut permissions = std::fs::metadata(path)
+            .map_err(|source| IdentityFileError::Metadata {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        std::fs::set_permissions(path, permissions).map_err(|source| IdentityFileError::Metadata {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod platform {
     use std::{fs::File, path::Path};
 
@@ -723,6 +937,10 @@ mod platform {
     pub(super) fn open_verified_file(_path: &Path) -> Result<File, IdentityFileError> {
         Err(IdentityFileError::UnsupportedPlatform)
     }
+
+    pub(super) fn open_verified_file_for_update(_path: &Path) -> Result<File, IdentityFileError> {
+        Err(IdentityFileError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(test)]
@@ -732,13 +950,13 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, unix))]
     use std::{fs::OpenOptions, io::Write};
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, unix))]
     use stella_crypto::MAX_IDENTITY_PKCS8_LENGTH;
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, unix))]
     use super::load_identity;
     use super::{create_identity, IdentityFileError};
 
@@ -752,7 +970,7 @@ mod tests {
         ))
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, unix))]
     #[test]
     fn create_load_verify_and_refuse_overwrite() {
         let directory = temp_directory();
@@ -770,7 +988,7 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, unix))]
     #[test]
     fn malformed_oversized_and_permission_tampered_files_are_rejected() {
         let directory = temp_directory();
@@ -820,7 +1038,7 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, unix))]
     fn overwrite(path: &std::path::Path, bytes: &[u8]) {
         let mut file = OpenOptions::new()
             .write(true)
@@ -831,7 +1049,7 @@ mod tests {
         file.sync_all().expect("sync identity");
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, unix)))]
     #[test]
     fn unsupported_platform_creates_nothing() {
         let directory = temp_directory();

@@ -26,11 +26,21 @@ const METADATA_LINE_LIMIT: u64 = 512;
 ///
 /// The root helper calls this once with its `--allow-uid` value so that a
 /// second helper instance started for a different user cannot take over an
-/// idle pair owned by the first user. When unset, records stay unbound and
+/// idle pair owned by the first user. A repeated call with the same value
+/// succeeds; a conflicting value fails closed before any ownership record is
+/// created under the wrong user. When unset, records stay unbound and
 /// validation does not require a UID match, which keeps direct privileged
 /// development paths working.
-pub(crate) fn set_authorized_uid(uid: u32) {
-    let _ = AUTHORIZED_UID.set(uid);
+pub(crate) fn set_authorized_uid(uid: u32) -> Result<()> {
+    match AUTHORIZED_UID.set(uid) {
+        Ok(()) => Ok(()),
+        // A repeated call with the same value is idempotent.
+        Err(existing) if existing == uid => Ok(()),
+        Err(_) => Err(TapError::InvalidConfig {
+            field: "allowed uid",
+            reason: "a different authorized UID is already active in this process",
+        }),
+    }
 }
 
 static AUTHORIZED_UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();

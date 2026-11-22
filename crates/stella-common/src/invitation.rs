@@ -33,10 +33,13 @@ pub const INVITATION_SIGNATURE_DOMAIN: &[u8] = b"stella invitation v1";
 ///
 /// Invitations are reference-implementation onboarding material, not protocol
 /// messages. They carry bearer credentials and the complete controller trust
-/// anchor, so they must still be delivered through a confidential channel, but
-/// the embedded controller Ed25519 signature now lets clients detect any
-/// in-transit substitution or tampering. Diagnostics redact the complete value,
-/// and the credential bytes are zeroized on drop.
+/// anchor, so they must still be delivered through a confidential channel.
+/// The embedded controller Ed25519 signature detects any in-transit edits of
+/// a legitimate invitation under the key it carries; for a client with no
+/// prior trust material it cannot by itself rule out a fully substituted,
+/// self-consistent invitation, so authenticated private delivery remains
+/// the required trust boundary. Diagnostics redact the complete value, and
+/// the credential bytes are zeroized on drop.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct JoinInvitation {
     #[zeroize(skip)]
