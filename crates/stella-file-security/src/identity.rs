@@ -310,13 +310,19 @@ impl CreatedFileIdentity {
 #[allow(unsafe_code)]
 fn native_file_identity(file: &File) -> (Option<u32>, Option<u64>) {
     use std::os::windows::io::AsRawHandle;
+    use winapi::ctypes::c_void;
     use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
     // SAFETY: the handle belongs to a live `File` and the pointer names a
     // `BY_HANDLE_FILE_INFORMATION` value of exactly the type the API fills.
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // The std raw handle is typed against std::ffi::c_void while this winapi
+    // binding expects winapi::ctypes::c_void. Both are one-byte-aligned void
+    // pointer representations of the same kernel handle value, so the cast
+    // only adjusts the pointer type.
+    let handle = file.as_raw_handle() as *mut c_void;
     // SAFETY: `GetFileInformationByHandle` reads the handle and writes the
     // structure; both arguments are valid for the duration of the call.
-    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    let succeeded = unsafe { GetFileInformationByHandle(handle, &mut information) };
     if succeeded == 0 {
         return (None, None);
     }
