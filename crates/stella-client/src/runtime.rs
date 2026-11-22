@@ -223,15 +223,30 @@ impl ClientDataRuntime {
             .trusted_time_anchor
             .lock()
             .expect("trusted time anchor lock");
+        let elapsed = anchor.elapsed();
+        let whole_seconds = elapsed.as_secs();
         let anchored_now = self
             .trusted_controller_time
             .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(anchor.elapsed().as_secs());
-        self.trusted_controller_time.store(
-            advance_trusted_time(anchored_now, server_time),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        *anchor = std::time::Instant::now();
+            .saturating_add(whole_seconds);
+        let recorded = advance_trusted_time(anchored_now, server_time);
+        self.trusted_controller_time
+            .store(recorded, std::sync::atomic::Ordering::Relaxed);
+        if server_time > anchored_now {
+            // The controller timestamp strictly replaced the anchored floor,
+            // so the anchor restarts from this observation.
+            *anchor = std::time::Instant::now();
+        } else {
+            // The anchored floor stands (a stale or identical controller
+            // timestamp cannot move it). The anchor advances only by the
+            // whole seconds just folded into that floor, so the sub-second
+            // remainder is preserved for the next observation instead of
+            // being discarded by a full reset.
+            match anchor.checked_sub(Duration::from_secs(whole_seconds)) {
+                Some(advanced) => *anchor = advanced,
+                None => *anchor = std::time::Instant::now(),
+            }
+        }
     }
 
     /// Returns the trust clock used for grant and session validity.
@@ -2970,6 +2985,24 @@ mod tests {
         assert!(
             after >= before + 590,
             "trusted time must advance with elapsed monotonic time, {before} -> {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_sub_second_observations_preserve_the_fractional_remainder() {
+        let runtime = runtime_with_pending_relay_recovery().await;
+        runtime.observe_controller_time(500);
+        // Two controller reports of the same timestamp arrive less than a
+        // second apart. The first observation stores it; the second must not
+        // discard the sub-second remainder via a full anchor reset, so the
+        // accumulated elapsed time keeps advancing the trust clock.
+        runtime.rewind_trusted_time_anchor(Duration::from_millis(500));
+        runtime.observe_controller_time(500);
+        runtime.rewind_trusted_time_anchor(Duration::from_millis(600));
+        let trusted = runtime.trusted_unix_time().expect("trusted time");
+        assert!(
+            trusted >= 501,
+            "the sub-second remainder between identical observations must count, got {trusted}"
         );
     }
 
