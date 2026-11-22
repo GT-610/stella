@@ -2799,10 +2799,19 @@ fn verified_state_path(path: &Path) -> Result<PathBuf, StoreError> {
     Ok(canonical.join(file_name))
 }
 
-/// Non-Unix state paths are used as given; the native file policy still
-/// verifies the destination itself on every open.
+/// Non-Unix state paths are used as given after checking that they name a
+/// file; the native file policy still verifies the destination itself on
+/// every open.
 #[cfg(not(unix))]
 fn verified_state_path(path: &Path) -> Result<PathBuf, StoreError> {
+    if path.file_name().is_none() {
+        return Err(StoreError::InsecureStateFile(
+            IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "the state path must name a file",
+            },
+        ));
+    }
     Ok(path.to_path_buf())
 }
 
@@ -3300,7 +3309,9 @@ mod tests {
 
     use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
-    use stella_file_security::{create_protected_secret_file, IdentityFileError};
+    use stella_file_security::create_protected_secret_file;
+    #[cfg(unix)]
+    use stella_file_security::IdentityFileError;
     use stella_proto::{
         encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
         ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
