@@ -75,8 +75,8 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
             ),
         ));
     }
-    validate_socket_path(&config.socket_path)?;
-    let (listener, _socket_guard) = prepare_listener(&config.socket_path, config.allowed_uid)?;
+    let socket_path = validate_socket_path(&config.socket_path)?;
+    let (listener, _socket_guard) = prepare_listener(&socket_path, config.allowed_uid)?;
     // Bind every new feth-pair lock record to this helper's authorized user
     // only after the socket work succeeds. A conflicting UID stored earlier
     // in the process fails closed before any session can open a device.
@@ -478,29 +478,36 @@ fn error_response(request_id: u64, error: &TapError) -> ServerMessage {
     }
 }
 
-fn validate_socket_path(path: &Path) -> Result<()> {
+/// Validates the operator-supplied socket path and returns the canonical path
+/// every socket operation must use.
+///
+/// The parent is resolved first so the ancestor walk covers the directories
+/// the socket actually lives in; every ancestor must be a root-owned
+/// directory without group or world write access. Binding, permission
+/// changes, ownership changes, and shutdown cleanup then operate on the
+/// returned canonical path, whose components the walk just verified: a
+/// non-root principal cannot retarget an alias component after validation,
+/// and root-controlled aliases such as `/var` are replaced by their real
+/// targets so they never appear in the bound path at all.
+fn validate_socket_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(TapError::InvalidConfig {
             field: "helper socket path",
             reason: "must be absolute",
         });
     }
-    if path.file_name().is_none() {
+    let Some(file_name) = path.file_name() else {
         return Err(TapError::InvalidConfig {
             field: "helper socket path",
             reason: "must name a Unix socket",
         });
-    }
+    };
     let Some(parent) = path.parent() else {
         return Err(TapError::InvalidConfig {
             field: "helper socket path",
             reason: "must live inside a directory",
         });
     };
-    // Resolve symlinks first so the ancestor walk covers the directories the
-    // socket actually lives in. Every ancestor must then be a root-owned
-    // directory without group or world write access, so a non-root principal
-    // cannot rewrite any path component the helper binds through.
     let canonical_parent = fs::canonicalize(parent).map_err(|source| {
         TapError::io(
             TapOperation::ConnectHelper,
@@ -534,7 +541,7 @@ fn validate_socket_path(path: &Path) -> Result<()> {
             None => break,
         }
     }
-    Ok(())
+    Ok(canonical_parent.join(file_name))
 }
 
 fn prepare_listener(path: &Path, allowed_uid: u32) -> Result<(UnixListener, SocketGuard)> {

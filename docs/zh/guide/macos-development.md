@@ -14,8 +14,8 @@ helper 是前台服务，需要管理员或服务管理器显式启动。
 
 ## 验证工作区
 
-开发时使用默认 stable。工作区保留 `rust-version = "1.85"` 作为声明的最低版本，但正常
-开发不要求另外安装 1.85 toolchain。
+开发时使用默认 stable。工作区保留 `rust-version = "1.100"` 作为声明的最低版本，但正常
+开发不要求另外安装 1.100 toolchain。
 
 ```sh
 cargo fmt --all -- --check

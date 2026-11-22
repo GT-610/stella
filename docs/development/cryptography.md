@@ -7,7 +7,7 @@ every domain string, byte range, nonce, and lifetime rule.
 ## Primitive dependencies
 
 The crate delegates primitive operations to maintained implementations whose
-current releases support the workspace Rust 1.85 baseline:
+current releases support the workspace Rust 1.100 baseline:
 
 - `ed25519-dalek` for Ed25519 signing and verification;
 - `x25519-dalek` for ephemeral X25519 agreement and contributory checks;

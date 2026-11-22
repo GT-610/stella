@@ -16,9 +16,9 @@ service manager must start explicitly.
 
 ## Verify the workspace
 
-Use the default stable toolchain. The workspace keeps `rust-version = "1.85"`
+Use the default stable toolchain. The workspace keeps `rust-version = "1.100"`
 as its declared minimum, but normal development does not require installing a
-separate 1.85 toolchain.
+separate 1.100 toolchain.
 
 ```sh
 cargo fmt --all -- --check

@@ -412,7 +412,9 @@ left_enrollment_file="$artifacts/left-enrollment-token"
 right_join_file="$artifacts/right-join-token"
 right_enrollment_file="$artifacts/right-enrollment-token"
 write_credential_file() {
-    printf '%s\n' "$2" >"$1"
+    # umask 077 keeps the token unreadable from the moment the file exists,
+    # regardless of the caller's umask; the explicit chmod re-asserts it.
+    (umask 077 && printf '%s\n' "$2" >"$1")
     chmod 600 "$1"
 }
 write_credential_file "$left_join_file" "$left_join"
