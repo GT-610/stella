@@ -65,6 +65,11 @@ const PERMISSION_LIFETIME: Duration = Duration::from_secs(300);
 const CHANNEL_LIFETIME: Duration = Duration::from_secs(600);
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TURN_UDP_DATAGRAM_SIZE: usize = 65_503;
+/// Minimum TURN long-term credential secret length in bytes (128 bits).
+///
+/// Shorter secrets can be brute-forced offline from a captured UDP
+/// MESSAGE-INTEGRITY exchange, so the client refuses them outright.
+const MIN_TURN_CREDENTIAL_SECRET_BYTES: usize = 16;
 const REQUESTED_TRANSPORT_UDP: [u8; 4] = [17, 0, 0, 0];
 
 /// Configuration for one authenticated TURN allocation reached over UDP.
@@ -535,16 +540,23 @@ impl TurnCredentials {
     ///
     /// # Errors
     ///
-    /// Returns [`TurnUdpError`] when either value is empty or expiry is zero.
+    /// Returns [`TurnUdpError`] when either value is empty, the secret is
+    /// shorter than the 128-bit minimum, or expiry is zero.
     pub fn new(
         username: Vec<u8>,
         password: Vec<u8>,
         expires_at: u64,
     ) -> Result<Self, TurnUdpError> {
-        if username.is_empty() || password.is_empty() {
+        if username.is_empty() {
             return Err(TurnUdpError::InvalidConfig {
                 field: "TURN credentials",
-                reason: "username and password must be non-empty",
+                reason: "username must be non-empty",
+            });
+        }
+        if password.len() < MIN_TURN_CREDENTIAL_SECRET_BYTES {
+            return Err(TurnUdpError::InvalidConfig {
+                field: "TURN credentials",
+                reason: "credential secret must carry at least 128 bits",
             });
         }
         if expires_at == 0 {

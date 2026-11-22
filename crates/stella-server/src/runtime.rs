@@ -232,6 +232,8 @@ async fn serve_listener(
     } = resources;
     let limits = config.limits;
     let semaphore = Arc::new(Semaphore::new(limits.max_connections));
+    let pending_handshakes = Arc::new(Semaphore::new(limits.max_pending_handshakes));
+    let per_ip = Arc::new(PerIpConnections::new(limits.max_connections_per_ip));
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let context = SessionContext {
         authority: authority.clone(),
@@ -273,20 +275,36 @@ async fn serve_listener(
                     );
                 }
             }
-            admitted = accept_with_permit(&listener, Arc::clone(&semaphore)) => {
+            admitted = accept_with_permit(
+                &listener,
+                Arc::clone(&semaphore),
+                Arc::clone(&pending_handshakes),
+                Arc::clone(&per_ip),
+            ) => {
                 let admitted = match admitted {
                     Ok(admitted) => admitted,
                     Err(error) => break Err(error),
                 };
-                let Some((stream, peer_addr, permit)) = admitted else {
+                let Some(admission) = admitted else {
                     continue;
                 };
+                let Admission {
+                    stream,
+                    peer_addr,
+                    main_permit,
+                    pending_permit,
+                    per_ip,
+                } = admission;
                 spawn_connection(
                     &mut tasks,
                     tls_acceptor.clone(),
-                    stream,
-                    peer_addr,
-                    permit,
+                    Admission {
+                        stream,
+                        peer_addr,
+                        main_permit,
+                        pending_permit,
+                        per_ip,
+                    },
                     context.clone(),
                     Arc::clone(&handler),
                 );
@@ -304,40 +322,130 @@ async fn serve_listener(
     loop_result
 }
 
+/// One admitted connection holding its global, per-source, and handshake quota.
+struct Admission {
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    main_permit: OwnedSemaphorePermit,
+    pending_permit: OwnedSemaphorePermit,
+    per_ip: PerIpGuard,
+}
+
 async fn accept_with_permit(
     listener: &TcpListener,
     semaphore: Arc<Semaphore>,
-) -> Result<Option<(TcpStream, SocketAddr, OwnedSemaphorePermit)>, RuntimeError> {
+    pending_handshakes: Arc<Semaphore>,
+    per_ip: Arc<PerIpConnections>,
+) -> Result<Option<Admission>, RuntimeError> {
     let (stream, peer_addr) = listener
         .accept()
         .await
         .map_err(|source| RuntimeError::Accept { source })?;
-    match semaphore.try_acquire_owned() {
-        Ok(permit) => Ok(Some((stream, peer_addr, permit))),
+    let main_permit = match semaphore.try_acquire_owned() {
+        Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => {
             tracing::debug!(peer = %peer_addr, "controller connection rejected at capacity");
-            Ok(None)
+            return Ok(None);
         }
-        Err(TryAcquireError::Closed) => Err(RuntimeError::ConnectionSemaphoreClosed),
+        Err(TryAcquireError::Closed) => return Err(RuntimeError::ConnectionSemaphoreClosed),
+    };
+    let pending_permit = match pending_handshakes.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => {
+            tracing::debug!(peer = %peer_addr, "controller handshake queue is saturated");
+            return Ok(None);
+        }
+        Err(TryAcquireError::Closed) => return Err(RuntimeError::ConnectionSemaphoreClosed),
+    };
+    let Some(per_ip) = per_ip.admit(peer_addr.ip()) else {
+        tracing::debug!(peer = %peer_addr, "controller connection rejected at per-source capacity");
+        return Ok(None);
+    };
+    Ok(Some(Admission {
+        stream,
+        peer_addr,
+        main_permit,
+        pending_permit,
+        per_ip,
+    }))
+}
+
+/// Bounded per-source connection accounting shared by the accept loop.
+struct PerIpConnections {
+    limit: usize,
+    counts: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+}
+
+impl PerIpConnections {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            counts: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn admit(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<PerIpGuard> {
+        let mut counts = self.counts.lock().expect("per-source connection lock");
+        let entry = counts.entry(ip).or_insert(0);
+        if *entry >= self.limit {
+            return None;
+        }
+        *entry += 1;
+        Some(PerIpGuard {
+            connections: Arc::clone(self),
+            ip,
+        })
+    }
+
+    fn release(&self, ip: std::net::IpAddr) {
+        let mut counts = self.counts.lock().expect("per-source connection lock");
+        match counts.get_mut(&ip) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                counts.remove(&ip);
+            }
+            None => {}
+        }
+    }
+}
+
+/// Scoped per-source connection slot released when the connection task ends.
+struct PerIpGuard {
+    connections: Arc<PerIpConnections>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        self.connections.release(self.ip);
     }
 }
 
 fn spawn_connection(
     tasks: &mut JoinSet<()>,
     tls_acceptor: TlsAcceptor,
-    stream: TcpStream,
-    peer_addr: SocketAddr,
-    permit: OwnedSemaphorePermit,
+    admission: Admission,
     context: SessionContext,
     handler: SessionHandler,
 ) {
     tasks.spawn(async move {
-        let _permit = permit;
+        let Admission {
+            stream,
+            peer_addr,
+            main_permit,
+            pending_permit,
+            per_ip,
+        } = admission;
+        let _main_permit = main_permit;
+        let _per_ip = per_ip;
         let handshake = timeout(
             Duration::from_secs(context.limits.tls_handshake_timeout_seconds),
             tls_acceptor.accept(stream),
         )
         .await;
+        // The handshake queue slot is released once the TLS handshake ends,
+        // keeping unauthenticated floods from saturating it.
+        drop(pending_permit);
         let tls_stream = match handshake {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
@@ -435,6 +543,28 @@ impl From<ConnectivityConfigError> for RuntimeError {
     }
 }
 
+#[cfg(test)]
+mod per_ip_tests {
+    use std::{net::IpAddr, sync::Arc};
+
+    use super::PerIpConnections;
+
+    #[test]
+    fn per_source_admission_is_bounded_and_released_on_drop() {
+        let connections = Arc::new(PerIpConnections::new(2));
+        let first = IpAddr::from([192, 0, 2, 1]);
+        let second = IpAddr::from([192, 0, 2, 2]);
+
+        let guard_a = connections.admit(first).expect("admit first connection");
+        let _guard_b = connections.admit(first).expect("admit second connection");
+        assert!(connections.admit(first).is_none());
+        assert!(connections.admit(second).is_some());
+
+        drop(guard_a);
+        assert!(connections.admit(first).is_some());
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::{
@@ -460,7 +590,7 @@ mod tests {
         TlsConnector,
     };
 
-    use super::{accept_with_permit, run_controller, SessionHandler};
+    use super::{accept_with_permit, run_controller, Admission, PerIpConnections, SessionHandler};
     use crate::{
         bootstrap::{initialize_controller, BootstrapOptions},
         config::ServerConfig,
@@ -520,21 +650,36 @@ mod tests {
             .expect("bind capacity test listener");
         let address = listener.local_addr().expect("capacity test address");
         let semaphore = Arc::new(Semaphore::new(1));
+        let pending = Arc::new(Semaphore::new(1));
+        let per_ip = Arc::new(PerIpConnections::new(64));
 
         let first_client = TcpStream::connect(address);
         let (first_client, first_admitted) = tokio::join!(
             first_client,
-            accept_with_permit(&listener, Arc::clone(&semaphore))
+            accept_with_permit(
+                &listener,
+                Arc::clone(&semaphore),
+                Arc::clone(&pending),
+                Arc::clone(&per_ip)
+            )
         );
         let _first_client = first_client.expect("connect first client");
-        let (_first_stream, _first_peer, first_permit) = first_admitted
+        let Admission {
+            main_permit: first_permit,
+            ..
+        } = first_admitted
             .expect("accept first client")
             .expect("first client obtains capacity");
 
         let second_client = TcpStream::connect(address);
         let (second_client, second_admitted) = tokio::join!(
             second_client,
-            accept_with_permit(&listener, Arc::clone(&semaphore))
+            accept_with_permit(
+                &listener,
+                Arc::clone(&semaphore),
+                Arc::clone(&pending),
+                Arc::clone(&per_ip)
+            )
         );
         let mut second_client = second_client.expect("connect second client");
         assert!(second_admitted.expect("accept saturated client").is_none());
@@ -551,7 +696,12 @@ mod tests {
         let third_client = TcpStream::connect(address);
         let (third_client, third_admitted) = tokio::join!(
             third_client,
-            accept_with_permit(&listener, Arc::clone(&semaphore))
+            accept_with_permit(
+                &listener,
+                Arc::clone(&semaphore),
+                Arc::clone(&pending),
+                Arc::clone(&per_ip)
+            )
         );
         let _third_client = third_client.expect("connect third client");
         assert!(third_admitted.expect("accept third client").is_some());

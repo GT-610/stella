@@ -169,12 +169,19 @@ $NetworkId
 
 Replace `--controller` with the numeric address clients can actually reach;
 `--tls-name` must be present in the certificate generated during initialization.
-The `stella1:` invitation contains controller trust, the network ID, and both
-single-use tokens. It expires after one hour by default and is printed exactly
-once. Deliver it through a trusted private channel, generate a separate
-invitation for every node, and do not place it in logs, tickets, or source
-control. The client can follow the [quick start](./quick-start) to configure and
-join with one command.
+The `stella2:` invitation contains controller trust, the network ID, and both
+single-use tokens, and carries an Ed25519 signature from the controller's
+identity key. Clients verify that signature and the controller-ID binding
+before persisting the trust anchor, so an invitation edited in transit under
+its carried key is rejected. The signature does not by itself identify the
+intended controller: for a client with no prior configuration, a fully
+substituted invitation can be internally consistent under an attacker's key.
+Authenticated private delivery therefore remains a required trust boundary.
+The invitation expires after one hour by default and is printed exactly once.
+Deliver it through a trusted private channel, generate a separate invitation
+for every node, and do not place it in logs, tickets, or source control.
+The client can follow the [quick start](./quick-start) to configure and join
+with one command.
 
 The lower-level `enrollment-token create` and `join-token create` commands
 remain available when tokens must be managed separately; see the
@@ -207,6 +214,26 @@ together with protected copies of the controller and TLS identities; the
 database alone cannot recreate the same controller trust identity. If
 connectivity services are enabled, also back up the Relay credential key; a
 replacement invalidates credentials issued under the prior key.
+
+## Revocation latency
+
+Suspending a member, disabling a node, or removing a network rotates the
+authority immediately: new snapshots, membership grants, and relay
+credentials are refused from that instant. Two bounded windows survive a
+revocation by design:
+
+- Peer sessions already established with the removed member stay authenticated
+  until their grants expire (at most the network's session lifetime, 15
+  minutes by default). Revoke during a maintenance window that is at least one
+  session lifetime long for immediate effect.
+- TURN relay credentials are stateless; credentials issued before the
+  revocation remain valid until they expire (5 minutes by default, at most
+  10 minutes). The relay does not query the authority, so plan revocations
+  accordingly.
+
+Clients evaluate grant and session validity against a trusted clock derived
+from the most recently authenticated controller time, so winding a client's
+local clock backwards does not extend a revoked member's access.
 
 For every administration command and policy default, see the
 [server CLI reference](/api/server-cli).

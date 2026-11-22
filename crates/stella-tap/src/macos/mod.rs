@@ -1,7 +1,7 @@
 //! Stella-owned macOS Layer-2 backend using persistent fake-Ethernet pairs.
 
 mod bpf;
-mod feth;
+pub(crate) mod feth;
 mod helper;
 mod interrupt;
 mod ndrv;

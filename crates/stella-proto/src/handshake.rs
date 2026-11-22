@@ -255,17 +255,25 @@ impl<'a> SessionInitView<'a> {
         let initiator_ephemeral = array_ref(
             cursor.read_slice(X25519_PUBLIC_KEY_LENGTH, "initiator ephemeral key")?,
             "initiator ephemeral key",
-            parts.signed_header.len() + cursor.position() - X25519_PUBLIC_KEY_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                X25519_PUBLIC_KEY_LENGTH,
+            )?,
         )?;
         let initiator_nonce = array_ref::<HANDSHAKE_NONCE_LENGTH>(
             cursor.read_slice(HANDSHAKE_NONCE_LENGTH, "initiator nonce")?,
             "initiator nonce",
-            parts.signed_header.len() + cursor.position() - HANDSHAKE_NONCE_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                HANDSHAKE_NONCE_LENGTH,
+            )?,
         )?;
         validate_nonzero_bytes(initiator_nonce, "initiator nonce")?;
         let max_datagram_size = cursor.read_u32("maximum datagram size")?;
         validate_datagram_size(max_datagram_size)?;
-        let reserved_offset = parts.signed_header.len() + cursor.position();
+        let reserved_offset = signed_field_end(parts.signed_header.len(), cursor.position(), 0)?;
         if cursor.read_u32("SESSION_INIT reserved")? != 0 {
             return Err(CodecError::NonZeroReserved {
                 field: "SESSION_INIT reserved",
@@ -275,7 +283,11 @@ impl<'a> SessionInitView<'a> {
         let signature = array_ref(
             cursor.read_slice(ED25519_SIGNATURE_LENGTH, "SESSION_INIT signature")?,
             "SESSION_INIT signature",
-            parts.signed_header.len() + cursor.position() - ED25519_SIGNATURE_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                ED25519_SIGNATURE_LENGTH,
+            )?,
         )?;
         let signed_payload = parts
             .payload
@@ -457,22 +469,34 @@ impl<'a> SessionResponseView<'a> {
         let init_hash = array_ref(
             cursor.read_slice(SHA256_DIGEST_LENGTH, "init hash")?,
             "init hash",
-            parts.signed_header.len() + cursor.position() - SHA256_DIGEST_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                SHA256_DIGEST_LENGTH,
+            )?,
         )?;
         let responder_ephemeral = array_ref(
             cursor.read_slice(X25519_PUBLIC_KEY_LENGTH, "responder ephemeral key")?,
             "responder ephemeral key",
-            parts.signed_header.len() + cursor.position() - X25519_PUBLIC_KEY_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                X25519_PUBLIC_KEY_LENGTH,
+            )?,
         )?;
         let responder_nonce = array_ref::<HANDSHAKE_NONCE_LENGTH>(
             cursor.read_slice(HANDSHAKE_NONCE_LENGTH, "responder nonce")?,
             "responder nonce",
-            parts.signed_header.len() + cursor.position() - HANDSHAKE_NONCE_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                HANDSHAKE_NONCE_LENGTH,
+            )?,
         )?;
         validate_nonzero_bytes(responder_nonce, "responder nonce")?;
         let max_datagram_size = cursor.read_u32("maximum datagram size")?;
         validate_datagram_size(max_datagram_size)?;
-        let reserved_offset = parts.signed_header.len() + cursor.position();
+        let reserved_offset = signed_field_end(parts.signed_header.len(), cursor.position(), 0)?;
         if cursor.read_u32("SESSION_RESPONSE reserved")? != 0 {
             return Err(CodecError::NonZeroReserved {
                 field: "SESSION_RESPONSE reserved",
@@ -482,7 +506,11 @@ impl<'a> SessionResponseView<'a> {
         let signature = array_ref(
             cursor.read_slice(ED25519_SIGNATURE_LENGTH, "SESSION_RESPONSE signature")?,
             "SESSION_RESPONSE signature",
-            parts.signed_header.len() + cursor.position() - ED25519_SIGNATURE_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                ED25519_SIGNATURE_LENGTH,
+            )?,
         )?;
         let signed_payload = parts
             .payload
@@ -688,11 +716,15 @@ impl<'a> SessionConfirmView<'a> {
         let response_hash = array_ref(
             cursor.read_slice(SHA256_DIGEST_LENGTH, "response hash")?,
             "response hash",
-            parts.signed_header.len() + cursor.position() - SHA256_DIGEST_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                SHA256_DIGEST_LENGTH,
+            )?,
         )?;
         let role = SessionConfirmRole::try_from(cursor.read_u8("SESSION_CONFIRM role")?)?;
         validate_confirm_role_flag(role, parts.header.common.flags)?;
-        let reserved_offset = parts.signed_header.len() + cursor.position();
+        let reserved_offset = signed_field_end(parts.signed_header.len(), cursor.position(), 0)?;
         let reserved = cursor.read_slice(7, "SESSION_CONFIRM reserved")?;
         if reserved.iter().any(|byte| *byte != 0) {
             return Err(CodecError::NonZeroReserved {
@@ -703,7 +735,11 @@ impl<'a> SessionConfirmView<'a> {
         let confirmation_tag = array_ref(
             cursor.read_slice(crate::AUTHENTICATION_TAG_LENGTH, "confirmation tag")?,
             "confirmation tag",
-            parts.signed_header.len() + cursor.position() - crate::AUTHENTICATION_TAG_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                crate::AUTHENTICATION_TAG_LENGTH,
+            )?,
         )?;
         let authenticated_payload = parts
             .payload
@@ -902,7 +938,7 @@ impl<'a> SessionRejectView<'a> {
         let parts = decode_handshake_parts(input, PacketType::SessionReject)?;
         let mut cursor = ReadCursor::new(parts.payload, parts.signed_header.len());
         let reason = SessionRejectReason::try_from(cursor.read_u16("SESSION_REJECT reason")?)?;
-        let reserved_offset = parts.signed_header.len() + cursor.position();
+        let reserved_offset = signed_field_end(parts.signed_header.len(), cursor.position(), 0)?;
         if cursor.read_u16("SESSION_REJECT reserved")? != 0 {
             return Err(CodecError::NonZeroReserved {
                 field: "SESSION_REJECT reserved",
@@ -914,12 +950,20 @@ impl<'a> SessionRejectView<'a> {
         let init_hash = array_ref(
             cursor.read_slice(SHA256_DIGEST_LENGTH, "init hash")?,
             "init hash",
-            parts.signed_header.len() + cursor.position() - SHA256_DIGEST_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                SHA256_DIGEST_LENGTH,
+            )?,
         )?;
         let signature = array_ref(
             cursor.read_slice(ED25519_SIGNATURE_LENGTH, "SESSION_REJECT signature")?,
             "SESSION_REJECT signature",
-            parts.signed_header.len() + cursor.position() - ED25519_SIGNATURE_LENGTH,
+            signed_field_end(
+                parts.signed_header.len(),
+                cursor.position(),
+                ED25519_SIGNATURE_LENGTH,
+            )?,
         )?;
         let signed_payload = parts
             .payload
@@ -1039,6 +1083,24 @@ struct HandshakeParts<'a> {
     signed_header: &'a [u8],
     extension_bytes: &'a [u8],
     payload: &'a [u8],
+}
+
+/// Offset of one signed field that ends at the header-relative cursor position.
+///
+/// The subtraction is checked even though the cursor has already consumed the
+/// field, so future layout changes cannot turn a regressed invariant into a
+/// remotely triggerable arithmetic wrap.
+fn signed_field_end(
+    header_length: usize,
+    position: usize,
+    field_length: usize,
+) -> Result<usize, CodecError> {
+    header_length
+        .checked_add(position)
+        .and_then(|end| end.checked_sub(field_length))
+        .ok_or(CodecError::IntegerOverflow {
+            field: "signed handshake field offset",
+        })
 }
 
 fn decode_handshake_parts(

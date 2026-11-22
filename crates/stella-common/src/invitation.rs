@@ -12,19 +12,34 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{ControllerId, NetworkId};
 
-const TEXT_PREFIX: &str = "stella1:";
-const ENCODING_VERSION: u8 = 1;
+const TEXT_PREFIX: &str = "stella2:";
+const ENCODING_VERSION: u8 = 2;
 const IPV4_FAMILY: u8 = 4;
 const IPV6_FAMILY: u8 = 6;
 const MAX_TLS_NAME_BYTES: usize = 253;
 const TOKEN_LENGTH: usize = 32;
+const CONTROLLER_PUBLIC_KEY_LENGTH: usize = 32;
+const SIGNATURE_LENGTH: usize = 64;
+
+/// Domain prefix for the controller Ed25519 signature over an invitation.
+///
+/// The signed message is this domain followed by the exact unsigned encoded
+/// invitation bytes produced by [`JoinInvitation::unsigned_bytes`]. Carrying
+/// the signature lets clients reject any invitation substituted or edited in
+/// transit, since the controller identity inside binds the trust anchor.
+pub const INVITATION_SIGNATURE_DOMAIN: &[u8] = b"stella invitation v1";
 
 /// One self-contained, single-use invitation to a Stella virtual network.
 ///
 /// Invitations are reference-implementation onboarding material, not protocol
-/// messages. They contain bearer credentials and therefore must be delivered
-/// through a trusted channel. Diagnostics redact the complete value, and the
-/// credential bytes are zeroized on drop.
+/// messages. They carry bearer credentials and the complete controller trust
+/// anchor, so they must still be delivered through a confidential channel.
+/// The embedded controller Ed25519 signature detects any in-transit edits of
+/// a legitimate invitation under the key it carries; for a client with no
+/// prior trust material it cannot by itself rule out a fully substituted,
+/// self-consistent invitation, so authenticated private delivery remains
+/// the required trust boundary. Diagnostics redact the complete value, and
+/// the credential bytes are zeroized on drop.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct JoinInvitation {
     #[zeroize(skip)]
@@ -39,12 +54,19 @@ pub struct JoinInvitation {
     network_id: NetworkId,
     #[zeroize(skip)]
     expires_at: u64,
+    #[zeroize(skip)]
+    controller_public_key: [u8; CONTROLLER_PUBLIC_KEY_LENGTH],
+    #[zeroize(skip)]
+    signature: [u8; SIGNATURE_LENGTH],
     enrollment_token: [u8; TOKEN_LENGTH],
     join_token: [u8; TOKEN_LENGTH],
 }
 
 impl JoinInvitation {
     /// Validates and owns all public trust and single-use credential material.
+    ///
+    /// The returned invitation is unsigned; the controller completes it with
+    /// [`Self::with_controller_signature`] before encoding it.
     ///
     /// # Errors
     ///
@@ -78,9 +100,57 @@ impl JoinInvitation {
             spki_sha256,
             network_id,
             expires_at,
+            controller_public_key: [0; CONTROLLER_PUBLIC_KEY_LENGTH],
+            signature: [0; SIGNATURE_LENGTH],
             enrollment_token,
             join_token,
         })
+    }
+
+    /// Completes the invitation with the controller's Ed25519 identity.
+    ///
+    /// The signature must cover [`Self::unsigned_bytes`] under
+    /// [`INVITATION_SIGNATURE_DOMAIN`], and the public key must derive the
+    /// invitation's controller ID.
+    #[must_use]
+    pub const fn with_controller_signature(
+        mut self,
+        controller_public_key: [u8; CONTROLLER_PUBLIC_KEY_LENGTH],
+        signature: [u8; SIGNATURE_LENGTH],
+    ) -> Self {
+        self.controller_public_key = controller_public_key;
+        self.signature = signature;
+        self
+    }
+
+    /// Returns the controller Ed25519 public key carried by the invitation.
+    #[must_use]
+    pub const fn controller_public_key(&self) -> &[u8; CONTROLLER_PUBLIC_KEY_LENGTH] {
+        &self.controller_public_key
+    }
+
+    /// Returns the controller signature carried by the invitation.
+    #[must_use]
+    pub const fn signature(&self) -> &[u8; SIGNATURE_LENGTH] {
+        &self.signature
+    }
+
+    /// Returns the canonical byte string covered by the controller signature.
+    ///
+    /// The value is the complete version-2 encoding with the public-key and
+    /// signature fields zeroed. The public key is not signed because it is
+    /// bound instead by the signed controller ID, which is derived from it.
+    /// Signing and verification both use this string under
+    /// [`INVITATION_SIGNATURE_DOMAIN`].
+    #[must_use]
+    pub fn unsigned_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Zeroizing::new(Vec::with_capacity(encoded_length(self)));
+        self.encode_body(
+            &[0; CONTROLLER_PUBLIC_KEY_LENGTH],
+            &[0; SIGNATURE_LENGTH],
+            &mut bytes,
+        );
+        bytes
     }
 
     /// Returns the numeric controller address clients should contact.
@@ -141,6 +211,16 @@ impl JoinInvitation {
     #[must_use]
     pub fn encode(&self) -> Zeroizing<String> {
         let mut bytes = Zeroizing::new(Vec::with_capacity(encoded_length(self)));
+        self.encode_body(&self.controller_public_key, &self.signature, &mut bytes);
+        Zeroizing::new(format!("{TEXT_PREFIX}{}", URL_SAFE_NO_PAD.encode(&*bytes)))
+    }
+
+    fn encode_body(
+        &self,
+        controller_public_key: &[u8; CONTROLLER_PUBLIC_KEY_LENGTH],
+        signature: &[u8; SIGNATURE_LENGTH],
+        bytes: &mut Zeroizing<Vec<u8>>,
+    ) {
         bytes.push(ENCODING_VERSION);
         match self.controller_address.ip() {
             IpAddr::V4(address) => {
@@ -162,7 +242,8 @@ impl JoinInvitation {
         bytes.extend_from_slice(&self.expires_at.to_be_bytes());
         bytes.extend_from_slice(&self.enrollment_token);
         bytes.extend_from_slice(&self.join_token);
-        Zeroizing::new(format!("{TEXT_PREFIX}{}", URL_SAFE_NO_PAD.encode(&*bytes)))
+        bytes.extend_from_slice(controller_public_key);
+        bytes.extend_from_slice(signature);
     }
 }
 
@@ -193,7 +274,7 @@ impl FromStr for JoinInvitation {
 #[non_exhaustive]
 pub enum InvitationError {
     /// The textual version prefix is missing or unsupported.
-    #[error("invitation must begin with stella1:")]
+    #[error("invitation must begin with stella2:")]
     Prefix,
     /// The invitation payload is not canonical unpadded base64url.
     #[error("invitation payload must be unpadded base64url")]
@@ -231,6 +312,12 @@ pub enum InvitationError {
     /// One of the bearer credentials is all zero.
     #[error("invitation bearer credentials must be non-zero")]
     ZeroCredential,
+    /// The carried controller public key is all zero.
+    #[error("invitation controller public key must be non-zero")]
+    ZeroControllerKey,
+    /// The carried controller signature is all zero.
+    #[error("invitation controller signature must be non-zero")]
+    ZeroSignature,
 }
 
 fn validate(
@@ -281,6 +368,8 @@ fn encoded_length(invitation: &JoinInvitation) -> usize {
         + NetworkId::LENGTH
         + 8
         + TOKEN_LENGTH * 2
+        + CONTROLLER_PUBLIC_KEY_LENGTH
+        + SIGNATURE_LENGTH
 }
 
 fn decode(bytes: &[u8]) -> Result<JoinInvitation, InvitationError> {
@@ -306,8 +395,16 @@ fn decode(bytes: &[u8]) -> Result<JoinInvitation, InvitationError> {
     let expires_at = u64::from_be_bytes(cursor.read_array()?);
     let enrollment_token = cursor.read_array()?;
     let join_token = cursor.read_array()?;
+    let controller_public_key = cursor.read_array()?;
+    let signature = cursor.read_array()?;
     if !cursor.is_empty() {
         return Err(InvitationError::TrailingBytes);
+    }
+    if signature.iter().all(|byte| *byte == 0) {
+        return Err(InvitationError::ZeroSignature);
+    }
+    if controller_public_key.iter().all(|byte| *byte == 0) {
+        return Err(InvitationError::ZeroControllerKey);
     }
     JoinInvitation::new(
         SocketAddr::new(ip, port),
@@ -319,6 +416,7 @@ fn decode(bytes: &[u8]) -> Result<JoinInvitation, InvitationError> {
         enrollment_token,
         join_token,
     )
+    .map(|invitation| invitation.with_controller_signature(controller_public_key, signature))
 }
 
 struct Cursor<'a> {
@@ -361,10 +459,9 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, str::FromStr};
-
-    use super::{InvitationError, JoinInvitation};
+    use super::{InvitationError, JoinInvitation, CONTROLLER_PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
     use crate::{ControllerId, NetworkId};
+    use std::{net::SocketAddr, str::FromStr};
 
     fn invitation(address: &str) -> JoinInvitation {
         JoinInvitation::new(
@@ -378,6 +475,7 @@ mod tests {
             [0x55; 32],
         )
         .expect("construct invitation")
+        .with_controller_signature([0x66; 32], [0x77; 64])
     }
 
     #[test]
@@ -394,6 +492,22 @@ mod tests {
             assert_eq!(decoded.expires_at(), original.expires_at());
             assert_eq!(decoded.enrollment_token(), original.enrollment_token());
             assert_eq!(decoded.join_token(), original.join_token());
+            assert_eq!(
+                *decoded.controller_public_key(),
+                *original.controller_public_key()
+            );
+            assert_eq!(*decoded.signature(), *original.signature());
+            let unsigned = original.unsigned_bytes();
+            assert!(unsigned.len() > SIGNATURE_LENGTH);
+            assert_eq!(
+                unsigned[unsigned.len() - SIGNATURE_LENGTH..],
+                [0; SIGNATURE_LENGTH]
+            );
+            assert_eq!(
+                unsigned[unsigned.len() - SIGNATURE_LENGTH - CONTROLLER_PUBLIC_KEY_LENGTH
+                    ..unsigned.len() - SIGNATURE_LENGTH],
+                [0; CONTROLLER_PUBLIC_KEY_LENGTH]
+            );
             assert_eq!(format!("{decoded:?}"), "JoinInvitation([REDACTED])");
         }
     }
@@ -421,5 +535,40 @@ mod tests {
             [0x55; 32],
         )
         .is_err());
+    }
+
+    #[test]
+    fn invitations_reject_unsigned_and_legacy_encodings() {
+        let unsigned = JoinInvitation::new(
+            SocketAddr::from_str("192.0.2.10:44900").expect("parse address"),
+            "controller.example.test".to_owned(),
+            ControllerId::from_bytes([0x11; 16]),
+            [0x22; 32],
+            NetworkId::from_bytes([0x33; 16]),
+            1_900_000_000,
+            [0x44; 32],
+            [0x55; 32],
+        )
+        .expect("construct invitation");
+        let text = unsigned.encode().to_string();
+        assert_eq!(
+            JoinInvitation::from_str(&text).expect_err("reject zero signature"),
+            InvitationError::ZeroSignature
+        );
+
+        let zero_key = unsigned.with_controller_signature([0; 32], [0x77; 64]);
+        let zero_key_text = zero_key.encode().to_string();
+        assert_eq!(
+            JoinInvitation::from_str(&zero_key_text).expect_err("reject zero controller key"),
+            InvitationError::ZeroControllerKey
+        );
+
+        let signed_text = invitation("192.0.2.10:44900").encode().to_string();
+        let mut legacy = signed_text;
+        legacy.replace_range(0..7, "stella1");
+        assert_eq!(
+            JoinInvitation::from_str(&legacy).expect_err("reject stella1 prefix"),
+            InvitationError::Prefix
+        );
     }
 }

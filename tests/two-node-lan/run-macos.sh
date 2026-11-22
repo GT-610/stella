@@ -405,18 +405,36 @@ server_pid=$!
 wait_tcp_port "$controller_port" "$server_pid"
 
 current_stage="network join"
+# Tokens are passed through owner-only files: process arguments are visible
+# to other local users, so the credentials never appear on a command line.
+left_join_file="$artifacts/left-join-token"
+left_enrollment_file="$artifacts/left-enrollment-token"
+right_join_file="$artifacts/right-join-token"
+right_enrollment_file="$artifacts/right-enrollment-token"
+write_credential_file() {
+    # umask 077 keeps the token unreadable from the moment the file exists,
+    # regardless of the caller's umask; the explicit chmod re-asserts it.
+    (umask 077 && printf '%s\n' "$2" >"$1")
+    chmod 600 "$1"
+}
+write_credential_file "$left_join_file" "$left_join"
+write_credential_file "$left_enrollment_file" "$left_enrollment"
+write_credential_file "$right_join_file" "$right_join"
+write_credential_file "$right_enrollment_file" "$right_enrollment"
 "$client" --config "$left_config" join \
     --network "$network_id" \
-    --token "$left_join" \
-    --enrollment-token "$left_enrollment" \
+    --token-file "$left_join_file" \
+    --enrollment-token-file "$left_enrollment_file" \
     --tap-adapter "$left_visible" \
     --tap-peer "$left_peer"
 "$client" --config "$right_config" join \
     --network "$network_id" \
-    --token "$right_join" \
-    --enrollment-token "$right_enrollment" \
+    --token-file "$right_join_file" \
+    --enrollment-token-file "$right_enrollment_file" \
     --tap-adapter "$right_visible" \
     --tap-peer "$right_peer"
+rm -f "$left_join_file" "$left_enrollment_file" "$right_join_file" \
+    "$right_enrollment_file"
 unset left_enrollment right_enrollment left_join right_join
 
 echo "INFO: starting initial client data planes"

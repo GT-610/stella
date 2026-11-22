@@ -18,7 +18,7 @@ executor progress and transaction lifetime to an untrusted network peer.
 ## Decision
 
 The reference controller uses `redb` 2.6.3 for its authoritative store. It is a
-pure-Rust embedded database compatible with the workspace Rust 1.85 baseline.
+pure-Rust embedded database compatible with the workspace Rust 1.100 baseline.
 The on-disk schema has explicit tables for metadata, nodes, networks,
 memberships, endpoint sets, enrollment-token digests, and join-token digests.
 Values use an internal versioned binary encoding; Rust memory layout and Serde

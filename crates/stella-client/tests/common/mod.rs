@@ -33,6 +33,7 @@ pub fn temp_directory(prefix: &str) -> PathBuf {
 }
 
 /// Reserves a loopback address by binding port zero and releasing it.
+#[must_use]
 pub fn reserve_loopback_address() -> SocketAddr {
     let listener =
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve loopback address");

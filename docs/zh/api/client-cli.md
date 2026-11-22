@@ -111,7 +111,7 @@ Windows 根据网络 ID 派生适配器名称，并在使用加入凭据前完�
 ```powershell
 stella-client --config C:\Stella\client.toml join `
   --network <id> `
-  --token <unpadded-base64url-token>
+  --token-file C:\Stella\join-token.txt
 ```
 
 macOS 必须选择 feth pair 两端。第一项是宿主可见端，第二项只供 Stella 报文 I/O：
@@ -119,14 +119,16 @@ macOS 必须选择 feth pair 两端。第一项是宿主可见端，第二项只
 ```sh
 stella-client --config /etc/stella/client.toml join \
   --network <id> \
-  --token <unpadded-base64url-token> \
+  --token-file /etc/stella/join-token.txt \
   --tap-adapter feth100 \
   --tap-peer feth101
 ```
 
-节点尚未向控制器注册时，加入一次性
-`--enrollment-token <unpadded-base64url-token>`。两类令牌都必须解码为恰好 32 字节。
-它们只存在于进程内，会从调试输出中脱敏，也不会写入配置。
+令牌通过仅属主可读的文件（`--token-file` 与 `--enrollment-token-file`）传入，而不是
+通过进程参数——其他本地用户可以读取进程参数。节点尚未向控制器注册时，加入一次性
+`--enrollment-token-file <路径>`。两类令牌文件都必须解码为恰好 32 字节的
+unpadded base64url。它们只存在于进程内，会从调试输出中脱敏，也不会写入配置。
+加入完成后请删除各令牌文件。
 
 Windows 上，`join` 会在认证前从已安装驱动包创建或复用
 `Stella <网络ID>`。如果认证、加入或配置持久化失败，本次新建的适配器会被删除。稳定名称
@@ -134,8 +136,8 @@ Windows 上，`join` 会在认证前从已安装驱动包创建或复用
 `--tap-adapter` 选项。
 
 macOS 上，`join` 会验证显式 TAP pair。两个平台都会等待完整、已验证的控制器快照，再
-原子持久化网络 ID 与选择。重复已接受的加入可省略 `--token`；macOS 上冲突的 adapter
-或 peer 会在连接控制器前被拒绝。
+原子持久化网络 ID 与选择。重复已接受的加入可省略 `--token-file`；macOS 上冲突的
+adapter 或 peer 会在连接控制器前被拒绝。
 
 生成的 Windows 条目记录托管名称：
 

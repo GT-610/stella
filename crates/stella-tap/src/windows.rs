@@ -657,7 +657,7 @@ fn read_optional_registry_string(
     if status != NO_ERROR {
         return Err(TapError::io(operation, win32_error_to_io(status)));
     }
-    if byte_length < 2 || byte_length % 2 != 0 {
+    if byte_length < 2 || !byte_length.is_multiple_of(2) {
         return Err(TapError::io(
             operation,
             io::Error::new(
@@ -1175,7 +1175,7 @@ fn parse_candidates(
             .ok_or_else(invalid_adapter_data)?;
         if address < start
             || record_end > end
-            || address % align_of::<IP_ADAPTER_ADDRESSES_LH>() != 0
+            || !address.is_multiple_of(align_of::<IP_ADAPTER_ADDRESSES_LH>())
             || remaining == 0
         {
             return Err(invalid_adapter_data());
@@ -1747,8 +1747,10 @@ mod tests {
 
         let encoded = utf16_multi_string("tap0901");
         let words = encoded
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(words, [116, 97, 112, 48, 57, 48, 49, 0, 0]);
     }

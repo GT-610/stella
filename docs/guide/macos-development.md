@@ -16,9 +16,9 @@ service manager must start explicitly.
 
 ## Verify the workspace
 
-Use the default stable toolchain. The workspace keeps `rust-version = "1.85"`
+Use the default stable toolchain. The workspace keeps `rust-version = "1.100"`
 as its declared minimum, but normal development does not require installing a
-separate 1.85 toolchain.
+separate 1.100 toolchain.
 
 ```sh
 cargo fmt --all -- --check
@@ -47,11 +47,15 @@ guides. The macOS join adds the required peer name:
 ```sh
 target/debug/stella-client --config /path/to/client.toml join \
   --network <id> \
-  --token <unpadded-base64url-token> \
-  --enrollment-token <unpadded-base64url-token> \
+  --token-file /path/to/join-token.txt \
+  --enrollment-token-file /path/to/enrollment-token.txt \
   --tap-adapter feth100 \
   --tap-peer feth101
 ```
+
+Tokens are read from files rather than command-line arguments so other local
+users cannot read them from the process list. Create each token file with
+owner-only permissions and remove it after the join completes.
 
 Build the client and helper, then start the helper for the client user's numeric
 UID. Keep this foreground process running; the socket is mode `0600` and owned

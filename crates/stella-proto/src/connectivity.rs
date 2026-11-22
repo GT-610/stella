@@ -1291,7 +1291,12 @@ impl<'a> StunServerListView<'a> {
         let records = cursor.read_slice(records_length, "STUN server records")?;
         let mut previous = None;
         for index in 0..usize::from(count) {
-            let server = decode_stun_server_at(records, index * STUN_SERVER_RECORD_LENGTH, 4)?;
+            let offset = index.checked_mul(STUN_SERVER_RECORD_LENGTH).ok_or(
+                CodecError::IntegerOverflow {
+                    field: "STUN server record offset",
+                },
+            )?;
+            let server = decode_stun_server_at(records, offset, 4)?;
             if previous.is_some_and(|prior: StunServer| prior.sort_cmp(server) != Ordering::Less) {
                 return Err(CodecError::NestedRecordsOutOfOrder {
                     context: "STUN server list",
@@ -1411,8 +1416,21 @@ pub fn encode_stun_server_list(
         cursor.write_bytes(&[0; 3], "STUN server list reserved")?;
     }
     for (index, server) in servers.iter().copied().enumerate() {
-        let start = 4 + index * STUN_SERVER_RECORD_LENGTH;
-        let end = start + STUN_SERVER_RECORD_LENGTH;
+        let start = 4_usize
+            .checked_add(index.checked_mul(STUN_SERVER_RECORD_LENGTH).ok_or(
+                CodecError::IntegerOverflow {
+                    field: "STUN server record offset",
+                },
+            )?)
+            .ok_or(CodecError::IntegerOverflow {
+                field: "STUN server record start",
+            })?;
+        let end =
+            start
+                .checked_add(STUN_SERVER_RECORD_LENGTH)
+                .ok_or(CodecError::IntegerOverflow {
+                    field: "STUN server record end",
+                })?;
         let remaining = output.len().saturating_sub(start);
         let record = output
             .get_mut(start..end)
@@ -1599,6 +1617,7 @@ fn validate_connectivity_address(
             address.is_unspecified()
                 || address.is_loopback()
                 || address.is_multicast()
+                || address.is_link_local()
                 || address == Ipv4Addr::BROADCAST
         }
         IpAddr::V6(address) => {
@@ -2041,6 +2060,34 @@ mod tests {
             Err(CodecError::NestedRecordsOutOfOrder {
                 context: "STUN server list",
                 index: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn connectivity_addresses_reject_link_local_and_other_probe_classes() {
+        // IPv4 link-local addresses, including the cloud metadata range, must
+        // be refused for every connectivity address class: STUN servers, ICE
+        // candidates, and advertised endpoints share this validator.
+        let server = StunServer {
+            priority: 0,
+            address: "169.254.169.254:80".parse().expect("metadata endpoint"),
+        };
+        let mut encoded = vec![0; 4 + super::STUN_SERVER_RECORD_LENGTH];
+        assert!(matches!(
+            encode_stun_server_list(&[server], &mut encoded),
+            Err(CodecError::InvalidEndpointAddress {
+                family: "STUN server"
+            })
+        ));
+        let ipv6_server = StunServer {
+            priority: 0,
+            address: "[fe80::1]:3478".parse().expect("link-local server"),
+        };
+        assert!(matches!(
+            encode_stun_server_list(&[ipv6_server], &mut encoded),
+            Err(CodecError::InvalidEndpointAddress {
+                family: "STUN server"
             })
         ));
     }

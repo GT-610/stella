@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{sync_channel, Receiver as SyncReceiver, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
@@ -200,10 +200,120 @@ pub struct ClientDataRuntime {
     networks: BTreeMap<NetworkId, ActiveNetwork>,
     tap_events: mpsc::Receiver<TapEvent>,
     tap_event_sender: mpsc::Sender<TapEvent>,
+    trusted_controller_time: AtomicU64,
+    trusted_time_anchor: std::sync::Mutex<std::time::Instant>,
     started_at: std::time::Instant,
 }
 
 impl ClientDataRuntime {
+    /// Records the most recently authenticated controller wall-clock time.
+    ///
+    /// The observation anchors the recorded value to a monotonic instant so
+    /// [`Self::trusted_unix_time`] keeps advancing between observations even
+    /// when the local clock runs behind. A stale controller timestamp can
+    /// therefore not freeze the trust clock and extend a session beyond its
+    /// lifetime while controller updates pause. One anchor critical section
+    /// covers the elapsed read, the floor update, and the anchor move, so
+    /// overlapping observations cannot count the same interval twice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal monotonic anchor lock is poisoned by a
+    /// panicking thread.
+    pub fn observe_controller_time(&self, server_time: u64) {
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        let elapsed = anchor.elapsed();
+        self.apply_controller_observation(server_time, elapsed, &mut anchor);
+    }
+
+    /// Applies one controller time observation against an explicit elapsed
+    /// span since the previous observation.
+    ///
+    /// Test callers pass fixed spans so the fold arithmetic is exercised
+    /// without the real clock advancing between assertions. The anchor lock
+    /// is held for the whole observation, exactly like the production path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal monotonic anchor lock is poisoned by a
+    /// panicking thread.
+    #[cfg(test)]
+    fn observe_controller_time_at(&self, server_time: u64, elapsed: Duration) {
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        self.apply_controller_observation(server_time, elapsed, &mut anchor);
+    }
+
+    /// Folds one observation into the recorded floor and moves the anchor.
+    ///
+    /// The caller holds the anchor lock for the entire observation; this
+    /// helper must never lock the anchor itself because the mutex is not
+    /// re-entrant.
+    fn apply_controller_observation(
+        &self,
+        server_time: u64,
+        elapsed: Duration,
+        anchor: &mut std::time::Instant,
+    ) {
+        let whole_seconds = elapsed.as_secs();
+        let anchored_now = self
+            .trusted_controller_time
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(whole_seconds);
+        let recorded = advance_trusted_time(anchored_now, server_time);
+        self.trusted_controller_time
+            .store(recorded, std::sync::atomic::Ordering::Relaxed);
+        if server_time > anchored_now {
+            // The controller timestamp strictly replaced the anchored floor,
+            // so the anchor restarts from this observation.
+            *anchor = std::time::Instant::now();
+        } else {
+            // The anchored floor stands (a stale or identical controller
+            // timestamp cannot move it). The anchor moves forward by exactly
+            // the whole seconds just folded into that floor, so the
+            // sub-second remainder stays pending for the next observation
+            // instead of being counted twice or discarded by a full reset.
+            *anchor = advance_anchor(*anchor, whole_seconds);
+        }
+    }
+
+    /// Returns the trust clock used for grant and session validity.
+    ///
+    /// The value is the maximum of the local clock and the anchored controller
+    /// time, so winding the local clock backwards can no longer extend a
+    /// revoked member's grants or sessions, and elapsed monotonic time keeps
+    /// the anchor advancing between controller observations.
+    fn trusted_unix_time(&self) -> Result<u64, RuntimeError> {
+        let local = unix_time()?;
+        let anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        let anchored = self
+            .trusted_controller_time
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(anchor.elapsed().as_secs());
+        Ok(anchored.max(local))
+    }
+
+    /// Rewinds the monotonic anchor for regression tests, simulating elapsed
+    /// time since the last controller observation.
+    #[cfg(test)]
+    fn rewind_trusted_time_anchor(&self, elapsed: std::time::Duration) {
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        if let Some(rewound) = anchor.checked_sub(elapsed) {
+            *anchor = rewound;
+        }
+    }
+
     /// Binds direct UDP and a preferred warm relay, opens TAP adapters, and starts handshakes.
     ///
     /// # Errors
@@ -259,14 +369,16 @@ impl ClientDataRuntime {
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
+            trusted_controller_time: AtomicU64::new(0),
+            trusted_time_anchor: std::sync::Mutex::new(std::time::Instant::now()),
             started_at,
         };
         for state in states.values().cloned() {
             runtime.insert_network(config, state, signing_key)?;
         }
-        runtime.replace_local_connectivity_generations(states)?;
+        let wall_time = runtime.trusted_unix_time()?;
+        runtime.replace_local_connectivity_generations(states, wall_time)?;
         runtime.prepare_relay_paths().await?;
-        let wall_time = unix_time()?;
         runtime.reconcile_ice_agents(states, wall_time)?;
         let monotonic_now = runtime.monotonic_now();
         let network_ids: Vec<NetworkId> = runtime.networks.keys().copied().collect();
@@ -410,7 +522,7 @@ impl ClientDataRuntime {
         }
         let common = CommonHeader::decode(datagram)?;
         let network_id = common.network_id;
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let monotonic_now = self.monotonic_now();
         let output = self
             .networks
@@ -471,7 +583,7 @@ impl ClientDataRuntime {
             .to_vec();
         let common = CommonHeader::decode(&datagram)?;
         let network_id = common.network_id;
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let monotonic_now = self.monotonic_now();
         let output = self
             .networks
@@ -494,7 +606,7 @@ impl ClientDataRuntime {
     ///
     /// Returns [`RuntimeError`] for clock, handshake, endpoint, UDP, or TAP failure.
     pub async fn maintain(&mut self, signing_key: &IdentitySigningKey) -> Result<(), RuntimeError> {
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let now = self.monotonic_now();
         self.refresh_host_candidates(wall_time, now).await?;
         let ice_network_ids = self.ice_agents.keys().copied().collect::<Vec<_>>();
@@ -555,7 +667,7 @@ impl ClientDataRuntime {
         self.refresh_server_reflexive_candidates(candidate_datagram_size)
             .await;
         let states = self.current_network_states();
-        self.replace_local_connectivity_generations(&states)?;
+        self.replace_local_connectivity_generations(&states, wall_time)?;
         self.reconcile_ice_agents(&states, wall_time)?;
         self.connectivity_changed = true;
         let current_count = self
@@ -669,8 +781,9 @@ impl ClientDataRuntime {
                 active.state = state.clone();
             }
         }
-        self.reconcile_local_connectivity_generations(states)?;
-        self.reconcile_ice_agents(states, unix_time()?)?;
+        let wall_time = self.trusted_unix_time()?;
+        self.reconcile_local_connectivity_generations(states, wall_time)?;
+        self.reconcile_ice_agents(states, wall_time)?;
         self.prepare_relay_paths().await?;
         Ok(())
     }
@@ -711,11 +824,11 @@ impl ClientDataRuntime {
             .iter()
             .map(|(network_id, generation)| (*network_id, generation.generation_id))
             .collect::<BTreeMap<_, _>>();
-        self.reconcile_local_connectivity_generations(states)?;
+        let wall_time = self.trusted_unix_time()?;
+        self.reconcile_local_connectivity_generations(states, wall_time)?;
         if self.connectivity_generations.is_empty() {
             return Ok(!before.is_empty());
         }
-        let wall_time = unix_time()?;
         let refresh_deadline = wall_time.saturating_add(ICE_GENERATION_REFRESH_LEAD);
         let prospective_expiry = LocalConnectivityGeneration::expiry_at(wall_time, &self.relays)?;
         let due = self
@@ -989,7 +1102,7 @@ impl ClientDataRuntime {
         if !path_changed {
             return Ok(());
         }
-        let wall_time = unix_time()?;
+        let wall_time = self.trusted_unix_time()?;
         let monotonic_now = self.monotonic_now();
         let handshakes = self
             .networks
@@ -1115,8 +1228,9 @@ impl ClientDataRuntime {
             network.plane.set_available_relay_carriers(&available)?;
         }
         self.relay_buffers = relay_buffers(&self.relays);
-        self.replace_local_connectivity_generations(states)?;
-        self.reconcile_ice_agents(states, unix_time()?)
+        let wall_time = self.trusted_unix_time()?;
+        self.replace_local_connectivity_generations(states, wall_time)?;
+        self.reconcile_ice_agents(states, wall_time)
     }
 
     fn current_network_states(&self) -> BTreeMap<NetworkId, NetworkState> {
@@ -1237,6 +1351,7 @@ impl ClientDataRuntime {
     fn replace_local_connectivity_generations(
         &mut self,
         states: &BTreeMap<NetworkId, NetworkState>,
+        wall_time: u64,
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations.clear();
         if self.relays.is_empty() && self.direct_candidates.is_empty() {
@@ -1245,7 +1360,11 @@ impl ClientDataRuntime {
         for network_id in states.keys().copied() {
             self.connectivity_generations.insert(
                 network_id,
-                LocalConnectivityGeneration::new(&self.relays, &self.direct_candidates)?,
+                LocalConnectivityGeneration::new_at(
+                    wall_time,
+                    &self.relays,
+                    &self.direct_candidates,
+                )?,
             );
         }
         Ok(())
@@ -1254,6 +1373,7 @@ impl ClientDataRuntime {
     fn reconcile_local_connectivity_generations(
         &mut self,
         states: &BTreeMap<NetworkId, NetworkState>,
+        wall_time: u64,
     ) -> Result<(), RuntimeError> {
         self.connectivity_generations
             .retain(|network_id, _| states.contains_key(network_id));
@@ -1265,7 +1385,8 @@ impl ClientDataRuntime {
             if let std::collections::btree_map::Entry::Vacant(entry) =
                 self.connectivity_generations.entry(network_id)
             {
-                entry.insert(LocalConnectivityGeneration::new(
+                entry.insert(LocalConnectivityGeneration::new_at(
+                    wall_time,
                     &self.relays,
                     &self.direct_candidates,
                 )?);
@@ -1655,6 +1776,12 @@ struct LocalConnectivityGeneration {
 }
 
 impl LocalConnectivityGeneration {
+    /// Creates a generation stamped with the current local clock.
+    ///
+    /// Production code always passes the runtime's trusted clock through
+    /// [`Self::new_at`]; this test-facing helper keeps the legacy direct
+    /// stamping for fixtures that do not model a controller observation.
+    #[cfg(test)]
     fn new(relays: &[WarmRelay], direct_candidates: &[IceCandidate]) -> Result<Self, RuntimeError> {
         let created_at = unix_time()?;
         Self::new_at(created_at, relays, direct_candidates)
@@ -2328,7 +2455,10 @@ async fn resolve_relay_address_set(
 const fn usable_relay_dns_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
-            !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
+            !address.is_unspecified()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+                && !address.is_link_local()
         }
         IpAddr::V6(address) => {
             !address.is_unspecified()
@@ -2769,6 +2899,27 @@ fn effective_tap_mtu(policy_mtu: u16, installed_mtu: u32) -> Result<u16, TapErro
     })
 }
 
+/// Chooses the next recorded controller time for one authenticated observation.
+///
+/// The recorded value never moves backwards: a controller timestamp that
+/// lags behind the anchored trust clock keeps the already-anchored value,
+/// while a newer timestamp is adopted immediately.
+fn advance_trusted_time(anchored_now: u64, server_time: u64) -> u64 {
+    server_time.max(anchored_now)
+}
+
+/// Moves the observation anchor forward by the folded whole seconds.
+///
+/// Folding must never move the anchor backward: a backward move would
+/// re-count the folded seconds on the next observation and accelerate the
+/// trust clock. The instant range overflow falls back to the current
+/// instant, which only drops the pending sub-second remainder once.
+fn advance_anchor(anchor: std::time::Instant, whole_seconds: u64) -> std::time::Instant {
+    anchor
+        .checked_add(Duration::from_secs(whole_seconds))
+        .unwrap_or_else(std::time::Instant::now)
+}
+
 fn unix_time() -> Result<u64, RuntimeError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2782,7 +2933,10 @@ mod tests {
         collections::{BTreeMap, BTreeSet, VecDeque},
         future::pending,
         net::{IpAddr, SocketAddr},
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::AtomicU64,
+            {Arc, Mutex},
+        },
         time::{Duration, SystemTime},
     };
 
@@ -2854,6 +3008,101 @@ mod tests {
         assert!(excluded.contains("feth101"));
     }
 
+    #[tokio::test]
+    async fn controller_time_raises_the_trusted_clock_monotonically() {
+        let runtime = runtime_with_pending_relay_recovery().await;
+        runtime.observe_controller_time(1_000_000_000_000);
+        assert!(
+            runtime.trusted_unix_time().expect("trusted time") >= 1_000_000_000_000,
+            "observed controller time must never be lower than the trust clock"
+        );
+        runtime.observe_controller_time(50);
+        assert!(
+            runtime.trusted_unix_time().expect("trusted time") >= 1_000_000_000_000,
+            "a stale controller time must not move the trust clock backwards"
+        );
+        // Elapsed monotonic time keeps the anchored clock advancing between
+        // observations even when the local wall clock runs behind and the
+        // controller stops sending timestamps.
+        let before = runtime.trusted_unix_time().expect("trusted time");
+        runtime.rewind_trusted_time_anchor(Duration::from_secs(600));
+        let after = runtime.trusted_unix_time().expect("trusted time");
+        assert!(
+            after >= before + 590,
+            "trusted time must advance with elapsed monotonic time, {before} -> {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_sub_second_observations_preserve_the_fractional_remainder() {
+        let runtime = runtime_with_pending_relay_recovery().await;
+        // Far above any real local wall clock, so every value below comes
+        // from the anchored component and none can pass through the local
+        // clock floor. Observations pass explicit elapsed spans, so no real
+        // time passing between the calls can influence the assertions.
+        let far_future = 1_000_000_000_000_000;
+        runtime.observe_controller_time_at(far_future, Duration::ZERO);
+        // An identical report arrives 600ms after the previous one: no whole
+        // second folds yet, and the accumulated remainder must be kept.
+        runtime.observe_controller_time_at(far_future, Duration::from_millis(600));
+        assert_eq!(
+            runtime
+                .trusted_controller_time
+                .load(std::sync::atomic::Ordering::Relaxed),
+            far_future,
+            "sub-second reports must not fold a whole second yet"
+        );
+        // The next identical report arrives after the accumulated span
+        // crossed one second, so exactly one whole second folds into the
+        // floor while the remainder stays pending on the anchor.
+        runtime.observe_controller_time_at(far_future, Duration::from_millis(1200));
+        assert_eq!(
+            runtime
+                .trusted_controller_time
+                .load(std::sync::atomic::Ordering::Relaxed),
+            far_future + 1,
+            "one whole second must be folded in, not more and not zero"
+        );
+        // A further 900ms interval folds one more whole second and keeps
+        // the rest pending. A backward-moving anchor would re-count the
+        // folded second into the next observation and record more; the
+        // direction is pinned separately in the anchor unit test.
+        runtime.observe_controller_time_at(far_future, Duration::from_millis(1100));
+        assert_eq!(
+            runtime
+                .trusted_controller_time
+                .load(std::sync::atomic::Ordering::Relaxed),
+            far_future + 2,
+            "the folded seconds must not be counted twice"
+        );
+    }
+
+    #[test]
+    fn folding_seconds_moves_the_anchor_forward_only() {
+        // Folding whole seconds must move the anchor exactly that far into
+        // the future, never backward. A backward move would re-count the
+        // folded seconds on the next observation and accelerate the trust
+        // clock. Comparing the instants directly keeps the check free of
+        // any real-time dependence.
+        let before = std::time::Instant::now();
+        let advanced = super::advance_anchor(before, 1);
+        assert_eq!(
+            advanced.checked_duration_since(before),
+            Some(Duration::from_secs(1)),
+            "folding one second must advance the anchor by exactly that second"
+        );
+    }
+
+    #[test]
+    fn trusted_time_observations_never_move_the_recorded_value_backwards() {
+        // A fresh anchor contributes no elapsed seconds, so the recorded value
+        // equals the newer of the two inputs.
+        assert_eq!(super::advance_trusted_time(0, 500), 500);
+        // A controller timestamp that lags the anchored clock keeps the floor.
+        assert_eq!(super::advance_trusted_time(10_000, 50), 10_000);
+        assert_eq!(super::advance_trusted_time(10_000, 10_001), 10_001);
+    }
+
     async fn runtime_with_pending_relay_recovery() -> ClientDataRuntime {
         let udp = UdpTransport::bind(UdpConfig {
             bind_address: "127.0.0.1:0".parse().expect("loopback bind"),
@@ -2886,6 +3135,8 @@ mod tests {
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
+            trusted_controller_time: AtomicU64::new(0),
+            trusted_time_anchor: std::sync::Mutex::new(std::time::Instant::now()),
             started_at: std::time::Instant::now(),
         }
     }
@@ -2926,6 +3177,8 @@ mod tests {
             networks: BTreeMap::new(),
             tap_events,
             tap_event_sender,
+            trusted_controller_time: AtomicU64::new(0),
+            trusted_time_anchor: std::sync::Mutex::new(std::time::Instant::now()),
             started_at: std::time::Instant::now(),
         }
     }
@@ -3359,7 +3612,7 @@ mod tests {
         assert_eq!(selections[6].settings.spki_pins, vec![[1; 32]]);
         assert_eq!(selections[6].settings.proxy_address, None);
         assert_eq!(selections[0].settings.trust, RelayTrustRequirements::NONE);
-        assert!(selections[0].settings.spki_pins.is_empty());
+        assert_eq!(selections[0].settings.spki_pins, Vec::<[u8; 32]>::new());
         let preferred = preferred_relay_settings(
             "0.0.0.0:51820".parse().expect("wildcard bind"),
             None,

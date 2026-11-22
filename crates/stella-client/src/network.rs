@@ -1017,21 +1017,17 @@ impl NetworkDataPlane {
             .into_iter()
             .filter_map(relay_transport_endpoint)
             .collect::<Vec<_>>();
-        let mut endpoints = self
-            .state
-            .peers()
-            .get(&peer)
-            .map(|state| {
-                state
-                    .endpoints()
-                    .iter()
-                    .copied()
-                    .filter(|endpoint| {
-                        self.udp_family_available(endpoint_socket_address(*endpoint))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut endpoints = self.state.peers().get(&peer).map_or_default(|state| {
+            state
+                .endpoints()
+                .iter()
+                .copied()
+                .filter(|endpoint| {
+                    let address = endpoint_socket_address(*endpoint);
+                    self.udp_family_available(address) && usable_peer_endpoint_address(address)
+                })
+                .collect::<Vec<_>>()
+        });
         endpoints.sort_by_key(|endpoint| {
             (
                 endpoint.priority(),
@@ -1341,6 +1337,33 @@ fn usable_direct_address(address: SocketAddr) -> bool {
     }
 }
 
+/// Address classes accepted for peer-advertised direct endpoints.
+///
+/// Loopback stays accepted so a controller on the same host can pair two
+/// local client instances, but link-local, IPv4-mapped, multicast, broadcast,
+/// and unspecified addresses are refused. A malicious member otherwise uses
+/// published link-local endpoints (including cloud metadata ranges) to turn
+/// every client into an intranet UDP probe source.
+fn usable_peer_endpoint_address(address: SocketAddr) -> bool {
+    if address.port() == 0 {
+        return false;
+    }
+    match address.ip() {
+        IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_multicast()
+                && address != Ipv4Addr::BROADCAST
+                && !address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            !address.is_unspecified()
+                && !address.is_multicast()
+                && !address.is_unicast_link_local()
+                && address.to_ipv4_mapped().is_none()
+        }
+    }
+}
+
 fn endpoint_address(endpoint: Endpoint) -> [u8; 16] {
     match endpoint {
         Endpoint::UdpIpv4 { address, .. } => {
@@ -1398,8 +1421,33 @@ mod tests {
     };
     use stella_transport::{Endpoint as TransportEndpoint, RelayCarrier};
 
+    use super::{usable_direct_address, usable_peer_endpoint_address};
     use super::{NetworkDataError, NetworkDataPlane};
     use crate::{NetworkState, SnapshotInput};
+
+    #[test]
+    fn peer_endpoint_address_classes_are_strict() {
+        let parse = |text: &str| text.parse::<SocketAddr>().expect("parse address");
+        // Loopback stays usable so controllers can pair two local instances,
+        // but link-local, multicast, and mapped classes never probe.
+        assert!(usable_peer_endpoint_address(parse("127.0.0.1:46001")));
+        assert!(usable_peer_endpoint_address(parse("192.168.1.5:46001")));
+        assert!(usable_peer_endpoint_address(parse("[fd00::1]:46001")));
+        assert!(!usable_peer_endpoint_address(parse("169.254.169.254:80")));
+        assert!(!usable_peer_endpoint_address(parse("224.0.0.1:46001")));
+        assert!(!usable_peer_endpoint_address(parse(
+            "255.255.255.255:46001"
+        )));
+        assert!(!usable_peer_endpoint_address(parse("0.0.0.0:46001")));
+        assert!(!usable_peer_endpoint_address(parse("10.0.0.1:0")));
+        assert!(!usable_peer_endpoint_address(parse("[fe80::1]:46001")));
+        assert!(!usable_peer_endpoint_address(parse(
+            "[::ffff:10.0.0.1]:46001"
+        )));
+        // Nominated direct paths keep the stricter loopback exclusion.
+        assert!(!usable_direct_address(parse("127.0.0.1:46001")));
+        assert!(usable_direct_address(parse("192.0.2.10:46001")));
+    }
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
     const WALL_TIME: u64 = 200;
@@ -1588,16 +1636,20 @@ mod tests {
         )
         .expect("create endpointless-peer data plane");
 
-        assert!(plane
-            .start_handshakes(local_key, WALL_TIME, Duration::ZERO)
-            .expect("skip endpointless peer")
-            .datagrams
-            .is_empty());
-        assert!(plane
-            .maintain(local_key, WALL_TIME, Duration::from_secs(1))
-            .expect("continue waiting for peer endpoint")
-            .datagrams
-            .is_empty());
+        assert_eq!(
+            plane
+                .start_handshakes(local_key, WALL_TIME, Duration::ZERO)
+                .expect("skip endpointless peer")
+                .datagrams,
+            []
+        );
+        assert_eq!(
+            plane
+                .maintain(local_key, WALL_TIME, Duration::from_secs(1))
+                .expect("continue waiting for peer endpoint")
+                .datagrams,
+            []
+        );
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
@@ -1719,7 +1771,7 @@ mod tests {
                 ConnectivityCarrier::TurnUdp,
             )])
             .expect("enable unrelated TURN UDP relay");
-        assert!(plane.relay_endpoints().is_empty());
+        assert_eq!(plane.relay_endpoints(), []);
         plane
             .set_available_relay_carriers(&[(relay_id, ConnectivityCarrier::TurnUdp)])
             .expect("enable TURN UDP paths");
@@ -1994,7 +2046,7 @@ mod tests {
             Duration::ZERO,
         )
         .expect("relay-aware data plane");
-        assert!(plane.relay_endpoints().is_empty());
+        assert_eq!(plane.relay_endpoints(), []);
 
         let mut available = Vec::new();
         for (carrier, expected) in [
@@ -2238,18 +2290,20 @@ mod tests {
                 1
             );
         }
-        assert!(receiver
-            .accept_datagram(
-                &endpoint,
-                initiation.bytes(),
-                responder,
-                WALL_TIME,
-                Duration::ZERO
-            )
-            .expect("silent budget drop")
-            .into_parts()
-            .0
-            .is_empty());
+        assert_eq!(
+            receiver
+                .accept_datagram(
+                    &endpoint,
+                    initiation.bytes(),
+                    responder,
+                    WALL_TIME,
+                    Duration::ZERO
+                )
+                .expect("silent budget drop")
+                .into_parts()
+                .0,
+            []
+        );
         assert_eq!(
             receiver
                 .accept_datagram(
@@ -2324,11 +2378,13 @@ mod tests {
             .maintain(&alice_key, expires_at, Duration::from_secs(2))
             .expect("expire Alice session without failing the network");
         assert!(alice.established_peers().is_empty());
-        assert!(alice
-            .accept_tap_frame(&frame, Duration::from_secs(2))
-            .expect("drop local frame after expiry")
-            .datagrams
-            .is_empty());
+        assert_eq!(
+            alice
+                .accept_tap_frame(&frame, Duration::from_secs(2))
+                .expect("drop local frame after expiry")
+                .datagrams,
+            []
+        );
         assert!(matches!(
             bob.accept_datagram(
                 &stella_transport::Endpoint::Udp(alice_address),
@@ -2660,7 +2716,7 @@ mod tests {
         let (mut pending, mut from_alice) = if alice_start.is_empty() {
             (bob_start, false)
         } else {
-            assert!(bob_start.is_empty());
+            assert_eq!(bob_start, []);
             (alice_start, true)
         };
         for _ in 0..8 {
@@ -2694,7 +2750,7 @@ mod tests {
             pending = next;
             from_alice = !from_alice;
         }
-        assert!(pending.is_empty());
+        assert_eq!(pending, []);
         assert_eq!(alice.established_peers().len(), 1);
         assert_eq!(bob.established_peers().len(), 1);
 

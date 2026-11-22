@@ -1260,6 +1260,7 @@ dependencies = [
  "libc",
  "stella-crypto",
  "thiserror",
+ "winapi",
  "windows-acl",
  "zeroize",
 ]

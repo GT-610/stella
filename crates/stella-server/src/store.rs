@@ -2,7 +2,6 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::OpenOptions,
     path::{Path, PathBuf},
     str,
 };
@@ -10,6 +9,10 @@ use std::{
 use redb::{Database, ReadableTable, TableDefinition};
 use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
 use stella_crypto::{derive_node_id, sha256_segments, CryptoError, IdentityPublicKey};
+use stella_file_security::{
+    create_protected_secret_file, open_protected_secret_file,
+    open_protected_secret_file_for_update, IdentityFileError,
+};
 use stella_proto::{
     encode_endpoint_set, CodecError, ConnectivityGenerationView, ConnectivityRecordView, Endpoint,
     EndpointSetView, MembershipPermissions, NetworkPolicy, CONNECTIVITY_RECORD_FIXED_LENGTH,
@@ -70,26 +73,26 @@ pub struct AuthorityStore {
 impl AuthorityStore {
     /// Creates a new redb file and initializes every version 1 authority table.
     ///
-    /// The target is opened with create-new semantics and is never silently
-    /// replaced or reused.
+    /// The target is created with the native protected-secret file policy
+    /// (mode `0600` or an exact DACL) so member topology and relay credentials
+    /// are never readable by other local principals, and is never silently
+    /// replaced or reused. On Unix every ancestor of the target must be a
+    /// directory owned by the running user or root without group or world
+    /// write access, so initialization cannot succeed in a directory that
+    /// [`Self::open`] would reject.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when the path already exists, the file cannot be
-    /// created, redb initialization fails, or metadata cannot be committed.
+    /// created securely, redb initialization fails, or metadata cannot be
+    /// committed.
     pub fn initialize(path: &Path, controller_id: ControllerId) -> Result<Self, StoreError> {
         if controller_id.is_zero() {
             return Err(StoreError::InvalidControllerId);
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|source| StoreError::Create {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        #[cfg(unix)]
+        verified_state_path(path)?;
+        let file = create_protected_secret_file(path).map_err(StoreError::from)?;
         let database = redb::Builder::new().create_file(file)?;
         let write = database.begin_write()?;
         {
@@ -109,16 +112,45 @@ impl AuthorityStore {
 
     /// Opens existing authority state and verifies schema and controller binding.
     ///
+    /// Every Unix ancestor of the state path must be a directory owned by the
+    /// running user or root without group or world write access; the state
+    /// file is then opened once through the protected update-capable policy
+    /// and the verified handle is handed straight to redb, so a path swapped
+    /// between the checks cannot make the store operate on an unverified
+    /// database. An empty file is rejected because opening must never
+    /// initialize a new database. The post-open path check is kept as defense
+    /// in depth.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] for redb failure, missing or malformed metadata,
-    /// an unsupported schema, a controller identity mismatch, or corrupt
+    /// Returns [`StoreError`] for an insecure state file or directory, an
+    /// empty state file, redb failure, missing or malformed metadata, an
+    /// unsupported schema, a controller identity mismatch, or corrupt
     /// versioned records.
     pub fn open(path: &Path, expected_controller_id: ControllerId) -> Result<Self, StoreError> {
         if expected_controller_id.is_zero() {
             return Err(StoreError::InvalidControllerId);
         }
-        let database = Database::open(path)?;
+        let open_path = verified_state_path(path)?;
+        // One policy-verified open; the handle is bound to the database so
+        // concurrent path replacement cannot influence what is opened.
+        let file = open_protected_secret_file_for_update(&open_path)?;
+        let length = file
+            .metadata()
+            .map_err(|source| StoreError::StateFileMetadata {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        if length == 0 {
+            return Err(StoreError::EmptyStateFile {
+                path: path.to_path_buf(),
+            });
+        }
+        let database = redb::Builder::new().create_file(file)?;
+        // Defense in depth: the path is re-verified after the database opens,
+        // although the retained handle is what the store operates on.
+        verify_state_file_permissions(&open_path)?;
         let (schema_version, controller_id) = read_metadata_unchecked(&database)?;
         if controller_id != expected_controller_id {
             return Err(StoreError::ControllerMismatch {
@@ -1421,15 +1453,12 @@ impl AuthorityStore {
 
     pub(crate) fn backup(&self, destination: &Path) -> Result<u64, StoreError> {
         self.verify()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|source| StoreError::BackupCreate {
-                path: destination.to_path_buf(),
-                source,
-            })?;
+        // Reject an unsuitable destination directory before any bytes are
+        // copied, so a `0770` directory cannot first materialize a complete
+        // backup only for the final reopen to reject and clean it up.
+        #[cfg(unix)]
+        verified_state_path(destination)?;
+        let file = create_protected_secret_file(destination)?;
         match self.populate_backup(file, destination) {
             Ok(copied) => Ok(copied),
             Err(error) => Err(cleanup_backup(destination, error)),
@@ -1456,14 +1485,10 @@ impl AuthorityStore {
         drop(source_read);
         drop(backup);
 
-        let backup_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(destination)
-            .map_err(|source| StoreError::BackupSync {
-                path: destination.to_path_buf(),
-                source,
-            })?;
+        // The update-capable handle keeps the native permission verification:
+        // on Windows `sync_all` needs write access on the handle, so the
+        // read-only policy opener cannot be reused here.
+        let backup_file = open_protected_secret_file_for_update(destination)?;
         backup_file
             .sync_all()
             .map_err(|source| StoreError::BackupSync {
@@ -2460,12 +2485,31 @@ impl JoinTokenRecord {
 /// Authority database initialization, validation, or transaction failure.
 #[derive(Debug, Error)]
 pub enum StoreError {
-    /// The new database file could not be created exclusively.
-    #[error("could not create authority database {path}: {source}")]
-    Create {
-        /// Requested database path.
+    /// The state file failed a native protected-secret security check.
+    ///
+    /// This covers creation and verification failures: an existing path, a
+    /// link, a non-regular file, or permissions broader than the exact
+    /// owner-only policy. Existing deployments created with a permissive
+    /// umask must tighten the file (for example `chmod 600 controller.redb`)
+    /// before the authority store will open it.
+    #[error("authority state file failed a native security check: {0}")]
+    InsecureStateFile(#[from] stella_file_security::IdentityFileError),
+    /// The state file exists but is empty.
+    ///
+    /// `open` never initializes a new database, so a zero-length file at the
+    /// state path is a hard error instead of silently creating state.
+    #[error("authority state file {path} is empty")]
+    EmptyStateFile {
+        /// Rejected state path.
+        path: PathBuf,
+    },
+    /// The state file metadata could not be inspected through its handle.
+    #[error("unable to inspect authority state file {path}")]
+    StateFileMetadata {
+        /// Inspected state path.
         path: PathBuf,
         /// Underlying filesystem error.
+        #[source]
         source: std::io::Error,
     },
     /// A boxed redb database, transaction, table, storage, or commit failure.
@@ -2611,15 +2655,6 @@ pub enum StoreError {
         /// Network whose counter cannot advance.
         network_id: NetworkId,
     },
-    /// A create-new backup destination could not be opened.
-    #[error("unable to create authority backup {path}")]
-    BackupCreate {
-        /// Requested backup path.
-        path: PathBuf,
-        /// Underlying filesystem failure.
-        #[source]
-        source: std::io::Error,
-    },
     /// Backup bytes could not be durably synchronized.
     #[error("unable to sync authority backup {path}")]
     BackupSync {
@@ -2682,6 +2717,102 @@ fn enrollment_token_digest(token: &BearerToken) -> [u8; 32] {
 
 fn join_token_digest(token: &BearerToken) -> [u8; 32] {
     sha256_segments(&[JOIN_TOKEN_DOMAIN, token.expose_secret()])
+}
+
+/// Verifies the native protected-secret policy for an authority state file.
+///
+/// The file handle is opened with link and file-kind checks and immediately
+/// dropped; callers that subsequently open by path must re-verify to narrow
+/// the replacement window.
+fn verify_state_file_permissions(path: &Path) -> Result<(), StoreError> {
+    drop(open_protected_secret_file(path)?);
+    Ok(())
+}
+
+/// Verifies that every ancestor of the state path is a directory that the
+/// running user or root owns and that no group or world principal can
+/// rewrite.
+///
+/// The parent is canonicalized first so alias components resolve to the real
+/// directories they name; every resulting real ancestor is then required to
+/// be a non-link directory owned by the effective user or root. Group- or
+/// world-writable ancestors are rejected, with the standard exception of
+/// the sticky-bit directories such as `/tmp`: the sticky bit already
+/// restricts replacement of directory entries to their owners, which is the
+/// property the walk needs. A principal who can replace any ancestor could
+/// otherwise swap the state file between the policy checks, so the walk
+/// covers the whole chain rather than only the immediate parent.
+#[cfg(unix)]
+fn verified_state_path(path: &Path) -> Result<PathBuf, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    const STICKY_BIT: u32 = 0o1000;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| {
+            StoreError::InsecureStateFile(IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "the state path must name a file",
+            })
+        })?
+        .to_owned();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical = std::fs::canonicalize(parent).map_err(|source| {
+        StoreError::InsecureStateFile(IdentityFileError::Metadata {
+            path: parent.to_path_buf(),
+            source,
+        })
+    })?;
+    let effective_uid = stella_file_security::current_effective_uid();
+    let mut current: &Path = canonical.as_path();
+    loop {
+        let metadata = std::fs::symlink_metadata(current).map_err(|source| {
+            StoreError::InsecureStateFile(IdentityFileError::Metadata {
+                path: current.to_path_buf(),
+                source,
+            })
+        })?;
+        let mode = metadata.mode();
+        let owner = metadata.uid();
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || (mode & 0o022 != 0 && mode & STICKY_BIT == 0)
+            || (owner != effective_uid && owner != 0)
+        {
+            return Err(StoreError::InsecureStateFile(
+                IdentityFileError::InsecurePermissions {
+                    path: current.to_path_buf(),
+                    reason: "every state-path ancestor must be a directory owned by this \
+                             user or root without group or world write access",
+                },
+            ));
+        }
+        match current.parent() {
+            Some(ancestor) => current = ancestor,
+            None => break,
+        }
+    }
+    // The canonical path contains no alias components, so every later open
+    // through it traverses only directories this walk just verified.
+    Ok(canonical.join(file_name))
+}
+
+/// Non-Unix state paths are used as given after checking that they name a
+/// file; the native file policy still verifies the destination itself on
+/// every open.
+#[cfg(not(unix))]
+fn verified_state_path(path: &Path) -> Result<PathBuf, StoreError> {
+    if path.file_name().is_none() {
+        return Err(StoreError::InsecureStateFile(
+            IdentityFileError::InsecurePermissions {
+                path: path.to_path_buf(),
+                reason: "the state path must name a file",
+            },
+        ));
+    }
+    Ok(path.to_path_buf())
 }
 
 fn cleanup_backup(path: &Path, cause: StoreError) -> StoreError {
@@ -3171,14 +3302,16 @@ const fn malformed(table: &'static str, reason: &'static str) -> StoreError {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::OpenOptions,
         net::Ipv4Addr,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
     use stella_common::{ControllerId, GrantSerial, NetworkId, NodeId};
     use stella_crypto::{IdentitySeed, IdentitySigningKey};
+    use stella_file_security::create_protected_secret_file;
+    #[cfg(unix)]
+    use stella_file_security::IdentityFileError;
     use stella_proto::{
         encode_connectivity_generation, ConfidentialityPolicy, ConnectivityCarrier,
         ConnectivityGenerationRef, Endpoint, IceCandidate, IceCandidateClass, NetworkPolicy,
@@ -3198,6 +3331,15 @@ mod tests {
             "stella-authority-store-{}-{sequence}",
             std::process::id()
         ))
+    }
+
+    /// Creates test fixture directories with owner-only permissions.
+    ///
+    /// `AuthorityStore` rejects group- or world-writable state directories,
+    /// so fixtures delegate to the crate helper and never depend on the
+    /// ambient umask.
+    fn create_secure_test_directory(directory: &Path) {
+        crate::create_owner_only_directory(directory);
     }
 
     fn signing_key(seed: u8) -> IdentitySigningKey {
@@ -3273,7 +3415,7 @@ mod tests {
 
     fn endpoint_test_store() -> (PathBuf, AuthorityStore, NodeId, NodeId, NetworkId) {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([40; 16]))
             .expect("initialize store");
@@ -3299,7 +3441,7 @@ mod tests {
     #[ignore = "manual release-mode multi-network query measurement"]
     fn benchmark_network_session_views() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("directory");
+        create_secure_test_directory(&directory);
         let store = AuthorityStore::initialize(
             &directory.join("state.redb"),
             ControllerId::from_bytes([1; 16]),
@@ -3347,7 +3489,7 @@ mod tests {
     #[test]
     fn initialization_binds_controller_and_creates_all_tables() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let controller_id = ControllerId::from_bytes([1; 16]);
         let store = AuthorityStore::initialize(&path, controller_id).expect("initialize store");
@@ -3365,7 +3507,89 @@ mod tests {
         ));
         assert!(matches!(
             AuthorityStore::initialize(&path, controller_id),
-            Err(StoreError::Create { .. })
+            Err(StoreError::InsecureStateFile(_))
+        ));
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_rejects_permissive_database_permissions() {
+        let directory = temp_directory();
+        create_secure_test_directory(&directory);
+        let path = directory.join("controller.redb");
+        let controller_id = ControllerId::from_bytes([91; 16]);
+        let store = AuthorityStore::initialize(&path, controller_id).expect("initialize store");
+        drop(store);
+
+        let mut permissions = std::fs::metadata(&path)
+            .expect("read database metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        std::fs::set_permissions(&path, permissions).expect("loosen permissions");
+        // The rejection must come from the database file's mode check, not
+        // from the directory walk, so the inner identity error is inspected
+        // instead of accepting any InsecureStateFile variant.
+        match AuthorityStore::open(&path, controller_id) {
+            Err(StoreError::InsecureStateFile(IdentityFileError::InsecurePermissions {
+                reason,
+                ..
+            })) => assert_eq!(reason, "mode must be exactly 0600"),
+            other => panic!("expected the database file mode rejection, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn open_rejects_an_empty_state_file() {
+        let directory = temp_directory();
+        create_secure_test_directory(&directory);
+        let path = directory.join("controller.redb");
+        create_protected_secret_file(&path).expect("create empty state file");
+        assert!(matches!(
+            AuthorityStore::open(&path, ControllerId::from_bytes([93; 16])),
+            Err(StoreError::EmptyStateFile { .. })
+        ));
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn initialize_rejects_a_group_writable_state_directory() {
+        let directory = temp_directory();
+        create_secure_test_directory(&directory);
+        let path = directory.join("controller.redb");
+        let mut permissions = std::fs::metadata(&directory)
+            .expect("read directory metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o770);
+        std::fs::set_permissions(&directory, permissions).expect("loosen directory");
+        assert!(matches!(
+            AuthorityStore::initialize(&path, ControllerId::from_bytes([94; 16])),
+            Err(StoreError::InsecureStateFile(_))
+        ));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_rejects_a_group_writable_state_directory() {
+        let directory = temp_directory();
+        create_secure_test_directory(&directory);
+        let path = directory.join("controller.redb");
+        let controller_id = ControllerId::from_bytes([92; 16]);
+        let store = AuthorityStore::initialize(&path, controller_id).expect("initialize store");
+        drop(store);
+
+        let mut permissions = std::fs::metadata(&directory)
+            .expect("read directory metadata")
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o770);
+        std::fs::set_permissions(&directory, permissions).expect("loosen directory");
+        assert!(matches!(
+            AuthorityStore::open(&path, controller_id),
+            Err(StoreError::InsecureStateFile(_))
         ));
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
@@ -3373,15 +3597,13 @@ mod tests {
     #[test]
     fn schema_one_is_atomically_migrated_before_verification() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let controller_id = ControllerId::from_bytes([55; 16]);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .expect("create legacy database");
+        // The legacy fixture goes through the protected-file API so it
+        // carries the exact native policy (mode 0600 or the Windows DACL)
+        // instead of Unix-only permission calls.
+        let file = create_protected_secret_file(&path).expect("create legacy database");
         let database = redb::Builder::new()
             .create_file(file)
             .expect("initialize legacy database");
@@ -3408,10 +3630,12 @@ mod tests {
         drop(database);
 
         let store = AuthorityStore::open(&path, controller_id).expect("migrate legacy database");
-        assert!(store
-            .list_connectivity(NetworkId::from_bytes([56; 16]))
-            .expect("read migrated connectivity table")
-            .is_empty());
+        assert_eq!(
+            store
+                .list_connectivity(NetworkId::from_bytes([56; 16]))
+                .expect("read migrated connectivity table"),
+            []
+        );
         let read = store.database.begin_read().expect("read migrated metadata");
         let metadata = read.open_table(METADATA).expect("open migrated metadata");
         let schema = metadata
@@ -3430,7 +3654,7 @@ mod tests {
     #[test]
     fn node_records_round_trip_and_enable_changes_are_idempotent() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([3; 16]))
             .expect("initialize store");
@@ -3465,7 +3689,7 @@ mod tests {
     #[test]
     fn network_records_round_trip_with_authority_counters() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([5; 16]))
             .expect("initialize store");
@@ -3490,7 +3714,7 @@ mod tests {
     #[test]
     fn network_delete_removes_all_scoped_authority_state() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([22; 16]))
             .expect("initialize store");
@@ -3570,7 +3794,7 @@ mod tests {
     #[test]
     fn coordinated_backup_is_create_new_verified_and_point_in_time() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let backup_path = directory.join("controller.backup.redb");
         let controller_id = ControllerId::from_bytes([27; 16]);
@@ -3583,7 +3807,7 @@ mod tests {
         assert!(store.backup(&backup_path).expect("create backup") > 0);
         assert!(matches!(
             store.backup(&backup_path),
-            Err(StoreError::BackupCreate { .. })
+            Err(StoreError::InsecureStateFile(_))
         ));
         store
             .set_node_enabled(node_id, false)
@@ -3603,7 +3827,7 @@ mod tests {
     #[test]
     fn enrollment_token_is_consumed_with_node_registration() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([7; 16]))
             .expect("initialize store");
@@ -3639,7 +3863,7 @@ mod tests {
     #[test]
     fn join_token_membership_and_leave_commit_authority_atomically() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([11; 16]))
             .expect("initialize store");
@@ -3717,7 +3941,7 @@ mod tests {
     #[test]
     fn administrative_membership_status_rotates_authority_once() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([15; 16]))
             .expect("initialize store");
@@ -3778,7 +4002,7 @@ mod tests {
     #[test]
     fn node_enable_changes_invalidate_every_membership_atomically() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([18; 16]))
             .expect("initialize store");
@@ -3922,7 +4146,7 @@ mod tests {
         assert_eq!(offline.local_node().node_id(), first_id);
         assert_eq!(offline.local_membership().node_id(), first_id);
         assert_eq!(offline.network().network_id(), network_id);
-        assert!(offline.peers().is_empty());
+        assert_eq!(offline.peers(), []);
 
         store
             .publish_endpoints(second_id, network_id, &[], 120)
@@ -3938,7 +4162,7 @@ mod tests {
         assert_eq!(peer.node().node_id(), second_id);
         assert_eq!(peer.membership().node_id(), second_id);
         assert_eq!(peer.endpoint_lease().node_id(), second_id);
-        assert!(peer.endpoint_lease().endpoints().is_empty());
+        assert_eq!(peer.endpoint_lease().endpoints(), []);
         assert_eq!(
             online.network().snapshot_revision(),
             store
@@ -3951,11 +4175,13 @@ mod tests {
         store
             .set_membership_status(second_id, network_id, MembershipStatus::Suspended)
             .expect("suspend peer");
-        assert!(store
-            .network_session_view(first_id, network_id)
-            .expect("read suspended peer view")
-            .peers()
-            .is_empty());
+        assert_eq!(
+            store
+                .network_session_view(first_id, network_id)
+                .expect("read suspended peer view")
+                .peers(),
+            []
+        );
         assert!(matches!(
             store.network_session_view(second_id, network_id),
             Err(StoreError::MembershipSuspended { .. })
@@ -3993,7 +4219,7 @@ mod tests {
             .expect("read generated lease")
             .expect("online lease exists");
         assert_eq!(lease.updated_at, 120);
-        assert!(lease.endpoints().is_empty());
+        assert_eq!(lease.endpoints(), []);
         let stored = store
             .get_connectivity(first_id, network_id)
             .expect("read connectivity")
@@ -4098,10 +4324,12 @@ mod tests {
             .publish_connectivity(first_id, network_id, Some(&generation), 145)
             .expect("republish before expiry");
         assert_eq!(republished.snapshot_revision, 6);
-        assert!(store
-            .expire_endpoints(174)
-            .expect("retain live connectivity")
-            .is_empty());
+        assert_eq!(
+            store
+                .expire_endpoints(174)
+                .expect("retain live connectivity"),
+            []
+        );
         let expired = store
             .expire_endpoints(175)
             .expect("expire connectivity lease");
@@ -4137,10 +4365,10 @@ mod tests {
                 .expect("refresh online lease"),
             published
         );
-        assert!(store
-            .expire_endpoints(699)
-            .expect("retain live generation")
-            .is_empty());
+        assert_eq!(
+            store.expire_endpoints(699).expect("retain live generation"),
+            []
+        );
 
         let generation_expired = store.expire_endpoints(700).expect("expire generation only");
         assert_eq!(generation_expired.len(), 1);
@@ -4158,10 +4386,12 @@ mod tests {
             690
         );
 
-        assert!(store
-            .expire_endpoints(719)
-            .expect("retain fresh online lease")
-            .is_empty());
+        assert_eq!(
+            store
+                .expire_endpoints(719)
+                .expect("retain fresh online lease"),
+            []
+        );
         let lease_expired = store.expire_endpoints(720).expect("expire online lease");
         assert_eq!(lease_expired.len(), 1);
         assert_eq!(lease_expired[0].snapshot_revision, 5);
@@ -4224,12 +4454,14 @@ mod tests {
             .publish_endpoints(second_id, network_id, &[], 125)
             .expect("publish empty endpoint set");
         assert_eq!(second_online.snapshot_revision, 5);
-        assert!(store
-            .get_endpoints(second_id, network_id)
-            .expect("get empty endpoints")
-            .expect("empty online record exists")
-            .endpoints()
-            .is_empty());
+        assert_eq!(
+            store
+                .get_endpoints(second_id, network_id)
+                .expect("get empty endpoints")
+                .expect("empty online record exists")
+                .endpoints(),
+            []
+        );
         let withdrawn = store
             .publish_endpoints(first_id, network_id, &[], 130)
             .expect("withdraw direct endpoint");
@@ -4250,19 +4482,21 @@ mod tests {
             .expect("refresh second lease");
         assert_eq!(first_refresh, withdrawn);
         assert_eq!(second_refresh, withdrawn);
-        assert!(store
-            .expire_endpoints(169)
-            .expect("retain live endpoints")
-            .is_empty());
+        assert_eq!(
+            store.expire_endpoints(169).expect("retain live endpoints"),
+            []
+        );
         let expired = store.expire_endpoints(170).expect("expire both endpoints");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].network_id, network_id);
         assert_eq!(expired[0].controller_epoch, 3);
         assert_eq!(expired[0].snapshot_revision, 7);
-        assert!(store
-            .list_endpoints(network_id)
-            .expect("list expired endpoints")
-            .is_empty());
+        assert_eq!(
+            store
+                .list_endpoints(network_id)
+                .expect("list expired endpoints"),
+            []
+        );
         store.verify().expect("endpoint lease state is valid");
         drop(store);
         std::fs::remove_dir_all(&directory).expect("remove test directory");
@@ -4271,7 +4505,7 @@ mod tests {
     #[test]
     fn authorization_changes_remove_endpoint_leases() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        create_secure_test_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([44; 16]))
             .expect("initialize store");

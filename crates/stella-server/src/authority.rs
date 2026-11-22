@@ -1060,7 +1060,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn typed_commands_preserve_transaction_order() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([31; 16]))
             .expect("initialize store");
@@ -1115,7 +1115,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn token_commands_own_zeroizing_secret_copies() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([34; 16]))
             .expect("initialize store");
@@ -1149,7 +1149,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn endpoint_commands_preserve_publish_refresh_and_expiry_order() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([36; 16]))
             .expect("initialize store");
@@ -1209,7 +1209,7 @@ mod tests {
             view.network().snapshot_revision(),
             published.snapshot_revision
         );
-        assert!(view.peers().is_empty());
+        assert_eq!(view.peers(), []);
         assert_eq!(
             authority
                 .list_endpoints(network_id)
@@ -1217,19 +1217,20 @@ mod tests {
                 .expect("list endpoints"),
             vec![stored]
         );
-        assert!(authority
-            .expire_endpoints(169)
-            .await
-            .expect("retain lease")
-            .is_empty());
+        assert_eq!(
+            authority.expire_endpoints(169).await.expect("retain lease"),
+            []
+        );
         let expired = authority.expire_endpoints(170).await.expect("expire lease");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].snapshot_revision, 4);
-        assert!(authority
-            .list_endpoints(network_id)
-            .await
-            .expect("list expired endpoints")
-            .is_empty());
+        assert_eq!(
+            authority
+                .list_endpoints(network_id)
+                .await
+                .expect("list expired endpoints"),
+            []
+        );
         worker.shutdown().await.expect("shutdown worker");
         std::fs::remove_dir_all(&directory).expect("remove test directory");
     }
@@ -1237,7 +1238,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn connectivity_commands_publish_list_and_withdraw_secret_generations() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let store = AuthorityStore::initialize(&path, ControllerId::from_bytes([39; 16]))
             .expect("initialize store");
@@ -1306,11 +1307,13 @@ mod tests {
             .await
             .expect("get withdrawn connectivity")
             .is_none());
-        assert!(authority
-            .list_connectivity(network_id)
-            .await
-            .expect("list withdrawn connectivity")
-            .is_empty());
+        assert_eq!(
+            authority
+                .list_connectivity(network_id)
+                .await
+                .expect("list withdrawn connectivity"),
+            []
+        );
 
         worker.shutdown().await.expect("shutdown authority worker");
         std::fs::remove_dir_all(&directory).expect("remove test directory");
@@ -1319,7 +1322,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn backup_and_network_delete_commands_are_serialized() {
         let directory = temp_directory();
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         let path = directory.join("controller.redb");
         let backup_path = directory.join("controller.backup.redb");
         let controller_id = ControllerId::from_bytes([36; 16]);

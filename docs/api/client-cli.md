@@ -137,7 +137,7 @@ using join credentials:
 ```powershell
 stella-client --config C:\Stella\client.toml join `
   --network <id> `
-  --token <unpadded-base64url-token>
+  --token-file C:\Stella\join-token.txt
 ```
 
 macOS selects both ends of one feth pair. The first name is host-visible; the
@@ -146,15 +146,18 @@ second is reserved for Stella packet I/O:
 ```sh
 stella-client --config /etc/stella/client.toml join \
   --network <id> \
-  --token <unpadded-base64url-token> \
+  --token-file /etc/stella/join-token.txt \
   --tap-adapter feth100 \
   --tap-peer feth101
 ```
 
-For a node not yet enrolled with the controller, add the one-use
-`--enrollment-token <unpadded-base64url-token>` argument. Both token forms must
-decode to exactly 32 bytes. They remain process-local, are redacted from debug
-output, and are never written to the configuration.
+Tokens are read from owner-only files (`--token-file` and
+`--enrollment-token-file`) rather than from process arguments, which other
+local users can observe. For a node not yet enrolled with the controller, add
+the one-use `--enrollment-token-file <path>` argument. Both token files must
+decode to exactly 32 bytes of unpadded base64url. The secrets remain
+process-local, are redacted from debug output, and are never written to the
+configuration. Remove each token file after the join completes.
 
 On Windows, `join` creates or reuses `Stella <network-id>` from the installed
 driver package before authenticating. If authentication, joining, or
@@ -165,8 +168,8 @@ its own persistent Layer-2 interface. `--tap-adapter` is not a Windows option.
 On macOS, `join` validates the explicit local TAP pair. Both platforms wait for
 a complete validated controller snapshot before atomically persisting the
 network ID and selection. Repeating an already accepted join may omit
-`--token`; a conflicting macOS adapter or peer is rejected before contacting
-the controller.
+`--token-file`; a conflicting macOS adapter or peer is rejected before
+contacting the controller.
 
 The resulting Windows entry records the managed name:
 

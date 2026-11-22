@@ -110,6 +110,11 @@ if ($left.InterfaceGuid -eq $right.InterfaceGuid) {
 }
 
 New-Item -ItemType Directory -Path $Artifacts | Out-Null
+# Restrict the artifact directory before any credential is written: token
+# files created later inherit this descriptor instead of ambient ACEs from
+# a caller-chosen shared parent.
+icacls $Artifacts /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" | Out-Null
+Require-Success 'artifact directory ACL restriction'
 $serverConfig = Join-Path $Artifacts 'server\server.toml'
 $leftConfig = Join-Path $Artifacts 'left\client.toml'
 $rightConfig = Join-Path $Artifacts 'right\client.toml'
@@ -117,6 +122,9 @@ $scapy = Join-Path $Artifacts 'python-packages'
 $serverProcess = $null
 $leftProcess = $null
 $rightProcess = $null
+# Credential files are registered as they are created so the final cleanup
+# removes them even when a join fails partway through.
+$credentialFiles = @()
 
 try {
     cargo build --manifest-path (Join-Path $repository 'Cargo.toml') --release -p stella-server -p stella-client
@@ -148,10 +156,27 @@ try {
     $serverProcess = Start-Process -FilePath $server -ArgumentList @('--config', $serverConfig, 'run') -RedirectStandardOutput $serverStdout -RedirectStandardError $serverStderr -WindowStyle Hidden -PassThru
     Wait-TcpPort $ControllerPort $serverProcess
 
-    & $client --config $leftConfig join --network $networkId --token $leftJoin --enrollment-token $leftEnrollment --tap-adapter $LeftAdapter
+    # Tokens are passed through local files: process arguments can be read
+    # by other local users, so the credentials never appear on a command line.
+    # Each file is registered as it is created so the outer finally removes
+    # it even when a later join fails.
+    foreach ($credential in @(
+        @{ Path = Join-Path $Artifacts 'left-join-token'; Value = $leftJoin },
+        @{ Path = Join-Path $Artifacts 'left-enrollment-token'; Value = $leftEnrollment },
+        @{ Path = Join-Path $Artifacts 'right-join-token'; Value = $rightJoin },
+        @{ Path = Join-Path $Artifacts 'right-enrollment-token'; Value = $rightEnrollment }
+    )) {
+        Set-Content -LiteralPath $credential.Path -Value $credential.Value -NoNewline
+        $credentialFiles += $credential.Path
+    }
+    & $client --config $leftConfig join --network $networkId --token-file $credentialFiles[0] --enrollment-token-file $credentialFiles[1] --tap-adapter $LeftAdapter
     Require-Success 'left client join'
-    & $client --config $rightConfig join --network $networkId --token $rightJoin --enrollment-token $rightEnrollment --tap-adapter $RightAdapter
+    & $client --config $rightConfig join --network $networkId --token-file $credentialFiles[2] --enrollment-token-file $credentialFiles[3] --tap-adapter $RightAdapter
     Require-Success 'right client join'
+    foreach ($credentialFile in $credentialFiles) {
+        Remove-Item -LiteralPath $credentialFile -ErrorAction Stop
+    }
+    $credentialFiles = @()
     $leftEnrollment = $null
     $rightEnrollment = $null
     $leftJoin = $null
@@ -201,6 +226,14 @@ try {
         if ($null -ne $process -and -not $process.HasExited) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             $process.WaitForExit(5000) | Out-Null
+        }
+    }
+    # Credential files are removed on every exit path so a failed join never
+    # leaves unused tokens in the diagnostic artifacts. Removal failures are
+    # reported rather than silently discarded.
+    foreach ($credentialFile in $credentialFiles) {
+        if (Test-Path -LiteralPath $credentialFile) {
+            Remove-Item -LiteralPath $credentialFile -ErrorAction Stop
         }
     }
 }

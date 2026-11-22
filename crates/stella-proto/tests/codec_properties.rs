@@ -1,18 +1,21 @@
 //! Property tests for strict Stella codec bounds and round-trip symmetry.
 
 use proptest::prelude::*;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use stella_common::{NetworkId, NodeId};
 use stella_proto::{
-    decode_control_record_length, decode_turn_stream_record_length, encode_session_confirm,
-    encode_session_reject, CommonHeader, ConnectivityGenerationView, ConnectivityListView,
-    ConnectivityRecordView, ControlFieldIter, ControlHeader, ControlMessageView, DataHeader,
-    DataPacketView, EndpointSetView, HandshakeHeader, IceCandidate, KeepaliveHeader,
-    KeepalivePacketView, MembershipGrantView, NetworkPolicy, NetworkRevisionListView, PacketType,
-    PeerListView, PeerRecordView, ProtocolVersion, RelayServiceListView, RelayServiceView,
-    SessionConfirmRef, SessionConfirmRole, SessionConfirmView, SessionInitView,
-    SessionRejectReason, SessionRejectRef, SessionRejectView, SessionResponseView, StunMessageView,
-    StunServerListView, TurnChannelDataView, VersionListView, HANDSHAKE_FIXED_HEADER_LENGTH,
-    SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG, SESSION_REJECT_PAYLOAD_LENGTH,
+    decode_control_record_length, decode_turn_stream_record_length, encode_endpoint_set,
+    encode_session_confirm, encode_session_reject, encode_stun_server_list, CommonHeader,
+    ConnectivityGenerationView, ConnectivityListView, ConnectivityRecordView, ControlFieldIter,
+    ControlHeader, ControlMessageView, DataHeader, DataPacketView, Endpoint, EndpointSetView,
+    HandshakeHeader, IceCandidate, KeepaliveHeader, KeepalivePacketView, MembershipGrantView,
+    NetworkPolicy, NetworkRevisionListView, PacketType, PeerListView, PeerRecordView,
+    ProtocolVersion, RelayServiceListView, RelayServiceView, SessionConfirmRef, SessionConfirmRole,
+    SessionConfirmView, SessionInitView, SessionRejectReason, SessionRejectRef, SessionRejectView,
+    SessionResponseView, StunMessageView, StunServer, StunServerListView, TurnChannelDataView,
+    VersionListView, HANDSHAKE_FIXED_HEADER_LENGTH, MAX_ENDPOINT_DATAGRAM_SIZE,
+    MIN_ENDPOINT_DATAGRAM_SIZE, SESSION_CONFIRM_PAYLOAD_LENGTH, SESSION_CONFIRM_RESPONDER_FLAG,
+    SESSION_REJECT_PAYLOAD_LENGTH, STUN_SERVER_RECORD_LENGTH,
 };
 
 #[derive(Clone, Copy)]
@@ -213,5 +216,236 @@ proptest! {
         prop_assert_eq!(decoded.init_hash(), &init_hash);
         prop_assert_eq!(decoded.signature(), &signature);
         prop_assert_eq!(decoded.datagram(), encoded);
+    }
+
+    #[test]
+    fn network_policy_encode_decode_is_symmetric(
+        encrypted in any::<bool>(),
+        max_frame_size in any::<u16>(),
+        max_flood_peers in any::<u16>(),
+        flood_rate in any::<u32>(),
+        flood_burst in any::<u32>(),
+        mac_age_seconds in any::<u32>(),
+        heartbeat_seconds in any::<u16>(),
+        peer_lease_seconds in any::<u16>(),
+        session_lifetime_seconds in any::<u32>(),
+        reassembly_timeout_ms in any::<u32>(),
+        network_id in any::<[u8; 16]>(),
+        policy_revision in any::<u64>(),
+    ) {
+        let policy = clamped_policy(
+            encrypted,
+            max_frame_size,
+            max_flood_peers,
+            flood_rate,
+            flood_burst,
+            mac_age_seconds,
+            heartbeat_seconds,
+            peer_lease_seconds,
+            session_lifetime_seconds,
+            reassembly_timeout_ms,
+            network_id,
+            policy_revision,
+        );
+        let mut encoded = [0_u8; 64];
+        policy.encode(&mut encoded).expect("clamped policy encodes");
+        let decoded =
+            NetworkPolicy::decode(&encoded).expect("encoded policy must decode");
+        prop_assert_eq!(decoded, policy);
+        for length in 0..encoded.len() {
+            prop_assert!(NetworkPolicy::decode(&encoded[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn endpoint_set_encode_decode_is_symmetric(
+        endpoints in prop::collection::vec(
+            (
+                any::<bool>(),
+                any::<u8>(),
+                any::<u8>(),
+                any::<u32>(),
+                any::<[u8; 16]>(),
+            ),
+            0..=8
+        ),
+    ) {
+        let mut endpoints: Vec<Endpoint> = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(index, (v6, _priority, port, datagram_size, address))| {
+                generated_endpoint(
+                    v6,
+                    u8::try_from(index).unwrap_or(0),
+                    port,
+                    datagram_size,
+                    address,
+                )
+            })
+            .collect();
+        endpoints.sort_by_key(|endpoint| (endpoint.priority(), endpoint.kind(), endpoint.port()));
+        endpoints
+            .dedup_by_key(|endpoint| (endpoint.priority(), endpoint.kind(), endpoint.port()));
+        let mut encoded = [0_u8; 4 + 8 * 28];
+        let length =
+            encode_endpoint_set(&endpoints, &mut encoded).expect("sorted endpoints encode");
+        let decoded = EndpointSetView::decode(&encoded[..length])
+            .expect("encoded endpoint set must decode");
+        prop_assert_eq!(decoded.endpoints().count(), endpoints.len());
+        for (decoded_endpoint, endpoint) in decoded.endpoints().zip(endpoints.iter().copied()) {
+            prop_assert_eq!(decoded_endpoint, endpoint);
+        }
+        for prefix in 0..length {
+            prop_assert!(EndpointSetView::decode(&encoded[..prefix]).is_err());
+        }
+    }
+
+    #[test]
+    fn stun_server_list_encode_decode_is_symmetric(
+        servers in prop::collection::vec(
+            (any::<bool>(), any::<u8>(), any::<u8>(), any::<[u8; 16]>()),
+            1..=8
+        ),
+    ) {
+        let servers: Vec<StunServer> = servers
+            .into_iter()
+            .enumerate()
+            .map(|(index, (v6, _priority, port, address))| {
+                let port = u16::from(port).max(1);
+                let address = if v6 {
+                    let candidate = Ipv6Addr::from(address);
+                    if candidate.is_multicast()
+                        || candidate.is_unicast_link_local()
+                        || candidate.is_loopback()
+                        || candidate.is_unspecified()
+                        || candidate.to_ipv4_mapped().is_some()
+                    {
+                        SocketAddr::new(
+                            std::net::IpAddr::V6(Ipv6Addr::from([
+                                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                            ])),
+                            port,
+                        )
+                    } else {
+                        SocketAddr::new(std::net::IpAddr::V6(candidate), port)
+                    }
+                } else {
+                    // STUN addresses additionally reject loopback, so every
+                    // generated IPv4 address maps into the TEST-NET-1 block.
+                    let mut last = address[3] & 0x7f;
+                    if last == 0 {
+                        last = 1;
+                    }
+                    SocketAddr::new(
+                        std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)),
+                        port,
+                    )
+                };
+                StunServer {
+                    priority: u8::try_from(index).unwrap_or(0),
+                    address,
+                }
+            })
+            .collect();
+        let mut encoded = [0_u8; 4 + 8 * STUN_SERVER_RECORD_LENGTH];
+        let length =
+            encode_stun_server_list(&servers, &mut encoded).expect("sorted servers encode");
+        let decoded = StunServerListView::decode(&encoded[..length])
+            .expect("encoded STUN server list must decode");
+        prop_assert_eq!(decoded.servers().count(), servers.len());
+        for (decoded_server, server) in decoded.servers().zip(servers.iter().copied()) {
+            prop_assert_eq!(decoded_server, server);
+        }
+        for prefix in 0..length {
+            prop_assert!(StunServerListView::decode(&encoded[..prefix]).is_err());
+        }
+    }
+}
+
+/// Random valid policy values clamped into their protocol ranges.
+#[allow(clippy::too_many_arguments)]
+fn clamped_policy(
+    encrypted: bool,
+    max_frame_size: u16,
+    max_flood_peers: u16,
+    flood_rate: u32,
+    flood_burst: u32,
+    mac_age_seconds: u32,
+    heartbeat_seconds: u16,
+    peer_lease_seconds: u16,
+    session_lifetime_seconds: u32,
+    reassembly_timeout_ms: u32,
+    network_id: [u8; 16],
+    policy_revision: u64,
+) -> NetworkPolicy {
+    let heartbeat_seconds = heartbeat_seconds.clamp(5, 300);
+    let minimum_lease = heartbeat_seconds.saturating_mul(3).clamp(5, 900);
+    let flood_rate = flood_rate.clamp(1, 1_000_000);
+    NetworkPolicy {
+        confidentiality: if encrypted {
+            stella_proto::ConfidentialityPolicy::Encrypt
+        } else {
+            stella_proto::ConfidentialityPolicy::AuthenticateOnly
+        },
+        max_frame_size: max_frame_size.clamp(1_514, 9_216),
+        max_flood_peers: max_flood_peers.clamp(2, 256),
+        flood_rate,
+        flood_burst: flood_burst.clamp(flood_rate, 2_000_000),
+        mac_age_seconds: mac_age_seconds.clamp(30, 3_600),
+        heartbeat_seconds,
+        peer_lease_seconds: peer_lease_seconds.clamp(minimum_lease, 900),
+        session_lifetime_seconds: session_lifetime_seconds.clamp(60, 3_600),
+        reassembly_timeout_ms: reassembly_timeout_ms.clamp(500, 10_000),
+        network_id: NetworkId::from_bytes(if network_id.iter().all(|byte| *byte == 0) {
+            [1; 16]
+        } else {
+            network_id
+        }),
+        policy_revision: policy_revision.max(1),
+    }
+}
+
+/// Builds one valid endpoint from arbitrary generator bytes.
+fn generated_endpoint(
+    v6: bool,
+    priority: u8,
+    port: u8,
+    datagram_size: u32,
+    address: [u8; 16],
+) -> Endpoint {
+    let datagram_size = datagram_size.clamp(MIN_ENDPOINT_DATAGRAM_SIZE, MAX_ENDPOINT_DATAGRAM_SIZE);
+    if v6 {
+        let candidate = Ipv6Addr::from(address);
+        let address = if candidate.is_multicast()
+            || candidate.is_unspecified()
+            || candidate.to_ipv4_mapped().is_some()
+        {
+            Ipv6Addr::from([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        } else {
+            candidate
+        };
+        Endpoint::UdpIpv6 {
+            priority,
+            port: u16::from(port).max(1),
+            max_datagram_size: datagram_size,
+            address,
+        }
+    } else {
+        let mut octets = [address[0], address[1], address[2], address[3]];
+        // Keep the first octet in the IPv4 unicast range and clear the
+        // unspecified and broadcast forms.
+        octets[0] &= 0x7f;
+        if octets == [0, 0, 0, 0] {
+            octets = [1, 0, 0, 0];
+        }
+        if octets == [255, 255, 255, 255] {
+            octets = [255, 255, 255, 254];
+        }
+        Endpoint::UdpIpv4 {
+            priority,
+            port: u16::from(port).max(1),
+            max_datagram_size: datagram_size,
+            address: Ipv4Addr::from(octets),
+        }
     }
 }

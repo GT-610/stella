@@ -75,8 +75,12 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
             ),
         ));
     }
-    validate_socket_path(&config.socket_path)?;
-    let (listener, _socket_guard) = prepare_listener(&config.socket_path, config.allowed_uid)?;
+    let socket_path = validate_socket_path(&config.socket_path)?;
+    let (listener, _socket_guard) = prepare_listener(&socket_path, config.allowed_uid)?;
+    // Bind every new feth-pair lock record to this helper's authorized user
+    // only after the socket work succeeds. A conflicting UID stored earlier
+    // in the process fails closed before any session can open a device.
+    crate::macos::feth::set_authorized_uid(config.allowed_uid)?;
     let active_sessions = Arc::new(AtomicUsize::new(0));
     let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
     loop {
@@ -98,7 +102,7 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
             },
         };
         if active_sessions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_HELPER_SESSIONS).then_some(active + 1)
             })
             .is_err()
@@ -120,7 +124,7 @@ pub fn run_macos_tap_helper(config: &MacosTapHelperConfig) -> Result<()> {
                         cancellation,
                     }))
                 });
-                let _ = serve_connection(stream, Some(allowed_uid), factory);
+                let _ = serve_connection(stream, allowed_uid, factory);
             })
         {
             active_sessions.fetch_sub(1, Ordering::AcqRel);
@@ -275,17 +279,15 @@ impl SessionOperation {
 
 fn serve_connection(
     mut stream: UnixStream,
-    expected_uid: Option<u32>,
+    expected_uid: u32,
     factory: DeviceFactory,
 ) -> io::Result<()> {
-    if let Some(expected_uid) = expected_uid {
-        let (actual_uid, _) = sys::peer_credentials(&stream)?;
-        if actual_uid != expected_uid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "TAP helper rejected an unauthorized local user",
-            ));
-        }
+    let (actual_uid, _) = sys::peer_credentials(&stream)?;
+    if actual_uid != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "TAP helper rejected an unauthorized local user",
+        ));
     }
     let ClientMessage::Open(config) = protocol::read_client(&mut stream)? else {
         return Err(invalid_protocol(
@@ -476,20 +478,70 @@ fn error_response(request_id: u64, error: &TapError) -> ServerMessage {
     }
 }
 
-fn validate_socket_path(path: &Path) -> Result<()> {
+/// Validates the operator-supplied socket path and returns the canonical path
+/// every socket operation must use.
+///
+/// The parent is resolved first so the ancestor walk covers the directories
+/// the socket actually lives in; every ancestor must be a root-owned
+/// directory without group or world write access. Binding, permission
+/// changes, ownership changes, and shutdown cleanup then operate on the
+/// returned canonical path, whose components the walk just verified: a
+/// non-root principal cannot retarget an alias component after validation,
+/// and root-controlled aliases such as `/var` are replaced by their real
+/// targets so they never appear in the bound path at all.
+fn validate_socket_path(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(TapError::InvalidConfig {
             field: "helper socket path",
             reason: "must be absolute",
         });
     }
-    if path.file_name().is_none() {
+    let Some(file_name) = path.file_name() else {
         return Err(TapError::InvalidConfig {
             field: "helper socket path",
             reason: "must name a Unix socket",
         });
+    };
+    let Some(parent) = path.parent() else {
+        return Err(TapError::InvalidConfig {
+            field: "helper socket path",
+            reason: "must live inside a directory",
+        });
+    };
+    let canonical_parent = fs::canonicalize(parent).map_err(|source| {
+        TapError::io(
+            TapOperation::ConnectHelper,
+            io::Error::new(
+                source.kind(),
+                format!(
+                    "helper socket directory {} is not accessible",
+                    parent.display()
+                ),
+            ),
+        )
+    })?;
+    let mut current: &Path = canonical_parent.as_path();
+    loop {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(current)
+            .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(TapError::InvalidConfig {
+                field: "helper socket path",
+                reason: "every path ancestor must be a root-owned directory \
+                         without group or world write access",
+            });
+        }
+        match current.parent() {
+            Some(ancestor) => current = ancestor,
+            None => break,
+        }
     }
-    Ok(())
+    Ok(canonical_parent.join(file_name))
 }
 
 fn prepare_listener(path: &Path, allowed_uid: u32) -> Result<(UnixListener, SocketGuard)> {
@@ -508,14 +560,27 @@ fn prepare_listener(path: &Path, allowed_uid: u32) -> Result<(UnixListener, Sock
         fs::remove_file(path)
             .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     }
-    let listener = UnixListener::bind(path)
-        .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
+    // Bind with a tightened process mask so the socket is owner-only from the
+    // instant it exists, independent of the launching environment's umask.
+    let previous_umask = sys::replace_umask(0o177);
+    let listener = UnixListener::bind(path);
+    sys::replace_umask(previous_umask);
+    let listener = listener.map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     sys::chown_path(path, allowed_uid)
         .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| TapError::io(TapOperation::ConnectHelper, source))?;
+    if metadata.mode() & 0o777 != 0o600 {
+        return Err(TapError::io(
+            TapOperation::ConnectHelper,
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper socket must be owner-only",
+            ),
+        ));
+    }
     Ok((
         listener,
         SocketGuard {
@@ -561,7 +626,7 @@ mod tests {
     };
 
     use super::{
-        accept_error_action, next_accept_backoff, serve_connection, AcceptErrorAction,
+        accept_error_action, next_accept_backoff, serve_connection, sys, AcceptErrorAction,
         DeviceFactory, HelperDevice, INITIAL_ACCEPT_BACKOFF, MAX_ACCEPT_BACKOFF,
     };
     use crate::{
@@ -668,7 +733,8 @@ mod tests {
                 destroyed: factory_destroyed,
             }))
         });
-        let worker = thread::spawn(move || serve_connection(server, None, factory));
+        let current_uid = sys::effective_uid();
+        let worker = thread::spawn(move || serve_connection(server, current_uid, factory));
         protocol::write_client(&mut client, &ClientMessage::Open(TapConfig::default()))
             .expect("open fake TAP");
         assert!(matches!(
@@ -717,7 +783,8 @@ mod tests {
                 destroyed: factory_destroyed,
             }))
         });
-        let worker = thread::spawn(move || serve_connection(server, None, factory));
+        let current_uid = sys::effective_uid();
+        let worker = thread::spawn(move || serve_connection(server, current_uid, factory));
         protocol::write_client(&mut client, &ClientMessage::Open(TapConfig::default()))
             .expect("open fake TAP");
         let _ = protocol::read_server(&mut client).expect("read opened");
@@ -743,7 +810,7 @@ mod tests {
         let actual_uid = super::sys::effective_uid();
         let unexpected_uid = actual_uid.wrapping_add(1);
         let factory: DeviceFactory = Box::new(|_| panic!("unauthorized factory must not run"));
-        let error = serve_connection(server, Some(unexpected_uid), factory)
+        let error = serve_connection(server, unexpected_uid, factory)
             .expect_err("wrong peer must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }

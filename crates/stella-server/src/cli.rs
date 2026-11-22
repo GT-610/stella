@@ -11,7 +11,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use stella_common::{JoinInvitation, NetworkId, NodeId, RelayId};
+use stella_common::{JoinInvitation, NetworkId, NodeId, RelayId, INVITATION_SIGNATURE_DOMAIN};
 use stella_crypto::derive_controller_id;
 use stella_proto::{ConfidentialityPolicy, NetworkPolicy};
 use stella_server::{
@@ -33,6 +33,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use zeroize::Zeroizing;
 
 const DEFAULT_TOKEN_TTL_SECONDS: u64 = 3_600;
+/// Upper bound for CLI-issued bearer tokens.
+///
+/// Bearer tokens cannot be revoked before expiry, so a typo in a huge
+/// `--ttl-seconds` value must not produce a de-facto permanent credential.
+const MAX_TOKEN_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -740,7 +745,6 @@ async fn execute_invite(
             )
         })?;
     let controller_id = derive_controller_id(identity.public_key());
-    drop(identity);
     let spki_sha256 = load_tls_spki_sha256(&config.tls_certificate_path).with_context(|| {
         format!(
             "could not load controller certificate {}",
@@ -770,6 +774,12 @@ async fn execute_invite(
         *join_token.expose_secret(),
     )
     .context("could not construct invitation")?;
+    let unsigned = invitation.unsigned_bytes();
+    let signature = identity
+        .sign_segments(INVITATION_SIGNATURE_DOMAIN, &[&unsigned])
+        .context("could not sign invitation")?;
+    let invitation =
+        invitation.with_controller_signature(identity.public_key().to_bytes(), signature);
     let encoded = invitation.encode();
     writeln!(output, "{}", encoded.as_str()).context("could not write invitation")
 }
@@ -928,6 +938,12 @@ fn token_lifetime(ttl_seconds: u64) -> Result<(u64, u64)> {
     if ttl_seconds == 0 {
         return Err(anyhow!("token lifetime must be non-zero"));
     }
+    if ttl_seconds > MAX_TOKEN_TTL_SECONDS {
+        return Err(anyhow!(
+            "token lifetime must not exceed {MAX_TOKEN_TTL_SECONDS} seconds (30 days); \
+             bearer tokens cannot be revoked early"
+        ));
+    }
     let created_at = unix_time()?;
     let expires_at = created_at
         .checked_add(ttl_seconds)
@@ -1030,6 +1046,25 @@ mod tests {
     #[cfg(any(windows, target_os = "macos"))]
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+    /// Creates fixture directories with owner-only permissions.
+    ///
+    /// The authority store rejects state paths whose ancestors are group or
+    /// world writable, so fixtures must not depend on the ambient umask
+    /// (`umask 0002` would turn a plain `create_dir` into `0775`).
+    #[cfg(any(windows, target_os = "macos"))]
+    fn create_owner_only_directory(directory: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(directory)
+                .expect("create test directory");
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(directory).expect("create test directory");
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     struct Fixture {
         directory: PathBuf,
@@ -1045,9 +1080,9 @@ mod tests {
                 "stella-server-cli-{}-{sequence}",
                 std::process::id()
             ));
-            std::fs::create_dir(&directory).expect("create fixture directory");
-            std::fs::create_dir(directory.join("state")).expect("create state directory");
-            std::fs::create_dir(directory.join("secrets")).expect("create secrets directory");
+            create_owner_only_directory(&directory);
+            create_owner_only_directory(&directory.join("state"));
+            create_owner_only_directory(&directory.join("secrets"));
             let identity_path = directory.join("secrets/controller.pk8");
             let identity = create_controller_identity(&identity_path).expect("create identity");
             let controller_id = derive_controller_id(identity.public_key());
@@ -1190,7 +1225,7 @@ mod tests {
             "stella-server-cli-relay-key-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::create_dir(&directory).expect("create relay key test directory");
+        create_owner_only_directory(&directory);
         let path = directory.join("relay-credential.key");
         let argv = [
             OsString::from("stella-server"),
@@ -1223,7 +1258,7 @@ mod tests {
         )
         .await
         .is_err());
-        assert!(repeated_output.is_empty());
+        assert_eq!(repeated_output, Vec::<u8>::new());
         assert_eq!(std::fs::read(&path).expect("reread relay key"), key);
 
         std::fs::remove_dir_all(directory).expect("remove relay key test directory");

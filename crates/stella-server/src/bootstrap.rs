@@ -148,7 +148,7 @@ fn validate_options(options: &BootstrapOptions) -> Result<(), BootstrapError> {
 
 fn configuration_document(listen: SocketAddr) -> String {
     format!(
-        "version = 1\nlisten = \"{listen}\"\n\n[state]\ndatabase = \"{DATABASE_RELATIVE_PATH}\"\n\n[identity]\ncontroller_key = \"{CONTROLLER_KEY_RELATIVE_PATH}\"\n\n[tls]\ncertificate = \"{TLS_CERTIFICATE_RELATIVE_PATH}\"\nprivate_key = \"{TLS_PRIVATE_KEY_RELATIVE_PATH}\"\n\n[limits]\nauthority_queue = 256\nmax_connections = 1024\noutbound_messages = 64\ntls_handshake_timeout_seconds = 10\nauthentication_timeout_seconds = 10\nrequest_timeout_seconds = 10\nshutdown_timeout_seconds = 10\n\n[logging]\nfilter = \"info,stella_server=info\"\n"
+        "version = 1\nlisten = \"{listen}\"\n\n[state]\ndatabase = \"{DATABASE_RELATIVE_PATH}\"\n\n[identity]\ncontroller_key = \"{CONTROLLER_KEY_RELATIVE_PATH}\"\n\n[tls]\ncertificate = \"{TLS_CERTIFICATE_RELATIVE_PATH}\"\nprivate_key = \"{TLS_PRIVATE_KEY_RELATIVE_PATH}\"\n\n[limits]\nauthority_queue = 256\nmax_connections = 1024\nmax_connections_per_ip = 64\nmax_pending_handshakes = 128\noutbound_messages = 64\ntls_handshake_timeout_seconds = 10\nauthentication_timeout_seconds = 10\nrequest_timeout_seconds = 10\nshutdown_timeout_seconds = 10\n\n[logging]\nfilter = \"info,stella_server=info\"\n"
     )
 }
 
@@ -213,7 +213,18 @@ fn ensure_directory(path: &Path, created: &mut Vec<PathBuf>) -> Result<(), Boots
     if let Some(parent) = path.parent() {
         ensure_directory(parent, created)?;
     }
-    match std::fs::create_dir(path) {
+    // The binding is mutable only where `mode` exists; other platforms keep
+    // an immutable builder and never trip the strict unused-mut lint.
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    match builder.create(path) {
         Ok(()) => created.push(path.to_path_buf()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = std::fs::metadata(path).map_err(|source| BootstrapError::Inspect {
@@ -515,7 +526,7 @@ mod tests {
         ));
         assert!(!directory.exists());
 
-        std::fs::create_dir(&directory).expect("create test directory");
+        crate::create_owner_only_directory(&directory);
         std::fs::write(&config_path, "owned by operator").expect("create existing target");
         assert!(matches!(
             initialize_controller(&config_path, &BootstrapOptions::default()),

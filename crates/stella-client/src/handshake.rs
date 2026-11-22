@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::{NetworkState, PeerDataSession};
 
 const TIMESTAMP_TOLERANCE_SECONDS: u64 = 120;
-const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const HANDSHAKE_HEADER_LENGTH: u16 = 96;
 const INIT_PAYLOAD_LENGTH: u32 = 392;
 const RESPONSE_PAYLOAD_LENGTH: u32 = 408;
@@ -37,7 +37,7 @@ const REJECT_PAYLOAD_LENGTH: u32 = 104;
 const INITIAL_RETRANSMIT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RETRANSMIT_DELAY: Duration = Duration::from_secs(2);
 const HANDSHAKE_ATTEMPT_LIFETIME: Duration = Duration::from_secs(10);
-const RESPONDER_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const RESPONDER_CACHE_LIFETIME: Duration = Duration::from_mins(5);
 const MAX_HANDSHAKES_PER_PEER: usize = 32;
 const MAX_CACHED_HANDSHAKES: usize = 256;
 const DEFAULT_REJECT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -2214,24 +2214,33 @@ mod tests {
         let first = manager
             .initiate(bob_id, &alice_key, NOW, std::time::Duration::ZERO)
             .expect("initiate");
-        assert!(manager
-            .poll_retransmissions(std::time::Duration::from_millis(249))
-            .is_empty());
+        assert_eq!(
+            manager
+                .poll_retransmissions(std::time::Duration::from_millis(249))
+                .len(),
+            0
+        );
         let retry = manager.poll_retransmissions(std::time::Duration::from_millis(250));
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].datagram(), first.datagram());
-        assert!(manager
-            .poll_retransmissions(std::time::Duration::from_millis(749))
-            .is_empty());
+        assert_eq!(
+            manager
+                .poll_retransmissions(std::time::Duration::from_millis(749))
+                .len(),
+            0
+        );
         assert_eq!(
             manager
                 .poll_retransmissions(std::time::Duration::from_millis(750))
                 .len(),
             1
         );
-        assert!(manager
-            .poll_retransmissions(std::time::Duration::from_secs(10))
-            .is_empty());
+        assert_eq!(
+            manager
+                .poll_retransmissions(std::time::Duration::from_secs(10))
+                .len(),
+            0
+        );
         let replacement = manager
             .initiate(
                 bob_id,

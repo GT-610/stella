@@ -1139,11 +1139,14 @@ mod tests {
             first.transmissions[0].target(),
             remote_candidates[0].address
         );
-        assert!(agent
-            .poll(Duration::from_millis(49))
-            .expect("respect pacing")
-            .transmissions
-            .is_empty());
+        assert_eq!(
+            agent
+                .poll(Duration::from_millis(49))
+                .expect("respect pacing")
+                .transmissions
+                .len(),
+            0
+        );
 
         let second = agent
             .poll(Duration::from_millis(50))
@@ -1492,14 +1495,14 @@ mod tests {
             .expect("send consent check")
             .into_all_parts();
         assert_eq!(consent.len(), 1);
-        assert!(nominations.is_empty());
-        assert!(failures.is_empty());
+        assert_eq!(nominations.len(), 0);
+        assert_eq!(failures.len(), 0);
         let (transmissions, nominations, failures) = alice
             .poll(Duration::from_secs(21))
             .expect("expire consent check")
             .into_all_parts();
-        assert!(transmissions.is_empty());
-        assert!(nominations.is_empty());
+        assert_eq!(transmissions.len(), 0);
+        assert_eq!(nominations.len(), 0);
         assert_eq!(
             failures,
             vec![super::IcePathFailure {
@@ -1507,11 +1510,14 @@ mod tests {
                 address: bob_candidate.address,
             }]
         );
-        assert!(alice
-            .poll(Duration::from_secs(50))
-            .expect("respect direct retry backoff")
-            .transmissions
-            .is_empty());
+        assert_eq!(
+            alice
+                .poll(Duration::from_secs(50))
+                .expect("respect direct retry backoff")
+                .transmissions
+                .len(),
+            0
+        );
         assert_eq!(
             alice
                 .poll(Duration::from_secs(51))

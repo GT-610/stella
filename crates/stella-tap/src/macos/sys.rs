@@ -80,6 +80,16 @@ pub(super) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Replaces the process file-creation mask and returns the previous one.
+///
+/// The helper is a single-purpose process, so tightening the mask around
+/// socket creation closes the window where the umask of the launching
+/// environment would make a freshly bound socket group or world accessible.
+pub(super) fn replace_umask(mask: libc::mode_t) -> libc::mode_t {
+    // SAFETY: `umask` has no preconditions and always succeeds.
+    unsafe { libc::umask(mask) }
+}
+
 pub(super) fn peer_credentials(stream: &impl AsRawFd) -> io::Result<(u32, u32)> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;

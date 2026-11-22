@@ -326,10 +326,12 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(encoded: &str) -> Result<Vec<u8>> {
-    anyhow::ensure!(encoded.len() % 2 == 0, "hex frame has odd length");
+    anyhow::ensure!(encoded.len().is_multiple_of(2), "hex frame has odd length");
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = hex_digit(pair[0]).context("invalid high hex digit")?;
             let low = hex_digit(pair[1]).context("invalid low hex digit")?;

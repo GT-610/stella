@@ -526,7 +526,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         pending = next;
         from_alice = !from_alice;
     }
-    assert!(pending.is_empty(), "handshake did not converge");
+    assert_eq!(pending, [], "handshake did not converge");
     assert_eq!(alice.established_peers().len(), 1);
     assert!(alice.established_peers().contains(&bob_id));
     assert_eq!(bob.established_peers().len(), 1);
@@ -593,7 +593,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         Duration::from_secs(1),
     )
     .await;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
     assert_eq!(delivered.as_deref(), Some(broadcast.as_slice()));
 
     let unicast = ethernet_frame(bob_mac, alice_mac, 0xb2);
@@ -612,7 +612,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         Duration::from_secs(2),
     )
     .await;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
     assert_eq!(delivered.as_deref(), Some(unicast.as_slice()));
 
     let delayed_old_first = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xc3);
@@ -664,7 +664,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         Duration::from_secs(5),
     )
     .await;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
     assert_eq!(delivered.as_deref(), Some(pending_upgrade_frame.as_slice()));
 
     assert!(alice.withdraw_direct_path(bob_id, bob_direct_address));
@@ -722,7 +722,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         pending = next;
         from_alice = !from_alice;
     }
-    assert!(pending.is_empty(), "direct handshake did not converge");
+    assert_eq!(pending, [], "direct handshake did not converge");
 
     let direct_broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xe5);
     let outbound = alice
@@ -739,7 +739,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         outbound,
         Duration::from_secs(11),
     );
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
     assert_eq!(delivered.as_deref(), Some(direct_broadcast.as_slice()));
 
     let (responses, delivered) = relay_flight(
@@ -752,7 +752,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         Duration::from_secs(12),
     )
     .await;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
     assert_eq!(delivered.as_deref(), Some(delayed_old_first.as_slice()));
 
     let maintenance = bob
@@ -845,10 +845,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         pending = next;
         from_alice = !from_alice;
     }
-    assert!(
-        pending.is_empty(),
-        "relay recovery handshake did not converge"
-    );
+    assert_eq!(pending, [], "relay recovery handshake did not converge");
 
     let recovered_broadcast = ethernet_frame(alice_mac, MacAddress::BROADCAST, 0xf6);
     let outbound = alice
@@ -866,7 +863,7 @@ async fn relay_first_session_upgrades_to_direct_and_retires_old_path() {
         Duration::from_secs(43),
     )
     .await;
-    assert!(responses.is_empty());
+    assert_eq!(responses, []);
     assert_eq!(delivered.as_deref(), Some(recovered_broadcast.as_slice()));
 
     alice_turn.shutdown().await.expect("shutdown Alice TURN");
