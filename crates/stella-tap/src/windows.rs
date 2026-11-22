@@ -1747,8 +1747,10 @@ mod tests {
 
         let encoded = utf16_multi_string("tap0901");
         let words = encoded
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(words, [116, 97, 112, 48, 57, 48, 49, 0, 0]);
     }
