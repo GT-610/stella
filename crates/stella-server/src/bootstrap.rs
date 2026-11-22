@@ -213,12 +213,17 @@ fn ensure_directory(path: &Path, created: &mut Vec<PathBuf>) -> Result<(), Boots
     if let Some(parent) = path.parent() {
         ensure_directory(parent, created)?;
     }
-    let mut builder = std::fs::DirBuilder::new();
+    // The binding is mutable only where `mode` exists; other platforms keep
+    // an immutable builder and never trip the strict unused-mut lint.
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     match builder.create(path) {
         Ok(()) => created.push(path.to_path_buf()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

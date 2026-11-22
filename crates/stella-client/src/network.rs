@@ -1017,22 +1017,17 @@ impl NetworkDataPlane {
             .into_iter()
             .filter_map(relay_transport_endpoint)
             .collect::<Vec<_>>();
-        let mut endpoints = self
-            .state
-            .peers()
-            .get(&peer)
-            .map(|state| {
-                state
-                    .endpoints()
-                    .iter()
-                    .copied()
-                    .filter(|endpoint| {
-                        let address = endpoint_socket_address(*endpoint);
-                        self.udp_family_available(address) && usable_peer_endpoint_address(address)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut endpoints = self.state.peers().get(&peer).map_or_default(|state| {
+            state
+                .endpoints()
+                .iter()
+                .copied()
+                .filter(|endpoint| {
+                    let address = endpoint_socket_address(*endpoint);
+                    self.udp_family_available(address) && usable_peer_endpoint_address(address)
+                })
+                .collect::<Vec<_>>()
+        });
         endpoints.sort_by_key(|endpoint| {
             (
                 endpoint.priority(),

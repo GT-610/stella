@@ -28,7 +28,7 @@ use thiserror::Error;
 use crate::{NetworkState, PeerDataSession};
 
 const TIMESTAMP_TOLERANCE_SECONDS: u64 = 120;
-const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const MAX_SESSION_LIFETIME: Duration = Duration::from_hours(1);
 const HANDSHAKE_HEADER_LENGTH: u16 = 96;
 const INIT_PAYLOAD_LENGTH: u32 = 392;
 const RESPONSE_PAYLOAD_LENGTH: u32 = 408;
@@ -37,7 +37,7 @@ const REJECT_PAYLOAD_LENGTH: u32 = 104;
 const INITIAL_RETRANSMIT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RETRANSMIT_DELAY: Duration = Duration::from_secs(2);
 const HANDSHAKE_ATTEMPT_LIFETIME: Duration = Duration::from_secs(10);
-const RESPONDER_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
+const RESPONDER_CACHE_LIFETIME: Duration = Duration::from_mins(5);
 const MAX_HANDSHAKES_PER_PEER: usize = 32;
 const MAX_CACHED_HANDSHAKES: usize = 256;
 const DEFAULT_REJECT_RETRY_DELAY: Duration = Duration::from_secs(1);

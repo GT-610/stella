@@ -544,8 +544,8 @@ fn candidate_foundation(class: IceCandidateClass, address: IpAddr) -> u32 {
     match address {
         IpAddr::V4(address) => value ^= u32::from_be_bytes(address.octets()),
         IpAddr::V6(address) => {
-            for chunk in address.octets().chunks_exact(4) {
-                value ^= u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            for chunk in address.octets().as_chunks::<4>().0 {
+                value ^= u32::from_be_bytes(*chunk);
             }
         }
     }

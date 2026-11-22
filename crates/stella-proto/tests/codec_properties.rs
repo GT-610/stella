@@ -307,7 +307,7 @@ proptest! {
             1..=8
         ),
     ) {
-        let mut servers: Vec<StunServer> = servers
+        let servers: Vec<StunServer> = servers
             .into_iter()
             .enumerate()
             .map(|(index, (v6, _priority, port, address))| {
