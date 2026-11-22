@@ -657,7 +657,7 @@ fn read_optional_registry_string(
     if status != NO_ERROR {
         return Err(TapError::io(operation, win32_error_to_io(status)));
     }
-    if byte_length < 2 || byte_length % 2 != 0 {
+    if byte_length < 2 || !byte_length.is_multiple_of(2) {
         return Err(TapError::io(
             operation,
             io::Error::new(
@@ -1175,7 +1175,7 @@ fn parse_candidates(
             .ok_or_else(invalid_adapter_data)?;
         if address < start
             || record_end > end
-            || address % align_of::<IP_ADAPTER_ADDRESSES_LH>() != 0
+            || !address.is_multiple_of(align_of::<IP_ADAPTER_ADDRESSES_LH>())
             || remaining == 0
         {
             return Err(invalid_adapter_data());

@@ -1636,16 +1636,20 @@ mod tests {
         )
         .expect("create endpointless-peer data plane");
 
-        assert!(plane
-            .start_handshakes(local_key, WALL_TIME, Duration::ZERO)
-            .expect("skip endpointless peer")
-            .datagrams
-            .is_empty());
-        assert!(plane
-            .maintain(local_key, WALL_TIME, Duration::from_secs(1))
-            .expect("continue waiting for peer endpoint")
-            .datagrams
-            .is_empty());
+        assert_eq!(
+            plane
+                .start_handshakes(local_key, WALL_TIME, Duration::ZERO)
+                .expect("skip endpointless peer")
+                .datagrams,
+            []
+        );
+        assert_eq!(
+            plane
+                .maintain(local_key, WALL_TIME, Duration::from_secs(1))
+                .expect("continue waiting for peer endpoint")
+                .datagrams,
+            []
+        );
         std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
@@ -1767,7 +1771,7 @@ mod tests {
                 ConnectivityCarrier::TurnUdp,
             )])
             .expect("enable unrelated TURN UDP relay");
-        assert!(plane.relay_endpoints().is_empty());
+        assert_eq!(plane.relay_endpoints(), []);
         plane
             .set_available_relay_carriers(&[(relay_id, ConnectivityCarrier::TurnUdp)])
             .expect("enable TURN UDP paths");
@@ -2042,7 +2046,7 @@ mod tests {
             Duration::ZERO,
         )
         .expect("relay-aware data plane");
-        assert!(plane.relay_endpoints().is_empty());
+        assert_eq!(plane.relay_endpoints(), []);
 
         let mut available = Vec::new();
         for (carrier, expected) in [
@@ -2286,18 +2290,20 @@ mod tests {
                 1
             );
         }
-        assert!(receiver
-            .accept_datagram(
-                &endpoint,
-                initiation.bytes(),
-                responder,
-                WALL_TIME,
-                Duration::ZERO
-            )
-            .expect("silent budget drop")
-            .into_parts()
-            .0
-            .is_empty());
+        assert_eq!(
+            receiver
+                .accept_datagram(
+                    &endpoint,
+                    initiation.bytes(),
+                    responder,
+                    WALL_TIME,
+                    Duration::ZERO
+                )
+                .expect("silent budget drop")
+                .into_parts()
+                .0,
+            []
+        );
         assert_eq!(
             receiver
                 .accept_datagram(
@@ -2372,11 +2378,13 @@ mod tests {
             .maintain(&alice_key, expires_at, Duration::from_secs(2))
             .expect("expire Alice session without failing the network");
         assert!(alice.established_peers().is_empty());
-        assert!(alice
-            .accept_tap_frame(&frame, Duration::from_secs(2))
-            .expect("drop local frame after expiry")
-            .datagrams
-            .is_empty());
+        assert_eq!(
+            alice
+                .accept_tap_frame(&frame, Duration::from_secs(2))
+                .expect("drop local frame after expiry")
+                .datagrams,
+            []
+        );
         assert!(matches!(
             bob.accept_datagram(
                 &stella_transport::Endpoint::Udp(alice_address),
@@ -2708,7 +2716,7 @@ mod tests {
         let (mut pending, mut from_alice) = if alice_start.is_empty() {
             (bob_start, false)
         } else {
-            assert!(bob_start.is_empty());
+            assert_eq!(bob_start, []);
             (alice_start, true)
         };
         for _ in 0..8 {
@@ -2742,7 +2750,7 @@ mod tests {
             pending = next;
             from_alice = !from_alice;
         }
-        assert!(pending.is_empty());
+        assert_eq!(pending, []);
         assert_eq!(alice.established_peers().len(), 1);
         assert_eq!(bob.established_peers().len(), 1);
 

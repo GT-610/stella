@@ -1258,7 +1258,7 @@ mod tests {
         )
         .await
         .is_err());
-        assert!(repeated_output.is_empty());
+        assert_eq!(repeated_output, Vec::<u8>::new());
         assert_eq!(std::fs::read(&path).expect("reread relay key"), key);
 
         std::fs::remove_dir_all(directory).expect("remove relay key test directory");
