@@ -212,35 +212,54 @@ impl ClientDataRuntime {
     /// [`Self::trusted_unix_time`] keeps advancing between observations even
     /// when the local clock runs behind. A stale controller timestamp can
     /// therefore not freeze the trust clock and extend a session beyond its
-    /// lifetime while controller updates pause.
+    /// lifetime while controller updates pause. One anchor critical section
+    /// covers the elapsed read, the floor update, and the anchor move, so
+    /// overlapping observations cannot count the same interval twice.
     ///
     /// # Panics
     ///
     /// Panics if the internal monotonic anchor lock is poisoned by a
     /// panicking thread.
     pub fn observe_controller_time(&self, server_time: u64) {
-        let elapsed = {
-            let anchor = self
-                .trusted_time_anchor
-                .lock()
-                .expect("trusted time anchor lock");
-            anchor.elapsed()
-        };
-        self.observe_controller_time_at(server_time, elapsed);
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        let elapsed = anchor.elapsed();
+        self.apply_controller_observation(server_time, elapsed, &mut anchor);
     }
 
     /// Applies one controller time observation against an explicit elapsed
     /// span since the previous observation.
     ///
-    /// Production callers pass the monotonic anchor's real elapsed time;
-    /// tests pass fixed spans so the fold arithmetic is exercised without
-    /// the real clock advancing between assertions.
+    /// Test callers pass fixed spans so the fold arithmetic is exercised
+    /// without the real clock advancing between assertions. The anchor lock
+    /// is held for the whole observation, exactly like the production path.
     ///
     /// # Panics
     ///
     /// Panics if the internal monotonic anchor lock is poisoned by a
     /// panicking thread.
+    #[cfg(test)]
     fn observe_controller_time_at(&self, server_time: u64, elapsed: Duration) {
+        let mut anchor = self
+            .trusted_time_anchor
+            .lock()
+            .expect("trusted time anchor lock");
+        self.apply_controller_observation(server_time, elapsed, &mut anchor);
+    }
+
+    /// Folds one observation into the recorded floor and moves the anchor.
+    ///
+    /// The caller holds the anchor lock for the entire observation; this
+    /// helper must never lock the anchor itself because the mutex is not
+    /// re-entrant.
+    fn apply_controller_observation(
+        &self,
+        server_time: u64,
+        elapsed: Duration,
+        anchor: &mut std::time::Instant,
+    ) {
         let whole_seconds = elapsed.as_secs();
         let anchored_now = self
             .trusted_controller_time
@@ -249,10 +268,6 @@ impl ClientDataRuntime {
         let recorded = advance_trusted_time(anchored_now, server_time);
         self.trusted_controller_time
             .store(recorded, std::sync::atomic::Ordering::Relaxed);
-        let mut anchor = self
-            .trusted_time_anchor
-            .lock()
-            .expect("trusted time anchor lock");
         if server_time > anchored_now {
             // The controller timestamp strictly replaced the anchored floor,
             // so the anchor restarts from this observation.
